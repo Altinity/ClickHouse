@@ -25,6 +25,7 @@ namespace GcStateWire
     constexpr WireKey snap_pruned_through{"snap_pruned_through"};
     constexpr WireKey snap_attempt{"snap_attempt"};
     constexpr WireKey manifest_sweep_cursor{"manifest_sweep_cursor"};
+    constexpr WireKey orphan_manifest_sweep_completed_at_ms{"orphan_manifest_sweep_completed_at_ms"};
     constexpr WireKey intent_sweep_cursor{"intent_sweep_cursor"};
     constexpr WireKey lease_owner{"lease_owner"};
     constexpr WireKey lease_seq{"lease_seq"};
@@ -52,6 +53,7 @@ String encodeGcState(const GcState & state)
     writeU64StringField(out, GcStateWire::snap_pruned_through, state.snap_pruned_through, first);
     writeU64StringField(out, GcStateWire::snap_attempt, state.snap_attempt, first);
     writeStringField(out, GcStateWire::manifest_sweep_cursor, state.manifest_sweep_cursor, first);
+    writeU64StringField(out, GcStateWire::orphan_manifest_sweep_completed_at_ms, state.orphan_manifest_sweep_completed_at_ms, first);
     if (state.header_generation >= G_BLOB_INTENTS)
         writeStringField(out, GcStateWire::intent_sweep_cursor, state.intent_sweep_cursor, first);
     writeHex128Field(out, GcStateWire::lease_owner, state.lease.owner, first);
@@ -98,6 +100,8 @@ GcState decodeGcState(std::string_view data)
             state.snap_attempt = r.readU64String();
         else if (key == GcStateWire::manifest_sweep_cursor)
             state.manifest_sweep_cursor = r.readString();
+        else if (key == GcStateWire::orphan_manifest_sweep_completed_at_ms)
+            state.orphan_manifest_sweep_completed_at_ms = r.readU64String();
         else if (key == GcStateWire::intent_sweep_cursor)
         {
             state.intent_sweep_cursor = r.readString();

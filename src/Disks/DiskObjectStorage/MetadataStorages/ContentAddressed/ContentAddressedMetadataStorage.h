@@ -660,6 +660,7 @@ private:
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t intent_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
+    const uint64_t orphan_manifest_sweep_interval_sec;
     const uint64_t gc_round_intent_create_budget;
     const uint64_t gc_round_redelete_budget;
     const uint64_t gc_round_sweep_namespace_budget;

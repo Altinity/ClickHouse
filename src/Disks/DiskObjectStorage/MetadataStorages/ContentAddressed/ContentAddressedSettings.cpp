@@ -66,6 +66,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
+    DECLARE(UInt64, orphan_manifest_sweep_interval_sec, 3600, "Seconds to wait after a completed orphan-manifest sweep before starting the next one (0 = no wait)", 0) \
     DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row, 1 to 999: one LIST response", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
     DECLARE(UInt64, gc_round_graduation_budget, 0, "Retired; when gc_round_intent_create_budget is not set, its value applies to that setting", SettingsTierType::OBSOLETE) \

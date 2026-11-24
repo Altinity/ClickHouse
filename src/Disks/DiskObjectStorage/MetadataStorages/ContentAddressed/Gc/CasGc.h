@@ -410,7 +410,7 @@ struct TxnApplyLedger
 /// cannot roll back state or delete a newer object incarnation; the safety argument does not depend on
 /// the lease being perfectly exclusive.
 ///
-/// LEASE / STEAL WINDOW (deterministic — this class NEVER reads a clock). The lease lives inside
+/// LEASE / STEAL WINDOW. The lease lives inside
 /// `gc/state` as {owner, seq} and moves only by CAS on the whole `gc/state` object. The
 /// `acquireOrRenewLease` method implements the observation, renewal, and steal protocol.
 ///
@@ -421,13 +421,10 @@ class Gc
     friend class tests::GcRoundPlanSignatureAccess;
 
 public:
-    /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
-    /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
-    /// OBSERVATION clock: monotonic on this
-    /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
-    /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
-    /// `mono_ms_fn`).
-    /// Everything else in the round stays deterministic/clock-free.
+    /// `now_ms_fn` returns wall-clock milliseconds since the Unix epoch. GC uses it to timestamp
+    /// orphan manifest sweep completion, decide when another traversal may start, and timestamp
+    /// heartbeat diagnostics. `mono_ms_fn` defaults to `Pool::bootMsNow` and measures elapsed time
+    /// on this server for the heartbeat fence-out threshold and per-round work deadlines.
     ///
     /// `log_` is the logger every round-engine log line is emitted through; pass a disk/srid-scoped
     /// logger (e.g. `CasGcScheduler`'s own `log`, built from a `fmt::format("{}::...", storage_path)`
@@ -807,7 +804,7 @@ private:
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
-                    GcRoundWorkBudget & work_budget);
+                    GcRoundWorkBudget & work_budget, bool run_orphan_manifest_sweep);
 
     struct RedeleteIo
     {

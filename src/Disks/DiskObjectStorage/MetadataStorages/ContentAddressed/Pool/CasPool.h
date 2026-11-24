@@ -95,6 +95,7 @@ struct PoolConfig
     /// 999 fits one `LIST` response: a page also needs the next key to know the listing continues.
     uint64_t intent_sweep_list_budget_keys = 999;
     uint64_t manifest_sweep_delete_budget_keys = 100;
+    uint64_t orphan_manifest_sweep_interval_sec = 3600;
     /// Keys per batch delete request for the write-once families; tests lower it to exercise chunk boundaries.
     uint64_t gc_bulk_delete_chunk_keys = 1000;
     /// Per-round blob-deletion work envelope. Excess rows are carried unchanged in `still_retired` and retried next

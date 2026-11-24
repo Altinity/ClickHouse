@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweepSchedule.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
@@ -28,6 +29,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <set>
@@ -910,6 +912,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// same key) -- see `fold_seal_reads` below.
     std::optional<RefPlan> walk_plan;
     bool defer_round = false;
+    const uint64_t orphan_manifest_sweep_decision_at_ms = now_ms_fn();
+    const auto orphan_manifest_sweep_decision = orphanManifestSweepDecisionOf(
+        state, store->poolConfig().orphan_manifest_sweep_interval_sec,
+        store->poolConfig().manifest_sweep_list_budget_keys, orphan_manifest_sweep_decision_at_ms);
+    const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepDecision::StartSweep
+        || orphan_manifest_sweep_decision == OrphanManifestSweepDecision::ContinueSweep;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool row_decision_due = rowDecisionDue(state, new_round);
@@ -928,6 +936,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("ref_log_keys_listed", ref_log_keys);
         t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("row_decision_due", row_decision_due ? 1 : 0);
+        t.metric("run_orphan_manifest_sweep", run_orphan_manifest_sweep ? 1 : 0);
+        t.metric("orphan_manifest_sweep_active", state.manifest_sweep_cursor.empty() ? 0 : 1);
+        t.metric("orphan_manifest_sweep_waiting_for_clock", orphan_manifest_sweep_decision == OrphanManifestSweepDecision::SkipUntilIntervalElapsed
+            && orphan_manifest_sweep_decision_at_ms < state.orphan_manifest_sweep_completed_at_ms ? 1 : 0);
         t.metric("dead_life_debris", ref_scan.dead_life_debris);
         t.metric("walk_plan_builds", 1);
         t.metric("walk_plan_rows", walk_plan->size());
@@ -1015,7 +1027,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / confirm intent / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget);
+    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget, run_orphan_manifest_sweep);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -1321,8 +1333,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const String manifest_sweep_cursor_before = state.manifest_sweep_cursor;
     GcState next = state;
     next.round = new_round;
-    if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
-        next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
     if (folded.intent_sweep_next_cursor)
         next.intent_sweep_cursor = *folded.intent_sweep_next_cursor;
     /// The generations the adopted seal's runs physically live in (reference-parent carry can point a
@@ -1347,6 +1357,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
+    if (!suppress_destructive && folded.orphan_sweep.orphan_manifest_sweep_page_listed)
+    {
+        next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
+        updateOrphanManifestSweepSchedule(next, orphan_manifest_sweep_decision, folded.orphan_sweep.wrapped, now_ms_fn());
+    }
     if (round_point_hook_for_test)
         runRoundPointHookForTest(RoundPointForTest::AfterRequestsBeforeCommit);
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
@@ -1570,6 +1585,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
         ManifestSweepResult & sweep = folded.orphan_sweep;
+        t.metric("orphan_manifest_sweep_page_listed", sweep.orphan_manifest_sweep_page_listed ? 1 : 0);
+        t.metric("orphan_manifest_sweep_completed", sweep.wrapped ? 1 : 0);
         for (const ManifestSweepResult::Nomination & nomination : sweep.nominations)
         {
             /// The nominated token was recorded from an earlier read, so the body is observed and compared by version
@@ -2046,7 +2063,7 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
 Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
-                        GcRoundWorkBudget & work_budget)
+                        GcRoundWorkBudget & work_budget, bool run_orphan_manifest_sweep)
 {
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
@@ -3790,7 +3807,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     reduce_timer.emplace(phase_sink, "fold_reduce");
 
     std::vector<BlobSourceRetirement> orphan_source_retirements;
-    if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
+    if (run_orphan_manifest_sweep && !suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
     {
         result.orphan_sweep = planManifestCursorPage(
             *store,
@@ -5267,6 +5284,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// family independently of that, and the two reasons are stated apart on purpose — a future reader
     /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
+    next.orphan_manifest_sweep_completed_at_ms = 0;
     /// The rebuilt state has no row, so every intent is an orphan again; the sweep starts over to meet each.
     next.intent_sweep_cursor = "";
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,

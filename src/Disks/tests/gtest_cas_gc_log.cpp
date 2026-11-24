@@ -435,7 +435,7 @@ TEST(CASGCLog, FinishLogLineMatchesCasGcLogRow)
 }
 
 /// A `Deferred` round completed as leader: it counts as a success for health, and like `NotALeader` it
-/// writes no `Information` line. On an empty pool with the default defer bound the first round defers.
+/// writes no `Information` line.
 TEST(CASGCLog, ADeferredRoundCountsAsASuccessAndLogsNoFinishLine)
 {
     auto backend = std::make_shared<InMemoryBackend>();
