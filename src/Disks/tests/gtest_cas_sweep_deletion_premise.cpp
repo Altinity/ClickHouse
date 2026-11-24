@@ -254,13 +254,24 @@ TEST(CASSweepDeletionPremise, TheCursorPageRetainsDebrisOfANamespaceThatFoldedNo
 TEST(CASSweepDeletionPremise, ConsecutiveRoundsSurviveAnOrphanOfAnEmptyRefStream)
 {
     OrphanFixture f(/*gc_fold_max_defer_rounds*/0);
-    Gc gc(f.store, hexToU128("00000000000000000000000000000001"));
+    uint64_t now_ms = 1000;
+    Gc gc(f.store, hexToU128("00000000000000000000000000000001"), [&] { return now_ms; });
+    uint64_t pages_listed = 0;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase)
+    {
+        if (phase.phase == "orphan_sweep")
+            pages_listed += phase.metrics.at("orphan_manifest_sweep_page_listed");
+    });
 
     const RoundReport first = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(first.acquired_lease);
     ASSERT_FALSE(first.deferred);
     for (int i = 0; i < 2; ++i)
+    {
+        now_ms += f.store->poolConfig().orphan_manifest_sweep_interval_sec * 1000;
         EXPECT_NO_THROW(runRegularRoundReclaiming(gc)) << "round " << i + 2;
+    }
+    EXPECT_EQ(pages_listed, 3u);
     EXPECT_TRUE(f.orphanExists());
 
     /// Positive control: the adopted seal carries a zero cursor and the manifest is eligible, so the

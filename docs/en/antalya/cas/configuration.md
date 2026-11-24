@@ -234,8 +234,8 @@ removes that churn, with no measured cost.
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}
 
-These settings bound individual phases of a `GC` round. The first two accept any `UInt64` value;
-for the remaining caps, `0` means unbounded.
+These settings control the schedule and work limits of a `GC` round. For per-round caps, `0` means
+unbounded unless the table states otherwise.
 
 Five of these caps (`cas_gc_round_intent_create_budget`, `cas_gc_round_redelete_budget`,
 `cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget`,
@@ -252,8 +252,9 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 
 | Setting | Default | Bounds | Description |
 |---|---|---|---|
-| `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per round |
-| `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep `DELETE` budget per round |
+| `cas_orphan_manifest_sweep_interval_sec` | `3600` | `UInt64` | Wait after a completed orphan-manifest traversal. See [clock-skew handling](#orphan-manifest-sweep-schedule). `0` means no wait |
+| `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per permitted round; `0` pauses the traversal without losing its cursor |
+| `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep candidate budget per page; `0` lists without nominating deletions |
 | `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
 | `cas_gc_round_intent_create_budget` | `0` | `0` = unbounded | Deletion-intent creates per round, summed over every GC shard and counted when a create is sent. The creates of a round run concurrently, at most `cas_gc_io_concurrency` at a time. A blob over the cap stays a `candidate` and its intent is created in a later round. When a round sends the whole cap, the next round resumes after the last key that was sent, so a key whose create cannot be confirmed does not starve the keys behind it: with `B` as the cap and `N` candidates, every candidate gets a create within `ceil(N / B) + 1` rounds that commit. The resume position is kept in memory: a new GC leader starts from the first key |
 | `cas_intent_sweep_list_budget_keys` | `999` | `1` to `999` | Keys of `blob-intents/` one GC round lists to find intents that have no GC row, in one `LIST` response. A value outside the range is refused at startup |
@@ -265,11 +266,57 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 | `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off. At the cap the rest of the prefix is never revisited; only `cas-fsck` reclaims it. Leave it at `0` |
 | `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round. At `0` the audit log of one shard is still limited: rows are dropped once a conservative estimate of its size reaches 128 MiB per round, so the written log is smaller (about 52 MiB with 34-character S3 ETags and a 128-bit hash). Deletes are unaffected |
 
+### Orphan-manifest sweep schedule {#orphan-manifest-sweep-schedule}
+
+The first eligible traversal starts on the next ordinary GC fold. Once started, it continues in bounded
+pages on subsequent ordinary folds without waiting for `cas_orphan_manifest_sweep_interval_sec`
+between successful pages. The interval
+starts after the traversal's completion is committed. Completion means reaching the end of the key
+space, not that every later manifest-body deletion succeeded. Repeated `SYSTEM CAS GC RUN` commands
+respect the same schedule. Setting the interval to `0` allows another traversal on the next eligible
+fold; setting the `LIST` budget to `0` pauses progress. Fold timing follows ref-log changes,
+pending blob deletes, candidates due for an intent, and the ordinary bounded deferral.
+An idle pool defers eight invocations by default before
+each fold, including folds that start or continue a traversal.
+
+A manifest can remain in storage for longer than the configured interval. For example, the sweep
+may pass a manifest while its writer's build is still active. If the writer then stops before
+`precommitAdd` records an owner for that manifest, the sweep will revisit the key after it finishes
+the current traversal, waits for the interval, and reaches the key in the next traversal.
+
+A zero wall-clock sample near commit allows page progress while preserving the previous completion
+timestamp. If no completion time is known, the next traversal can start on the next ordinary fold. A later
+completed traversal with a positive clock sample establishes the interval again.
+
+With a positive clock reading, the next ordinary fold may start a new traversal if the saved
+completion time is more than one interval ahead of the GC leader's clock. A zero clock reading at
+the scheduling decision keeps waiting when the interval is positive, a completion time is known,
+and the cursor is empty.
+
+When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
+An exception while planning the page, writing the fold seal or pruning old generations fails the
+round without committing traversal progress. A conflicting round-state `CAS` also leaves that
+progress uncommitted. After an unknown write outcome, the next invocation reads `gc/state` to
+determine the accepted cursor. The next ordinary fold resumes from that cursor. Ref-log changes
+and pending work on blob deletion intents can cause that fold to run sooner. The fold thresholds are internal
+`PoolConfig` fields, not additional disk settings.
+
+Normal blob reclamation and cleanup of manifests whose owners were removed keep their own GC rules;
+the hourly interval applies to the orphan-manifest traversal.
+
+During a rolling upgrade within pool generation 4, set `cas_orphan_manifest_sweep_interval_sec` explicitly only after
+all servers that read the disk configuration support it. Older versions reject the unknown setting
+when loading the disk. An older GC leader preserves `manifest_sweep_cursor` when rewriting
+`gc/state`, but omits `orphan_manifest_sweep_completed_at_ms`. A newer leader resumes an unfinished
+traversal from that cursor. If the cursor is empty, the missing timestamp makes a new traversal
+eligible on the next ordinary fold, even if the previous traversal completed recently.
+
 ### Protocol version and retired settings {#protocol-version}
 
 A pool at generation 4 uses the [deletion-intent protocol](/antalya/cas/architecture/blob-protocol).
-There are no mixed versions on one pool: a server of this build refuses a pool below generation 4 at every
-open, and a server of an older build refuses a pool at generation 4. An older pool is converted once, offline,
+This build requires generation 4 when opening a pool. Servers that only support earlier protocol
+generations refuse a generation 4 pool. Builds that support generation 4 can share the pool during
+the [sweep schedule rollout](#orphan-manifest-sweep-schedule). An older pool is converted once, offline,
 by `clickhouse-disks cas-migrate-pool` with every server of the pool stopped; see
 [migrating a pool to generation 4](/antalya/cas/operations/migration).
 

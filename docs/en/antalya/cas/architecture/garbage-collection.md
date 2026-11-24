@@ -241,7 +241,9 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
   object, the state itself is gone, and this leader's next lease fails with `CORRUPTED_DATA`. Either way the round ends with
   `ABORTED` ("gc/state moved during the round"), as a lost commit does
 - **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
-  number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`
+  number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`, `row_decision_due`,
+  `run_orphan_manifest_sweep`, `orphan_manifest_sweep_active`, and
+  `orphan_manifest_sweep_waiting_for_clock`
 
 The plan has one row per admitted catalog life (`Live` or `Removing`; `Creating` excluded), joining
 its last folded position, its greatest listed `_log` position, and the keys later phases need. A row
@@ -252,6 +254,19 @@ delete; an adopted shard has a `candidate` row condemned before this round
 consecutive defers were reached. Both thresholds are internal `PoolConfig` fields, not disk
 settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work) and the round
 returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST`.
+
+`run_orphan_manifest_sweep` makes the next page eligible inside an ordinary fold according to
+`cas_orphan_manifest_sweep_interval_sec`. The intent sweep in phase 9 uses its own cursor and can
+run while the manifest sweep waits. Fold timing follows the conditions above. An idle pool defers
+eight invocations by default before each fold, including the first page and every continuation page.
+Interval `0` permits a page on every ordinary
+fold. A nonempty cursor permits continuation without another interval wait.
+`orphan_manifest_sweep_active` is an observation derived from a nonempty accepted
+`manifest_sweep_cursor`; it is not a separate field in `gc/state`.
+Suppression and failures before the state commit preserve the accepted cursor and completion time.
+Exceptions propagate, and the next ordinary fold retries the requested page when its safety gates
+permit it. The same fold cadence applies after a successful page, restart or rebuild. Cursor and
+completion changes become authoritative through the round's state `CAS`.
 
 ## Phase 5 — parent seal read {#phase-5-parent-seal-read}
 
@@ -747,7 +762,10 @@ from the catalog.
 ## Phase 18 — orphan sweep {#phase-18-orphan-sweep}
 
 The last phase: executes the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep)
-planned in phase 10 and adopted by phase 13's `CAS`.
+planned in phase 10 and adopted by phase 13's `CAS`. Planning runs only when the schedule requests
+it and the destructive gate permits it. The default wait before starting another traversal is
+one hour, subject to the clock-skew rule below. Successful pages of an active traversal continue
+without that wait.
 
 - **Runs on:** post-`CAS` (fold path)
 - **Reads / writes:** one `HEAD` per nomination, then a `DELETE` conditional on the observed etag
@@ -755,12 +773,15 @@ planned in phase 10 and adopted by phase 13's `CAS`.
   body sends no `DELETE`
 - **Safety:** phase 10 exact-read and identity-validated each candidate and computed its source-edge
   retirements; phase 13's `CAS` adopted both those retirements and the sweep cursor, so a post-`CAS`
-  body delete cannot orphan a still-reachable edge. A manifest is deletable only once the sealed fold
-  cursor is in a strictly higher epoch than the manifest's build epoch and no tail record above the
-  cursor names it as a removal; any uncertainty retains.
+  body delete cannot orphan a still-reachable edge. Every nominated manifest has passed the mount-floor
+  check. For a namespace in the catalog, the sealed fold cursor must also be in a strictly higher
+  epoch than the build and no tail record above the cursor may name the manifest as a removal.
+  For a namespace absent from the initial catalog read, the sweep verifies that it is still absent
+  after the floor check. See the [nomination rules](/antalya/cas/architecture/manifests-and-refs#orphan-sweep).
 - **Fails the round if:** a `TokenMismatch` — an immutable manifest identity must never change token
   (illegal ABA); stricter than every other post-`CAS` delete (`CORRUPTED_DATA`)
-- **Observability:** phase row `orphan_sweep`; metrics `listed`, `floor_lookups` / `floor_reads`
+- **Observability:** phase row `orphan_sweep`; metrics `orphan_manifest_sweep_page_listed`,
+  `orphan_manifest_sweep_completed`, `listed`, `floor_lookups` / `floor_reads`
   (mount-floor lookups per namespace and the reads they cost), `deleted`, `skipped`,
   `undecodable`, `cursor_advanced`, `suppressed`, and the retained share of `skipped` by reason:
   `retained_no_coverage`, `retained_hold`, `retained_unconsumed_seal`, `retained_tail_removal`,
@@ -768,6 +789,10 @@ planned in phase 10 and adopted by phase 13's `CAS`.
 
 Under `suppress_destructive` phase 10 planned nothing, so the nomination list is empty and the cursor
 does not move.
+
+`orphan_manifest_sweep_page_listed` reports a successful page `LIST`, including an empty page;
+`orphan_manifest_sweep_completed` reports that the committed traversal reached the end of the key
+space. Physical body deletion follows adoption and is counted separately in `deleted`.
 
 ## GC anomalies {#gc-anomalies}
 
@@ -812,11 +837,34 @@ named in that line:
 ## The one-pass commit {#gc-state}
 
 `<pool_prefix>/gc/state` is the durable safety and round-adoption state: `round`, `gc_shards`,
-`snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `intent_sweep_cursor`, and the lease. A
+`snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`,
+`orphan_manifest_sweep_completed_at_ms`, `intent_sweep_cursor`, and the lease. A
 folding round publishes it with exactly one commit `CAS` in phase 13, `round_commit`; the fold
 itself performs no `CAS` of its own, and within a round execution phase 1's lease `CAS` over the
 same object is the only other writer. Outside the round, `SYSTEM CAS GC REBUILD` replaces the
 baseline with a `CAS` of its own.
+
+The orphan-sweep cursor and completion timestamp control pacing, not deletion authority. A nonempty
+cursor denotes an unfinished traversal; its next page can run on the next ordinary fold without an interval wait.
+An empty cursor means no traversal is in progress. At EOF, the round records a completion time
+sampled near commit in UTC milliseconds; `0` means unknown or never recorded. Legacy state without
+this timestamp resumes a nonempty cursor or permits a first traversal for an empty cursor on the next
+ordinary fold. The reader ignores the former `orphan_manifest_sweep_active` and
+`orphan_manifest_sweep_started_at_ms` keys in three-field state. The intermediate three-field
+reader cannot read completion-only state, so rollback to it is unsupported. Renewal and takeover
+preserve the cursor and timestamp; rebuild resets both.
+
+A zero clock sample near commit preserves the previous completion timestamp, including an unknown
+value of `0`. The round still adopts the page's cursor through the same state `CAS`. If the page
+reaches EOF and the completion time remains unknown, another traversal can start on the next ordinary fold.
+A later EOF with a positive clock sample records a known completion time and restores interval
+pacing. A conflicting state `CAS` adopts neither the cursor nor the timestamp.
+
+With a positive clock reading, the next ordinary fold may start a new traversal if the current
+leader's clock is behind the saved completion time by more than one configured interval.
+A positive gap of at most one interval keeps waiting and sets `orphan_manifest_sweep_waiting_for_clock`.
+A zero clock sample at the scheduling decision also keeps waiting when the completion time is
+known and the interval is positive. An active traversal or interval `0` bypasses the time check.
 
 **The fold seal *is* the coverage record**: generation, parent generation, one `ref_lives` row per
 catalog-admitted opaque life (coverage plus optional cleanup evidence), references to the
@@ -1059,8 +1107,9 @@ disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without
 | `cas_gc_round_prefix_wholesale_budget` | 20000 | listed objects the retention prune may process per round, gone ones included (phase 13) |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | 0 | listed objects the hand-off reclaim may process per round, reserved separately (phase 14) |
 | `cas_gc_round_ref_cleanup_budget` | 0 | covered `_log` / `_snap` deletes per round (phase 17) |
-| `cas_manifest_sweep_list_budget_keys` | 1000 | orphan-manifest sweep `LIST` budget in keys per round; `0` disables the sweep (phase 10) |
-| `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep `DELETE` budget per round (phases 10, 18) |
+| `cas_orphan_manifest_sweep_interval_sec` | 3600 | Wait after a completed traversal, subject to the clock-skew rule above. `0` removes the wait |
+| `cas_manifest_sweep_list_budget_keys` | 1000 | orphan-manifest sweep `LIST` budget in keys per permitted round; `0` disables the sweep without clearing its cursor (phase 10) |
+| `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep candidate budget per page; `0` lists without nominations (phases 10, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 10) |
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 10) |
 | `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
@@ -1173,7 +1222,8 @@ No writes.
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
 | manifest candidate body | `GET` | one per nominated candidate (≤ `cas_manifest_sweep_delete_budget_keys`), through the read-ahead; keys decided from their name alone are never read; only when orphan planning runs |
-| `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
+| `gc/state`, adopted `fold_seal` | `GET` | the page reads `gc/state` and the seal it names. After a namespace's removal walk it rereads `gc/state` and fetches the seal again if the adopted generation or attempt changed |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | one initial read per planned page, plus one after the floor checks if the page has tentative candidates |
 | `<server_root_id>/mount` | `GET` | one memoized mount-floor lookup per namespace per page (`floor_lookups` / `floor_reads`), only when orphan planning runs |
 | `_ckpt`, the snapshot's same-id `_log`, the tombstone its backlink names, `_snap`, tail `_log` | `GET` | per namespace on the page (the recovery base plus the tail), only when orphan planning runs |
 
