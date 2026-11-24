@@ -294,7 +294,7 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"), [] { return 1001; });
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblForgotten"};
 
@@ -311,7 +311,12 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
             op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
     }
 
+    GcState state;
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
+    state.lease = GcLease{hexToU128("0000000000000000000000000000000a"), 1};
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.gcStateKey(), encodeGcState(state), Retry::once())));
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
+    EXPECT_TRUE(report.deferred);
     EXPECT_TRUE(report.anomalies.empty());
     EXPECT_FALSE(op.list(layout.namespaceStreamPrefix(forgotten_life), "", 100, Retry::once()).keys.empty());
 }

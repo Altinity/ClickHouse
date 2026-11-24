@@ -14,22 +14,16 @@
 #include <memory>
 #include <string_view>
 
-namespace DB::ErrorCodes
-{
-    extern const int CORRUPTED_DATA;
-}
-
 namespace DB::Cas
 {
 
-/// Row tags for the sealed source-edge run. These byte values are part of the source-edge payload
-/// format, shared by this codec and the GC fold that interprets the rows.
+/// Row tags for the sealed source-edge run.
 ///
 /// Source-edge rows use `source_id == 0` as a sentinel key. A real active edge must never use that key;
 /// both sentinel tags are restricted to it. `RunMarker::Zero` describes a zero transition for the current
 /// generation and is dropped when the row is carried forward. `RunMarker::Condemned` carries the condemned
-/// incarnation at the sentinel key across generations until settlement; its payload contains the full
-/// deletion token and other condemned-row state. A condemned row subsumes the zero marker for that
+/// incarnation at the sentinel key across generations until settlement, with the full deletion token and
+/// other condemned-row state. A condemned row subsumes the zero marker for that
 /// generation.
 enum class RunMarker : char
 {
@@ -37,19 +31,6 @@ enum class RunMarker : char
     Edge = 0x01,
     Condemned = 0x02,
 };
-
-constexpr char runMarkerByte(RunMarker marker)
-{
-    return static_cast<char>(marker);
-}
-
-inline RunMarker runMarkerFromByte(char byte, std::string_view what)
-{
-    if (byte != runMarkerByte(RunMarker::Zero) && byte != runMarkerByte(RunMarker::Edge)
-        && byte != runMarkerByte(RunMarker::Condemned))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: unknown marker byte {}", what, static_cast<int>(byte));
-    return static_cast<RunMarker>(byte);
-}
 
 /// The `cas_run` codec represents the GC source-edge in-degree data plane as sorted NDJSON. This is
 /// the `RecordStream` family
@@ -75,8 +56,8 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
 /// `mark` maps to the `RunMarker` bytes; a `condemned` row additionally
-/// carries the retired incarnation (`pending`/`token_type`/`token`/`size`/`condemn_round`) and the durable condemn-marker
-/// confirmation bit (`confirmed`).
+/// carries the retired incarnation (`pending`/`token_type`/`token`/`size`/`condemn_round`) and `confirmed` (`marker_confirmed`),
+/// which no decision reads.
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.
 /// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`/`marker_confirmed`) are
@@ -90,7 +71,8 @@ struct SourceEdgeRecord
     PersistedEtag token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
-    bool marker_confirmed = false;   /// written with `delete_pending`; the graduation gate reads the marker, not this bit
+    bool marker_confirmed = false;   /// set only in rows of earlier builds; nothing reads it
+    bool standing = false;           /// implies `delete_pending`; written only when true. The body of this incarnation is deleted or known absent; the intent still exists.
 };
 
 /// The header-line `kind` word for the only live `cas_run` kind.
