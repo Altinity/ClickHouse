@@ -1640,8 +1640,8 @@ TEST_F(ConnectionPoolTest, PreservingConnectionSurvivesAllocationFailureWhileCac
     query_tracker.setHardLimit(0);
     thread_tracker->setParent(prev_parent);
 
-    /// The `catch` and the destructor of the half-built connection both count a reset.
-    ASSERT_GT(DB::CurrentThread::getProfileEvents()[metrics.reset], reset_before);
+    /// Exactly one reset: the destructor of the half-built connection must not count another one.
+    ASSERT_EQ(reset_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reset]);
     ASSERT_EQ(preserved_before, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
     ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
 }

@@ -1334,9 +1334,13 @@ private:
             return;
         }
 
+        /// Declared outside the `try` so the `catch` can mark it expired: otherwise its destructor
+        /// (a connected, completed connection that is not marked expired) would call
+        /// `atConnectionDestroy` again, count a second reset and retry preserving it.
+        ConnectionPtr connection_to_store;
         try
         {
-            auto connection_to_store = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
+            connection_to_store = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
             connection_to_store->assign(connection);
             connection_to_store->updateCachedResolvedIp();
             connection_to_store->notifySocketInode();
@@ -1355,6 +1359,8 @@ private:
             /// This handler runs in a `noexcept` function and must not throw: building the log message
             /// allocates, and the failure being handled may itself be a memory limit exception.
             LockMemoryExceptionInThread lock_memory_exception{VariableContext::Global};
+            if (connection_to_store)
+                connection_to_store->markAsExpired();
             ProfileEvents::increment(getMetrics().reset, 1);
             tryLogCurrentException("HTTPConnectionPool", "Failed to preserve connection for reuse");
         }
