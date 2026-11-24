@@ -125,6 +125,11 @@ namespace
     {
         FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
 
+        /// The destination types come from the table metadata the export was validated against, so a destination whose
+        /// schema changed since then is not noticed by the cast below. Fail now, before anything is read or written,
+        /// instead of at the commit.
+        destination_storage.checkExportDestinationUnchanged(iceberg_metadata_json, local_context);
+
         /// The destination types come from the destination metadata that the export was validated against, which the
         /// manifest carries, so every replica casts to the types the scheduling node validated.
         const auto destination_metadata = destination_storage.getExportDestinationMetadata(iceberg_metadata_json, local_context);

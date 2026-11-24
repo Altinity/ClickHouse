@@ -860,6 +860,17 @@ StorageMetadataHandle StorageObjectStorage::getExportDestinationMetadata(
     return export_metadata;
 }
 
+void StorageObjectStorage::checkExportDestinationUnchanged(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr local_context) const
+{
+    if (!isDataLake() || !iceberg_metadata_json || iceberg_metadata_json->empty())
+        return;
+
+    configuration->lazyInitializeIfNeeded(object_storage, local_context);
+    configuration->getExternalMetadata()->checkExportDestinationUnchanged(*iceberg_metadata_json, local_context);
+}
+
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
 {
     if (isDataLake())

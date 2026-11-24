@@ -55,6 +55,10 @@ public:
         const std::optional<std::string> & iceberg_metadata_json,
         ContextPtr context) const override;
 
+    void checkExportDestinationUnchanged(
+        const std::optional<std::string> & iceberg_metadata_json,
+        ContextPtr context) const override;
+
     void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void prepareForDrop(ContextPtr query_context) override;
 

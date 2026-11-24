@@ -2811,6 +2811,48 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         persistent_components.table_uuid);
 }
 
+void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    const auto pinned_metadata = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+    /// The latest metadata is always read, like the commit does, not the one a query may have cached.
+    const auto latest_metadata_file = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method,
+        /* force_fetch_latest_metadata= */ true);
+    const auto latest_metadata = getMetadataJSONObject(
+        latest_metadata_file.path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        latest_metadata_file.compression_method,
+        persistent_components.table_uuid);
+
+    const auto pinned_schema_id = pinned_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+    const auto latest_schema_id = latest_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+    if (latest_schema_id != pinned_schema_id)
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
+            "Table schema changed after the export was scheduled (expected schema {}, got {}). "
+            "Restart the export operation.",
+            pinned_schema_id, latest_schema_id);
+
+    const auto pinned_spec_id = pinned_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+    const auto latest_spec_id = latest_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+    if (latest_spec_id != pinned_spec_id)
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
+            "Partition spec changed after the export was scheduled (expected spec {}, got {}). "
+            "Restart the export operation.",
+            pinned_spec_id, latest_spec_id);
+}
+
 NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const
 {
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file

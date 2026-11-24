@@ -751,6 +751,35 @@ def test_export_partition_bucket_type_change_rejected(cluster, source_engine):
     )
 
 
+def test_export_partition_bucket_into_nullable_destination_column(cluster, source_engine):
+    """A non-nullable source column bucketed into an optional (Nullable) Iceberg field is accepted by the
+    structural match. Iceberg tables created by Spark have optional fields, so the destination column is
+    `Nullable(Int64)` over a source `Int64`. A non-null source never produces a NULL, so the bucket is
+    the same, and a hash such as icebergBucket could not be proven single-valued by the dynamic proof."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_bucket_nullable_{uid}"
+    iceberg_table = f"iceberg_bucket_nullable_{uid}"
+
+    make_source(node, mt_table, "id Int64, key Int64", "icebergBucket(16, key)",
+             replica_name="replica1", engine=source_engine)
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 42), (2, 42)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, key Nullable(Int64)",
+                    partition_by="icebergBucket(16, key)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    result = node.query(f"SELECT id, key FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "1\t42\n2\t42", f"Unexpected exported data:\n{result}"
+
+
 def test_export_partition_truncate_type_change_rejected(cluster, source_engine):
     """icebergTruncate with the same width but a changed column type (Int64 -> String) is rejected.
     Truncate is numeric on integers (120..129 -> 120) but byte-wise on strings ('120'..'129' stay

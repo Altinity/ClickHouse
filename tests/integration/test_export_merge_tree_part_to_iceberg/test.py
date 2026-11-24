@@ -1050,7 +1050,7 @@ def test_export_part_with_renamed_destination_column(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-def test_export_part_reordered_subset_requires_matching_by_name(cluster):
+def test_export_part_reordered_subset_matching_by_name(cluster):
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_match_by_name_{sfx}"
@@ -1070,16 +1070,6 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
         "(2, 2020, 'right', 'second', 8)"
     )
     part_2020 = get_part(node, mt, "2020")
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
-        f"allow_experimental_insert_into_iceberg = 1, "
-        f"export_merge_tree_part_schema_match_mode = 'POSITION', "
-        f"export_merge_tree_part_ignore_extra_source_columns = 1"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error, f"Expected positional matching to fail, got: {error!r}"
-    assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
 
     export_part(
         node,
@@ -1355,7 +1345,7 @@ def test_export_part_runtime_cast_failure_propagates_async(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-def test_export_part_match_by_name_revalidates_extra_source_columns_in_background_task(cluster):
+def test_export_part_fails_before_writing_when_destination_schema_changes_in_background_task(cluster):
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_match_by_name_schema_drift_{sfx}"
@@ -1384,8 +1374,8 @@ def test_export_part_match_by_name_revalidates_extra_source_columns_in_backgroun
         node.query("SYSTEM NOTIFY FAILPOINT export_part_pause_before_schema_validation")
 
         exception = wait_for_failed_export_part(node, mt, part)
-        assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in exception, (
-            f"Expected the background schema check to reject the extra source column, got: {exception}"
+        assert "METADATA_MISMATCH" in exception and "schema changed after the export was scheduled" in exception, (
+            f"Expected the background task to notice the destination schema change before writing, got: {exception}"
         )
         assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
     finally:

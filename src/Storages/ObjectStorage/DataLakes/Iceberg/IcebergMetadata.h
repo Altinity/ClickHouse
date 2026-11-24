@@ -153,6 +153,8 @@ public:
 
     NamesAndTypesList getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const override;
 
+    void checkExportDestinationUnchanged(const std::string & iceberg_metadata_json_string, ContextPtr context) const override;
+
     SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> catalog,
         const std::function<void(const std::string &)> & new_file_path_callback,

@@ -728,9 +728,17 @@ namespace
     /// is too weak here: it deliberately treats DateTime and DateTime64 with different time zones as equal,
     /// since they are interchangeable for INSERT, but a time zone changes what a temporal transform returns,
     /// so the same expression over the two types can produce different partitions.
-    bool isSameTypeForPartitioning(const DataTypePtr & lhs, const DataTypePtr & rhs)
+    ///
+    /// A destination column that is `Nullable` over a source column that is not counts as the same type: the source
+    /// never produces a NULL, so every transform returns the same value for the two. An Iceberg table created by
+    /// Spark has optional fields, so this is the usual case there. The other direction does not: a `Nullable` source
+    /// may hold NULLs, which a non-nullable destination cannot.
+    bool isSameTypeForPartitioning(const DataTypePtr & source, const DataTypePtr & destination)
     {
-        return lhs->getName() == rhs->getName();
+        if (!source->isNullable() && destination->isNullable())
+            return source->getName() == removeNullable(destination)->getName();
+
+        return source->getName() == destination->getName();
     }
 
     /// The structural match is kind of permissive and is matching terms by name, not by type.

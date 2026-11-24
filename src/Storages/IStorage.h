@@ -576,6 +576,16 @@ It is currently only implemented in StorageObjectStorage.
         return getInMemoryMetadataPtr(context, false);
     }
 
+    /// Throws if the destination table changed its schema or partition spec after the export was scheduled, that is, if
+    /// they no longer are the ones of `iceberg_metadata_json`, the table metadata the export was validated against.
+    /// It lets an export task fail before it reads or writes anything. The commit repeats the same check. Storages
+    /// without such a metadata ignore it.
+    virtual void checkExportDestinationUnchanged(
+        const std::optional<std::string> & /* iceberg_metadata_json */,
+        ContextPtr /* context */) const
+    {
+    }
+
     struct IcebergCommitExportPartitionArguments
     {
       std::string metadata_json_string;
