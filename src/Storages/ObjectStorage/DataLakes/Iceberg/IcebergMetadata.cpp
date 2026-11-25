@@ -270,12 +270,37 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
     if (!configuration->catalog_iceberg_table_uuid.empty())
         known_table_uuid = normalizeUuid(configuration->catalog_iceberg_table_uuid);
 
+    /// `table-uuid` is optional in a format version 1 metadata file. A file without it cannot contradict the
+    /// catalog, and such a table is opened with `table_uuid` empty exactly as it is without a catalog uuid.
+    auto check_catalog_table_uuid = [&](const Poco::JSON::Object::Ptr & object)
+    {
+        if (!known_table_uuid || !object->has(Iceberg::f_table_uuid))
+            return;
+        const auto file_table_uuid = normalizeUuid(object->getValue<String>(f_table_uuid));
+        if (file_table_uuid != *known_table_uuid)
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Iceberg table-uuid '{}' returned by the catalog doesn't match the one in metadata file '{}': '{}'",
+                *known_table_uuid,
+                metadata_file_path,
+                file_table_uuid);
+    };
+
     Poco::JSON::Object::Ptr metadata_object;
     size_t metadata_json_size = 0;
-    if (known_table_uuid)
+    if (known_table_uuid && cache_ptr)
     {
-        metadata_object = getMetadataJSONObject(
-            metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, known_table_uuid);
+        /// The entry is keyed on the uuid reported by the catalog, which is not trusted yet. Check it against the
+        /// file before the entry is stored, so that a mismatching file is never cached under another table's key.
+        metadata_object = cache_ptr->getOrSetTableMetadata(
+            IcebergMetadataFilesCache::getKey(*known_table_uuid, metadata_file_path),
+            [&]()
+            {
+                auto metadata_json_str = readMetadataJSONString(metadata_file_path, object_storage, /* use_metadata_cache */ true, context_, log, compression_method);
+                auto parsed_object = parseMetadataJSONString(metadata_json_str);
+                check_catalog_table_uuid(parsed_object);
+                return std::make_shared<IcebergMetadataFilesCacheCell>(parsed_object, metadata_json_str.size());
+            });
     }
     else
     {
@@ -301,16 +326,8 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
                 Iceberg::f_table_uuid);
         }
     }
-    /// `table-uuid` is optional in a format version 1 metadata file. A file without it cannot contradict the
-    /// catalog, and such a table is opened with `table_uuid` empty exactly as it is without a catalog uuid.
-    if (known_table_uuid && table_uuid && *known_table_uuid != *table_uuid)
-        throw Exception(
-            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-            "Iceberg table-uuid '{}' returned by the catalog doesn't match the one in metadata file '{}': '{}'",
-            *known_table_uuid,
-            metadata_file_path,
-            *table_uuid);
-    /// With a known uuid `getMetadataJSONObject` has already stored the entry.
+    check_catalog_table_uuid(metadata_object);
+    /// With a known uuid and a cache the entry has already been stored above, after the uuid check.
     if (cache_ptr && table_uuid && !known_table_uuid)
         cache_ptr->getOrSetTableMetadata(
             IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path),
