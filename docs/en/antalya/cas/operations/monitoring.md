@@ -39,12 +39,28 @@ every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-a
 | `CASBlobBodyPutAvoided` | Safe writer observations increment it when a physical body publication is avoided | Compare with query-attributed writer materialization tasks; the aggregate HEAD counters include unrelated callers |
 | `CASRefAppendWedged` | Zero | A ref-log append lane exhausted its retries after an uncertain `PUT`; ref-log progress on that namespace may be stalled |
 | `CASRefNeedsRecovery` | Zero | A ref-append lane could not install a known-durable transaction and now refuses writes, snapshots, and confirmation until durable replay completes |
-| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer keeps retrying after losing its mount and does not yet know it |
+| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer met a successor's tombstone in the slot it needed and was rejected; a lane that keeps counting is a writer that lost its mount and does not yet know it |
+| `CASRefRecoveryEpochSealed` | Follows unclean restarts | Recovery wrote a tombstone because the last epoch that wrote to the namespace may have ended without a clean farewell. After a clean farewell the first append of the new epoch writes the tombstone instead |
+| `CASRefAppendTombstoneWritten` | Follows epoch changes of namespaces that are written | An append lane wrote the tombstone that closes the previous epoch of a namespace before its first record in this epoch |
+| `CASRefCheckpointStamped` | About one per namespace written after an upgrade, then zero | Recovery or an append lane replaced a generation 1 or 2 `_ckpt` with its generation 3 form |
+| `CASRefCheckpointNotAdvanced` | Zero | A snapshot was published but its `_ckpt` could not be advanced (fenced out, refused, contended or failed); recovery keeps replaying from an older base. Ref-log appends never write `_ckpt` |
 | `CASGCHeartbeatFenceOuts` | Zero on a healthy pool | GC fenced an expired mount; check `system.cas_mounts` for a member that should have cleanly unmounted |
 | `CASGCUnmatchedRemoveDeltas` | Occasional (benign per-key no-op by design) | A persistent nonzero rate means removal deltas are reaching the reducer without their matching activation — a correctness signal worth a look, not an automatic false deletion |
-| `CASGCCondemnMarkerUnconfirmedCarry` | Zero | The graduation read found no `Condemned` marker at the entry's round or later (absent, `Clean`, older round, or unreadable); deletion is postponed and the marker is rewritten, but investigate repeated carries |
-| `CASGCMetaWriteAnomaly` | Zero | The bounded GC metadata pool failed an operation; backend or pool pressure may delay metadata convergence |
+| `CASGCIntentUnconfirmedCarry` | Zero | A deletion-intent create did not confirm (a refused or unanswered request, or other bytes at the intent key); the blob stays a `candidate` and its deletion is postponed. Sustained growth means object-storage errors, or a bucket policy that refuses `PUT` on `blob-intents/` |
+| `CASGCIntentTokenRejected` | Zero | `GC` observed a body whose token names no incarnation, so no intent can be keyed by it; such a body is never deleted. Check the store's `ETag` form |
+| `CASBlobReuseTokenRejected` | Zero | A writer found a body whose token names no incarnation and uploaded it again instead of reusing it |
+| `CASBlobReuseIntentPresent` | Follows how often condemned content is written again | A writer found a deletion intent over the body and published a fresh body. Intents left over live bodies after a blob was referenced again also count here, once per next writer |
+| `CASBlobIntentGet` / `CASBlobIntentPut` / `CASBlobIntentDelete` / `CASBlobIntentList` | `Get` follows blob reuse; `Put`, `Delete` and `List` follow `GC` rounds | Requests on `blob-intents/`. They are not counted in the `CASBlob*` request counters |
+| `CASGCIntentAdopted` | Follows `CASGCIntentLeftOnSpare`; large after `SYSTEM CAS GC REBUILD` | The sweep gave a row to an intent that had none: an intent left on a spared blob, one whose leader died before its commit, or, after a rebuild, every intent of the pool |
+| `CASGCIntentStandingAnomaly` | Zero | A `standing` row, whose body `GC` had deleted, saw its own token at the key again. The row is carried and nothing is deleted; the log names the first blob |
+| `CASGCUndecodableBlobBody` | Zero | A body at a blob key is shorter than the pool's blob envelope. `GC` records nothing for it and deletes nothing; the key is in the log and in a `corrupt_decode` event (see [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body)) |
+| `CASGCIntentLeftOnSpare` | Follows how often condemned blobs are referenced again | A row dropped because a reference returned; its intent stays until the blob is unreferenced again |
+| `CASGCIntentDeletedOnSpare` | Follows how often condemned content is written again and then referenced | A row dropped because a reference returned, whose body a writer had already replaced; the intent of the replaced body was deleted. Included in `CASGCIntentDeleted` |
+| `CASBlobPublishDigestMismatch` | Zero | A streamed publication was refused because the payload did not hash to the blob's key: a corrupted or changed source |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
+
+`CASRefCheckpointPublished` and `CASRefCheckpointIdenticalSkip` count `_ckpt` writes by snapshot
+publication only.
 
 ### Mount renewal and remount counters {#mount-renewal-remount-counters}
 
@@ -58,7 +74,7 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
-| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion |
+| `CASMountRenewalDeadlineExceeded` | One per bounded logical renewal (startup or remount re-anchor, or a decommission's background renewal) stopped by the external lease-safety deadline | Growth means a bounded renewal found too little confirmed lease left; a mount's own background renewal never counts here |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
 | `CASRemountSucceeded` | One per whole-chain attempt that restored `Live` under a fresh writer epoch | Must be a subset of `CASRemountAttempts` |
 | `CASRemountFailed` | One per whole-chain attempt that returned without restoring `Live` | Includes a named step exception or a step that returned transiently |
@@ -117,17 +133,47 @@ ORDER BY disk_name, rounds DESC;
 ```
 
 A steady stream of `Success` and `Deferred` rows is healthy; `Deferred` means the round found no
-changed shard needing a fold and no graduation was due — a cheap round, not a stuck one (see
+changed shard needing a fold and no deletion was due — a cheap round, not a stuck one (see
 [the round](/antalya/cas/architecture/garbage-collection#the-round)). Recurring `Error` rows, or
 `NotALeader` outcomes for the disk's own scheduler, warrant investigation. `anomalies` in the
 `Finish` row is worth a steady watch: it is fold clamps surfaced and survived, so a non-zero value
 that persists across rounds is more interesting than an isolated one.
+
+A round that deletes nothing although rows are `pending` or `standing` may be suppressed because its parent
+check failed: the `fold_reduce` row of the round has `parent_unconfirmed = 1` in `phase_metrics`, the server log has
+a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The check does not fail the round, but
+when `gc/state` moved or is absent the round's commit is refused with `ABORTED`.
+
+A backlog that rounds carry without deleting shows in `pending_rows` of the `fold_reduce` row: the number of
+`pending` and `standing` rows on file after the round. A value that stays the same over many rounds, with the
+`bodies_deleted` metric of the `pending_deletes` row at 0, means the rows are carried, not reclaimed.
 
 A dashboard alert that filters on `outcome = 'Error'` alone misses `Aborted` and `Stopped` rows too
 — see the [`outcome` column](/operations/system-tables/cas_gc_log#columns) for what each one means.
 A round that is recurring `Aborted` rather than `Error` still deserves attention: it keeps retrying,
 but the underlying transient condition (backend unavailability, a lost lease, a competing leader)
 has not gone away.
+
+Each finished round also writes one `Information` line to the server log, for operators who have only
+the text log:
+
+```text
+GC round finished: round=42 outcome=Success trigger=Scheduled duration_ms=815 deleted=12 condemned=30 error_code=0 keys_listed=1043
+```
+
+The line is written for the outcomes `Success`, `Aborted`, `Error` and `Stopped`, for scheduled rounds and
+for `SYSTEM CAS GC RUN`. A round that ends as `NotALeader` or `Deferred` writes no `Information` line.
+
+| Field | `system.cas_gc_log` column of the `Finish` row |
+|---|---|
+| `round` | `round` |
+| `outcome` | `outcome` |
+| `trigger` | `trigger` |
+| `duration_ms` | `duration_ms` |
+| `deleted` | `objects_deleted` |
+| `condemned` | `entries_condemned` |
+| `error_code` | `error_code` |
+| `keys_listed` | none: the `ref_keys_listed` metric of the `defer_decision` phase row; `0` when the round ends before that phase |
 
 Which phase dominates round duration or the `LIST` budget — reproduced from the
 [per-phase rows](/operations/system-tables/cas_gc_log#per-phase-rows) reference:
@@ -156,3 +202,30 @@ ORDER BY disk, server_root_id;
 process-local — `NULL` on every row describing a peer's mount — so this query is only informative
 run against the node whose GC leadership you are checking; run it on each node to see the whole
 pool's view of itself.
+
+`last_success_age_seconds` is `NULL`, and the asynchronous metric `CASGCLastSuccessAgeSeconds_<disk>` is
+absent, until this server's GC completes its first round as leader. The age counts every round that
+completed as leader, a `Deferred` one included; a round that failed with an exception does not count.
+A threshold rule on the age alone reads the missing state as healthy, so alert on the absence of a
+recent age across all servers of the disk:
+
+```yaml
+- alert: CasGcStale
+  # <disk> is the disk name with every character outside [a-zA-Z0-9_:] replaced by "_".
+  expr: absent(ClickHouseAsyncMetrics_CASGCLastSuccessAgeSeconds_<disk> < 2400)
+  for: 5m
+```
+
+The rule fires when no server of the disk reports an age below 2400 s. Evaluate it over all servers of
+the disk, not per server: a server that led once keeps reporting an age that grows without bound after
+it loses leadership, so a per-server rule fires on every former leader. After a restart of every
+server the expression is true until the first round completes, because no server reports the metric
+before that; the alert fires only if that takes longer than 5 minutes.
+Do not deploy it for a disk whose GC is disabled on every server (`cas_gc_enabled = false`): no server
+ever reports the metric, so the rule fires forever. Treat 2400 s as an example. Set the
+threshold above the configured `cas_gc_interval_sec` plus the longest healthy full-round duration you expect, with a
+margin for slow storage. The 30-minute deadline only decides whether the second pass of the intake starts another record.
+
+Fold begin and end events in `system.cas_log` carry the candidate round number. A fold can emit begin alone,
+or both events, before its commit fails. A later successful attempt can use the same number. Filtering `Finish` to
+`Success` still admits events from both attempts. `round_id` correlates rows within `system.cas_gc_log` only.

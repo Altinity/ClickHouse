@@ -39,16 +39,6 @@ namespace DB
 namespace
 {
 
-Poco::JSON::Object::Ptr deepCopy(Poco::JSON::Object::Ptr obj)
-{
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    obj->stringify(oss);
-
-    Poco::JSON::Parser parser;
-    auto result = parser.parse(oss.str());
-    return result.extract<Poco::JSON::Object::Ptr>();
-}
-
 /// Read a numeric `total-*` field from the parent snapshot's summary, returning std::nullopt when absent or null.
 std::optional<Int64> readParentTotal(Poco::JSON::Object::Ptr parent_snapshot, const char * field_name)
 {
@@ -291,6 +281,16 @@ bool isFieldAtRequestedPosition(
     return true;
 }
 
+/// `last-column-id` written by some writers does not count nested field ids, so the ids of all schemas are taken into account too.
+Int32 getLastAssignedFieldId(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    Int64 result = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
+    auto schemas = metadata_object->getArray(Iceberg::f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+        result = std::max(result, Iceberg::IcebergSchemaProcessor::getMaxFieldId(schemas->getObject(i)->getArray(Iceberg::f_fields)));
+    return static_cast<Int32>(result);
+}
+
 }
 
 MetadataGenerator::MetadataGenerator(Poco::JSON::Object::Ptr metadata_object_)
@@ -450,6 +450,14 @@ Poco::JSON::Object::Ptr MetadataGenerator::getParentSnapshot(Int64 parent_snapsh
     return nullptr;
 }
 
+void MetadataGenerator::appendMetadataLog(const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path, Int64 timestamp_ms)
+{
+    Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
+    new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
+    new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp_ms);
+    getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
+}
+
 MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     FileNamesGenerator & generator,
     const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path,
@@ -588,12 +596,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
 
     if (!previous_metadata_file_path.empty())
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+        appendMetadataLog(previous_metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
@@ -617,12 +620,16 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     return {new_snapshot, manifest_list_path};
 }
 
-MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySnapshot(
+MetadataGenerator::NextMetadataResult MetadataGenerator::appendReplaceSnapshot(
     FileNamesGenerator & generator,
     const Iceberg::IcebergPathFromMetadata & metadata_file_path,
-    Int64 parent_snapshot_id)
+    Int64 parent_snapshot_id,
+    Poco::JSON::Object::Ptr summary,
+    Int64 records_delta,
+    Int64 files_size_delta,
+    Int64 data_files_delta)
 {
-    int format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
 
     /// These arrays are optional per the Iceberg spec, so external metadata may omit them.
     /// Seed an empty one (as Array::Ptr so getArray/extract see the right type tag) before use,
@@ -631,9 +638,9 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySna
         if (!metadata_object->has(field))
             metadata_object->set(field, Poco::JSON::Array::Ptr(new Poco::JSON::Array));
 
-    /// A manifest-only rewrite always runs against a table with a current snapshot, so `snapshots`
-    /// must already be present. Guard the same way as `generateNextMetadata` instead of dereferencing
-    /// a null array below: with a live parent snapshot a missing `snapshots` list is corrupt metadata.
+    /// A rewrite always runs against a table with a current snapshot, so `snapshots` must already be
+    /// present. Guard the same way as `generateNextMetadata` instead of dereferencing a null array
+    /// below: with a live parent snapshot a missing `snapshots` list is corrupt metadata.
     if (!metadata_object->has(Iceberg::f_snapshots))
         throw Exception(
             ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
@@ -659,22 +666,13 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySna
     new_snapshot->set(Iceberg::f_timestamp_ms, timestamp);
     metadata_object->set(Iceberg::f_last_updated_ms, timestamp);
 
-    auto parent_snapshot = getParentSnapshot(parent_snapshot_id);
-
-    /// Manifest-only rewrite: all added-* deltas are zero so `total-*` counters are inherited unchanged from the parent.
-    Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
     summary->set(Iceberg::f_operation, Iceberg::f_replace);
-    summary->set(Iceberg::f_added_data_files, "0");
-    summary->set(Iceberg::f_added_records, "0");
-    summary->set(Iceberg::f_added_files_size, "0");
-    summary->set(Iceberg::f_changed_partition_count, "0");
-
     setSnapshotTotals(
         summary,
-        parent_snapshot,
-        /*added_records=*/0,
-        /*added_files_size=*/0,
-        /*added_data_files=*/0,
+        getParentSnapshot(parent_snapshot_id),
+        /*added_records=*/records_delta,
+        /*added_files_size=*/files_size_delta,
+        /*added_data_files=*/data_files_delta,
         /*added_delete_files=*/0,
         /*added_position_deletes=*/0,
         /*added_equality_deletes=*/0);
@@ -687,7 +685,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySna
     metadata_object->set(Iceberg::f_current_snapshot_id, snapshot_id);
 
     if (!metadata_object->has(Iceberg::f_refs))
-        metadata_object->set(Iceberg::f_refs, new Poco::JSON::Object);
+        metadata_object->set(Iceberg::f_refs, Poco::JSON::Object::Ptr(new Poco::JSON::Object));
 
     if (!metadata_object->getObject(Iceberg::f_refs)->has(Iceberg::f_main))
     {
@@ -701,12 +699,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySna
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
     }
 
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        metadata_object->getArray(Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+    appendMetadataLog(metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
@@ -717,11 +710,74 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySna
     return {new_snapshot, manifest_list_path};
 }
 
+MetadataGenerator::NextMetadataResult MetadataGenerator::generateManifestOnlySnapshot(
+    FileNamesGenerator & generator,
+    const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+    Int64 parent_snapshot_id)
+{
+    /// Manifest-only rewrite: all added-* deltas are zero so `total-*` counters are inherited unchanged from the parent.
+    Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
+    summary->set(Iceberg::f_added_data_files, "0");
+    summary->set(Iceberg::f_added_records, "0");
+    summary->set(Iceberg::f_added_files_size, "0");
+    summary->set(Iceberg::f_changed_partition_count, "0");
+
+    return appendReplaceSnapshot(
+        generator,
+        metadata_file_path,
+        parent_snapshot_id,
+        summary,
+        /*records_delta=*/0,
+        /*files_size_delta=*/0,
+        /*data_files_delta=*/0);
+}
+
+MetadataGenerator::NextMetadataResult MetadataGenerator::generateReplaceSnapshot(
+    FileNamesGenerator & generator,
+    const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+    Int64 parent_snapshot_id,
+    Int64 added_data_files,
+    Int64 added_records,
+    Int64 added_files_size,
+    Int64 removed_data_files,
+    Int64 removed_records,
+    Int64 removed_files_size,
+    Int64 num_partitions)
+{
+    /// A v3 `replace` must preserve row lineage of the rewritten rows, which is not implemented.
+    const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    if (format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "A `replace` snapshot for bin-packing can be generated only for Iceberg format_version 2, got {}",
+            format_version);
+
+    Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
+    summary->set(Iceberg::f_added_data_files, std::to_string(added_data_files));
+    summary->set(Iceberg::f_added_records, std::to_string(added_records));
+    summary->set(Iceberg::f_added_files_size, std::to_string(added_files_size));
+    summary->set(Iceberg::f_deleted_data_files, std::to_string(removed_data_files));
+    summary->set(Iceberg::f_removed_data_files, std::to_string(removed_data_files));
+    summary->set(Iceberg::f_deleted_records, std::to_string(removed_records));
+    summary->set(Iceberg::f_removed_files_size, std::to_string(removed_files_size));
+    summary->set(Iceberg::f_changed_partition_count, std::to_string(num_partitions));
+
+    /// `total-*` counters: parent totals + added - removed.
+    return appendReplaceSnapshot(
+        generator,
+        metadata_file_path,
+        parent_snapshot_id,
+        summary,
+        /*records_delta=*/added_records - removed_records,
+        /*files_size_delta=*/added_files_size - removed_files_size,
+        /*data_files_delta=*/added_data_files - removed_data_files);
+}
+
 void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
 {
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     UInt32 index_to_drop = static_cast<UInt32>(fields->size());
@@ -832,7 +888,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto existing_fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < existing_fields->size(); ++i)
@@ -841,12 +897,11 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} already exists", column_name);
     }
 
-    auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
     /// The new top-level field takes the next id; nested tuple/array/map
     /// children (when `type` is complex) take the ids after it via the shared
     /// `iter`. After getIcebergType `iter` is the max assigned id, which is what
     /// last-column-id must record so every added child gets a globally unique id.
-    Int32 new_field_id = last_column_id + 1;
+    Int32 new_field_id = getLastAssignedFieldId(metadata_object) + 1;
     Int32 iter = new_field_id;
     auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
     auto new_type = Iceberg::getIcebergType(type, iter, format_version);
@@ -967,7 +1022,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
         return false;
 
     const auto next_schema_id = getNextSchemaId(metadata_object);
-    current_schema = deepCopy(current_schema);
+    current_schema = Iceberg::deepCopy(current_schema);
     schema_fields = current_schema->getArray(Iceberg::f_fields);
     auto target_field = schema_fields->getObject(target_index);
 
@@ -1018,7 +1073,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
 void MetadataGenerator::generateRenameColumnMetadata(const String & column_name, const String & new_column_name)
 {
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 

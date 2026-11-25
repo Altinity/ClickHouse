@@ -101,6 +101,8 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             {
                 out.function = RPNElement::FUNCTION_IN_RANGE;
                 out.range = Range(value);
+                /// `NULL <=> c` is false, so `NOT (key <=> c)` is true and must keep a chunk that has NULL.
+                out.false_on_null = true;
                 return true;
             }
         },
@@ -4035,6 +4037,17 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
                 (isNativeInteger(key_expr_type_not_null) || isDateTimeOrDateTime64(key_expr_type_not_null))
                 && (isNativeInteger(const_type) || isDateTimeOrDateTime64(const_type));
 
+            /// `Range` closes the open integer bound of a strict comparison by stepping it by 1, a whole second here;
+            /// a scale-0 decimal compares the same and is not stepped.
+            if (cast_not_needed && (func_name == "less" || func_name == "greater") && isDateTime64(key_expr_type_not_null)
+                && assert_cast<const DataTypeDateTime64 &>(*key_expr_type_not_null).getScale() > 0)
+            {
+                if (const_value.getType() == Field::Types::Int64)
+                    const_value = DecimalField<Decimal256>(Decimal256(const_value.safeGet<Int64>()), 0);
+                else if (const_value.getType() == Field::Types::UInt64 || const_value.getType() == Field::Types::Bool)
+                    const_value = DecimalField<Decimal256>(Decimal256(const_value.safeGet<UInt64>()), 0);
+            }
+
             if (!cast_not_needed && !key_expr_type_not_null->equals(*const_type))
             {
                 if (const_value.getType() == Field::Types::String)
@@ -5199,6 +5212,14 @@ std::optional<Range> KeyCondition::applyMonotonicFunctionsChainToRange(
     DataTypePtr current_type,
     bool single_point)
 {
+    if (functions.empty())
+        return key_range;
+
+    /// A bound where `isNull()` holds stands in for NULL or for an infinity, and is left untransformed below,
+    /// so no transformed value would remain to compare against an atom in the function's result domain.
+    if (single_point && (key_range.left.isNull() || key_range.right.isNull()))
+        return {};
+
     /// The chain was built against a recursively `LowCardinality`-stripped key type, so seed it with the
     /// stripped type here rather than in each caller: several of them pass the key column's raw type.
     current_type = recursiveRemoveLowCardinality(current_type);
@@ -5230,17 +5251,21 @@ std::optional<Range> KeyCondition::applyMonotonicFunctionsChainToRange(
             /// If we apply function to open interval, we can get empty intervals in result.
             /// E.g. for ('2020-01-03', '2020-01-20') after applying 'toYYYYMM' we will get ('202001', '202001').
             /// To avoid this we make range left and right included.
-            /// Any function that treats NULL specially is not monotonic.
-            /// Thus we can safely use isNull() as an -Inf/+Inf indicator here.
+            /// A NULL bound is an -inf/+inf stand-in and is left as is. A function that returns NULL for a non-NULL
+            /// argument leaves a bound with no position in the `Range` order, so the range cannot be analyzed.
             if (!key_range.left.isNull())
             {
                 key_range.left = applyFunction(func, current_type, key_range.left);
+                if (key_range.left.isNull())
+                    return {};
                 key_range.left_included = true;
             }
 
             if (!key_range.right.isNull())
             {
                 key_range.right = applyFunction(func, current_type, key_range.right);
+                if (key_range.right.isNull())
+                    return {};
                 key_range.right_included = true;
             }
         }
@@ -6275,52 +6300,23 @@ BoolMask KeyCondition::checkInHyperrectangle(
             }
             else
             {
-                Range key_range = sparse_hyperrectangle[sparse_pos];
+                /// The column may be wrapped in a chain of possibly monotonic functions; for an empty chain
+                /// the helper returns the range unchanged.
+                std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
+                    sparse_hyperrectangle[sparse_pos],
+                    element.monotonic_functions_chain,
+                    sparse_data_types[sparse_pos],
+                    single_point);
 
-                /// The case when the column is wrapped in a chain of possibly monotonic functions.
-                if (!element.monotonic_functions_chain.empty())
+                if (!new_range)
                 {
-                    std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
-                        key_range,
-                        element.monotonic_functions_chain,
-                        sparse_data_types[sparse_pos],
-                        single_point);
-
-                    if (!new_range)
-                    {
-                        /// Cannot determine monotonicity on this range – unknown.
-                        rpn_stack.emplace_back(true, true);
-                    }
-                    else
-                    {
-                        key_range = *new_range;
-
-                        bool intersects = element.range.intersectsRange(key_range);
-                        bool contains   = element.range.containsRange(key_range);
-
-                        /// NaN doesn't satisfy any comparison condition in SQL (e.g., NaN > 0 is false/NULL).
-                        /// In ClickHouse sort order, NaN has a defined position (after +inf), so Range-based
-                        /// analysis may incorrectly include NaN values.
-                        /// - If left bound is NaN: all values in the range are NaN (NaN sorts last),
-                        ///   so no comparison condition can be true.
-                        /// - If only right bound is NaN: the range extends into NaN territory,
-                        ///   so it cannot be fully contained (NaN values don't satisfy the condition).
-                        if (unlikely(key_range.left.isNaN()))
-                        {
-                            intersects = false;
-                            contains = false;
-                        }
-                        else if (unlikely(key_range.right.isNaN()))
-                        {
-                            contains = false;
-                        }
-
-                        rpn_stack.emplace_back(intersects, !contains);
-                        /// we don't create bloom_filter_data if monotonic_functions_chain is present
-                    }
+                    /// Cannot determine monotonicity on this range – unknown.
+                    rpn_stack.emplace_back(true, true);
                 }
                 else
                 {
+                    const Range & key_range = *new_range;
+
                     bool intersects = element.range.intersectsRange(key_range);
                     bool contains = element.range.containsRange(key_range);
 
@@ -6342,7 +6338,6 @@ BoolMask KeyCondition::checkInHyperrectangle(
                     }
 
                     rpn_stack.emplace_back(intersects, !contains);
-
                 }
             }
 
@@ -6788,6 +6783,15 @@ void KeyCondition::prepareBloomFilterData(std::function<std::optional<uint64_t>(
                     continue;
                 }
 
+                /// Sort and deduplicate the probe hashes once, here, instead of leaving that to every
+                /// lookup on every granule/row group: a filter can then intersect them with its own
+                /// sorted value set in one merge pass (see the Parquet `DictionaryLookup`), and the
+                /// duplicates that an `IN` set can produce - different values whose hashes collide, or
+                /// a tuple element repeated across set rows - are probed once instead of many times.
+                std::sort(hashes_for_column.begin(), hashes_for_column.end());
+                hashes_for_column.erase(
+                    std::unique(hashes_for_column.begin(), hashes_for_column.end()), hashes_for_column.end());
+
                 hashes.emplace_back(hashes_for_column);
 
                 key_columns_for_element.push_back(indexes_mapping[i].key_index);
@@ -6810,6 +6814,197 @@ bool KeyCondition::mayBeTrueInRange(
     const DataTypes & data_types) const
 {
     return checkInRange(used_key_size, left_keys, right_keys, data_types, BoolMask::consider_only_can_be_true).can_be_true;
+}
+
+namespace
+{
+
+/// One SQL result when the column under consideration is NULL.
+enum class SqlBool
+{
+    False,
+    True,
+    Unknown,
+};
+
+/// Every SQL result an expression might still have. Other columns are `any`: false, true, or unknown.
+struct TruthOnNull
+{
+    bool has_false = false;
+    bool has_true = false;
+    bool has_unknown = false;
+
+    static TruthOnNull isFalse()
+    {
+        TruthOnNull value;
+        value.has_false = true;
+        return value;
+    }
+
+    static TruthOnNull isTrue()
+    {
+        TruthOnNull value;
+        value.has_true = true;
+        return value;
+    }
+
+    static TruthOnNull isUnknown()
+    {
+        TruthOnNull value;
+        value.has_unknown = true;
+        return value;
+    }
+
+    static TruthOnNull any()
+    {
+        TruthOnNull value;
+        value.has_false = true;
+        value.has_true = true;
+        value.has_unknown = true;
+        return value;
+    }
+
+    static TruthOnNull from(SqlBool value)
+    {
+        if (value == SqlBool::False)
+            return isFalse();
+        if (value == SqlBool::True)
+            return isTrue();
+        return isUnknown();
+    }
+
+    bool has(SqlBool value) const
+    {
+        if (value == SqlBool::False)
+            return has_false;
+        if (value == SqlBool::True)
+            return has_true;
+        return has_unknown;
+    }
+
+    void add(TruthOnNull other)
+    {
+        has_false = has_false || other.has_false;
+        has_true = has_true || other.has_true;
+        has_unknown = has_unknown || other.has_unknown;
+    }
+};
+
+SqlBool sqlAnd(SqlBool left, SqlBool right)
+{
+    if (left == SqlBool::False || right == SqlBool::False)
+        return SqlBool::False;
+    if (left == SqlBool::True && right == SqlBool::True)
+        return SqlBool::True;
+    return SqlBool::Unknown;
+}
+
+SqlBool sqlOr(SqlBool left, SqlBool right)
+{
+    if (left == SqlBool::True || right == SqlBool::True)
+        return SqlBool::True;
+    if (left == SqlBool::False && right == SqlBool::False)
+        return SqlBool::False;
+    return SqlBool::Unknown;
+}
+
+/// `NOT` swaps false and true. Unknown stays unknown, including when the set is every possible result.
+TruthOnNull sqlNot(TruthOnNull value)
+{
+    std::swap(value.has_false, value.has_true);
+    return value;
+}
+
+TruthOnNull combineOnNull(TruthOnNull left, TruthOnNull right, bool is_and)
+{
+    const SqlBool values[] = {SqlBool::False, SqlBool::True, SqlBool::Unknown};
+    TruthOnNull result;
+    for (SqlBool left_value : values)
+    {
+        if (!left.has(left_value))
+            continue;
+        for (SqlBool right_value : values)
+        {
+            if (!right.has(right_value))
+                continue;
+            result.add(TruthOnNull::from(is_and ? sqlAnd(left_value, right_value) : sqlOr(left_value, right_value)));
+        }
+    }
+    return result;
+}
+
+}
+
+bool KeyCondition::mayBeTrueOnNull(size_t key_column) const
+{
+    /// `WHERE` keeps a row only when the predicate is true. A comparison with NULL is unknown.
+    std::vector<TruthOnNull> stack;
+    for (const auto & element : rpn)
+    {
+        const bool uses_this_column
+            = std::find(element.key_columns.begin(), element.key_columns.end(), key_column) != element.key_columns.end();
+
+        switch (element.function)
+        {
+            case RPNElement::FUNCTION_IN_RANGE:
+            case RPNElement::FUNCTION_NOT_IN_RANGE:
+            case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
+            case RPNElement::FUNCTION_POINT_IN_POLYGON:
+                /// A bare comparison is unknown on NULL. `<=>` is false. `assumeNotNull` can make either one true.
+                if (!uses_this_column || !element.monotonic_functions_chain.empty())
+                {
+                    stack.push_back(TruthOnNull::any());
+                }
+                else if (element.false_on_null)
+                {
+                    stack.push_back(TruthOnNull::isFalse());
+                }
+                else
+                {
+                    stack.push_back(TruthOnNull::isUnknown());
+                }
+                break;
+            case RPNElement::FUNCTION_IN_SET:
+            case RPNElement::FUNCTION_NOT_IN_SET:
+                /// `nullIn` / `notNullIn` (`transform_null_in`) can match NULL. A normal `IN` does not, but the
+                /// RPN does not record which one this is, so keep the chunk.
+                stack.push_back(TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_IS_NULL:
+                stack.push_back(uses_this_column ? TruthOnNull::isTrue() : TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_IS_NOT_NULL:
+                stack.push_back(uses_this_column ? TruthOnNull::isFalse() : TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_UNKNOWN:
+                stack.push_back(TruthOnNull::any());
+                break;
+            case RPNElement::ALWAYS_FALSE:
+                stack.push_back(TruthOnNull::isFalse());
+                break;
+            case RPNElement::ALWAYS_TRUE:
+                stack.push_back(TruthOnNull::isTrue());
+                break;
+            case RPNElement::FUNCTION_NOT:
+                if (stack.empty())
+                    return true;
+                stack.back() = sqlNot(stack.back());
+                break;
+            case RPNElement::FUNCTION_AND:
+            case RPNElement::FUNCTION_OR:
+            {
+                if (stack.size() < 2)
+                    return true;
+                const TruthOnNull right = stack.back();
+                stack.pop_back();
+                stack.back() = combineOnNull(stack.back(), right, element.function == RPNElement::FUNCTION_AND);
+                break;
+            }
+        }
+    }
+
+    /// A broken expression, or one that can still be true, must not prune.
+    return stack.size() != 1 || stack.back().has_true;
 }
 
 String KeyCondition::RPNElement::toString(const std::vector<String> & key_names) const

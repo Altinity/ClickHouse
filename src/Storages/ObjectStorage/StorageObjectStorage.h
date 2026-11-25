@@ -211,6 +211,7 @@ public:
     std::shared_ptr<DataLake::ICatalog> getCatalog() const { return catalog; }
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalRowsInSnapshot(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
     std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const override;
 

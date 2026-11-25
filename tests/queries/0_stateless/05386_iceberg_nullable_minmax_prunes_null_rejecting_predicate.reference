@@ -1,0 +1,10 @@
+--- a matching row is returned, including null ---
+1
+2
+1
+2
+--- min/max prunes a file with nulls when the predicate rejects null ---
+2
+2
+1
+1

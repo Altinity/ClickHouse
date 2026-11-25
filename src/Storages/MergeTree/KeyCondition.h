@@ -105,6 +105,10 @@ public:
     {
         virtual ~BloomFilter() = default;
 
+        /// `hashes` are the hashes of the query constants of one atom for one column. They are sorted
+        /// and deduplicated (see `prepareBloomFilterData`), which lets an implementation with a sorted
+        /// value set intersect the two sequences in one pass instead of searching for each hash
+        /// separately. Returns true if any of them may be present.
         virtual bool findAnyHash(const std::vector<uint64_t> & hashes) = 0;
     };
 
@@ -194,6 +198,9 @@ public:
         const FieldRef * left_keys,
         const FieldRef * right_keys,
         const DataTypes & data_types) const;
+
+    /// Whether the condition can be true when `key_column` is SQL NULL. Other columns stay arbitrary.
+    bool mayBeTrueOnNull(size_t key_column) const;
 
     /// Checks that the index can not be used
     /// FUNCTION_UNKNOWN will be AND'ed (if any).
@@ -357,6 +364,10 @@ public:
 
         /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
         bool relaxed = false;
+
+        /// `isNotDistinctFrom` (`<=>`) with a non-NULL constant is false when the column is NULL.
+        /// A normal comparison is unknown. `NOT` of this atom is therefore true for NULL.
+        bool false_on_null = false;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();

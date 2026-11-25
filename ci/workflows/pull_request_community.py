@@ -87,10 +87,14 @@ workflow = Workflow.Config(
         # *JobConfigs.integration_test_asan_flaky_pr_jobs,
         # JobConfigs.bugfix_validation_ft_pr_job,
         # JobConfigs.bugfix_validation_it_job,
+        # The CAS stateless lanes need only their build artifact. Deferring them
+        # behind the blocking jobs makes a red ASan integration shard skip them
+        # silently, so they are not deferred.
         *[
             j.set_run_after(
                 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
                 if j.name not in FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
+                and j not in AltinityJobConfigs.cas_functional_tests_jobs
                 else []
             )
             for j in FUNCTIONAL_TESTS_JOBS if 'coverage' not in j.name

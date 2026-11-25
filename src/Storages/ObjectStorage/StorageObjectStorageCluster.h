@@ -64,6 +64,7 @@ public:
     String getPathSample(ContextPtr context);
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalRowsInSnapshot(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
     std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const override;
 
@@ -195,17 +196,26 @@ public:
 
     bool isIcebergStorage() const { return configuration->isIcebergConfiguration(); }
 
+    /// Only Iceberg can name a snapshot in its table function, through `iceberg_metadata_file_path`, which a catalog
+    /// table gets from the catalog's metadata location.
+    bool isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context,
-        bool make_cluster_function) override;
+        bool make_cluster_function,
+        bool add_structure_and_format) override;
 
     bool isClusterSupported() const override;
 
     /// Whether this query is served by `pure_storage` instead of being distributed over a cluster.
     bool readsFromPureStorage(ContextPtr context) const;
+    /// Only `DataLakeCatalog` tables may reuse the resolved query tree for the header. Re-analyzing their
+    /// AST resolves the table through the REST catalog again. Other cluster reads keep re-analyzing the AST,
+    /// so their headers do not change.
+    bool canReuseResolvedQueryTreeForHeader() const override { return is_datalake_catalog_table; }
 
     void readFallBackToPure(
         QueryPlan & query_plan,
@@ -237,7 +247,7 @@ private:
     to
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
     (and optionally to s3Cluster when make_cluster_function is true on the non-deferred path).
-    Returns true if cluster name was added to settings.
+    Returns true if a named engine table was converted to a table function, even if no cluster setting was added.
     */
     bool updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
 
@@ -246,6 +256,8 @@ private:
     const ObjectStoragePtr object_storage;
     /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
     bool cluster_name_from_function_argument = false;
+    /// True only for tables resolved through a `DataLakeCatalog` database.
+    bool is_datalake_catalog_table = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;

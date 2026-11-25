@@ -67,7 +67,7 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
                             FormatId::GcOutcomes, FormatId::PartManifest, FormatId::RunFile,
                             FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
                             FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat,
-                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState};
+                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState, FormatId::BlobIntent};
     std::set<std::string_view> types;
     for (FormatId id : all)
     {
@@ -137,6 +137,27 @@ TEST(CASJsonVocab, WriteAndReadBack)
     ASSERT_TRUE(r.nextKey(key)); EXPECT_EQ(key, "ref");
     EXPECT_EQ(r.readString(), "t-1/all_1_2_0\n\"quoted\"");
     EXPECT_FALSE(r.nextKey(key));
+}
+
+TEST(CASJsonVocab, DecimalUInt64String)
+{
+    const auto read = [](std::string_view digits)
+    {
+        const String json = fmt::format(R"({{"seq":"{}"}})", digits);
+        DB::ReadBufferFromMemory in(json);
+        JsonObjectReader reader(in, "test");
+        String key;
+        EXPECT_TRUE(reader.nextKey(key));
+        return reader.readU64String();
+    };
+
+    EXPECT_EQ(read("007"), 7u);
+    EXPECT_EQ(read("18446744073709551615"), 18446744073709551615ULL);
+    for (const auto * invalid : {"", "+5", "-0", "5x", "18446744073709551616"})
+    {
+        SCOPED_TRACE(invalid);
+        expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { read(invalid); });
+    }
 }
 
 TEST(CASJsonVocab, WordArrayFieldAndReaderRejectInvalidValues)

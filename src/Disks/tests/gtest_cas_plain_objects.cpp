@@ -18,7 +18,7 @@ namespace
 /// `makeRequests`), so a policy's whole deadline is exercised in no wall-clock time.
 CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fence::open())
 {
-    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn());
+    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 /// Refuses the FIRST removal attempt of every key with `Mismatch`, then delegates -- models a

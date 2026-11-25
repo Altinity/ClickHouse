@@ -19,7 +19,7 @@ namespace DB::ErrorCodes
 /// sequence that carries a namespace from nothing to `Live` --
 ///   1. catalog CAS: insert `{ns, Creating, fresh incarnation, creator}` (`CasRefCatalog::createNamespace`,
 ///      built on Task 2's `casAdmitEntry`);
-///   2. `_ckpt` create (`CasRefCatalog::completeCreation`, step 2 -- Stage A's `publishCkpt` unchanged);
+///   2. `_ckpt` create (`CasRefCatalog::completeCreation`, step 2, `createCkptAtCreation`);
 ///   3. catalog CAS: `Creating -> Live`, re-presenting the creator's admission GENERATION and
 ///      value-CASing the OBSERVED entry (`completeCreation`, step 3 -- the "ZombieGoLive" guard) --
 /// plus stale-`Creating` reconciliation (`CasRefCatalog::reconcileStaleCreator`) and the publication
@@ -255,6 +255,46 @@ TEST(CASNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
     /// different mechanism (the OLD `RefOpKind::NamespaceBirth` writer, `Pool/CasRefLedger.cpp`); this
     /// driver's own `_ckpt` is simply left in place for whichever actor next reconciles this entry.
     EXPECT_TRUE(readCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation)).has_value());
+}
+
+/// A creator makes `_ckpt` durable at epoch 5 and stalls before `Creating -> Live`; a later actor at epoch 9
+/// reconciles the entry and completes the creation over the same incarnation. `life_epoch` stays 5: it is
+/// set once, by whoever created `_ckpt`.
+TEST(CASNsCreationLifecycle, ResumedCreationKeepsTheDurableLifeEpoch)
+{
+    auto backend = initializedCatalogBackend();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    Layout layout("p");
+    const RootNamespace ns{"a"};
+
+    backend->withdraw_after_ckpt_write = true;
+    CasOperation creating_op = requests.admit([&backend] { return backend->admitted; });
+    ASSERT_EQ(CasRefCatalog::createNamespace(creating_op, layout, 1, ns, creatorFence("srv1", 5)),
+              CasRefCatalog::NamespaceCreationOutcome::FencedOut);
+    backend->withdraw_after_ckpt_write = false;
+    backend->admitted = true;
+
+    /// Bound to a name: a pointer taken from an unbound `Snapshot` dangles when the full expression ends.
+    const CasRefCatalog::Snapshot stalled = CasRefCatalog::read(op, layout);
+    const CatalogEntry * entry = findEntryForTest(stalled.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    ASSERT_EQ(entry->state, NsState::Creating);
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
+    const std::optional<CkptSample> before = readCkpt(op, layout, life);
+    ASSERT_TRUE(before.has_value());
+    EXPECT_EQ(before->ckpt.life_epoch, 5u) << "step 2 landed before the creator stalled";
+
+    const CreatorFence resumer = creatorFence("srv2", 9);
+    ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(op, layout, *entry, resumer, fixedTerminality(true)),
+              CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
+    CatalogEntry resumed = *entry;
+    resumed.creator = resumer;
+    EXPECT_EQ(CasRefCatalog::completeCreation(op, layout, resumed), CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    const std::optional<CkptSample> after = readCkpt(op, layout, life);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->ckpt.life_epoch, 5u) << "the durable life_epoch is never replaced";
 }
 
 /// Regression (CI PR#2073, `03611_freeze_partition_parallel_verbose` under `amd_tsan, cas s3 storage`):

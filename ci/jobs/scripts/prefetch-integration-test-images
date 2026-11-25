@@ -10,6 +10,7 @@
 # Environment variables:
 #   PULL_RETRIES   Number of pull attempts per image (default: 3)
 #   PULL_TIMEOUT   Per-attempt timeout in seconds (default: 300)
+#   PREFETCH_FETCHED_FILE  If set, the references actually pulled are reported to this path
 
 set -uo pipefail
 
@@ -34,6 +35,7 @@ pull_one()
 {
     local image="$1"
     local fail_file="$2"
+    local fetched_file="$3"
     local attempt out start elapsed
 
     for ((attempt = 1; attempt <= PULL_RETRIES; attempt++)); do
@@ -42,6 +44,7 @@ pull_one()
         if out=$(timeout "$PULL_TIMEOUT" docker pull "$image" 2>&1); then
             elapsed=$((SECONDS - start))
             echo "Pulled $image in ${elapsed}s"
+            echo "$image" > "$fetched_file"
             return 0
         fi
         elapsed=$((SECONDS - start))
@@ -67,7 +70,7 @@ pids=()
 for image in "${images[@]}"; do
     # Sanitize image name to a safe filename.
     safe="${image//[^a-zA-Z0-9._-]/_}"
-    pull_one "$image" "$work_dir/fail_${safe}" &
+    pull_one "$image" "$work_dir/fail_${safe}" "$work_dir/fetched_${safe}" &
     pids+=($!)
 done
 
@@ -76,6 +79,17 @@ any_fail=0
 for pid in "${pids[@]}"; do
     wait "$pid" || any_fail=1
 done
+
+if [[ -n "${PREFETCH_FETCHED_FILE:-}" ]]; then
+    # Published by rename inside the report's own directory, so the publish is atomic and any
+    # write failure leaves no report at all, which the caller reads as "nothing was fetched".
+    shopt -s nullglob
+    records=("$work_dir"/fetched_*)
+    shopt -u nullglob
+    if cat /dev/null "${records[@]}" > "${PREFETCH_FETCHED_FILE}.partial"; then
+        mv "${PREFETCH_FETCHED_FILE}.partial" "$PREFETCH_FETCHED_FILE"
+    fi
+fi
 
 # Report failures.
 failed=()

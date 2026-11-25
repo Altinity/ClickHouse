@@ -19,8 +19,9 @@ mutable state with immutable, hash-addressed objects plus a small CAS
   (`Formats/CasBlobEnvelopeFormat`). Blobs are logically immutable and shared: equivalent
   physical incarnations may replace one another under the same hash key. The pool
   is the only index, and identity is always established by (re-)hashing the
-  bytes — there are no trust-the-checksum shortcuts. A freshness sidecar
-  (`blobMetaKey` = `blobKey` + `.meta`) carries GC state per hash.
+  bytes — there are no trust-the-checksum shortcuts. A blob may have a deletion
+  intent under `blob-intents/`, written and removed only by GC. A legacy `.meta` object beside a body is
+  read only by `cas-migrate-pool` and `cas-inspect`; `cas-fsck` lists the keys and reports them.
 - **Manifest** — an immutable description of one part: the full file tree with
   per-file blob references or inline bytes. Small per-part files
   (`uuid.txt`, `checksums.txt`, ...) live *inside* the manifest as inline tree
@@ -53,9 +54,9 @@ Everything persisted is a text format with a versioned header line; see
 
 - **Write**: `ContentAddressedTransaction` buffers or spills file writes
   (`scratch_path`, or opt-in S3 staging), hashes the payload, and hands it to
-  `Pool/CasPartWriteTxn`: start every materialization with blob `HEAD`, adopt a present
-  non-condemned body or publish the writer's source unconditionally, reconcile `.meta` to
-  `Clean`, and record explicit `Materialized` proof; then stage the manifest, `precommitAdd` the ref,
+  `Pool/CasPartWriteTxn`: start every materialization with blob `HEAD`, adopt only when the deletion
+  intent of the observed incarnation is absent, otherwise publish the writer's source unconditionally,
+  and record explicit `Materialized` proof; then stage the manifest, `precommitAdd` the ref,
   then promote it to committed in the ref log.
 - **Read**: disk path → `Parts/PartPathParser` (namespace + part + file) →
   ref table resolves the manifest → `Pool/CasManifestReader` locates the

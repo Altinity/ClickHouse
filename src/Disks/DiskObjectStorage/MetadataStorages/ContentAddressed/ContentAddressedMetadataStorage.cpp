@@ -19,6 +19,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ContentAddressedGarbageCollectionLog.h>
 #include <Interpreters/ContentAddressedLog.h>
+#include <atomic>
 #include <Common/CurrentThread.h>
 #include <base/getThreadId.h>
 #include <Common/DateLUT.h>
@@ -31,6 +32,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
 #include <chrono>
+#include <limits>
 #include <filesystem>
 #include <ctime>
 #include <unordered_set>
@@ -68,8 +70,10 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
+    extern const ContentAddressedSettingsUInt64 intent_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
-    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 orphan_manifest_sweep_interval_sec;
+    extern const ContentAddressedSettingsUInt64 gc_round_intent_create_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
@@ -85,11 +89,11 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsBool allow_packed_parts;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
-    extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -293,8 +297,10 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
+    , intent_sweep_list_budget_keys(settings_[ContentAddressedSetting::intent_sweep_list_budget_keys].value)
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
-    , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
+    , orphan_manifest_sweep_interval_sec(settings_[ContentAddressedSetting::orphan_manifest_sweep_interval_sec].value)
+    , gc_round_intent_create_budget(settings_[ContentAddressedSetting::gc_round_intent_create_budget].value)
     , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
     , gc_round_sweep_namespace_budget(settings_[ContentAddressedSetting::gc_round_sweep_namespace_budget].value)
     , gc_round_sweep_recovery_op_budget(settings_[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value)
@@ -310,11 +316,11 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , allow_packed_parts(settings_[ContentAddressedSetting::allow_packed_parts].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
-    , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
     , gc_io_concurrency(settings_[ContentAddressedSetting::gc_io_concurrency].value)
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
+    , cas_request_window_ms(settings_[ContentAddressedSetting::request_window_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
@@ -467,8 +473,8 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
     }
 
     const Cas::Pool::LifecycleSnapshot ps = pool->lifecycleSnapshot();
-    snap.lifecycle = casLifecycleToString(ps.lifecycle);
-    snap.reason = casLifecycleReasonWord(ps.lifecycle);
+    snap.lifecycle = ps.writes_paused ? "not_live" : casLifecycleToString(ps.lifecycle);
+    snap.reason = ps.writes_paused ? "lease_expired" : casLifecycleReasonWord(ps.lifecycle);
     snap.detail = ps.detail;
     snap.since = ps.since;
     return snap;
@@ -552,9 +558,9 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.objects_spared = r.objects_spared;
         e.manifests_deleted = r.manifests_deleted;
         e.entries_condemned = r.entries_condemned;
-        e.entries_graduated = r.entries_graduated;
-        e.entries_redeleted = r.entries_redeleted;
-        e.entries_redelete_failed = r.entries_redelete_failed;
+        e.entries_intent_confirmed = r.entries_intent_confirmed;
+        e.entries_bodies_deleted = r.entries_bodies_deleted;
+        e.entries_body_delete_failed = r.entries_body_delete_failed;
         e.fence_outs = r.fence_outs;
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
@@ -716,7 +722,27 @@ std::optional<uint64_t> ContentAddressedMetadataStorage::freezeConnectTimeoutCap
 #endif
 }
 
-ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool context_available) const
+namespace
+{
+std::atomic<bool> defer_pool_open_for_migration{false};
+}
+
+void setDeferPoolOpenForMigration(bool defer)
+{
+    defer_pool_open_for_migration.store(defer);
+}
+
+bool deferPoolOpenForMigration()
+{
+    return defer_pool_open_for_migration.load();
+}
+
+Cas::PoolPtr ContentAddressedMetadataStorage::openPoolForMigration() const
+{
+    return openPoolView(/*context_available=*/false, /*for_migration=*/true).pool;
+}
+
+ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool context_available, bool for_migration) const
 {
     /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
@@ -793,8 +819,10 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_snapshot_generations_to_keep = gc_snapshot_generations_to_keep;
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
+    pool_config.intent_sweep_list_budget_keys = intent_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
-    pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
+    pool_config.orphan_manifest_sweep_interval_sec = orphan_manifest_sweep_interval_sec;
+    pool_config.gc_round_intent_create_budget = gc_round_intent_create_budget;
     pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
     pool_config.gc_round_sweep_namespace_budget = gc_round_sweep_namespace_budget;
     pool_config.gc_round_sweep_recovery_op_budget = gc_round_sweep_recovery_op_budget;
@@ -802,11 +830,11 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_prefix_wholesale_budget = gc_round_prefix_wholesale_budget;
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
-    pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.gc_io_concurrency = gc_io_concurrency;
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
+    setCasRequestWindow(pool_config.cas_request_budget, cas_request_window_ms);
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`. A later reload that widens the disk's
     /// connect timeout cannot widen the envelope the lease arithmetic was validated against.
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);
@@ -835,7 +863,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
     view.native_token_type = backend->nativeTokenType();
-    view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
+    view.pool = for_migration ? Cas::Pool::openForMigration(std::move(backend), std::move(pool_config))
+                              : Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }
 
@@ -858,6 +887,10 @@ void ContentAddressedMetadataStorage::startup()
     /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
     /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
     read_only = object_storage->isReadOnly();
+
+    /// `cas-migrate-pool` opens the pool itself, at a floor no ordinary open accepts.
+    if (deferPoolOpenForMigration())
+        return;
 
     /// Explicit S3 staging can publish only by provider-native same-store copy. Validate the actual
     /// object-storage configuration before opening a writable mount; never infer capability from an
@@ -895,7 +928,8 @@ void ContentAddressedMetadataStorage::startup()
     {
         Cas::sweepOwnMountStaging(
             *object_storage,
-            physicalKey(view.pool_prefix + "/staging/" + server_root_id) + "/");
+            physicalKey(Cas::Layout(view.pool_prefix).stagingPrefix(server_root_id)),
+            pool->liveWriterEpoch());
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
@@ -1356,7 +1390,12 @@ String ContentAddressedMetadataStorage::stagingKeyPrefix() const
 {
     /// This is the writer-owned `staging/<server_root_id>/` subtree. `store` throws `INVALID_STATE`
     /// when no pool is published; every writer caller runs after `startup`.
-    return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
+    return physicalKey(store()->layout().stagingPrefix(server_root_id));
+}
+
+String ContentAddressedMetadataStorage::stagingKey(uint64_t writer_epoch, const String & leaf) const
+{
+    return physicalKey(store()->layout().stagingKey(server_root_id, writer_epoch, leaf));
 }
 
 /// ==== namespace mapping ====
@@ -2148,17 +2187,15 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     /// `partAccess()` then `store()` pair (each an independent `pointer_mutex` acquisition) -- see
     /// `poolAccess()`.
     const auto snap = poolAccess();
-    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
-    if (!view)
+    const auto manifest_view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    if (!manifest_view)
         return std::nullopt;
-    if (const auto * entry = view->findFile(r->file))
+    if (const auto * entry = manifest_view->findFile(r->file))
     {
+        if (entry->placement != Cas::EntryPlacement::Blob)
+            return std::nullopt;
         const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;
-        /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a
-        /// right-bounded read stops at payload_end, and a shared blob's bytes beyond it belong
-        /// to other files. The caches key on the physical blob key, so payload ranges are
-        /// shared between every part that references the same blob.
         plan.object = StoredObject(physicalKey(location.key), path, location.offset + location.length);
         plan.payload_offset = location.offset;
         plan.payload_end = location.offset + location.length;
@@ -2201,10 +2238,10 @@ bool ContentAddressedMetadataStorage::ownsNamespace(const String & other_server_
 CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
     const String & root_namespace, const String & ref_name, const String & manifest_ref_text) const
 {
-    /// Gate 1 of the relink confirm: a thin forward to the ledger, whose declaration
-    /// (`CasRefLedger::confirmExactRef`) carries the six-rule snapshot and the zero-I/O contract. This
-    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle is
-    /// answered as `Unknown` instead of as an exception.
+    /// Gate 1 of the relink confirm: a thin forward to the pool, whose `confirmExactRef` adds the
+    /// mount-slot read to the ledger's six-rule snapshot (`CasRefLedger::confirmExactRef`). This
+    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle and
+    /// a failed slot read are answered as `Unknown` instead of as an exception.
     const auto manifest_ref = Cas::tryParseManifestRef(manifest_ref_text);
     if (!manifest_ref)
     {
@@ -2213,6 +2250,14 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
             "the canonical epoch:build:ordinal form", ref_name, root_namespace, manifest_ref_text);
         return CasConfirmAnswer::Unknown;
     }
+
+    const auto unanswerable = [&](const String & reason)
+    {
+        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
+            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
+            ref_name, root_namespace, disk_name, reason);
+        return CasConfirmAnswer::Unknown;
+    };
 
     Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
     try
@@ -2223,17 +2268,15 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
         checkOpAdmitted(CasOpClass::ContentRead);
         answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref);
     }
+    /// Only `Yes` authorizes, and no `catch` can produce a `Yes`. The slot read can also fail with a
+    /// transport exception that is not a `DB::Exception`, hence the second clause.
     catch (const Exception & e)
     {
-        /// This is NOT a fallback path: `Unknown` is the typed refusal this primitive is built around,
-        /// not an alternate behavior substituted for a failed one. Nothing consequential happens on it --
-        /// the receiver aborts its prepared relink and retries later -- so swallowing the lifecycle
-        /// refusal costs a retry and can never authorize anything. Only `Yes` authorizes, and no `catch`
-        /// can produce a `Yes`.
-        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
-            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
-            ref_name, root_namespace, disk_name, e.message());
-        return CasConfirmAnswer::Unknown;
+        return unanswerable(e.message());
+    }
+    catch (...)
+    {
+        return unanswerable(getCurrentExceptionMessage(false));
     }
 
     switch (answer)
@@ -2338,17 +2381,16 @@ public:
                     ref_name, e.message());
                 return CaRelinkPromote::Unresolved;
             }
-            /// The same retryable class the staging half classifies: a body-absent precommit or a precommit
-            /// binding that is no longer the live owner (`ABORTED`), or a ref already committed with other
-            /// content (write-retry-later `NETWORK_ERROR`; an ownership conflict propagates). `promote` has
-            /// already abandoned the build on its way out, so the `+1` is released and the sender's
-            /// bytes are a sound recovery. Anything else propagates -- it is not a known-safe
+            /// Refused before its append, so nothing committed: `requireAlive`'s retry-later (`NETWORK_ERROR`)
+            /// for a build that a namespace drop cancelled or whose mount incarnation was superseded. A lost
+            /// owner or a ref conflict is refused inside the append and took the `Unresolved` arm above.
+            /// `promote` has already abandoned the build on its way out, so the `+1` is released and the
+            /// sender's bytes are a sound recovery. Anything else propagates -- it is not a known-safe
             /// mechanism failure, and the receiver must not silently turn it into a byte fetch.
-            if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
+            if (e.code() != ErrorCodes::NETWORK_ERROR)
                 throw;
             LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
-                "Relink of part {} could not be promoted (one of: body-absent precommit, precommit not the live "
-                "owner, a ref already committed with other content, a retry-later backend outcome; code {}): {}; the caller may fetch the bytes from the same source",
+                "Relink of part {} was refused before its promotion append (a cancelled or superseded build; code {}): {}; the caller may fetch the bytes from the same source",
                 ref_name, e.code(), e.message());
             return CaRelinkPromote::MechanismFallbackAllowed;
         }
@@ -2414,7 +2456,7 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     /// plainly that a confirmed relink is not proven dangle-free (`DataPartsExchange.cpp`, "What a
     /// `yes` does NOT prove"). Durable-before-asking is necessary, not sufficient.
     ///
-    /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD/loadMeta
+    /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD
     /// probe); a genuinely-absent adopted blob is an invariant violation caught by fsck, not here — the
     /// ordinary ReplicatedMergeTree interserver trust.
     out.reset();
@@ -2455,11 +2497,8 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     }
     catch (const Exception & e)
     {
-        /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no
-        /// longer the live owner (`ABORTED`), a ref already committed with other content (write-retry-later
-        /// `NETWORK_ERROR`; an ownership conflict propagates), or — since the transient-classifier round — this node's
-        /// own mount fence refusing the work (`throwCasTransientUnavailable`): all retryable, and the
-        /// sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
+        /// `ABORTED` or `NETWORK_ERROR` is the retryable class, this node's own mount fence refusing the work
+        /// (`throwCasTransientUnavailable`) included: the sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
         /// build before propagating, so nothing is staged and no `+1` is left behind. The fence case needs
         /// no special handling and stays fail-close by construction: the byte fetch it falls back to writes
         /// through the SAME fenced disk and is refused in turn, so the fallback cannot smuggle a write past
@@ -2467,8 +2506,8 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
         /// that a byte fetch would do better.
         if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
-        LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
-            "precommit not the live owner, or a ref already committed with other content): {}; caller falls back to a byte fetch", part_path, e.message());
+        LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
+            "Relink of part {} deferred by a retryable error: {}; caller falls back to a byte fetch", part_path, e.message());
         return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 }

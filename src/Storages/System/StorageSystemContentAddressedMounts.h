@@ -1,12 +1,17 @@
 #pragma once
 
 #include <Storages/StorageWithCommonVirtualColumns.h>
+#include <Core/UUID.h>
+#include <base/extended_types.h>
 
 
 namespace DB
 {
 
 class Context;
+
+/// The UUID whose text form is the 32 hex digits of `server_id`, as the server's `uuid` file writes it.
+UUID casServerIdToUuid(const UInt128 & server_id);
 
 /// system.cas_mounts: one row per CAS mount slot (`gc/server-roots/<server_root_id>/mount`)
 /// visible from every content-addressed disk — live lease state for operators (who holds which

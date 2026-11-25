@@ -17,6 +17,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <base/defines.h>
 
@@ -74,7 +75,8 @@ public:
         ObjectStoragePtr object_storage_,
         StorageObjectStorageConfigurationPtr configuration_,
         Iceberg::PersistentTableComponents && persistent_components_,
-        ContextPtr context_);
+        ContextPtr context_,
+        std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata_ = std::nullopt);
 
     ~IcebergMetadata() override;
 
@@ -113,6 +115,9 @@ public:
         LoggerPtr metadata_logger);
 
     bool supportsUpdate() const override { return true; }
+
+    void update(const ContextPtr & context) override;
+
     bool supportsWrites() const override { return true; }
     bool supportsParallelInsert() const override { return true; }
     bool supportsTruncate() const override { return true; }
@@ -135,6 +140,7 @@ public:
     /// nullopt when that state is missing or an exact answer is impossible: equality or position deletes,
     /// deletion vectors, an unreadable path, or a negative `record_count`. An empty snapshot is an empty vector.
     std::optional<std::vector<IdentityPartitionFile>> getDataFileIdentityPartitions(StorageMetadataPtr storage_metadata, ContextPtr local_context) const;
+    std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const override;
     static bool supportsTotalBytes(ContextPtr, ObjectStorageType) { return true; }
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
 
@@ -191,7 +197,12 @@ public:
 
     std::string getTableLocation() const override { return persistent_components.table_location; }
 
-    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
+    bool optimize(
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        const std::optional<FormatSettings> & format_settings,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override;
     bool optimizeManifestFiles(
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
@@ -267,7 +278,7 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
-    static Iceberg::PersistentTableComponents initializePersistentTableComponents(
+    static std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
         StorageObjectStorageConfigurationPtr configuration,
         IcebergMetadataFilesCachePtr cache_ptr,
@@ -277,7 +288,7 @@ private:
     Iceberg::IcebergDataSnapshotPtr
     getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context) const;
 
-    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
+    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
     Iceberg::IcebergDataSnapshotPtr
@@ -296,6 +307,7 @@ private:
     std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
+        String & metadata_file_path,
         Poco::JSON::Object::Ptr & partition_spec,
         const String & transaction_id,
         Int64 original_schema_id,
@@ -332,6 +344,11 @@ private:
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
 
+    mutable std::mutex cached_latest_metadata_mutex;
+    mutable std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata TSA_GUARDED_BY(cached_latest_metadata_mutex);
+
+    Iceberg::MetadataFileWithInfo fetchLatestMetadata(const ContextPtr & context, bool force_fetch_latest_metadata) const;
+
     void backgroundMetadataPrefetcherThread();
 
     void alterPartitionDropImpl(
@@ -340,6 +357,11 @@ private:
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & storage_id);
 };
+
+/// Find the partition spec / schema object by id inside a metadata JSON document.
+/// Throws METADATA_MISMATCH if not found.
+Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & metadata, Int64 spec_id);
+Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & metadata, Int64 schema_id);
 }
 
 #endif

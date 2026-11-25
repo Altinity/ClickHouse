@@ -155,7 +155,7 @@ public:
     virtual bool isIcebergConfiguration() const { return false; }
 
     virtual bool supportsTotalRows(ContextPtr, ObjectStorageType) const { return false; }
-    virtual std::optional<size_t> totalRows(ContextPtr) { return {}; }
+    virtual std::optional<size_t> totalRows(ContextPtr, const std::optional<DataLakeTableStateSnapshot> &) { return {}; }
     virtual bool supportsTotalBytes(ContextPtr, ObjectStorageType) const { return false; }
     virtual std::optional<size_t> totalBytes(ContextPtr) { return {}; }
     /// NOTE: In this function we are going to check is data which we are going to read sorted by sorting key specified in StorageMetadataPtr.
@@ -342,7 +342,13 @@ public:
         return nullptr;
     }
 
-    virtual bool optimize(ObjectStoragePtr /*object_storage*/, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr /*context*/, const std::optional<FormatSettings> & /*format_settings*/)
+    virtual bool optimize(
+        ObjectStoragePtr /*object_storage*/,
+        const StorageMetadataPtr & /*metadata_snapshot*/,
+        ContextPtr /*context*/,
+        const std::optional<FormatSettings> & /*format_settings*/,
+        std::shared_ptr<DataLake::ICatalog> /*catalog*/,
+        const StorageID & /*storage_id*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Table engine {} doesn't support optimize", getTypeName());
     }

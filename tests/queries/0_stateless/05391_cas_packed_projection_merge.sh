@@ -9,7 +9,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pk', cas_allow_packed_parts = 1, name = '${CLICKHOUSE_DATABASE}_pk', path = '${CLICKHOUSE_DATABASE}_pk_pool/')"
+DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pk', cas_allow_packed_parts = 1, name = '${CLICKHOUSE_DATABASE}_pk', path = '${CLICKHOUSE_DATABASE}_pk_pool/')"
 
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS t_pk SYNC"
 ${CLICKHOUSE_CLIENT} -q "CREATE TABLE t_pk (a UInt64, v UInt64, PROJECTION p1 (SELECT v % 10, sum(a) GROUP BY v % 10)) ENGINE = MergeTree ORDER BY a SETTINGS disk = ${DISK}, min_bytes_for_wide_part = 0, min_bytes_for_full_part_storage = 1000000000"

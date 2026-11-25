@@ -354,6 +354,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(delete_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 delete_data_result[partition_key].total_bytes = static_cast<Int32>(delete_bytes);
             }
+            delete_data_writers[partition_key].reset();
+            delete_data_write_buffers[partition_key].reset();
         }
     }
 
@@ -428,6 +430,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(update_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 update_data_result[partition_key].total_bytes = static_cast<Int32>(update_bytes);
             }
+            update_data_writers[partition_key].reset();
+            update_data_write_buffers[partition_key].reset();
         }
     }
 
@@ -790,7 +794,7 @@ void mutate(
         filename_generator.setVersion(last_version + 1);
         filename_generator.setCompressionMethod(compression_method);
 
-        auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto metadata = deepCopy(getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid));
         auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
         /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
@@ -936,7 +940,7 @@ void alter(
         filename_generator.setVersion(last_version + 1);
         filename_generator.setCompressionMethod(compression_method);
 
-        auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto metadata = deepCopy(getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid));
 
         const auto previous_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
 
@@ -980,6 +984,10 @@ void alter(
 
         if (succeeded)
             break;
+
+        metadata_json_generator.appendMetadataLog(
+            persistent_table_components.path_resolver.reverseResolve(metadata_path),
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
         const auto new_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
         Poco::JSON::Object::Ptr new_schema;

@@ -126,6 +126,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
+    , is_datalake_catalog_table(is_datalake_query)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
     configuration->check(context_);
@@ -313,12 +314,22 @@ void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
 
 std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_context) const
 {
+    return totalRowsInSnapshot(nullptr, query_context);
+}
+
+std::optional<UInt64> StorageObjectStorageCluster::totalRowsInSnapshot(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const
+{
     if (pure_storage)
-        return pure_storage->totalRows(query_context);
+        return pure_storage->totalRowsInSnapshot(storage_snapshot, query_context);
     configuration->lazyInitializeIfNeeded(
         object_storage,
         query_context);
-    return configuration->totalRows(query_context);
+
+    std::optional<DataLakeTableStateSnapshot> state;
+    if (storage_snapshot && storage_snapshot->metadata)
+        state = storage_snapshot->metadata->datalake_table_state;
+
+    return configuration->totalRows(query_context, state);
 }
 
 std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_context) const
@@ -454,7 +465,7 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
                 "Can't be here without cluster name, no cluster name in query {}",
                 query->formatForLogging());
         }
-        return false;
+        return true;
     }
 
     /// Inject OSC into SELECT SETTINGS (query setting, not a table-function argument).
@@ -476,13 +487,34 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     return true;
 }
 
+bool StorageObjectStorageCluster::isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const
+{
+    if (!configuration->isIcebergConfiguration())
+        return false;
+
+    const auto * function = table_function ? table_function->as<ASTFunction>() : nullptr;
+    const auto * arguments = function && function->arguments ? function->arguments->as<ASTExpressionList>() : nullptr;
+    if (!arguments)
+        return false;
+
+    for (const auto & argument : arguments->children)
+        if (const auto * settings = argument->as<ASTSetQuery>())
+            if (const auto * path = settings->changes.tryGet("iceberg_metadata_file_path"))
+                return !path->safeGet<String>().empty();
+
+    return false;
+}
+
 void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     ASTPtr & query,
     const DB::StorageSnapshotPtr & storage_snapshot,
     const ContextPtr & context,
-    bool make_cluster_function)
+    bool make_cluster_function,
+    bool add_structure_and_format)
 {
-    updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
+    const bool converted_from_engine_table = updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
+    /// An engine's declared schema must survive conversion; destination hints apply only to user-written functions.
+    const bool inject_structure_and_format = add_structure_and_format || converted_from_engine_table;
 
     auto * table_function = extractTableFunctionFromSelectQuery(query);
     if (!table_function)
@@ -524,7 +556,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
     if (!cluster_name_from_function_argument || !endsWith(table_function->name, "Cluster"))
     {
-        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
+        if (inject_structure_and_format)
+            configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
 
         if (make_cluster_function)
         {
@@ -587,7 +620,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     { /// *Cluster function has cluster name as first argument. Temporary remove it before add structure and format
         ASTPtr cluster_name_arg = args.front();
         args.erase(args.begin());
-        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
+        if (inject_structure_and_format)
+            configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
         args.insert(args.begin(), cluster_name_arg);
     }
     if (settings_temporary_storage)
@@ -701,6 +735,11 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// Catalog tables may defer initialization until their first read.
+    /// Task creation must also initialize them: whole-query dispatch lists files without a table read.
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),

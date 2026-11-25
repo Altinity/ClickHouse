@@ -93,6 +93,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       pr_number: ${{ github.event.number }}
       artifacts: builds
+      S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
       regression_args: ${{ inputs.regression_args }}
       # Args
       args: --test-to-end
@@ -130,7 +131,7 @@ jobs:
 
       - name: 📦 Get deb url
         env:
-          S3_BASE_URL: https://altinity-build-artifacts.s3.amazonaws.com/
+          S3_BASE_URL: https://${{ vars.S3_ARTIFACT_BUCKET }}.s3.amazonaws.com/
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
         run: |
           REPORTS_PATH=${{ runner.temp }}/reports_dir

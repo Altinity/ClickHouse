@@ -92,7 +92,7 @@ void optimizeTreeFirstPass(const QueryPlanOptimizationSettings & optimization_se
         optimization_settings.max_limit_for_top_k_optimization,
         optimization_settings.use_skip_indexes_on_data_read,
         optimization_settings.read_in_order,
-        optimization_settings.read_in_order_through_join,
+        optimization_settings.read_in_order_through_join != 0,
         optimization_settings.join_swap_table,
         optimization_settings.enable_group_by_top_k_optimization,
         optimization_settings.top_k_optimization_observation_rows,
@@ -223,7 +223,7 @@ void optimizeTreeSecondPass(
         optimization_settings.max_limit_for_top_k_optimization,
         optimization_settings.use_skip_indexes_on_data_read,
         optimization_settings.read_in_order,
-        optimization_settings.read_in_order_through_join,
+        optimization_settings.read_in_order_through_join != 0,
         optimization_settings.join_swap_table,
         optimization_settings.enable_group_by_top_k_optimization,
         optimization_settings.top_k_optimization_observation_rows,
@@ -813,6 +813,9 @@ void optimizeTreeSecondPass(
     {
         traverseQueryPlan(stack, root, [&](auto & frame_node) { tryOptimizeGroupByTopK(&frame_node, nodes, extra_settings); });
     }
+
+    /// Last: it reads the final consumers of every remote read.
+    allowReadingShardsFromSeveralReplicas(root);
 }
 
 void addStepsToBuildSets(

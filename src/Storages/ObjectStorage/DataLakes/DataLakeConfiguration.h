@@ -242,7 +242,9 @@ public:
 
     void check(ContextPtr context) override
     {
-        if (ready_object_storage && ready_object_storage->getType() == ObjectStorageType::S3)
+        if (ready_object_storage
+            && (ready_object_storage->getType() == ObjectStorageType::S3
+                || ready_object_storage->getType() == ObjectStorageType::Azure))
             this->checkFormat();
         else
             BaseStorageConfiguration::check(context);
@@ -263,9 +265,9 @@ public:
         return DataLakeMetadata::supportsTotalRows(context, storage_type);
     }
 
-    std::optional<size_t> totalRows(ContextPtr local_context) override
+    std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) override
     {
-        return getMetadata()->totalRows(local_context);
+        return getMetadata()->totalRows(local_context, state);
     }
 
     bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override
@@ -425,10 +427,16 @@ public:
 #endif
     }
 
-    bool optimize(ObjectStoragePtr object_storage, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
+    bool optimize(
+        ObjectStoragePtr object_storage,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        const std::optional<FormatSettings> & format_settings,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override
     {
         lazyInitializeIfNeeded(object_storage, context);
-        return getMetadata()->optimize(metadata_snapshot, context, format_settings);
+        return getMetadata()->optimize(metadata_snapshot, context, format_settings, catalog, storage_id);
     }
 
     void addDeleteTransformers(ObjectInfoPtr object_info, QueryPipelineBuilder & builder, const std::optional<FormatSettings> & format_settings, FormatParserSharedResourcesPtr parser_shared_resources, ContextPtr local_context) const override
@@ -658,7 +666,7 @@ public:
     bool isIcebergConfiguration() const override { return getImpl().isIcebergConfiguration(); }
 
     bool supportsTotalRows(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalRows(context, storage_type); }
-    std::optional<size_t> totalRows(ContextPtr context) override { return getImpl().totalRows(context); }
+    std::optional<size_t> totalRows(ContextPtr context, const std::optional<DataLakeTableStateSnapshot> & state) override { return getImpl().totalRows(context, state); }
     bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalBytes(context, storage_type); }
     std::optional<size_t> totalBytes(ContextPtr context) override { return getImpl().totalBytes(context); }
     bool isDataSortedBySortingKey(StorageMetadataPtr storage_metadata, ContextPtr context) const override
@@ -913,8 +921,14 @@ public:
     std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, const StorageID & table_id) const override
         { return getImpl().getCatalog(context, table_id); }
 
-    bool optimize(ObjectStoragePtr object_storage, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
-        { return getImpl().optimize(object_storage, metadata_snapshot, context, format_settings); }
+    bool optimize(
+        ObjectStoragePtr object_storage,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        const std::optional<FormatSettings> & format_settings,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override
+        { return getImpl().optimize(object_storage, metadata_snapshot, context, format_settings, catalog, storage_id); }
 
     bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 

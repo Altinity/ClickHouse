@@ -35,6 +35,16 @@ using OutputFormatPtr = std::shared_ptr<IOutputFormat>;
 class MultipleFileWriter
 {
 public:
+    /// What `max_data_file_num_bytes` is compared with.
+    enum class FileSizeMeasure : uint8_t
+    {
+        /// In-memory size of the chunks written to the current file.
+        InMemoryBytes,
+        /// Bytes the format has emitted to the current file. Formats that buffer rows (e.g. Parquet
+        /// row groups) emit them later, so the file can exceed the limit by the buffered part.
+        WrittenBytes,
+    };
+
     explicit MultipleFileWriter(
         UInt64 max_data_file_num_rows_,
         UInt64 max_data_file_num_bytes_,
@@ -46,7 +56,8 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         const String & write_format_,
         SharedHeader sample_block_,
-        std::function<void(const std::string &)> new_file_path_callback_ = {});
+        std::function<void(const std::string &)> new_file_path_callback_ = {},
+        FileSizeMeasure file_size_measure_ = FileSizeMeasure::InMemoryBytes);
 
     void consume(const Chunk & chunk);
     void startNewFile();
@@ -93,8 +104,10 @@ private:
     /// Per `sample_block` column: whether it is left out of the data file, so statistics must not describe it.
     std::vector<bool> getStatisticsExcludedColumns() const;
 
+    /// Rollover thresholds for the current data file; 0 means "no limit".
     UInt64 max_data_file_num_rows;
     UInt64 max_data_file_num_bytes;
+    FileSizeMeasure file_size_measure;
     Poco::JSON::Array::Ptr schema;
     DataFileStatistics aggregate_stats;   /// accumulates across all files
     DataFileStatisticsPtr current_file_stats; /// accumulates for the current file only

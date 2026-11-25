@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
@@ -74,7 +75,7 @@ PoolMeta rmwPoolMeta(CasOperation & op, const String & key, std::string_view wha
         [&](const std::optional<Object> & current) -> std::optional<String>
         {
             if (!current)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta '{}' vanished during {}", key, what);
+                throw Exception(ErrorCodes::INVALID_STATE, "CAS pool meta '{}' vanished during {}", key, what);
             observed = decodePoolMeta(current->bytes);
             if (!mutate(observed))
                 return std::nullopt;
@@ -120,6 +121,30 @@ PoolMeta PoolMeta::raiseMinReaderGeneration(CasOperation & op, const Layout & la
         meta.min_reader_generation = generation;
         return true;
     });
+}
+
+bool PoolMeta::raiseToGeneration4(CasOperation & op, const Layout & layout)
+{
+    const Dialect dialect = op.backendDialect();
+    bool wrote = false;
+    rmwPoolMeta(op, layout.poolMetaKey(), "raise to generation 4", [&](PoolMeta & meta)
+    {
+        /// Reset on every attempt: a retry that finds another writer's raise reports no write by this call.
+        wrote = false;
+        if (meta.min_reader_generation >= G_BLOB_INTENTS)
+        {
+            if (meta.token_dialect != dialect)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "CAS pool records token dialect '{}', this disk uses '{}': identities are not comparable",
+                    meta.token_dialect ? dialectWord(*meta.token_dialect) : "none", dialectWord(dialect));
+            return false;
+        }
+        meta.min_reader_generation = G_BLOB_INTENTS;
+        meta.token_dialect = dialect;
+        wrote = true;
+        return true;
+    });
+    return wrote;
 }
 
 PoolMeta PoolMeta::createOrValidate(
@@ -171,14 +196,16 @@ PoolMeta PoolMeta::createOrValidate(
     pm.blob_header_len = blob_header_len;
     pm.gc_shards = gc_shards;
     pm.min_reader_generation = initial_min_reader_generation;
+    if (initial_min_reader_generation >= G_BLOB_INTENTS)
+        pm.token_dialect = op.backendDialect();
     pm.algos_used = {static_cast<uint8_t>(blob_hash_algo)};
 
     WriteResult result = op.create(key, encodePoolMeta(pm), Retry::standard());
     if (std::holds_alternative<Committed>(result))
         return pm;
 
-    /// Lost the race: the winner's object MUST be present now. The loser UNIONS its algo via the SAME
-    /// flag-gated admission path as a reopen, instead of the old unconditional fail-close.
+    /// Lost the race: the winner's object is present unless something removed it since. The loser UNIONS
+    /// its algo via the SAME flag-gated admission path as a reopen.
     if (std::holds_alternative<Conflict>(result))
         return admitOrValidate(op, key, blob_hash_algo, allow_new);
 

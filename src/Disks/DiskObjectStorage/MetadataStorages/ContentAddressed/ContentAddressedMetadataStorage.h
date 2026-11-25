@@ -48,6 +48,16 @@ enum class StagingBackend
 namespace DB
 {
 
+/// A process flag set only by `clickhouse-disks` for `cas-migrate-pool`: a content-addressed disk's `startup` then
+/// opens no pool and sends no request, and the command opens it with `openPoolForMigration`.
+void setDeferPoolOpenForMigration(bool defer);
+bool deferPoolOpenForMigration();
+
+}
+
+namespace DB
+{
+
 /// The SIX operation classes the central `ContentAddressedMetadataStorage::checkOpAdmitted` gate keys on
 /// (rev.7 spec §1). Every public metadata/transaction entry declares its class so a single place decides
 /// what happens per pool-lifecycle condition:
@@ -95,13 +105,17 @@ enum class CasOpAdmission : uint8_t
 ///   - `lifecycle`      — one of `live` / `not_live` / `identity_lost` / `vanished` (a live pool), or
 ///                        `constructing` / `shutdown` (no pool published).
 ///   - `reason`         — the ENUM-CLEAN sub-state word: `replaced` / `forgotten` for a
-///                        `vanished` pool, empty otherwise. Kept a small closed vocabulary so a downstream
+///                        `vanished` pool, `lease_expired` for a `not_live` row whose pool is `Live` but
+///                        whose lease has too little time left to admit a write, empty otherwise. Kept a
+///                        small closed vocabulary so a downstream
 ///                        `lifecycle || '(' || reason || ')'` yields e.g. exactly `vanished(forgotten)` —
 ///                        the [D5] free text lives in `detail`, never here.
 ///   - `detail`         — the full [D5] reason text naming the actual failure (the replaced
 ///                        diagnosis, the timestamped `FORGET` message, or the identity-loss message); spec §1
-///                        requires it appear verbatim in the snapshot. Empty while `live` and for a null pool.
-///   - `since`          — wall-clock second the current non-`live` state was entered; 0 while `live`/no pool.
+///                        requires it appear verbatim in the snapshot. Empty while `live`, for
+///                        `lease_expired`, and for a null pool.
+///   - `since`          — wall-clock second the current non-`live` state was entered (for
+///                        `lease_expired`, when writes paused); 0 while `live`/no pool.
 ///   - `pool_id`        — last-known pool UUID (empty before the first `startup`); the disk stays
 ///                        introspectable under its identity even once the pool is gone.
 ///   - `server_root_id` — this server's node-local root id owning the mount slot.
@@ -205,7 +219,7 @@ public:
 
     /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
     /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
-    /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
+    /// (`report.performed == false`) installs no baseline; the `SYSTEM` interpreter surfaces the refusal.
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
 
@@ -361,8 +375,9 @@ public:
     /// at ITS `server_root_id` (`liveNamespace` builds every live/detached namespace as
     /// `<server_root_id>/<mirrored table dir>`). Factory-class: I/O-free, ungated, never throws.
     bool ownsNamespace(const String & other_server_root_id, const String & root_namespace) const override;
-    /// Gate 1 of the relink confirm, forwarded to the pool's ref ledger. Answers `Unknown` for an
-    /// unparsable token and for a disk that has not started or has reached a terminal lifecycle.
+    /// Gate 1 of the relink confirm, forwarded to the pool. Answers `Unknown` for an unparsable token,
+    /// for a failed mount-slot read, and for a disk that has not started or has reached a terminal
+    /// lifecycle. A ledger `Yes` costs at most one mount-slot `GET`; every other ledger answer costs none.
     CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                      const String & manifest_ref_text) const override;
     /// Returns the canonical encoded manifest for a committed part plus the confirm token minted from
@@ -383,6 +398,9 @@ public:
     /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when no pool is
     /// published (before the first `startup`, or after `shutdown`). A thin wrapper over `poolAccess()`.
     Cas::PoolPtr store() const;
+    /// Opens this disk's pool with `Cas::Pool::openForMigration`, configured as `startup` configures it. Unpublished:
+    /// the caller owns the pool. Meant for a disk whose `startup` deferred the pool open.
+    Cas::PoolPtr openPoolForMigration() const;
     /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `INVALID_STATE`
     /// under the same not-started condition as `store()`. Committed part-folder reads and mutations
     /// go through this facade so cache validation remains centralized. Returning a `shared_ptr`
@@ -398,9 +416,10 @@ public:
     /// Returns the underlying object storage for an S3 staging writer. It is meaningful only when
     /// `stagingBackend` is `S3`.
     const ObjectStoragePtr & objectStorage() const { return object_storage; }
-    /// Returns the physical `pool_prefix/staging/server_root_id` prefix for this mount's staging
-    /// area. Callers append a unique leaf.
+    /// The physical `Cas::Layout::stagingPrefix` of this mount's staging area, with a trailing `/`.
     String stagingKeyPrefix() const;
+    /// The physical `Cas::Layout::stagingKey` of one staged upload of this mount.
+    String stagingKey(uint64_t writer_epoch, const String & leaf) const;
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
     /// manifest tree entry, or a verbatim namespace file. nullopt = the path is blob-backed (a real
@@ -636,11 +655,13 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
+    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (the disk setting refuses 0 and loads 1 as 2; `PoolConfig` 0 prunes nothing).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
+    const uint64_t intent_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
-    const uint64_t gc_round_graduation_budget;
+    const uint64_t orphan_manifest_sweep_interval_sec;
+    const uint64_t gc_round_intent_create_budget;
     const uint64_t gc_round_redelete_budget;
     const uint64_t gc_round_sweep_namespace_budget;
     const uint64_t gc_round_sweep_recovery_op_budget;
@@ -660,8 +681,6 @@ private:
     const bool allow_packed_parts;
     /// Byte bound for the manifest decode cache in `Cas::Pool`. Zero disables decode caching.
     const uint64_t manifest_decode_cache_bytes;
-    /// Bounded pool size for GC's per-hash freshness-metadata writes.
-    const uint64_t gc_meta_pool_size;
     /// Maximum number of threads in the GC I/O pool; 1 disables parallel GC I/O.
     const uint64_t gc_io_concurrency;
     /// Keys per batch delete request for the write-once families.
@@ -673,6 +692,7 @@ private:
     /// Startup-only margin validated against the mount lease TTL; feeds
     /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
     const uint64_t cas_lease_safety_margin_ms;
+    const uint64_t cas_request_window_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
@@ -789,7 +809,7 @@ private:
     /// (`<readonly>`) disk opens with no write probe, no background watermark, and no GC scheduler. Never
     /// touches `cas_store`/`part_access`/`gc_scheduler`/`physical_key_prefix`/`pool_uuid`; `startup`
     /// applies its own result to those members itself, in its single publish step.
-    PoolView openPoolView(bool context_available) const;
+    PoolView openPoolView(bool context_available, bool for_migration = false) const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Common/Exception.h>
@@ -23,6 +24,10 @@ namespace ProfileEvents
 namespace DB::ErrorCodes
 {
     extern const int CAS_OWNERSHIP_CONFLICT;
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+    extern const int CORRUPTED_DATA;
+    extern const int TOO_DEEP_RECURSION;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 #include <optional>
 #include <string_view>
@@ -34,11 +39,12 @@ namespace DB::Cas
 {
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
-/// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
+/// too large, an access denial, or a credential failure; for a local store, `READONLY` or an `errno` of
+/// `EACCES`, `EPERM` or `EROFS`. Whether a STALE CREDENTIAL explains it is not
 /// asked here -- the engine asks the backend for fresh credentials first, and refuses only when no
 /// refresh HELPED: the error was outside the credential class, the one refresh this call is allowed
 /// installed nothing, or there is no reissue left to sign with what it did install. A refresh that
-/// helps re-sends the attempt, which is known not to have applied. A non-S3 exception is never a
+/// helps re-sends the attempt, which is known not to have applied. Any other exception is never a
 /// refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
@@ -60,6 +66,24 @@ bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
+/// A `MEMORY_LIMIT_EXCEEDED` raised by the memory tracker, whatever it was allocating for.
+bool isMemoryLimitExceeded(const std::exception & e);
+/// A GC decode of a stored ref log or manifest failed because the bytes are malformed. Any other error says nothing
+/// about the bytes and must propagate. The JSON reader does not translate a bad escape or an unknown key nested past
+/// its depth limit to `CORRUPTED_DATA`, so those two parse codes are listed here.
+inline bool isMalformedStoredRecordError(int code)
+{
+    return code == ErrorCodes::CORRUPTED_DATA || code == ErrorCodes::UNKNOWN_FORMAT_VERSION
+        || code == ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE || code == ErrorCodes::TOO_DEEP_RECURSION;
+}
+inline bool isMalformedStoredRecordError(const Exception & e)
+{
+    return isMalformedStoredRecordError(e.code());
+}
+/// An exception the store or the transport raised, as opposed to a local fault.
+bool isStoreAnswer(const std::exception & e);
+/// `VERB key: refused|transport code message`; `code` is the store's error name when it sent one.
+String describeRequestFailure(std::string_view verb, const String & key, const std::exception & e);
 
 /// Throw the recoverable "CAS write could not be committed, retry later" condition.
 ///
@@ -94,6 +118,10 @@ bool isDeterministicLocalFailure(int code);
 /// their meaning and are not rerouted here.
 [[noreturn]] void throwCasWriteRetryLater(const String & why);
 
+/// Same class as `throwCasWriteRetryLater` (`NETWORK_ERROR`, retry later), worded for a request that is not a
+/// commit: a read, a probe, a delete, or recovery and maintenance work.
+[[noreturn]] void throwCasRequestRetryLater(const String & why);
+
 /// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
 /// `std::exception_ptr` for call sites that fail a pending future/promise rather than throw directly.
 /// Both entry points route through the SAME construction internally, so the error code / message shape
@@ -102,8 +130,10 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 
 /// Throw `CAS_OWNERSHIP_CONFLICT`: the committed ref a caller read moved, dropped or changed owner before the
 /// caller's write landed; the caller must re-resolve the part before trying again. Counted in
-/// `ProfileEvents::CASOwnershipConflict`, so every conflict site goes through here (the counter counts
-/// throws; a ref-log builder that is re-run counts again).
+/// `ProfileEvents::CASOwnershipConflict`, so every conflict site goes through here. The counter counts
+/// throws on the throwing thread: inside an `appendRefOps` builder that is the append leader, which may be
+/// another query's thread, so per-query attribution in `system.query_log` is best-effort; the global
+/// counter is exact (a builder runs once per append).
 template <typename... Args>
 [[noreturn]] void throwCasOwnershipConflict(FormatStringHelper<Args...> fmt, Args &&... args)
 {
@@ -155,6 +185,15 @@ struct ListPage
 /// The walk's callback: FALSE stops the walk.
 using ListedKeyFn = std::function<bool(const ListedKey &)>;
 
+/// Live progress of one operation, called on its thread inside the engine's retry loops; must not throw.
+struct RequestObserver
+{
+    /// A conditional write is about to send its `attempts_sent`-th physical attempt.
+    std::function<void(uint32_t attempts_sent)> on_write_attempt;
+    /// A conditional `PUT` or a body `GET` failed with a store answer (`isStoreAnswer`).
+    std::function<void(std::string_view verb, const String & key, const std::exception & e)> on_failure;
+};
+
 namespace detail
 {
 /// The engine's per-attempt counters, behind functions so the header need not declare the events.
@@ -165,6 +204,9 @@ void recordFirstAttemptFuse();
 }
 
 class CasOperation;
+
+/// What a read does when an admitted attempt fails with `MEMORY_LIMIT_EXCEEDED`.
+enum class OnMemoryLimit : uint8_t { Reissue, Propagate };
 
 /// The only caller of `Backend`. It owns the three things a physical request must be measured
 /// against -- the transport, the mount fence, and the clock -- and it is the sole minter of
@@ -183,20 +225,24 @@ public:
     /// envelope (attempt timeout plus its connect caps): it is what the engine reserves before it
     /// starts anything. `hot_keys` is the pool's
     /// write lane, shared by its planes; without one this object owns a private lane with no cache,
-    /// so a write through it costs today's read and write.
+    /// so a write through it costs today's read and write. `default_window_ms` is the window of a
+    /// policy that names none (`Retry::standard`, `Retry::once`); it has no default, so a plane that
+    /// forgets the disk's `cas_request_window_ms` does not compile.
     CasRequests(BackendPtr backend_, Fence fence_,
-                std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {},
-                CasHotKeys * hot_keys_ = nullptr);
+                std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
+                CasHotKeys * hot_keys_, uint64_t default_window_ms_);
 
     /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
     /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
-    /// too. The test setters below DO write members, and belong to setup, before any operation runs.
+    /// too. The test setters below DO write members: they belong to setup, before any operation runs
+    /// and before a pool's background workers start (`Pool::openForDecommission` starts them).
     ///
     /// Admitted now, under the fence's current generation.
     CasOperation admit(Liveness liveness = {});
     /// Admitted earlier: the generation came from a persisted runtime record, and an operation that
     /// resumes under a generation the fence has since moved past gives up rather than writing.
-    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {});
+    /// A non-empty `sleep_ms` replaces the plane's inter-attempt sleep for this operation only.
+    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {}, std::function<void(uint64_t)> sleep_ms = {});
 
     /// The capability predicates and `dialect()`.
     Backend & backendForCapabilityPredicates() { return *backend; }
@@ -214,6 +260,9 @@ public:
     /// envelope). A caller that derives its OWN policy window from a write's cost -- rather than from a
     /// constant that predates this reservation -- reads it here instead of duplicating the backend call.
     uint64_t attemptReservationMs() const { return attempt_reservation_ms; }
+
+    /// The clock every policy on this plane is bound to.
+    uint64_t nowMs() const { return now_ms(); }
 
 private:
     friend class CasOperation;
@@ -233,6 +282,9 @@ private:
         return std::forward<Fn>(fn)(access);
     }
 
+    /// `policy` bound to this plane's clock and default window.
+    Retry::Bound bindPolicy(const Retry & policy) const { return policy.bind(now_ms(), default_window_ms); }
+
     /// The store's answer for `key`, as an incarnation. Throws `CORRUPTED_DATA` naming the key when
     /// the value fails this backend's dialect grammar.
     Etag mint(const String & key, String value) const;
@@ -249,6 +301,7 @@ private:
     std::function<uint64_t()> now_ms;
     std::function<void(uint64_t)> sleep_ms;
     uint64_t attempt_reservation_ms;
+    uint64_t default_window_ms;
     /// The private lane of a `CasRequests` built without a pool; null when `hot_keys` is the pool's.
     std::unique_ptr<CasHotKeys> own_hot_keys;
     CasHotKeys * hot_keys;
@@ -272,13 +325,20 @@ public:
     CasOperation & operator=(const CasOperation &) = delete;
 
     uint64_t generation() const { return admitted_generation; }
+    /// The dialect of the backend this operation was admitted on.
+    Dialect backendDialect() const;
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
-    void pause(uint64_t ms) { owner.sleep_ms(ms); }
+    void pause(uint64_t ms) { sleep(ms); }
+    /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
+    /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
+    /// attempt reservations (the re-read and the write) do not fit in `policy`.
+    std::optional<WriteResult> pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy);
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
+    void observeRequests(RequestObserver observer_) { observer = std::move(observer_); }
 
     /// The write lane for keys several writers of this pool share.
     CasHotKeys & hotKeys() const { return *owner.hot_keys; }
@@ -290,16 +350,26 @@ public:
     /// of paced retrying. A policy that already carries a deadline is returned unchanged, so freezing
     /// twice cannot extend it.
     Retry freeze(const Retry & policy) const;
+    /// Would a read verb start its first attempt now under a policy frozen to `deadline_ms`? The same test the
+    /// verb applies before it sends, without any lease bound. A caller with a deadline of its own asks first, so
+    /// its running out of time is its own error and not the verb's retry-later give-up.
+    bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
-    std::optional<Object> read(const String & key, const Retry & policy);
+    /// `OnMemoryLimit::Propagate` makes a `MEMORY_LIMIT_EXCEEDED` from an admitted attempt escape at once: the
+    /// reader that hit its own memory limit gains nothing from the loop replaying the GET until the window ends.
+    /// Only a read that loads data for its caller may ask; settlement and maintenance reads keep reissuing.
+    std::optional<Object> read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
+    /// The store returns at most 1000 keys per request, and a page needs one key more than its size to prove
+    /// the prefix continues, so a page and its sentinel fit one store response.
+    static constexpr size_t kCasListPageKeys = 999;
     /// Walks every key under `prefix` exactly once. The policy governs EACH PAGE, not the walk: a walk
     /// is an unbounded number of requests, and a silently truncated enumeration is the error a
     /// coverage record exists to prevent. `on_page_fetched` fires once per page DELIVERED; a page that
     /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
     void forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
-                          size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
+                          size_t page_limit = kCasListPageKeys, const std::function<void()> & on_page_fetched = {});
     Removal remove(const String & key, const Etag & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
     /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a
@@ -337,10 +407,14 @@ private:
     /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.
     friend class CasHotKeys;
 
-    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_)
+    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_,
+                 std::function<void(uint64_t)> own_sleep_ms_ = {})
         : owner(owner_), admitted_generation(admitted_generation_), liveness(std::move(liveness_))
+        , own_sleep_ms(std::move(own_sleep_ms_))
     {
     }
+
+    void sleep(uint64_t ms) { own_sleep_ms ? own_sleep_ms(ms) : owner.sleep_ms(ms); }
 
     enum class Gate : uint8_t { Ok, FenceLost, NoBudget };
     /// The admission point: the fence for `needed_ms` from now, then the caller's own facts.
@@ -363,6 +437,13 @@ private:
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;
         bool refresh_attempted = false;
+        /// Under `Retry::attempt_spacing_ms`: that spacing, and when the latest attempt was sent.
+        struct Spacing
+        {
+            uint64_t spacing_ms = 0;
+            uint64_t attempt_started_ms = 0;
+        };
+        std::optional<Spacing> spacing;
     };
 
     /// Why a read-class request stopped without an answer. Every give-up below throws the same
@@ -385,9 +466,10 @@ private:
     /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
     template <typename Fn>
     auto readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                  const Retry::Bound & bound, Fn && once);
+                  const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
 
-    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
+    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound,
+                                    OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   headUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
     ListPage               listUnder(const String & prefix, const String & cursor, size_t limit,
                                     const Retry & policy, const Retry::Bound & bound);
@@ -428,7 +510,8 @@ private:
     std::optional<WriteResult> gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
                                          const Retry::Bound & bound, void (*record)(), bool should_sleep);
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
-    /// caller may send another attempt.
+    /// caller may send another attempt. Under `WriteState::spacing` this and the two siblings below
+    /// sleep `reissuePause` instead.
     std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
     /// The sibling for a clean lost race: the same admission and the same reservation, a flat
     /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
@@ -441,6 +524,8 @@ private:
     /// sleep at all, and `state.reissues` untouched -- the fuse is a connection-quality answer about a
     /// fresh connection, not a store fault, so nothing here is paced against it.
     std::optional<WriteResult> reissueAtOnce(WriteState & state, const Retry::Bound & bound);
+    /// The pause before a write reissue: `unspaced_ms`, or `Retry::pauseAfterAttempt` under `state.spacing`.
+    uint64_t reissuePause(const WriteState & state, uint64_t unspaced_ms) const;
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
@@ -465,16 +550,19 @@ private:
     CasRequests & owner;
     uint64_t admitted_generation;
     Liveness liveness;
+    std::function<void(uint64_t)> own_sleep_ms;
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
+    RequestObserver observer;
 };
 
 template <typename Fn>
 auto CasOperation::readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                            const Retry::Bound & bound, Fn && once)
+                            const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit)
 {
     bool refresh_attempted = false;
+    uint64_t attempt_started_ms = 0;
     /// Two counters, deliberately kept separate: `attempt_no` is the PHYSICAL attempt count handed to
     /// the transport (so a reissue is seen as attempt >= 2); `ordinary_reissues` is the
     /// exponential-backoff index. They advance together on an ordinary failure, but the first-attempt
@@ -492,6 +580,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(reservation, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no - 1);
 
+        if (policy.attempt_spacing_ms)
+            attempt_started_ms = owner.now_ms();
         detail::recordAttempt();
         try
         {
@@ -499,6 +589,10 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         }
         catch (const std::exception & e)
         {
+            if (observer.on_failure && verb == "read" && isStoreAnswer(e))
+                observer.on_failure("GET", subject, e);
+            if (on_memory_limit == OnMemoryLimit::Propagate && isMemoryLimitExceeded(e))
+                throw;
             bool refreshed = false;
             if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;
@@ -532,7 +626,10 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             }
         }
 
-        const uint64_t pause_ms = Retry::backoff(++ordinary_reissues);
+        ++ordinary_reissues;
+        const uint64_t pause_ms = policy.attempt_spacing_ms
+            ? Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, attempt_started_ms, owner.now_ms())
+            : Retry::backoff(ordinary_reissues);
         const uint64_t needed = reservedFor(pause_ms, 1);
         switch (gate(needed))
         {
@@ -543,7 +640,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(needed, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 

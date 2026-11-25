@@ -47,8 +47,7 @@ timestamp); clean decommission of a permanently departed pool member
 
 **Backends.** AWS S3 (`ETag`-based conditional dialect) is validated. Google Cloud Storage's
 generation-token implementation and deterministic tests are complete, but its credentialed
-[real-GCS release gate](/superpowers/cas/unconditional-blob-publication-live-results) has not run. A
-capability probe runs at every writable mount and refuses a backend that does not enforce the
+real-GCS release gate has not run. A capability probe runs when a writable disk starts and refuses a backend that does not enforce the
 conditions CAS depends on.
 
 **Operability.** `system.cas_log`, `system.cas_gc_log`, and `system.cas_mounts` for introspection;
@@ -96,6 +95,10 @@ positioning.
 
 ## Backups {#backups}
 
+Ordinary `BACKUP` and `RESTORE` already work for a table on a `CAS` disk — see
+[backup](/antalya/cas/operations/backup) for how they behave and what the limits are. What follows is
+about the `CAS`-native model, which is a different thing.
+
 A `snapshot` / `mirror` / `fetch` / `restore` design is **approved but not implemented**. The
 model is deliberately git-shaped: `snapshot` is instant and free (like `git tag` — it references
 existing manifests, copies nothing); `mirror` is a continuous pull from a production pool into a
@@ -114,7 +117,6 @@ A short pointer list; the reasons and the counterexamples that drove each decisi
 - An integer in-degree refcount instead of a folded edge set.
 - A persistent, append-only namespace registry for GC discovery.
 - Per-incarnation body keys as an alternative to an in-body incarnation tag.
-- Using a blob's freshness metadata as the authority for its lifecycle instead of an advisory hint.
 - A separate all-shard fence-and-recheck phase per GC round.
 - A sparse ref-id allocator with a certificate stack bolted on to prove completeness.
 - Extending zero-copy replication instead of building a new mechanism — CAS is an alternative to

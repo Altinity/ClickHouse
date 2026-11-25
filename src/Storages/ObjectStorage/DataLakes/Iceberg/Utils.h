@@ -56,9 +56,29 @@ void writeMessageToFile(
     const std::string & write_if_match = "",
     DB::CompressionMethod compression_method = DB::CompressionMethod::None);
 
+enum class MetadataCommitResult : uint8_t
+{
+    Committed,
+    /// The metadata file already existed, so nothing was written.
+    Conflict,
+    /// Writing the metadata file failed, and it is unknown whether the file was created.
+    Unknown,
+};
+
 /// Tries to write metadata file and version hint file. Uses If-None-Match header to avoid overwriting existing files.
-/// Maybe return false if failed to write metadata.json
 /// Will try to write hint multiple times, but will not report failure to write hint.
+/// Throws if checking whether the metadata file exists fails, since nothing has been written then.
+MetadataCommitResult tryWriteMetadataFileAndVersionHint(
+    const IcebergPathResolver & resolver,
+    const DB::GeneratedMetadataFileWithInfo & metadata_file_info,
+    const std::string & metadata_file_content,
+    const IcebergPathFromMetadata & version_hint_path,
+    DB::ObjectStoragePtr object_storage,
+    DB::ContextPtr context,
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file = nullptr);
+
+/// Same as `tryWriteMetadataFileAndVersionHint`, returns false unless the result is `Committed`.
 bool writeMetadataFileAndVersionHint(
     const IcebergPathResolver & resolver,
     const DB::GeneratedMetadataFileWithInfo & metadata_file_info,
@@ -92,6 +112,18 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     LoggerPtr log,
     CompressionMethod compression_method,
     const std::optional<String> & table_uuid);
+
+String readMetadataJSONString(
+    const String & metadata_file_path,
+    ObjectStoragePtr object_storage,
+    bool use_metadata_cache,
+    const ContextPtr & local_context,
+    LoggerPtr log,
+    CompressionMethod compression_method);
+
+Poco::JSON::Object::Ptr parseMetadataJSONString(const String & metadata_json_str);
+
+Poco::JSON::Object::Ptr deepCopy(const Poco::JSON::Object::Ptr & object);
 
 
 /// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
@@ -149,6 +181,11 @@ MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
     CompressionMethod known_compression_method,
     bool ignore_explicit_metadata_file_path = true);
 
+/// The highest version among the metadata files in the `metadata` directory of the table,
+/// regardless of the version hint, the metadata cache, and which file is current.
+/// Returns `std::nullopt` if the directory has no metadata files.
+std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr & object_storage, const String & table_path);
+
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::string normalizeUuid(const std::string & uuid);
@@ -192,6 +229,15 @@ PartitionColumnValues getIdentityPartitionColumnValues(
     const ProcessedManifestFileEntry & manifest_file_entry,
     const IcebergSchemaProcessor & schema_processor,
     bool skip_nulls = true);
+
+    const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor);
+
+/// Walk a schema's fields array and return field-id -> raw Iceberg type string
+/// (e.g. "date", "timestamptz") for every leaf field, including nested struct members.
+std::unordered_map<Int64, String> collectIcebergTypesByFieldId(Poco::JSON::Array::Ptr schema_fields);
+
+/// Returns the manifest-list path of the current snapshot, or empty string if no current snapshot.
+String getCurrentManifestListPath(const Poco::JSON::Object::Ptr & metadata);
 }
 
 #endif

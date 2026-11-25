@@ -46,18 +46,18 @@ before the blob it names is guaranteed reachable, never the other way round.
 ## The object model {#object-model}
 
 Four durable object kinds exist in a pool: one mutable (the ref), three immutable
-(part manifest, blob, and a blob's condemnation-marker sidecar).
+(part manifest, blob, and a blob's deletion intent).
 
 ```mermaid
 graph TD
     R["Ref: part name maps to manifest id"]
     M["Part manifest: file list of one part"]
     B["Blob: one part file's bytes, keyed by content hash"]
-    BM["Blob meta: condemnation marker sidecar"]
+    BI["Deletion intent: GC warning for one body incarnation"]
 
     R -->|names| M
     M -->|entry references| B
-    B -.->|sidecar| BM
+    BI -.->|names one incarnation of| B
 ```
 
 **The reachability rule, stated once:** a blob is live if and only if some live manifest names

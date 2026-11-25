@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tags: no-random-merge-tree-settings
+# Tags: no-fasttest, no-random-merge-tree-settings, cas-storage
+# cas-storage: uses the cas_packed_mixed policy of the CAS lane config.
 
 set -euo pipefail
 
@@ -14,11 +15,8 @@ HAS_MIXED_POLICY=$(${CLICKHOUSE_CLIENT} --query "
     WHERE policy_name = 'cas_packed_mixed'")
 
 if [ "${HAS_MIXED_POLICY}" != "1" ]; then
-    printf 'packed_before_merge\t2\tWide\tPacked\t2\n'
-    printf 'merge_algorithm\tVertical\n'
-    printf 'rows_after_merge\t2\t3\t30\n'
-    printf 'storage_after_merge\t1\tFull\t1\n'
-    exit 0
+    echo "storage policy 'cas_packed_mixed' is missing; the CAS lane config defines it" >&2
+    exit 1
 fi
 
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF

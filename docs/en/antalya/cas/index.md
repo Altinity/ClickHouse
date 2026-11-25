@@ -64,6 +64,8 @@ Two consequences for planning:
   Each prefix is a fully independent pool (its own refs, leases, and `GC`), so rounds stay short
   regardless of the total fleet size.
 
+Each pool owns its prefix, and its bucket credential is its trust boundary. See [what must not run on the bucket](/antalya/cas/bucket-requirements#must-not) and [the trust boundary](/antalya/cas/bucket-requirements#trust-boundary).
+
 :::tip
 For replicated tables on `CAS`, enable
 [`execute_merges_on_single_replica_time_threshold`](/operations/settings/merge-tree-settings#execute_merges_on_single_replica_time_threshold).
@@ -94,4 +96,5 @@ per disk, so adopting it never requires migrating an existing deployment.
 | [Architecture overview](/antalya/cas/architecture/) | The object model, the Git analogy, and the safety invariants |
 | [Correctness](/antalya/cas/architecture/correctness) | How the design was verified: TLA+ models, counterexamples, soak methodology |
 | [Design history](/antalya/cas/architecture/design-history) | What earlier designs were tried and rejected, and why |
+| [Backup](/antalya/cas/operations/backup) | How `BACKUP` and `RESTORE` behave on a content-addressed disk |
 | [Roadmap](/antalya/cas/roadmap) | What is shipped, planned, and deliberately not pursued |

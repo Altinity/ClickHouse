@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <optional>
 #include <vector>
 
 /// v3 text codec tests for the `EpochSeal` record kind + strict seal grammar added to `cas_ref_log`
@@ -15,6 +16,8 @@
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::ScopedReadCeiling;
+using DB::Cas::tests::tombstoneTxn;
 
 namespace
 {
@@ -80,16 +83,15 @@ TEST(CASRefEpochSealFormat, RemovalClassIsFalseForEpochSeal)
 
 TEST(CASRefEpochSealFormat, RoundTripSealAtSequenceOneWithPrevEpochSeal)
 {
-    /// An empty dead epoch (3) closes with a sequence-1 seal, which is therefore itself required to
-    /// carry `prev_epoch_seal` chaining to the seal that closed epoch 2 (spec INV-2's grammar: required
-    /// on exactly sequence 1 of every epoch above genesis).
+    /// An old-format sequence-1 seal of an empty epoch (3) carries `prev_epoch_seal` chaining to the seal
+    /// that closed epoch 2. Only a header below 3 carries a seal without `next_epoch`.
     RefLogTxn txn;
     txn.ns = "ns";
     txn.txn_id = RefTxnId{3, 1};
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
 
-    const String bytes = encodeRefLogTxn(txn);
+    const String bytes = encodeRefLogTxnAtGeneration(txn, 1);
     const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
     EXPECT_EQ(decoded, txn);
     ASSERT_TRUE(decoded.prev_epoch_seal.has_value());
@@ -123,9 +125,9 @@ TEST(CASRefEpochSealFormat, ByteIdenticalReencodeWithPrevEpochSeal)
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
 
-    const String bytes1 = encodeRefLogTxn(txn);
+    const String bytes1 = encodeRefLogTxnAtGeneration(txn, 1);
     const RefLogTxn decoded = decodeRefLogTxn(bytes1, txn.ns, txn.txn_id);
-    const String bytes2 = encodeRefLogTxn(decoded);
+    const String bytes2 = encodeRefLogTxnAtGeneration(decoded, 1);
     EXPECT_EQ(bytes1, bytes2);
 }
 
@@ -265,7 +267,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     txn.txn_id = RefTxnId{3, 1};
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
-    const String bytes = encodeRefLogTxn(txn);
+    const String bytes = encodeRefLogTxnAtGeneration(txn, 1);
 
     const String needle = R"(,"!prev_seq":"9")";
     const auto pos = bytes.find(needle);
@@ -484,10 +486,129 @@ TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
     const String ns = txn.ns;
     const RefTxnId id = txn.txn_id;
     runFormatBattery({FormatId::RefLog,
-        [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
+        [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, 1)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         "{\"type\":\"cas_ref_log\",\"v\":1}\n"
         "{\"namespace\":\"ns\",\"txn_epoch\":\"3\",\"txn_seq\":\"1\",\"!prev_epoch\":\"2\",\"!prev_seq\":\"9\"}\n"
         "{\"op\":\"epoch_seal\"}\n"
         "{\"n\":1}\n"});
+}
+
+/// ===================================================================================
+/// Generation 3: the forward-linked tombstone and the sparse backlink
+/// ===================================================================================
+
+namespace DB::ErrorCodes
+{
+    extern const int UNKNOWN_FORMAT_VERSION;
+}
+
+namespace
+{
+
+RefLogTxn headTxn(const String & ns, RefTxnId id, RefTxnId prev, std::vector<RefOp> ops)
+{
+    return RefLogTxn{ns, id, std::move(ops), prev};
+}
+
+RefOp moveOpForFormat()
+{
+    const ManifestRef mref{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "from", mref};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "to", mref};
+    return op;
+}
+
+}
+
+TEST(CASRefEpochSealFormat, NextEpochMustExceedOwnEpoch)
+{
+    const String ns = "ns";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 5)); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 4)); });
+
+    ScopedReadCeiling c(3);
+    const String bytes = encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 6));
+    EXPECT_EQ(decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}).next_epoch, std::optional<uint64_t>{6});
+    ASSERT_TRUE(sniffHeaderLine(bytes).has_value());
+    EXPECT_EQ(sniffHeaderLine(bytes)->v, 3u);
+}
+
+TEST(CASRefEpochSealFormat, NextEpochOnlyOnATombstone)
+{
+    RefLogTxn birth{"ns", RefTxnId{5, 3}, {namespaceBirthOp()}, std::nullopt};
+    birth.next_epoch = 6;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(birth); });
+}
+
+TEST(CASRefEpochSealFormat, HeaderThreeTombstoneRequiresNextEpoch)
+{
+    const String ns = "ns";
+    const RefLogTxn seal = tombstoneTxn(ns, RefTxnId{5, 3}, std::nullopt);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(seal, 3); });
+
+    const String bytes = encodeRefLogTxn(seal);
+    ASSERT_TRUE(sniffHeaderLine(bytes).has_value());
+    EXPECT_EQ(sniffHeaderLine(bytes)->v, 1u);
+    ScopedReadCeiling c(2);
+    EXPECT_NO_THROW(decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}));
+}
+
+TEST(CASRefEpochSealFormat, SparseBacklinkNeedsHeaderThree)
+{
+    const String ns = "ns";
+    const RefLogTxn head = headTxn(ns, RefTxnId{7, 1}, RefTxnId{4, 9}, {namespaceBirthOp()});
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(head, 1); });
+
+    ScopedReadCeiling c(3);
+    const RefLogTxn back = decodeRefLogTxn(encodeRefLogTxnAtGeneration(head, 3), ns, RefTxnId{7, 1});
+    const std::optional<RefTxnId> expected_prev = RefTxnId{4, 9};
+    EXPECT_EQ(back.prev_epoch_seal, expected_prev);
+}
+
+TEST(CASRefEpochSealFormat, ReadCeilingTwoRejectsHeaderThree)
+{
+    const String ns = "ns";
+    const String bytes = encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 7));
+    ScopedReadCeiling c(2);
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}); });
+}
+
+TEST(CASRefEpochSealFormat, BacklinkHeadIsHeaderThree)
+{
+    const String ns = "ns";
+    const RefLogTxn head = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {namespaceBirthOp()});
+    EXPECT_EQ(refLogTxnHeaderGeneration(head), 3u);
+    ASSERT_TRUE(sniffHeaderLine(encodeRefLogTxn(head)).has_value());
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(head))->v, 3u);
+
+    const RefLogTxn with_move = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {moveOpForFormat()});
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(with_move))->v, 3u);
+
+    RefLogTxn plain;
+    plain.ns = ns;
+    plain.txn_id = RefTxnId{5, 2};
+    plain.ops = {namespaceBirthOp()};
+    EXPECT_EQ(refLogTxnHeaderGeneration(plain), 1u);
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(plain))->v, 1u);
+
+    /// An old-format head stays encodable below 3: what content needs is not what the encoder stamps.
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxnAtGeneration(head, 1))->v, 1u);
+}
+
+TEST(CASRefEpochSealFormat, HeaderBelowThreeRejectsNextEpoch)
+{
+    const String ns = "ns";
+    const RefLogTxn tomb = tombstoneTxn(ns, RefTxnId{5, 3}, 7);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(tomb, 1); });
+
+    String text = encodeRefLogTxn(tomb);
+    const String needle = "\"v\":3";
+    const auto pos = text.find(needle);
+    ASSERT_NE(pos, String::npos);
+    text.replace(pos, needle.size(), "\"v\":1");
+    ScopedReadCeiling c(3);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(text, ns, RefTxnId{5, 3}); });
 }

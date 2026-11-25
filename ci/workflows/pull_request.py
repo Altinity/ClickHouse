@@ -94,12 +94,19 @@ workflow = Workflow.Config(
         ],
         *[
             job.set_run_after(REGULAR_BUILD_NAMES)
-            for job in JobConfigs.release_build_jobs_with_examples
+            # NOTE (strtgbb): no clickhouse-examples, nothing uses it and it delays the ThinLTO link of clickhouse
+            for job in JobConfigs.release_build_jobs
         ],
         # *[ # NOTE (strtgbb): we don't run special build jobs
         #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.special_build_jobs
         # ],
+        *[
+            job.set_run_after(CORE_BLOCKING_JOB_NAMES)
+            for job in JobConfigs.special_build_jobs
+            if "ppc64le" in job.name
+        ],
+        JobConfigs.smoke_test_ppc64le,
         # Gated like the regular builds rather than like the special ones: it is the only job
         # that compiles the standalone parser at all, and it needs no build artifact, so there
         # is nothing to gain by deferring it behind the functional tests.
@@ -141,10 +148,14 @@ workflow = Workflow.Config(
         # reproduce) — a reproduction or an inconclusive ERROR does not block.
         # Like the sibling FT/IT jobs, it is deferred behind the core blocking jobs.
         JobConfigs.bugfix_validation_ut_job.set_run_after(CORE_BLOCKING_JOB_NAMES),
+        # The CAS stateless lanes need only their build artifact. Deferring them
+        # behind the blocking jobs makes a red ASan integration shard skip them
+        # silently, so they are not deferred.
         *[
             j.set_run_after(
                 CORE_BLOCKING_JOB_NAMES
                 if j.name not in CORE_BLOCKING_JOB_NAMES
+                and j not in AltinityJobConfigs.cas_functional_tests_jobs
                 else []
             )
             for j in FUNCTIONAL_TESTS_JOBS
@@ -224,7 +235,8 @@ workflow = Workflow.Config(
         #     for job in JobConfigs.clickbench_jobs
         # ],
         # JobConfigs.llvm_coverage_job,
-        JobConfigs.promql_compliance_job,
+        # NOTE (strtgbb): baseline is only published by upstream master, so this has nothing to compare against
+        # JobConfigs.promql_compliance_job,
         # NOTE (strtgbb): Inc-only — needs AWS SSM CI logs cluster credentials
         # JobConfigs.build_profile_diff_job.set_allow_failure(),
         JobConfigs.sqllogic_test_master_job.set_run_after(
@@ -239,7 +251,6 @@ workflow = Workflow.Config(
             .set_name("Keeper Stress Tests (PR)")
             .set_timeout(3 * 3600),
         *JobConfigs.toolchain_build_jobs,
-        AltinityJobConfigs.source_upload_job,
     ],
     additional_jobs=["GrypeScan", "RegressionPR", "CIReport"],
     artifacts=[
@@ -255,7 +266,7 @@ workflow = Workflow.Config(
         ArtifactConfigs.wasm_parser,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
-        ArtifactConfigs.clickhouse_examples,
+        # ArtifactConfigs.clickhouse_examples,
         # *ArtifactConfigs.llvm_profdata_file,
         # ArtifactConfigs.llvm_coverage_info_file,
         ArtifactConfigs.toolchain_pgo_bolt_amd,

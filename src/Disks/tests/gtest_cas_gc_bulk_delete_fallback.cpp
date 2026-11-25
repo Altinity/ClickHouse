@@ -46,6 +46,7 @@ std::vector<WriteOnceKey> manifestKeys(uint32_t count)
     return keys;
 }
 
+/// A writable open runs the intent probe, which sends one bulk delete of its own; the tests count from after it.
 PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend)
 {
     PoolConfig config;
@@ -60,6 +61,7 @@ TEST(CASGCBulkDeleteFallback, HappyPathIsOneRequest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPlainPool(backend);
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     CasOperation op = store->openRequests().admit();
     const std::vector<WriteOnceKey> keys = manifestKeys(3);
     for (const WriteOnceKey & key : keys)
@@ -68,7 +70,7 @@ TEST(CASGCBulkDeleteFallback, HappyPathIsOneRequest)
     const uint64_t requests_issued = removeChunkWriteOnceOrOneByOne(op, keys, Retry::once());
 
     EXPECT_EQ(requests_issued, 1u);
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1u);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 1u);
     for (const WriteOnceKey & key : keys)
         EXPECT_FALSE(op.head(key.str(), Retry::once()).has_value()) << key.str();
 }
@@ -77,6 +79,7 @@ TEST(CASGCBulkDeleteFallback, NotImplementedFallsBackToOneRequestPerKeyEachDelet
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPlainPool(backend);
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     CasOperation op = store->openRequests().admit();
     const std::vector<WriteOnceKey> keys = manifestKeys(3);
     for (const WriteOnceKey & key : keys)
@@ -87,7 +90,7 @@ TEST(CASGCBulkDeleteFallback, NotImplementedFallsBackToOneRequestPerKeyEachDelet
     const uint64_t requests_issued = removeChunkWriteOnceOrOneByOne(op, keys, Retry::once());
 
     EXPECT_EQ(requests_issued, 4u) << "the failed bulk attempt is itself a call, counted alongside the 3 that followed it";
-    EXPECT_EQ(backend->bulkRemoveCalls(), 4u) << "1 failed bulk attempt + 3 single-key fallback requests";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 4u) << "1 failed bulk attempt + 3 single-key fallback requests";
     for (const WriteOnceKey & key : keys)
         EXPECT_FALSE(op.head(key.str(), Retry::once()).has_value()) << key.str();
 }
@@ -99,6 +102,7 @@ TEST(CASGCBulkDeleteFallback, TeardownBegunBetweenTwoFallbackKeysStopsTheRemaind
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPlainPool(backend);
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     CasOperation op = store->openRequests().admit();
     const std::vector<WriteOnceKey> keys = manifestKeys(4);
     for (const WriteOnceKey & key : keys)
@@ -129,7 +133,7 @@ TEST(CASGCBulkDeleteFallback, TeardownBegunBetweenTwoFallbackKeysStopsTheRemaind
     EXPECT_FALSE(verify.head(keys[1].str(), Retry::once()).has_value()) << "deleted before teardown began";
     EXPECT_TRUE(verify.head(keys[2].str(), Retry::once()).has_value()) << "refused at admission, never reached the backend";
     EXPECT_TRUE(verify.head(keys[3].str(), Retry::once()).has_value()) << "never attempted";
-    EXPECT_EQ(backend->bulkRemoveCalls(), 3u) << "1 failed bulk attempt + 2 single-key fallback requests that landed";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 3u) << "1 failed bulk attempt + 2 single-key fallback requests that landed";
 }
 
 /// A REAL error on one of the fallback's per-key deletes (not "batch not supported", so not caught and
@@ -139,6 +143,7 @@ TEST(CASGCBulkDeleteFallback, ARealErrorOnAFallbackKeyStopsTheRemainderAndPropag
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPlainPool(backend);
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     CasOperation op = store->openRequests().admit();
     const std::vector<WriteOnceKey> keys = manifestKeys(4);
     for (const WriteOnceKey & key : keys)
@@ -160,7 +165,7 @@ TEST(CASGCBulkDeleteFallback, ARealErrorOnAFallbackKeyStopsTheRemainderAndPropag
     EXPECT_TRUE(op.head(keys[1].str(), Retry::once()).has_value()) << "this delete is the one that failed";
     EXPECT_TRUE(op.head(keys[2].str(), Retry::once()).has_value()) << "never attempted";
     EXPECT_TRUE(op.head(keys[3].str(), Retry::once()).has_value()) << "never attempted";
-    EXPECT_EQ(backend->bulkRemoveCalls(), 3u) << "1 failed bulk attempt + key[0]'s delete + key[1]'s failed attempt";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 3u) << "1 failed bulk attempt + key[0]'s delete + key[1]'s failed attempt";
 }
 
 /// A failure outside the "batch delete not supported" class must propagate as-is, with no fallback:
@@ -169,6 +174,7 @@ TEST(CASGCBulkDeleteFallback, OtherFailureClassPropagatesWithNoFallback)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPlainPool(backend);
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     CasOperation op = store->openRequests().admit();
     const std::vector<WriteOnceKey> keys = manifestKeys(3);
     for (const WriteOnceKey & key : keys)
@@ -178,7 +184,7 @@ TEST(CASGCBulkDeleteFallback, OtherFailureClassPropagatesWithNoFallback)
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)removeChunkWriteOnceOrOneByOne(op, keys, Retry::once()); });
 
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1u) << "no per-key fallback for a non-capability failure";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 1u) << "no per-key fallback for a non-capability failure";
     for (const WriteOnceKey & key : keys)
         EXPECT_TRUE(op.head(key.str(), Retry::once()).has_value()) << "nothing was deleted";
 }

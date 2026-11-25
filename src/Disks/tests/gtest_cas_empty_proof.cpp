@@ -75,6 +75,8 @@ struct ReadOnlyMount
 {
     std::shared_ptr<ContentAddressedMetadataStorage> ro;
     std::string root;
+    /// Owns `root`: the directory is removed when the last owner of this storage goes.
+    DB::ObjectStoragePtr backing;
 };
 
 /// Delete ONLY the physical `_pool_meta` object under `root`, leaving the container directory and every
@@ -133,7 +135,7 @@ ReadOnlyMount openReadOnlyOverBootstrappedBacking()
     auto ro = std::make_shared<ContentAddressedMetadataStorage>(
         ro_os, "pool", "srv1", "", nullptr, settings);
     ro->startup();
-    return {std::move(ro), root};
+    return {std::move(ro), root, std::move(rw_os)};
 }
 
 }

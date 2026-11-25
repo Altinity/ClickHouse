@@ -1296,7 +1296,8 @@ bool applyTrivialCountIfPossible(
     select_query_info.optimize_trivial_count = true;
 
     /// Get number of rows
-    std::optional<UInt64> num_rows = storage->totalRows(query_context);
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    std::optional<UInt64> num_rows = storage->totalRowsInSnapshot(storage_snapshot, query_context);
     if (!num_rows)
         return false;
 

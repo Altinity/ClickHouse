@@ -40,7 +40,8 @@ private:
         ASTPtr & query,
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context,
-        bool /*make_cluster_function*/) override;
+        bool /*make_cluster_function*/,
+        bool add_structure_and_format) override;
     void updateBeforeRead(const ContextPtr & context) override;
 
     Strings paths;

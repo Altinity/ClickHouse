@@ -795,10 +795,16 @@ void generateManifestFile(
         const DataFileEntryLineage * entry_lineage
             = per_file_entry_lineage.empty() ? nullptr : &per_file_entry_lineage[file_idx];
 
-        manifest.field(Iceberg::f_status)
-            = avro::GenericDatum(entry_lineage ? static_cast<Int32>(ManifestEntryStatus::EXISTING)
-                                               : static_cast<Int32>(ManifestEntryStatus::ADDED));
-        Int64 snapshot_id = (entry_lineage && entry_lineage->added_snapshot_id)
+        ManifestEntryStatus entry_status;
+        if (entry_lineage && entry_lineage->status_override)
+            entry_status = *entry_lineage->status_override;
+        else if (entry_lineage)
+            entry_status = ManifestEntryStatus::EXISTING;
+        else
+            entry_status = ManifestEntryStatus::ADDED;
+        manifest.field(Iceberg::f_status) = avro::GenericDatum(static_cast<Int32>(entry_status));
+        /// The spec defines `snapshot_id` of a DELETED entry as the snapshot that deleted the file.
+        Int64 snapshot_id = (entry_status != ManifestEntryStatus::DELETED && entry_lineage && entry_lineage->added_snapshot_id)
             ? *entry_lineage->added_snapshot_id
             : user_defined_snapshot_id.value_or(new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id));
 
@@ -1406,16 +1412,17 @@ void generateManifestList(
         if (manifest_rewrite)
         {
             /// The counts must agree per entry with the manifest's entry statuses: a manifest
-            /// whose entries are ADDED in this snapshot reports added_* counts, while a
+            /// whose entries are ADDED in this snapshot reports added_* counts, a
             /// carried-forward manifest (or a metadata-only rewrite that preserves lineage,
-            /// whose entries stay EXISTING) reports existing_* counts.
+            /// whose entries stay EXISTING) reports existing_* counts, and a bin-pack rewrite
+            /// also marks the replaced files as DELETED.
             const auto & counts = entry_counts[entry_idx];
-            setVersionedField(entry, counts.counts_are_added ? counts.files_count : 0, Iceberg::f_added_files_count);
-            setVersionedField(entry, counts.counts_are_added ? 0 : counts.files_count, Iceberg::f_existing_files_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
-            setVersionedField(entry, counts.counts_are_added ? counts.rows_count : 0, Iceberg::f_added_rows_count);
-            setVersionedField(entry, counts.counts_are_added ? 0 : counts.rows_count, Iceberg::f_existing_rows_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
+            setVersionedField(entry, static_cast<Int32>(counts.added_files_count), Iceberg::f_added_files_count);
+            setVersionedField(entry, static_cast<Int32>(counts.existing_files_count), Iceberg::f_existing_files_count);
+            setVersionedField(entry, static_cast<Int32>(counts.deleted_files_count), Iceberg::f_deleted_files_count);
+            setVersionedField(entry, counts.added_rows_count, Iceberg::f_added_rows_count);
+            setVersionedField(entry, counts.existing_rows_count, Iceberg::f_existing_rows_count);
+            setVersionedField(entry, counts.deleted_rows_count, Iceberg::f_deleted_rows_count);
 
             write_partition_summary(entry, entry_idx);
 
@@ -1503,14 +1510,14 @@ IcebergStorageSink::IcebergStorageSink(
         persistent_table_components.metadata_compression_method,
         /* ignore_explicit_metadata_file_path */ false);
 
-    metadata = getMetadataJSONObject(
+    metadata = deepCopy(getMetadataJSONObject(
         metadata_path,
         object_storage,
         persistent_table_components.metadata_cache,
         context,
         log,
         compression_method,
-        persistent_table_components.table_uuid);
+        persistent_table_components.table_uuid));
     metadata_compression_method = compression_method;
     previous_metadata_file_path = metadata_path;
     filename_generator = FileNamesGenerator(
@@ -1816,14 +1823,14 @@ bool IcebergStorageSink::initializeMetadata()
             previous_metadata_file_path = metadata_path;
             filename_generator.setVersion(last_version + 1);
 
-            metadata = getMetadataJSONObject(
+            metadata = deepCopy(getMetadataJSONObject(
                 metadata_path,
                 object_storage,
                 persistent_table_components.metadata_cache,
                 context,
                 getLogger("IcebergWrites"),
                 compression_method,
-                persistent_table_components.table_uuid);
+                persistent_table_components.table_uuid));
             partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
             auto partitions_specs = metadata->getArray(Iceberg::f_partition_specs);
 

@@ -2,10 +2,57 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_test_helpers.h"
 #include <base/types.h>
+#include <functional>
+#include <mutex>
+#include <utility>
 
 namespace DB::Cas::tests
 {
+
+class SweepReadHookBackend final : public CountingBackend
+{
+public:
+    void arm(const String & key, uint64_t read_number, std::function<void()> callback)
+    {
+        std::lock_guard lock(hook_mutex);
+        hook_key = key;
+        remaining_reads = read_number;
+        hook = std::move(callback);
+        fired = false;
+    }
+
+    bool didFire() const
+    {
+        std::lock_guard lock(hook_mutex);
+        return fired;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::function<void()> callback;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (hook && key == hook_key && --remaining_reads == 0)
+            {
+                callback = std::move(hook);
+                hook = {};
+                fired = true;
+            }
+        }
+        if (callback)
+            callback();
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    mutable std::mutex hook_mutex;
+    String hook_key;
+    uint64_t remaining_reads = 0;
+    std::function<void()> hook;
+    bool fired = false;
+};
 
 /// TEST-ONLY variant of the cursor page: plans a page via the production `planManifestCursorPage` and
 /// then exact-token-deletes every nomination immediately, with no source-edge retirement and no
@@ -29,7 +76,7 @@ inline ManifestSweepResult sweepManifestCursorPageForTest(
         /// key and refuses unless what is there now is still that one: a key a fresh owner has since
         /// replaced must survive.
         const std::optional<Meta> seen = op.head(nomination.key, Retry::standard());
-        if (seen && nomination.token.matches(seen->etag)
+        if (seen && DB::Cas::sameVersion(nomination.token, seen->etag)
             && op.remove(nomination.key, seen->etag, Retry::standard()) == Removal::Removed)
             ++result.deleted;
         else

@@ -9,6 +9,9 @@
 namespace DB
 {
 
+class IDisk;
+using DiskPtr = std::shared_ptr<IDisk>;
+
 class ReadPipeline;
 struct ReadSettings;
 
@@ -88,8 +91,9 @@ enum class CaRelinkPrepare : uint8_t
 /// three outcomes and only two of them are knowledge:
 ///  - `Committed` -- the receiver's ref is committed.
 ///  - `MechanismFallbackAllowed` -- the promote is PROVEN to have committed nothing (it was rejected
-///    before its ref-log append: a body-absent precommit, a precommit that is no longer the live owner,
-///    a ref conflict), which leaves the sender's copy the only authority and its bytes a sound recovery.
+///    before its ref-log append: `requireAlive` refused a build that a namespace drop cancelled or whose
+///    mount incarnation was superseded, `NETWORK_ERROR`), which leaves the sender's copy the only authority
+///    and its bytes a sound recovery. A lost owner or a ref conflict is refused inside the append: `Unresolved`.
 ///  - `Unresolved` -- the ref-log append was attempted and did not come back with a verdict, so the ref
 ///    MAY be committed. This is NOT a mechanism fallback and must never be reported as one: fetching
 ///    the bytes after a relink that actually committed publishes the same part twice. The only sound
@@ -167,13 +171,15 @@ public:
     /// unproven answer.
     virtual bool ownsNamespace(const String & server_root_id, const String & root_namespace) const = 0;
 
-    /// Sender side, gate 1 of the relink confirm (spec §confirm-primitive), forwarded to the ledger:
+    /// Sender side, gate 1 of the relink confirm, forwarded to the pool:
     /// does `ref_name` in `root_namespace` still name EXACTLY the manifest rendered by
     /// `manifest_ref_text` (the canonical `writer_epoch:build_sequence:manifest_ordinal` form) in this
-    /// writer's committed view? Read-only, performs ZERO object-store I/O, and creates nothing: a cold,
-    /// evicted, recovering, busy, wedged, poisoned or unfenced table answers `Unknown` rather than
-    /// doing work, because a remote peer drives this query. Never throws: an unparsable token and a
-    /// disk that is not started or has reached a terminal lifecycle are `Unknown` too.
+    /// writer's committed view? Read-only and creates nothing: a cold, evicted, recovering, busy,
+    /// wedged, poisoned or unfenced table answers `Unknown` rather than doing work, because a remote
+    /// peer drives this query. The only object-store request is at most one `GET` of this mount's lease slot,
+    /// made only when the in-memory view says `Yes`; a slot this mount no longer holds answers
+    /// `Unknown`. Never throws: an unparsable token, a failed slot read and a disk that is not started
+    /// or has reached a terminal lifecycle are `Unknown` too.
     virtual CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                              const String & manifest_ref_text) const = 0;
 
@@ -215,9 +221,8 @@ public:
     /// nothing about the window that follows it.
     ///
     /// On `MechanismFallbackAllowed` nothing was staged and `out` is null: the manifest did not decode,
-    /// or the local staging hit the retryable class (a body-absent precommit or a precommit that is no
-    /// longer the live owner -- `ABORTED`; a ref already committed with other content -- write-retry-later
-    /// `NETWORK_ERROR`). Any OTHER error propagates, an ownership conflict included.
+    /// or the local staging hit the retryable class (`ABORTED` or `NETWORK_ERROR`). Any OTHER error
+    /// propagates, an ownership conflict included.
     ///
     /// Promotion trusts the adopted references through the durable manifest edge -- it does not re-read
     /// each blob body -- the same interserver trust as an ordinary `ReplicatedMergeTree` fetch. A blob
@@ -257,5 +262,7 @@ public:
     /// in-manifest, loose, directory, or otherwise unresolved paths.
     virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
+
+IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk);
 
 }
