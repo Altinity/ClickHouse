@@ -223,23 +223,24 @@ public:
     ObjectIteratorWithPrefetchedObjects(
         ObjectInfos pulled_,
         ObjectIterator remaining_,
-        std::optional<UInt64> snapshot_version_)
+        std::optional<UInt64> snapshot_version_,
+        ObjectMetadataResolver resolve_metadata_)
         : pulled(std::move(pulled_))
         , remaining(std::move(remaining_))
         , snapshot_version(snapshot_version_)
+        , resolve_metadata(std::move(resolve_metadata_))
     {
     }
 
     ObjectInfoPtr next(size_t id) override
     {
-        std::lock_guard lock(mutex);
-        if (index < pulled.size())
-            return pulled[index++];
-
-        if (!remaining)
-            return nullptr;
-
-        return remaining->next(id);
+        while (true)
+        {
+            auto object = nextListed(id);
+            /// The resolver may read metadata from the object storage, so it runs without the mutex.
+            if (!object || !resolve_metadata || resolve_metadata(*object))
+                return object;
+        }
     }
 
     size_t estimatedKeysCount() override
@@ -262,10 +263,23 @@ public:
     }
 
 private:
+    ObjectInfoPtr nextListed(size_t id)
+    {
+        std::lock_guard lock(mutex);
+        if (index < pulled.size())
+            return pulled[index++];
+
+        if (!remaining)
+            return nullptr;
+
+        return remaining->next(id);
+    }
+
     ObjectInfos pulled;
     size_t index = 0;
     ObjectIterator remaining;
     std::optional<UInt64> snapshot_version;
+    ObjectMetadataResolver resolve_metadata;
     std::mutex mutex;
 };
 
@@ -281,7 +295,9 @@ std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe
     return it->second;
 }
 
-ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe)
+ObjectIterator takeObjectStorageClusterReadProbe(
+    const std::shared_ptr<ObjectStorageClusterReadProbe> & probe,
+    ObjectMetadataResolver resolve_metadata)
 {
     if (!probe || probe->consumed)
         return nullptr;
@@ -296,7 +312,7 @@ ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectSto
     probe->snapshot_version.reset();
 
     return std::make_shared<ObjectIteratorWithPrefetchedObjects>(
-        std::move(pulled), std::move(remaining), snapshot_version);
+        std::move(pulled), std::move(remaining), snapshot_version, std::move(resolve_metadata));
 }
 
 }

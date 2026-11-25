@@ -76,6 +76,11 @@ public:
         bool skip_object_metadata = false,
         bool with_tags = false);
 
+    /// Fetches the metadata of an object listed without it (a `skip_object_metadata` placeholder).
+    /// Returns false when the object does not exist and `ignore_non_existent_file` is set, so the caller skips it.
+    static bool fetchObjectMetadataIfNeeded(
+        ObjectInfo & object_info, const ObjectStoragePtr & object_storage, bool ignore_non_existent_file, bool with_tags);
+
     static std::string getUniqueStoragePathIdentifier(
         const StorageObjectStorageConfiguration & configuration, const ObjectInfo & object_info, bool include_connection_info = true);
 

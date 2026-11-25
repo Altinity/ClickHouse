@@ -1080,6 +1080,34 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfoPtr & object_
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
+bool StorageObjectStorageSource::fetchObjectMetadataIfNeeded(
+    ObjectInfo & object_info, const ObjectStoragePtr & object_storage, bool ignore_non_existent_file, bool with_tags)
+{
+    /// A `skip_object_metadata` placeholder (`is_fetched = false`) has `size_bytes = 0` and `is_size_known = true`.
+    /// It is not a real size: without a fetch it would be taken for an empty file.
+    if (const auto & current_metadata = object_info.relative_path_with_metadata.metadata; current_metadata && current_metadata->is_fetched)
+        return true;
+
+    const auto & path = object_info.isArchive() ? object_info.getPathToArchive() : object_info.getPath();
+    auto metadata_object = object_info.relative_path_with_metadata;
+    metadata_object.relative_path = path;
+
+    ObjectStoragePtr storage_to_use = object_info.getResolvedStorage(object_storage);
+
+    if (ignore_non_existent_file)
+    {
+        auto metadata = storage_to_use->tryGetObjectMetadata(metadata_object, with_tags);
+        if (!metadata)
+            return false;
+
+        object_info.setObjectMetadata(metadata.value());
+        return true;
+    }
+
+    object_info.setObjectMetadata(storage_to_use->getObjectMetadata(metadata_object, with_tags));
+    return true;
+}
+
 StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(bool prefetch_input_format)
 {
     return createReader(
@@ -1149,31 +1177,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (object_info->getPath().empty())
             return {};
-        /// A `skip_object_metadata` placeholder (`is_fetched = false`) has `size_bytes = 0` and `is_size_known = true`.
-        /// It is not a real size: without a fetch it would be taken for an empty file and skipped below.
-        /// It reaches here when the cluster local-read probe reuses its listing.
-        if (const auto & current_metadata = object_info->relative_path_with_metadata.metadata;
-            !current_metadata || !current_metadata->is_fetched)
+        if (!fetchObjectMetadataIfNeeded(
+                *object_info,
+                object_storage,
+                query_settings.ignore_non_existent_file,
+                /*with_tags=*/ read_from_format_info.requested_virtual_columns.contains("_tags")))
         {
-            bool with_tags = read_from_format_info.requested_virtual_columns.contains("_tags");
-            const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
-            auto metadata_object = object_info->relative_path_with_metadata;
-            metadata_object.relative_path = path;
-
-            ObjectStoragePtr storage_to_use = object_info->getResolvedStorage(object_storage);
-
-            if (query_settings.ignore_non_existent_file)
-            {
-                auto metadata = storage_to_use->tryGetObjectMetadata(metadata_object, with_tags);
-                if (!metadata)
-                    return {};
-
-                object_info->setObjectMetadata(metadata.value());
-            }
-            else
-            {
-                object_info->setObjectMetadata(storage_to_use->getObjectMetadata(metadata_object, with_tags));
-            }
+            /// The object disappeared after it was listed. Skip it: ending the stream here would drop the objects after it.
+            continue;
         }
 
         if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0

@@ -8,6 +8,7 @@
 #include <Common/Logger.h>
 #include <Common/Macros.h>
 #include <Formats/FormatSettings.h>
+#include <functional>
 #include <unordered_map>
 
 namespace DB
@@ -188,8 +189,14 @@ struct ObjectStorageClusterReadProbe
     bool consumed = false;
 };
 
+/// Brings the metadata of an object that the probe listed without it up to date. Returns false to skip the object.
+using ObjectMetadataResolver = std::function<bool(ObjectInfo &)>;
+
 /// Hands the probe to one consumer. A second call returns null.
-ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe);
+/// `resolve_metadata`, when set, is applied to every object before it is returned, and objects it rejects are skipped.
+ObjectIterator takeObjectStorageClusterReadProbe(
+    const std::shared_ptr<ObjectStorageClusterReadProbe> & probe,
+    ObjectMetadataResolver resolve_metadata = {});
 
 /// The probe this storage ran, or null when this storage has not probed yet.
 std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(

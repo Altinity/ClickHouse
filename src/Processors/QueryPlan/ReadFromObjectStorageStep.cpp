@@ -176,7 +176,21 @@ void ReadFromObjectStorageStep::createIterator()
     /// (`with_tags` is false there), so a query that reads `_tags` lists again.
     if (!info.requested_virtual_columns.contains("_tags"))
     {
-        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe))
+        /// The probe listed the files without their metadata, reporting zero bytes for each. A local read fetches the
+        /// metadata here, skips the files that no longer exist, and reports each real size to the progress callback.
+        const bool ignore_non_existent_file = configuration->getQuerySettings(getContext()).ignore_non_existent_file;
+        ObjectMetadataResolver resolve_metadata = [storage = object_storage, ignore_non_existent_file,
+                                                   file_progress_callback = getContext()->getFileProgressCallback()](ObjectInfo & object)
+        {
+            const bool is_placeholder = object.relative_path_with_metadata.metadata && !object.relative_path_with_metadata.metadata->is_fetched;
+            if (!StorageObjectStorageSource::fetchObjectMetadataIfNeeded(object, storage, ignore_non_existent_file, /*with_tags=*/ false))
+                return false;
+            if (is_placeholder && file_progress_callback)
+                file_progress_callback(FileProgress(0, object.getObjectMetadata()->size_bytes));
+            return true;
+        };
+
+        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe, std::move(resolve_metadata)))
         {
             iterator_wrapper = std::move(reused);
             return;
