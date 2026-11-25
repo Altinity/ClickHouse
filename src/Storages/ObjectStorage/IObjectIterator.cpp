@@ -132,6 +132,7 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
     , format_settings(getFormatSettings(context_))
     , storage_id(storage_id_)
     , format_filter_info(std::move(format_filter_info_))
+    , file_progress_callback(context_->getFileProgressCallback())
 {
     if (format_filter_info && format_filter_info->condition_hash)
         query_condition_cache = context_->getQueryConditionCache();
@@ -171,8 +172,17 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
                 }
             }
 
+            /// The listing reported zero bytes for a file that it listed without metadata (`skip_object_metadata`).
+            const auto & listed_metadata = last_object_info->relative_path_with_metadata.metadata;
+            const bool listed_without_metadata = listed_metadata && !listed_metadata->is_fetched;
+
             auto storage_to_use = last_object_info->getResolvedStorage(object_storage);
             auto buffer = createReadBuffer(last_object_info->relative_path_with_metadata, storage_to_use, getContext(), log);
+
+            /// `createReadBuffer` fetched the real size. The buckets below are copies of this object, so they
+            /// cannot tell that the listing missed it: report the file once here.
+            if (listed_without_metadata && file_progress_callback)
+                file_progress_callback(FileProgress(0, last_object_info->getObjectMetadata()->size_bytes));
             size_t bucket_size = getContext()->getSettingsRef()[Setting::cluster_table_function_buckets_batch_size];
             auto file_bucket_infos = splitter->splitToBuckets(bucket_size, *buffer, format_settings);
             for (const auto & file_bucket : file_bucket_infos)

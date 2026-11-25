@@ -171,6 +171,9 @@ private:
     StorageID storage_id;
     FormatFilterInfoPtr format_filter_info;
     QueryConditionCachePtr query_condition_cache;
+    /// Reports the size of a file that the listing skipped the metadata of. All buckets of a file share it,
+    /// so it is reported here once per file and not for every bucket.
+    std::function<void(FileProgress)> file_progress_callback;
 
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");
