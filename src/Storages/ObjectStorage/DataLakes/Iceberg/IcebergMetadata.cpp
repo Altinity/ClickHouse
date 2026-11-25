@@ -293,7 +293,7 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
         /// The entry is keyed on the uuid reported by the catalog, which is not trusted yet. Check it against the
         /// file before the entry is stored, so that a mismatching file is never cached under another table's key.
         metadata_object = cache_ptr->getOrSetTableMetadata(
-            IcebergMetadataFilesCache::getKey(*known_table_uuid, metadata_file_path),
+            IcebergMetadataFilesCache::getKey(*object_storage, *known_table_uuid, metadata_file_path),
             [&]()
             {
                 auto metadata_json_str = readMetadataJSONString(metadata_file_path, object_storage, /* use_metadata_cache */ true, context_, log, compression_method);
@@ -330,7 +330,7 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
     /// With a known uuid and a cache the entry has already been stored above, after the uuid check.
     if (cache_ptr && table_uuid && !known_table_uuid)
         cache_ptr->getOrSetTableMetadata(
-            IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path),
+            IcebergMetadataFilesCache::getKey(*object_storage, *table_uuid, metadata_file_path),
             [&]() { return std::make_shared<IcebergMetadataFilesCacheCell>(metadata_object, metadata_json_size); });
     auto table_path = configuration->getPathForRead().path;
     auto root_derivation = IcebergPathResolver::deriveTableRoot(table_location, table_path, metadata_file_path);
