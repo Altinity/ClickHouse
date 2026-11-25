@@ -603,6 +603,20 @@ public:
 
     bool isParallelizeMergePrepareNeeded() const override { return is_parallelize_merge_prepare_needed; }
 
+    size_t getEstimatedMergeWork(ConstAggregateDataPtr place) const override
+    {
+        if constexpr (detail::IsUniqExactSet<typename Data::Set>::value)
+            return this->data(place).set.size();
+        return 0;
+    }
+
+    size_t getStateBytesPerDistinctInput() const override
+    {
+        if constexpr (detail::IsUniqExactSet<typename Data::Set>::value)
+            return Data::Set::getEstimatedBytesPerValue();
+        return 0;
+    }
+
     constexpr static bool parallelizeMergeWithKey() { return true; }
 
     void parallelizeMergePrepare(AggregateDataPtrs & places, ThreadPool & thread_pool, std::atomic<bool> & is_cancelled) const override
@@ -689,6 +703,13 @@ public:
 
     String getName() const override { return Data::getName(); }
 
+    size_t getStateBytesPerDistinctInput() const override
+    {
+        if constexpr (detail::IsUniqExactSet<typename Data::Set>::value)
+            return Data::Set::getEstimatedBytesPerValue();
+        return 0;
+    }
+
     bool allocatesMemoryInArena() const override { return false; }
 
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
@@ -729,6 +750,12 @@ public:
     }
 
     bool isAbleToParallelizeMerge() const override { return is_able_to_parallelize_merge; }
+    size_t getEstimatedMergeWork(ConstAggregateDataPtr place) const override
+    {
+        if constexpr (detail::IsUniqExactSet<typename Data::Set>::value)
+            return this->data(place).set.size();
+        return 0;
+    }
     bool canOptimizeEqualKeysRanges() const override { return !is_able_to_parallelize_merge; }
 
     void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, ThreadPool & thread_pool, std::atomic<bool> & is_cancelled, Arena *) const override

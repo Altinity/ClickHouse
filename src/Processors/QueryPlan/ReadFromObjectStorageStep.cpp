@@ -17,6 +17,16 @@
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/ReadBufferFromString.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/PreparedSets.h>
+#include <Processors/QueryPlan/ReadNothingStep.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Common/SipHash.h>
+#include <Processors/QueryPlan/IParameterLookup.h>
+#include <Core/Block.h>
+#include <Analyzer/TableExpressionModifiers.h>
+#include <Planner/PlannerActionsVisitor.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/algorithm/string/predicate.hpp>
@@ -30,6 +40,13 @@
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
+    extern const int UNKNOWN_TABLE;
+}
 
 namespace Setting
 {
@@ -102,9 +119,81 @@ void ReadFromObjectStorageStep::updatePrewhereInfo(const PrewhereInfoPtr & prewh
     output_header = std::make_shared<const Block>(info.source_header);
 }
 
-void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+namespace
 {
+
+/// Passes only the files of one bucket: the task of a bucket of a distributed read reads the files whose identifier hashes to it.
+class BucketFilteringObjectIterator final : public IObjectIterator
+{
+public:
+    BucketFilteringObjectIterator(ObjectIterator iterator_, size_t bucket_count_, size_t bucket_)
+        : iterator(std::move(iterator_)), bucket_count(bucket_count_), bucket(bucket_)
+    {
+    }
+
+    ObjectInfoPtr next(size_t id) override
+    {
+        while (auto object_info = iterator->next(id))
+        {
+            const String identifier = object_info->getIdentifier(/*include_file_bucket_info=*/false);
+            if (sipHash64(identifier.data(), identifier.size()) % bucket_count == bucket)
+                return object_info;
+        }
+        return nullptr;
+    }
+
+    size_t estimatedKeysCount() override { return std::max<size_t>(iterator->estimatedKeysCount() / bucket_count, 1); }
+    std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
+    void setEmitProfileEvents(bool value) override
+    {
+        IObjectIterator::setEmitProfileEvents(value);
+        iterator->setEmitProfileEvents(value);
+    }
+    void setTasksGoToOtherReplicas(bool value) override
+    {
+        IObjectIterator::setTasksGoToOtherReplicas(value);
+        iterator->setTasksGoToOtherReplicas(value);
+    }
+
+private:
+    ObjectIterator iterator;
+    size_t bucket_count;
+    size_t bucket;
+};
+
+}
+
+void ReadFromObjectStorageStep::applyPendingPrewhereFilter()
+{
+    if (!prewhere_pruning_filter_pending)
+        return;
+    prewhere_pruning_filter_pending = false;
+
+    if (!query_info.prewhere_info)
+        return;
+
+    const auto & prewhere = *query_info.prewhere_info;
+    if (const auto * node = prewhere.prewhere_actions.tryFindInOutputs(prewhere.prewhere_column_name))
+        applyFilters(ActionDAGNodes{{node}});
+}
+
+void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings)
+{
+    applyPendingPrewhereFilter();
     createIterator();
+
+    if (distributed_read_bucket_count > 0 && !distributed_read_iterator_applied)
+    {
+        if (!settings.parameter_lookup)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "A distributed read of {} has no task parameters", storage_id.getNameForLogs());
+        const UInt64 bucket = settings.parameter_lookup->getParameter("bucket_id").safeGet<String>().empty()
+            ? 0
+            : parse<UInt64>(settings.parameter_lookup->getParameter("bucket_id").safeGet<String>());
+        if (bucket >= distributed_read_bucket_count)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Bucket {} of a distributed read is out of {} buckets", bucket, distributed_read_bucket_count);
+        iterator_wrapper = std::make_shared<BucketFilteringObjectIterator>(iterator_wrapper, distributed_read_bucket_count, bucket);
+        distributed_read_iterator_applied = true;
+    }
 
     Pipes pipes;
     auto context = getContext();
@@ -249,11 +338,9 @@ bool ReadFromObjectStorageStep::canUseLazyMaterialization() const
     if (!configuration->dataFilesAreImmutable() && !reread_is_generation_pinned)
         return false;
 
-#if CLICKHOUSE_CLOUD
     /// The transformed plan is not serializable.
     if (distributed_read_bucket_count)
         return false;
-#endif
 
     return true;
 }
@@ -305,6 +392,139 @@ bool ReadFromObjectStorageStep::requestReadingInOrder() const
 InputOrderInfoPtr ReadFromObjectStorageStep::getDataOrder() const
 {
     return convertSortingKeyToInputOrder(storage_snapshot->metadata->getSortingKey());
+}
+
+
+void ReadFromObjectStorageStep::setDistributedRead(size_t bucket_count)
+{
+    distributed_read_bucket_count = bucket_count;
+}
+
+Strings ReadFromObjectStorageStep::getShardsForDistributedRead() const
+{
+    Strings shards;
+    shards.reserve(distributed_read_bucket_count);
+    for (size_t bucket = 0; bucket < distributed_read_bucket_count; ++bucket)
+        shards.push_back(fmt::format("bucket {} of {} of the files of {}", bucket, distributed_read_bucket_count, storage_id.getNameForLogs()));
+    return shards;
+}
+
+std::optional<UInt64> ReadFromObjectStorageStep::totalRows() const
+{
+    auto storage = DatabaseCatalog::instance().tryGetTable(storage_id, getContext());
+    if (!storage)
+        return std::nullopt;
+    return storage->totalRows(getContext());
+}
+
+void ReadFromObjectStorageStep::serialize(Serialization & ctx) const
+{
+    if (lazy_row_index_registry)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "make_distributed_plan does not support a read with lazy materialization");
+
+    /// The worker looks the table up by its name, so every node of the plan must see the same catalog.
+    writeStringBinary(storage_id.getDatabaseName(), ctx.out);
+    writeStringBinary(storage_id.getTableName(), ctx.out);
+
+    writeVarUInt(required_source_columns.size(), ctx.out);
+    for (const auto & column : required_source_columns)
+        writeStringBinary(column, ctx.out);
+
+    writeVarUInt(max_block_size, ctx.out);
+    writeVarUInt(max_num_streams, ctx.out);
+
+    UInt8 flags = 0;
+    if (query_info.row_level_filter != nullptr)
+        flags |= 1;
+    if (query_info.prewhere_info != nullptr)
+        flags |= 2;
+    if (need_only_count)
+        flags |= 4;
+    writeIntBinary(flags, ctx.out);
+
+    if (query_info.row_level_filter)
+        query_info.row_level_filter->serialize(ctx);
+    if (query_info.prewhere_info)
+        query_info.prewhere_info->serialize(ctx);
+
+    writeVarUInt(distributed_read_bucket_count, ctx.out);
+}
+
+std::unique_ptr<IQueryPlanStep> ReadFromObjectStorageStep::deserialize(Deserialization & ctx)
+{
+    String database_name;
+    String table_name;
+    readStringBinary(database_name, ctx.in);
+    readStringBinary(table_name, ctx.in);
+
+    size_t num_columns = 0;
+    readVarUInt(num_columns, ctx.in);
+    Names column_names;
+    column_names.reserve(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+    {
+        String column_name;
+        readStringBinary(column_name, ctx.in);
+        column_names.push_back(std::move(column_name));
+    }
+
+    UInt64 max_block_size = 0;
+    readVarUInt(max_block_size, ctx.in);
+    size_t num_streams = 0;
+    readVarUInt(num_streams, ctx.in);
+
+    UInt8 flags = 0;
+    readIntBinary(flags, ctx.in);
+
+    SelectQueryInfo query_info;
+    if (flags & 1)
+        query_info.row_level_filter = std::make_shared<FilterDAGInfo>(FilterDAGInfo::deserialize(ctx));
+    if (flags & 2)
+        query_info.prewhere_info = std::make_shared<PrewhereInfo>(PrewhereInfo::deserialize(ctx));
+    query_info.optimize_trivial_count = flags & 4;
+    /// There is no query on a worker: without the modifiers `SelectQueryInfo::isFinal` reads the missing AST.
+    query_info.table_expression_modifiers = TableExpressionModifiers(/*has_final_=*/ false, /*sample_size_ratio_=*/ {}, /*sample_offset_ratio_=*/ {});
+
+    size_t distributed_read_bucket_count = 0;
+    readVarUInt(distributed_read_bucket_count, ctx.in);
+
+    /// The plan is only being drained off the buffer and will be discarded.
+    if (ctx.skipping)
+        return std::make_unique<ReadNothingStep>(ctx.output_header);
+
+    StorageID table_id(database_name, table_name);
+    auto storage_ptr = DatabaseCatalog::instance().getTable(table_id, ctx.context);
+    const auto metadata_snapshot = storage_ptr->getInMemoryMetadataPtr(ctx.context, false);
+    auto storage_snapshot = storage_ptr->getStorageSnapshot(metadata_snapshot, ctx.context);
+
+    QueryPlan plan;
+    storage_ptr->read(
+        plan, column_names, storage_snapshot, query_info, Context::createCopy(ctx.context), QueryProcessingStage::FetchColumns, max_block_size, num_streams);
+    if (!plan.isInitialized() || !plan.getRootNode()->children.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading from {} is expected to produce one step", table_id.getNameForLogs());
+
+    QueryPlanStepPtr step = std::move(plan.getRootNode()->step);
+    auto * read_step = typeid_cast<ReadFromObjectStorageStep *>(step.get());
+    if (!read_step)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading from {} is expected to produce ReadFromObjectStorage", table_id.getNameForLogs());
+
+    /// The files are pruned by the filter: the one the prewhere carries is the one the initiator pruned with.
+    /// It is applied when the pipeline is built: the sets of an `IN` in it are not resolved before the plan is deserialized.
+    read_step->prewhere_pruning_filter_pending = query_info.prewhere_info != nullptr;
+
+    if (distributed_read_bucket_count)
+        read_step->setDistributedRead(distributed_read_bucket_count);
+
+    assertBlocksHaveEqualStructure(*read_step->getOutputHeader(), *ctx.output_header, "ReadFromObjectStorage deserialization");
+
+    ctx.storage_holders.push_back(storage_ptr);
+    return step;
+}
+
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry);
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry)
+{
+    registry.registerStep(ReadFromObjectStorageStep::STEP_NAME, ReadFromObjectStorageStep::deserialize);
 }
 
 }

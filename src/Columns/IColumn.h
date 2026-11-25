@@ -89,6 +89,19 @@ struct ColumnsWithRowNumbers
     VectorWithMemoryTracking<UInt32> row_numbers;
 };
 
+struct RowStorePointers
+{
+    /// Either `ptrs` or `base_ptr` should be used.
+    /// Pre-resolved pointers into `RowDataStore` rows, one entry per output row.
+    /// A nullptr entry is interpreted as a default value.
+    VectorWithMemoryTracking<const char *> ptrs;
+    /// Whether `ptrs` contains any nullptr entry.
+    bool has_defaults = false;
+    /// A contiguous run of rows: row `i` is `base_ptr + i * row_length`.
+    const char * base_ptr = nullptr;
+    size_t row_length = 0;
+};
+
 /// Helper throw functions so Column headers don't need to include Exception.h.
 [[noreturn]] void throwCannotPopBack(size_t n, const std::string & column_name, size_t column_size);
 [[noreturn]] void throwColumnConvertNotSupported(std::string_view type_name, const char * as_type);
@@ -415,8 +428,8 @@ public:
     /// Per-row weak hash kernel. Writes a 32-bit CRC32C-based hash for each row in
     /// [row_begin, row_end) into the caller-provided buffer `hash_out` (which must hold at
     /// least row_end - row_begin entries). It's a fast weak hash, mainly needed to scatter
-    /// data between threads (sharded aggregation, `grace_hash` joins, parallel-window
-    /// partitioning, hash-join scatter).
+    /// data between threads (`grace_hash` joins, parallel-window partitioning, hash-join
+    /// scatter).
     ///
     /// `h(row)` denotes the finalized per-row hash. With `initial == true` the buffer is
     /// overwritten with it; with `initial == false` the buffer is combined with it via
@@ -775,6 +788,14 @@ public:
         return getPtr();
     }
 
+    /// Fills column values from pre-resolved row-store pointers.
+    virtual void fillFromRowStorePtrs(const DataTypePtr & type, const RowStorePointers & row_store_ptrs, size_t field_offset, size_t field_size, size_t begin, size_t count, PaddedPODArray<UInt8> * null_map);
+
+    void fillFromRowStorePtrs(const DataTypePtr & type, const RowStorePointers & row_store_ptrs, size_t field_offset, size_t field_size, size_t begin, size_t count)
+    {
+        fillFromRowStorePtrs(type, row_store_ptrs, field_offset, field_size, begin, count, /*null_map=*/ nullptr);
+    }
+
     /// Fills column values from encoded join row refs (see RowRef / RowRefList in Interpreters/RowRefs.h).
     /// `block_columns[block_no]` is the resolved source column for this output column in that block, and
     /// `block_replicated[block_no]` is that column as ColumnReplicated* if it is one (else nullptr). Both
@@ -1068,6 +1089,9 @@ private:
 
     /// Devirtualize updateAt.
     void updateInplaceFrom(const IColumn::Patch & patch) override;
+
+    /// Fills column values from pre-resolved row-store pointers
+    void fillFromRowStorePtrs(const DataTypePtr & type, const RowStorePointers & row_store_ptrs, size_t field_offset, size_t field_size, size_t begin, size_t count, PaddedPODArray<UInt8> * null_map) override;
 
     /// Fills column values from encoded join row refs
     /// If row_refs_are_ranges is true, then each entry represents >= 1 consecutive rows of one block

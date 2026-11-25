@@ -7,7 +7,9 @@
 -- step checks, so a randomized `optimize_aggregation_in_order = 1` would make every other case
 -- reject for that reason instead of the one it means to exercise.
 
+-- The free-memory cap of the thread count is off, so the queries keep their four streams on a loaded server.
 SET max_threads = 4;
+SET max_threads_min_free_memory_per_thread = 0;
 SET max_block_size = 8192;
 SET adaptive_aggregator_freeze_threshold = 128;
 SET group_by_two_level_threshold = 10000000;
@@ -53,12 +55,6 @@ FROM system.query_log
 WHERE current_database = currentDatabase() AND type = 'QueryFinish'
     AND event_date >= yesterday() AND event_time >= now() - 600
     AND log_comment = '04653_break_mode';
-
-SELECT 'Sharded aggregation takes precedence';
-SELECT
-    (SELECT count(), sum(s) FROM (SELECT k, sum(v) AS s FROM t_admission GROUP BY k SETTINGS optimize_aggregation_in_order = 0, enable_sharding_aggregator = 1, enable_adaptive_aggregator = 0))
-    =
-    (SELECT count(), sum(s) FROM (SELECT k, sum(v) AS s FROM t_admission GROUP BY k SETTINGS optimize_aggregation_in_order = 0, enable_sharding_aggregator = 1, enable_adaptive_aggregator = 1));
 
 SELECT 'Serialized query plan carries the settings';
 SELECT
