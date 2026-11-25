@@ -55,7 +55,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_detect_variant_by_structure", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"},
             {"use_iceberg_manifest_list_partition_pruning", false, true, "New setting to skip Iceberg manifest files whose manifest-list partition summaries cannot match the query filter, without reading them."},
             {"allow_experimental_iceberg_add_files", false, false, "New setting to gate the experimental Iceberg command `ALTER TABLE ... EXECUTE add_files`."},
-            {"input_format_parquet_read_min_fill_ratio", 0., 0., "New experimental setting: anti-amplification guard for Parquet v3 read coalescing - stop bridging gaps once a coalesced task would be less than this fraction wanted bytes, so a tiny scattered column no longer drags in its neighbours. 0 disables."},
+            {"input_format_parquet_read_min_fill_ratio", 0., 0., "New experimental setting: anti-amplification guard for read coalescing in the Parquet reader - stop extending a coalesced read task once less than this fraction of it would be wanted bytes, which limits how much of the neighbouring columns a tiny scattered column drags in. 0 disables."},
         });
         addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
         {
