@@ -111,7 +111,8 @@ bool Prefetcher::fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, s
     /// Tasks with little filler in absolute terms are always fine: a request costs more than
     /// reading a few extra bytes, and dense reads must never be split. (`new_wanted < new_span`
     /// here because the ratio is at most 1, so the subtraction doesn't underflow.)
-    if (new_span - new_wanted < filler_floor_for_fill_ratio)
+    const size_t filler_floor = std::min(max_filler_floor_for_fill_ratio, bytes_per_read_task / 2);
+    if (new_span - new_wanted < filler_floor)
         return false;
 
     ProfileEvents::increment(ProfileEvents::ParquetPrefetcherFillRatioLimitedTasks);

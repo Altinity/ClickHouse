@@ -6,8 +6,14 @@ dense, guard off
 120000	7199940000	960000	15360000
 dense, guard on
 120000	7199940000	960000	15360000
+small seek threshold, guard off
+120000	960000
+small seek threshold, guard on
+120000	960000
 dense: guard on does not change reads	1
 dense: guard on does not limit tasks	1
+small seek: guard on issues more reads	1
+small seek: guard on limits tasks	1
 sparse: guard off does not limit tasks	1
 sparse: guard on issues more reads	1
 sparse: guard on limits tasks	1
