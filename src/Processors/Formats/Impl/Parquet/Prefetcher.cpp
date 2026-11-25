@@ -108,8 +108,8 @@ bool Prefetcher::fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, s
     if (static_cast<double>(new_wanted) >= read_min_fill_ratio * static_cast<double>(new_span))
         return false;
 
-    /// Tasks with little filler in absolute terms are always fine: a request costs more than
-    /// reading a few extra bytes, and dense reads must never be split. (`new_wanted < new_span`
+    /// Tasks with little filler in absolute terms are always fine: an extra request costs more than
+    /// reading that much filler, and dense reads must never be split. (`new_wanted < new_span`
     /// here because the ratio is at most 1, so the subtraction doesn't underflow.)
     const size_t filler_floor = std::min(max_filler_floor_for_fill_ratio, bytes_per_read_task / 2);
     if (new_span - new_wanted < filler_floor)
@@ -360,7 +360,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
-            /// Don't let the task degrade into mostly filler bytes.
+            /// Limit the filler in the task, see `fillRatioWouldBreak`.
             if (fillRatioWouldBreak(total_length_of_covered_ranges, start_offset, end_offset, r))
                 break;
 
