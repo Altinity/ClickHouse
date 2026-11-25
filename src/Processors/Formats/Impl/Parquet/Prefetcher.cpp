@@ -103,21 +103,15 @@ bool Prefetcher::fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, s
     if (read_min_fill_ratio <= 0)
         return false;
 
-    /// Gap that would be bridged to include `r` in the task (0 if `r` overlaps the task).
-    size_t gap = 0;
-    if (r.start >= end_offset)
-        gap = r.start - end_offset;
-    else if (start_offset >= r.end)
-        gap = start_offset - r.end;
-
-    /// Small gaps are always bridged: a request costs more than reading a few extra bytes, and
-    /// dense reads (fill close to 1) must never be split.
-    if (gap < small_gap_floor_for_fill_ratio)
-        return false;
-
     const size_t new_span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
     const size_t new_wanted = wanted_bytes + r.length();
     if (static_cast<double>(new_wanted) >= read_min_fill_ratio * static_cast<double>(new_span))
+        return false;
+
+    /// Tasks with little filler in absolute terms are always fine: a request costs more than
+    /// reading a few extra bytes, and dense reads must never be split. (`new_wanted < new_span`
+    /// here because the ratio is at most 1, so the subtraction doesn't underflow.)
+    if (new_span - new_wanted < filler_floor_for_fill_ratio)
         return false;
 
     ProfileEvents::increment(ProfileEvents::ParquetPrefetcherFillRatioLimitedTasks);
