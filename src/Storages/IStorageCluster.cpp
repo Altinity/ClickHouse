@@ -55,6 +55,8 @@
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/stripQuerySettings.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -445,8 +447,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     const ContextPtr & context,
     QueryTreeNodePtr * resolved_query_tree)
 {
-    auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
-    switch (object_storage_cluster_join_mode)
+    switch (context->getSettingsRef()[Setting::object_storage_cluster_join_mode])
     {
     case ObjectStorageClusterJoinMode::LOCAL: /// Legacy alias of `allow`
     case ObjectStorageClusterJoinMode::ALLOW:
@@ -857,6 +858,69 @@ void IStorageCluster::read(
     query_plan.addStep(std::move(reading));
 }
 
+ASTPtr IStorageCluster::getTableFunctionToSend(
+    const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks)
+{
+    /// Reuse `updateQueryToSendIfNeeded` with a query containing only this table.
+    auto select_query = make_intrusive<ASTSelectQuery>();
+    select_query->replaceDatabaseAndTable(getStorageID());
+    ASTPtr query = select_query;
+    /// A `SELECT` is sent, so every node needs the structure and format to produce the initiator's header.
+    updateQueryToSendIfNeeded(
+        query, storage_snapshot, context, /*make_cluster_function=*/read_initiator_file_tasks, /*add_structure_and_format=*/true);
+
+    auto table_function = extractTableFunctionASTPtrFromSelectQuery(query);
+    if (!table_function)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Storage {} of table {} has no table function to send", getName(), getStorageID().getNameForLogs());
+    return table_function;
+}
+
+bool IStorageCluster::canDispatchToCluster(ContextPtr context) const
+{
+    return !resolveClusterRead(context).fallback_to_pure;
+}
+
+/// The planner has already prepared the query and its header.
+void IStorageCluster::readPreparedClusterQuery(
+    QueryPlan & query_plan,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    QueryProcessingStage::Enum processed_stage,
+    ASTPtr query_to_send,
+    SharedHeader sample_block,
+    std::shared_ptr<const ActionsDAG> driver_filter)
+{
+    /// Honors `object_storage_cluster_fallback_to_local_if_empty` like an ordinary read. A dispatch is
+    /// only built for a cluster that is not read locally (see `canDispatchToCluster`).
+    auto resolved = resolveClusterRead(context);
+    if (resolved.fallback_to_pure)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Whole-query dispatch for table {} that is read locally", getStorageID().getNameForLogs());
+
+    ClusterPtr cluster = resolved.object_storage_cluster;
+    if (!cluster)
+        cluster = getClusterImpl(
+            context, getClusterName(context), isObjectStorage() ? context->getSettingsRef()[Setting::object_storage_max_nodes] : 0);
+
+    std::optional<Tables> external_tables = std::nullopt;
+    if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
+        external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
+
+    auto reading = std::make_unique<ReadFromClusterQuery>(
+        sample_block,
+        std::static_pointer_cast<IStorageCluster>(shared_from_this()),
+        storage_snapshot,
+        context,
+        std::move(query_to_send),
+        processed_stage,
+        cluster,
+        log,
+        std::move(external_tables),
+        std::move(driver_filter));
+
+    query_plan.addStep(std::move(reading));
+}
+
 IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     ClusterPtr cluster,
     ContextPtr context,
@@ -949,14 +1013,25 @@ SinkToStoragePtr IStorageCluster::write(
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
 }
 
-void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+namespace
 {
-    const Scalars & scalars = context->hasQueryContext() ? context->getQueryContext()->getScalars() : Scalars{};
-    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
 
-    Pipes pipes;
-    auto new_context = updateSettings(context->getSettingsRef());
+/// Shared transport for `ReadFromCluster` and `ReadFromClusterQuery`.
+/// Each replica acts as a shard with one connection; all replicas share the file-task iterator.
+Pipe buildClusterFunctionRemotePipe(
+    const ASTPtr & query_to_send,
+    const SharedHeader & output_header,
+    const ContextPtr & new_context,
+    const ClusterPtr & cluster,
+    QueryProcessingStage::Enum processed_stage,
+    const RemoteQueryExecutor::Extension & extension,
+    const std::optional<Tables> & external_tables,
+    LoggerPtr log)
+{
+    const Scalars & scalars = new_context->hasQueryContext() ? new_context->getQueryContext()->getScalars() : Scalars{};
+    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
     const auto & current_settings = new_context->getSettingsRef();
+
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
 
     size_t replica_index = 0;
@@ -964,10 +1039,9 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
 
-    createExtension();
-
     ProfileEvents::increment(ProfileEvents::Shards, max_replicas_to_use);
 
+    Pipes pipes;
     for (const auto & shard_info : cluster->getShardsInfo())
     {
         if (pipes.size() >= max_replicas_to_use)
@@ -990,14 +1064,14 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
         auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
             std::vector<IConnectionPool::Entry>{try_results.front()},
             query_to_send->formatWithSecretsOneLine(),
-            getOutputHeader(),
+            output_header,
             new_context,
             /*throttler=*/nullptr,
             scalars,
             external_tables.has_value() ? *external_tables : Tables(),
             processed_stage,
             nullptr,
-            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)},
+            RemoteQueryExecutor::Extension{.task_iterator = extension.task_iterator, .replica_info = std::move(replica_info)},
             shard_info.pool);
 
         remote_query_executor->setLogger(log);
@@ -1013,11 +1087,78 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (pipes.empty())
         throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "Cannot connect to any replica for query execution");
 
-    auto pipe = Pipe::unitePipes(std::move(pipes));
+    return Pipe::unitePipes(std::move(pipes));
+}
+
+}
+
+void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = updateSettings(context->getSettingsRef());
+
+    /// The query-text half of resetting the setting in `updateSettings`: a worker applies the query's own
+    /// SETTINGS clause on top of the settings it received. Drops both `name = value` and `name = DEFAULT`
+    /// and detaches a clause left empty, which would otherwise be sent as a bare `SETTINGS`.
+    static constexpr std::string_view dispatch_only_setting_names[] = {"allow_object_storage_cluster_distributed_join"};
+    removeSettingsFromQuery(query_to_send, dispatch_only_setting_names);
+
+    createExtension();
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, *extension, external_tables, log);
+
     for (const auto & processor : pipe.getProcessors())
         processors.emplace_back(processor);
 
     pipeline.init(std::move(pipe));
+}
+
+ContextPtr ReadFromClusterQuery::createRemoteContext() const
+{
+    auto remote_context = Context::createCopy(context);
+
+    /// Initiator-only settings such as `limit` would cut each worker's partial result, as in `ReadFromCluster`.
+    Settings settings = remote_context->getSettingsCopy();
+    ClusterProxy::stripInitiatorOnlySettings(settings);
+
+    /// A worker runs the dispatched query as sent and must not dispatch it again. Not sending the setting
+    /// also keeps a worker that does not know it from rejecting the settings.
+    settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
+    remote_context->setSettings(settings);
+
+    /// Cluster table functions should always skip unavailable shards.
+    remote_context->setSetting("skip_unavailable_shards", true);
+
+    /// Partners read locally. Only the driver's explicit `*Cluster` function consumes the initiator's file tasks.
+    remote_context->setSetting("object_storage_cluster", String{});
+
+    return remote_context;
+}
+
+void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = createRemoteContext();
+
+    /// The planner supplies a predicate over the driver's columns for file pruning.
+    const ActionsDAG::Node * predicate = driver_filter ? driver_filter->getOutputs().front() : nullptr;
+    auto extension = driver_storage->getTaskIteratorExtension(
+        predicate, driver_filter.get(), new_context, cluster, driver_snapshot->metadata);
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, extension, external_tables, log);
+
+    for (const auto & processor : pipe.getProcessors())
+        processors.emplace_back(processor);
+
+    pipeline.init(std::move(pipe));
+}
+
+void ReadFromClusterQuery::describeActions(FormatSettings & format_settings) const
+{
+    std::string prefix(format_settings.offset, format_settings.indent_char);
+    format_settings.out << prefix << "Cluster: " << cluster->getName() << '\n';
+    format_settings.out << prefix << "File tasks from: " << driver_storage->getStorageID().getNameForLogs() << '\n';
+    format_settings.out << prefix << "Query: " << query_to_send->formatForLogging() << '\n';
 }
 
 IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context)
@@ -1249,7 +1390,7 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
-    auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
+    const auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     const auto join_info = getQueryJoinInfo(query_info, context);
     /// `global` still fetches columns for `RIGHT`/`FULL`/`PASTE`: those joins stay on the initiator.
     const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
@@ -1297,6 +1438,10 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// to the remote servers, where they would re-shape the per-shard subquery a second time or
     /// break it (e.g. `format = 'Null'`). This mirrors the `Distributed` fan-out.
     ClusterProxy::stripInitiatorOnlySettings(new_settings);
+
+    /// Whole-query dispatch is decided on the initiator. Workers neither need the setting nor, if they
+    /// predate it, recognize it.
+    new_settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);
