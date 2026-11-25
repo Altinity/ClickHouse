@@ -113,6 +113,18 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     CompressionMethod compression_method,
     const std::optional<String> & table_uuid);
 
+String readMetadataJSONString(
+    const String & metadata_file_path,
+    ObjectStoragePtr object_storage,
+    bool use_metadata_cache,
+    const ContextPtr & local_context,
+    LoggerPtr log,
+    CompressionMethod compression_method);
+
+Poco::JSON::Object::Ptr parseMetadataJSONString(const String & metadata_json_str);
+
+Poco::JSON::Object::Ptr deepCopy(const Poco::JSON::Object::Ptr & object);
+
 
 /// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
 /// require `format_version` >= 3; lower versions throw instead of writing v3 types
@@ -215,6 +227,13 @@ using PartitionColumnValues = std::vector<std::pair<String, DB::Field>>;
 
 PartitionColumnValues getIdentityPartitionColumnValues(
     const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor);
+
+/// Walk a schema's fields array and return field-id -> raw Iceberg type string
+/// (e.g. "date", "timestamptz") for every leaf field, including nested struct members.
+std::unordered_map<Int64, String> collectIcebergTypesByFieldId(Poco::JSON::Array::Ptr schema_fields);
+
+/// Returns the manifest-list path of the current snapshot, or empty string if no current snapshot.
+String getCurrentManifestListPath(const Poco::JSON::Object::Ptr & metadata);
 }
 
 #endif

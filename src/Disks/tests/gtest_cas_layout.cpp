@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include "cas_test_helpers.h"
+#include <limits>
+#include <optional>
+#include <vector>
 
 using namespace DB::Cas;
 
@@ -379,4 +382,64 @@ TEST(CASLayout, BlobKeyRoundTripsThroughParse)
     EXPECT_EQ(*parsed_body, ref);
     EXPECT_EQ(*parsed_meta, ref);
     EXPECT_FALSE(layout.parseBlobKey("pool0/blobs/unknown-algo/aa/aa00").has_value());  /// foreign => nullopt
+}
+
+/// The body parser takes any spelling `fromHex` takes; the marker parser takes only the writer's own key.
+TEST(CASLayout, BlobAndMarkerKeyParsersAcceptExactlyTheirSpellings)
+{
+    const Layout layout("p");
+    const String hex = "aabbccddeeff00112233445566778899";
+    const String body = "p/blobs/ch128/aa/" + hex;
+    const BlobRef ref{BlobHashAlgo::CityHash128, codecFor(BlobHashAlgo::CityHash128).fromHex(hex)};
+    ASSERT_EQ(layout.blobKey(ref), body);
+
+    EXPECT_EQ(layout.parseBlobKey(body), ref);
+    EXPECT_EQ(layout.parseBlobKey(body + ".meta"), ref);
+    EXPECT_EQ(layout.parseBlobKey("p/blobs/ch128/AA/AABBCCDDEEFF00112233445566778899"), ref);
+    EXPECT_EQ(layout.parseLegacyMarkerKey(body + ".meta"), ref);
+
+    const std::vector<std::pair<String, String>> foreign{
+        {"unknown algo", "p/blobs/md5/aa/" + hex},
+        {"shard other than hex[0:2]", "p/blobs/ch128/ab/" + hex},
+        {"lowercase shard over an uppercase digest", "p/blobs/ch128/aa/AABBCCDDEEFF00112233445566778899"},
+        {"one-character shard", "p/blobs/ch128/a/" + hex},
+        {"digest of the wrong width", "p/blobs/ch128/aa/aabbcc"},
+        {"non-hex digest", "p/blobs/ch128/aa/aabbccddeeff0011223344556677889g"},
+        {"no shard segment", "p/blobs/ch128/" + hex},
+        {"one segment more", body + "/x"},
+        {"another pool prefix", "q/blobs/ch128/aa/" + hex},
+    };
+    for (const auto & [what, key] : foreign)
+    {
+        EXPECT_FALSE(layout.parseBlobKey(key).has_value()) << what << ": " << key;
+        EXPECT_FALSE(layout.parseLegacyMarkerKey(key + ".meta").has_value()) << what << ": " << key;
+    }
+    EXPECT_FALSE(layout.parseLegacyMarkerKey(body).has_value()) << "a body is not a marker";
+    EXPECT_FALSE(layout.parseLegacyMarkerKey("p/blobs/ch128/AA/AABBCCDDEEFF00112233445566778899.meta").has_value())
+        << "uppercase is a spelling the writer never emits";
+}
+
+TEST(CASLayout, StagingKeyCarriesTheWriterEpoch)
+{
+    const Layout layout("p");
+    EXPECT_EQ(layout.stagingPrefix("a/b"), "p/staging/a/b/");
+    const String key = layout.stagingKey("a/b", 7, "x.tmp");
+    EXPECT_EQ(key, "p/staging/a/b/7/x.tmp");
+    EXPECT_EQ(Layout::stagedEpochOf(std::string_view(key).substr(layout.stagingPrefix("a/b").size())), 7u);
+
+    const std::vector<std::pair<std::string_view, std::optional<uint64_t>>> cases{
+        {"x.tmp", 0},                        /// flat key written before keys carried an epoch
+        {"0/x.tmp", 0},
+        {"007/x.tmp", 7},
+        {"18446744073709551615/x.tmp", std::numeric_limits<uint64_t>::max()},
+        {"18446744073709551616/x.tmp", std::nullopt},   /// overflow
+        {"", std::nullopt},
+        {"7/", std::nullopt},                /// a folder marker
+        {"/x.tmp", std::nullopt},
+        {"a/x.tmp", std::nullopt},           /// a nested member's key
+        {"+7/x.tmp", std::nullopt},
+        {"7/a/x.tmp", std::nullopt},         /// deeper than one epoch directory
+    };
+    for (const auto & [rest, expected] : cases)
+        EXPECT_EQ(Layout::stagedEpochOf(rest), expected) << rest;
 }

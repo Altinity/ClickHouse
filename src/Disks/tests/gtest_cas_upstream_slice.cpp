@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/tests/cas_scoped_test_directory.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteSettings.h>
 
@@ -61,7 +62,8 @@ std::shared_ptr<DB::LocalObjectStorage> makeLocalObjectStorageForRetryProfileTes
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
 
-    return std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 /// Every refusal below is NOT_IMPLEMENTED, and so is the pre-existing refusal of conditional removal,
@@ -264,14 +266,18 @@ private:
     const std::shared_ptr<State> state;
 
 public:
-    ScriptedGetObjectClient() : ScriptedGetObjectClient(std::make_shared<State>(), GetClientConfiguration()) { }
+    using ConfigureClient = std::function<void(DB::S3::PocoHTTPClientConfiguration &)>;
 
-    static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration()
+    explicit ScriptedGetObjectClient(const ConfigureClient & configure = {})
+        : ScriptedGetObjectClient(std::make_shared<State>(), GetClientConfiguration(configure))
+    {
+    }
+
+    static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration(const ConfigureClient & configure)
     {
         DB::RemoteHostFilter remote_host_filter;
-        /// max_retries is deliberately nonzero: it is the disk client's own attempt loop, and the
-        /// only thing that distinguishes it from the single-attempt clone. The two slow-down flags
-        /// are off so that loop spins without waiting out a real backoff.
+        /// Keep a nonzero retry budget so retry-enabled tests can distinguish this client
+        /// from its single-attempt clone.
         auto configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
             "some-region",
             remote_host_filter,
@@ -283,6 +289,8 @@ public:
             /* for_disk_s3 = */ false,
             /* opt_disk_name = */ {},
             /* request_throttler = */ {});
+        if (configure)
+            configure(configuration);
         /// `ClientFactory::create` normally fills `retryStrategy`; this fake bypasses the factory.
         configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(configuration.retry_strategy);
         return configuration;
@@ -444,9 +452,10 @@ private:
 
 std::shared_ptr<DB::S3ObjectStorage> makeScriptedS3ObjectStorage(
     ScriptedGetObjectClient *& out_client,
-    DB::S3ObjectStorage::S3CredentialsRefreshCallback credentials_refresh_callback = {})
+    DB::S3ObjectStorage::S3CredentialsRefreshCallback credentials_refresh_callback = {},
+    const ScriptedGetObjectClient::ConfigureClient & configure_client = {})
 {
-    auto owned_client = std::make_unique<ScriptedGetObjectClient>();
+    auto owned_client = std::make_unique<ScriptedGetObjectClient>(configure_client);
     out_client = owned_client.get();
 
     DB::S3::URI uri;
@@ -703,7 +712,7 @@ TEST(CASUpstreamSlice, ConditionalRemoveRecoversFromAnExpiredTokenAndInstallsThe
     EXPECT_EQ(refreshed->deleteRequestTimeouts().size(), 1u);
 }
 
-/// The client the conditional DELETE selects is what decides whether the SDK reissues a throttled
+/// The client the conditional DELETE selects is what decides whether ClickHouse reissues a throttled
 /// request. The `Default` half is what makes "exactly one" mean something: the disk client here does
 /// retry a throttle, so a single attempt is a property of the clone, not of the fake.
 ///
@@ -714,8 +723,18 @@ TEST(CASUpstreamSlice, SingleAttemptConditionalRemoveIssuesExactlyOneRequestOnTh
 {
     (void)getContext();
 
+    /// The fake bypasses SDK retries. Since https://github.com/ClickHouse/ClickHouse/pull/124557,
+    /// ClickHouse's loop retries throttle errors only with `s3_slow_all_threads_after_retryable_error` enabled.
+    /// Zero delays avoid a real backoff.
+    const auto configure_retries = [](DB::S3::PocoHTTPClientConfiguration & configuration)
+    {
+        configuration.s3_slow_all_threads_after_retryable_error = true;
+        configuration.retry_strategy.initial_delay_ms = 0;
+        configuration.retry_strategy.max_delay_ms = 0;
+    };
+
     ScriptedGetObjectClient * retrying = nullptr;
-    auto retrying_storage = makeScriptedS3ObjectStorage(retrying);
+    auto retrying_storage = makeScriptedS3ObjectStorage(retrying, {}, configure_retries);
     retrying->scriptDelete({controlThrottle()});
 
     EXPECT_ANY_THROW(retrying_storage->removeObjectIfTokenMatches(
@@ -723,7 +742,7 @@ TEST(CASUpstreamSlice, SingleAttemptConditionalRemoveIssuesExactlyOneRequestOnTh
     EXPECT_EQ(retrying->deleteRequestTimeouts().size(), 3u);   /// max_retries = 2, so three attempts
 
     ScriptedGetObjectClient * client = nullptr;
-    auto storage = makeScriptedS3ObjectStorage(client);
+    auto storage = makeScriptedS3ObjectStorage(client, {}, configure_retries);
     client->scriptDelete({controlThrottle()});
 
     EXPECT_ANY_THROW(storage->removeObjectIfTokenMatches(

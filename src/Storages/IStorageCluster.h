@@ -3,6 +3,7 @@
 #include <Storages/IStorage.h>
 #include <Interpreters/ActionsDAG.h>
 #include <QueryPipeline/RemoteQueryExecutor.h>
+#include <Processors/QueryPlan/ISourceStep.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
 
 namespace DB
@@ -58,6 +59,33 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
+    /// False if an ordinary read would not use the cluster: `object_storage_cluster_fallback_to_local_if_empty`
+    /// selects a local read for a missing or empty cluster, or the table has no cluster. A whole-query
+    /// dispatch is only built for a table where this is true.
+    bool canDispatchToCluster(ContextPtr context) const;
+
+    /// Dispatches a prepared query using this storage's cluster and file tasks.
+    /// `ReadFromClusterQuery` returns the query's result at `processed_stage` for the planner to finalize.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        ASTPtr query_to_send,
+        SharedHeader sample_block,
+        std::shared_ptr<const ActionsDAG> driver_filter);
+
+    /// Builds the worker's table function using the ordinary cluster-read rewrite.
+    /// `read_initiator_file_tasks` selects the `*Cluster` variant; the plain variant reads all files locally.
+    ASTPtr getTableFunctionToSend(const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks);
+
+    /// Whether `table_function`, built by `getTableFunctionToSend`, makes a worker read the snapshot the initiator
+    /// resolved instead of the latest one. A worker resolves a table that is not driven by the initiator's file
+    /// tasks on its own, so an unpinned one can mix snapshots across workers. A storage that cannot say it pins
+    /// the snapshot is treated as not pinning it.
+    virtual bool isSnapshotPinnedByTableFunction(const ASTPtr & /*table_function*/) const { return false; }
+
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
     bool supportsOptimizationToSubcolumns() const override { return false; }
@@ -76,12 +104,18 @@ public:
     /// function (`url`, `s3`, ...) that `parallel_replicas_for_cluster_engines` converted into this cluster
     /// storage into its `*Cluster` variant with the cluster name argument, so that the nodes take their read
     /// tasks from the initiator instead of reading every file on their own. Called by `read` and by the
-    /// distributed `INSERT ... SELECT` in `InterpreterInsertQuery`, which forwards the query the same way.
+    /// distributed `INSERT ... SELECT` in `InterpreterInsertQuery`.
+    /// A `SELECT` needs the structure and format so all nodes produce the initiator's header. For a forwarded
+    /// `INSERT ... SELECT`, leave the arguments as written: an omitted or `'auto'` structure then takes the
+    /// destination table's columns and `DEFAULT` expressions on each node.
+    /// Named engine-table sources must retain their declared schema when converted to functions.
+    /// `make_cluster_function` is independent: remote-initiator deferral keeps a plain function.
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
-        bool /*make_cluster_function*/) {}
+        bool /*make_cluster_function*/,
+        bool /*add_structure_and_format*/) {}
 
     /// Key for this storage's local-read probe on `SelectQueryInfo`. A `Merge` passes one query info
     /// to every child, so the probe cannot live in a single slot.
@@ -89,7 +123,13 @@ public:
 
 protected:
     virtual void updateBeforeRead(const ContextPtr &) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(
+        ASTPtr & query_to_send,
+        SelectQueryInfo query_info,
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree = nullptr);
+    /// `DataLakeCatalog` tables need this to avoid resolving the catalog table a second time for the header.
+    virtual bool canReuseResolvedQueryTreeForHeader() const { return false; }
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 
@@ -193,7 +233,8 @@ private:
         ASTPtr & query_to_send,
         const SelectQueryInfo & query_info,
         const QueryTreeInfo & info,
-        const ContextPtr & context);
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree);
 };
 
 
@@ -245,6 +286,58 @@ private:
 
     void createExtension();
     ContextPtr updateSettings(const Settings & settings);
+};
+
+
+/// Dispatches one already-prepared query to a cluster, giving every node a share of one table's files.
+///
+/// The output describes the query result; `driver_storage` and `driver_snapshot` describe the file-task source.
+/// Keep this separate from `ReadFromCluster`, whose table filters and column mappings do not apply to this output.
+class ReadFromClusterQuery : public ISourceStep
+{
+public:
+    std::string getName() const override { return "ReadFromClusterQuery"; }
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+    void describeActions(FormatSettings & format_settings) const override;
+
+    /// The context sent to workers.
+    ContextPtr createRemoteContext() const;
+
+    ReadFromClusterQuery(
+        SharedHeader output_header_,
+        std::shared_ptr<IStorageCluster> driver_storage_,
+        StorageSnapshotPtr driver_snapshot_,
+        ContextPtr context_,
+        ASTPtr query_to_send_,
+        QueryProcessingStage::Enum processed_stage_,
+        ClusterPtr cluster_,
+        LoggerPtr log_,
+        std::optional<Tables> external_tables_,
+        std::shared_ptr<const ActionsDAG> driver_filter_)
+        : ISourceStep(std::move(output_header_))
+        , driver_storage(std::move(driver_storage_))
+        , driver_snapshot(std::move(driver_snapshot_))
+        , context(std::move(context_))
+        , query_to_send(std::move(query_to_send_))
+        , processed_stage(processed_stage_)
+        , cluster(std::move(cluster_))
+        , log(log_)
+        , external_tables(std::move(external_tables_))
+        , driver_filter(std::move(driver_filter_))
+    {
+    }
+
+private:
+    std::shared_ptr<IStorageCluster> driver_storage;
+    StorageSnapshotPtr driver_snapshot;
+    ContextPtr context;
+    ASTPtr query_to_send;
+    QueryProcessingStage::Enum processed_stage;
+    ClusterPtr cluster;
+    LoggerPtr log;
+    std::optional<Tables> external_tables;
+    /// Predicate over the driver's own columns, used to prune its file listing. Null means list everything.
+    std::shared_ptr<const ActionsDAG> driver_filter;
 };
 
 }

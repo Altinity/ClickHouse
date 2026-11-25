@@ -50,8 +50,10 @@ DiskWithPath::DiskWithPath(DiskPtr disk_, std::optional<String> path_) : disk(di
         path = String{"/"};
     }
 
+    /// The root needs no probe: `cas-migrate-pool` runs on a content-addressed disk that has no pool open,
+    /// where every probe throws.
     String relative_path = normalizePathAndGetAsRelative(path);
-    if (disk->existsDirectory(relative_path) || relative_path.empty())
+    if (relative_path.empty() || disk->existsDirectory(relative_path))
     {
         return;
     }

@@ -92,21 +92,6 @@ static constexpr auto MAX_TRANSACTION_RETRIES = 100;
 namespace
 {
 
-/// Find the partition spec object with the given spec-id inside a metadata JSON document.
-/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
-Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
-{
-    auto specs = meta->getArray(f_partition_specs);
-    for (size_t i = 0; i < specs->size(); ++i)
-    {
-        auto spec = specs->getObject(static_cast<UInt32>(i));
-        if (spec->getValue<Int64>(f_spec_id) == spec_id)
-            return spec;
-    }
-    throw Exception(ErrorCodes::METADATA_MISMATCH,
-        "Partition spec with id {} not found in table metadata", spec_id);
-}
-
 /// One term per partition field in spec order
 PartitionSpecSignature getPartitionSpecSignature(const Poco::JSON::Array::Ptr & spec_fields)
 {
@@ -429,14 +414,14 @@ std::optional<AlterDropPartitionExecutor::SnapshotState> AlterDropPartitionExecu
     }
 
     auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(state.table_state.metadata_file_path);
-    auto metadata_object = getMetadataJSONObject(
+    auto metadata_object = deepCopy(getMetadataJSONObject(
         state.table_state.metadata_file_path,
         object_storage,
         components.metadata_cache,
         context,
         log,
         compression_method,
-        components.table_uuid);
+        components.table_uuid));
 
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
     if (format_version != 2)

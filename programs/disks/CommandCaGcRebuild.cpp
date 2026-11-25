@@ -4,6 +4,7 @@
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 #include <ICommand.h>
+#include <Utils.h>
 
 #include <iostream>
 
@@ -43,14 +44,7 @@ public:
     {
         const bool force = options.contains("force");
         auto disk = client.getCurrentDiskWithPath().getDisk();
-
-        auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
-        if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-gc-rebuild: '{}' is not an object-storage disk", disk->getName());
-
-        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
-        if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-gc-rebuild: disk '{}' is not content-addressed", disk->getName());
+        auto * ca = &contentAddressedStorageOf(*disk, "cas-gc-rebuild");
 
         if (!ca->isReadOnly())
             throw Exception(

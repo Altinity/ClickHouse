@@ -29,7 +29,9 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory={Utils.physical_memory() * 95 // 100}"
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
-    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
+    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"+--env=S3_ARTIFACT_BUCKET="$S3_ARTIFACT_BUCKET"'
+    # Writes to the ThinLTO cache in Hetzner Object Storage; jobs without them read anonymously
+    '+--env=HETZNER_S3_ACCESS_KEY="$HETZNER_S3_ACCESS_KEY"+--env=HETZNER_S3_SECRET_KEY="$HETZNER_S3_SECRET_KEY"+--env=HETZNER_CACHE_BUCKET="$HETZNER_CACHE_BUCKET"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
     BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
@@ -254,7 +256,7 @@ class JobConfigs:
         runs_on=RunnerLabels.AMD_LARGE,
         command="python3 ./ci/jobs/fast_test.py",
         # --network=host required for ec2 metadata http endpoint to work
-        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
+        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY+--env=S3_ARTIFACT_BUCKET=$S3_ARTIFACT_BUCKET",
         digest_config=fast_test_digest_config,
         result_name_for_cidb="Tests",
         needs_submodules=True,
@@ -443,7 +445,7 @@ class JobConfigs:
                 ArtifactNames.RPM_ARM_RELEASE,
                 ArtifactNames.TGZ_ARM_RELEASE,
             ],
-            runs_on=RunnerLabels.BUILDER_AMD,
+            runs_on=RunnerLabels.BUILDER_ARM,
         ),
     )
     release_build_jobs_with_examples = [
@@ -490,10 +492,9 @@ class JobConfigs:
     # master data directly comparable to a PR build (official master builds
     # keep debug symbols, PR builds strip them). The hook uploads only for the
     # arm variant (see _PROFILED_BUILDS in build_profile_hook.py).
+    # NOTE (strtgbb): no --build-examples for the arm warmup, PR builds no longer build clickhouse-examples
     sccache_warmup_build_jobs = [
-        job.set_command(f"{job.command} --build-examples")
-        if f"({BuildTypes.ARM_RELEASE_PR_CACHE_WARMUP})" in job.name
-        else job
+        job
         for job in common_build_job_config.set_post_hooks(
             post_hooks=[
                 # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
@@ -558,8 +559,11 @@ class JobConfigs:
         ),
         Job.ParamSet(
             parameter=BuildTypes.PPC64LE,
-            provides=[ArtifactNames.CH_PPC64LE],
-            runs_on=RunnerLabels.ARM_LARGE,
+            provides=[
+                ArtifactNames.CH_PPC64LE,
+                ArtifactNames.CH_PPC64LE_GH,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
         ),
         Job.ParamSet(
             parameter=BuildTypes.AMD_COMPAT,
@@ -633,6 +637,18 @@ class JobConfigs:
             provides=[ArtifactNames.CH_WASM_PARSER],
             runs_on=RunnerLabels.ARM_LARGE,
         ),
+    )
+    smoke_test_ppc64le = Job.Config(
+        name=JobNames.SMOKE_TEST_PPC64LE,
+        runs_on=RunnerLabels.FUNC_TESTER_AMD,
+        command="python3 ./ci/jobs/smoke_test_ppc64le.py",
+        digest_config=Job.CacheDigestConfig(
+            include_paths=[
+                "./ci/jobs/smoke_test_ppc64le.py",
+            ],
+        ),
+        requires=[ArtifactNames.CH_PPC64LE_GH],
+        timeout=900,
     )
     install_check_jobs = Job.Config(
         name=JobNames.INSTALL_TEST,
@@ -1697,7 +1713,7 @@ class JobConfigs:
     docker_server = Job.Config(
         name=JobNames.DOCKER_SERVER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1707,13 +1723,18 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.DEB_AMD_RELEASE,
+            ArtifactNames.DEB_ARM_RELEASE,
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     docker_keeper = Job.Config(
         name=JobNames.DOCKER_KEEPER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1723,7 +1744,10 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     sqlancer_master_jobs = Job.Config(

@@ -80,12 +80,13 @@ stateDiagram-v2
     Creating --> Live: reconcileStaleCreator finds the creator fence provably dead,<br/>a fresh opener steals and completes it
     Live --> Removing: beginRemoving -- table drop, stamps removal_started_round
     Removing --> [*]: GC drains the row once a fold sealed positive cleanup evidence
+    Creating --> [*]: cancelled as stalled -- the GC leader once the creator fence is provably dead,<br/>or the creating mount itself while no admission of the name is in flight there
     [*] --> Creating: a fresh createNamespace call, only once the old row is fully absent -- brand new life_id
 ```
 
 A row's own state machine is linear per row (`Creating → Live → Removing → gone`); what makes the
-catalog non-linear as a whole is that a stalled `Creating` row can resolve two different ways
-depending on whether its creator fence is still alive, and that a name only becomes creatable again
+catalog non-linear as a whole is that a stalled `Creating` row can be completed or cancelled,
+depending on whose creator fence it carries and whether that fence is still alive, and that a name only becomes creatable again
 once its prior row is completely gone — both shown above.
 
 ## Lifetime end to end {#lifetime}
@@ -96,7 +97,8 @@ There is no explicit "create namespace" statement; a namespace is born the first
 resolves its ref table (`CasRefLedger::resolveNamespaceLife`, bounded at 32 loop attempts). If the
 catalog has no row for the name at all, the resolving mount admits a `Creating` entry stamped with
 its own creator fence and a freshly minted `life_id`
-(`CasRefCatalog::createNamespace` → `casAdmitEntry`). Two more steps make it usable:
+(`CasRefCatalog::createNamespace` → `createNamespaceStep1`). Each decision mints a new `life_id`. An
+attempt of unknown fate is decided again on a fresh read and is never resent. Two more steps make it usable:
 
 1. **Publish the genesis checkpoint.** The first `_ckpt` ever written for this `life_id` carries
    `life_epoch = creator.writer_epoch` — the only writer that will ever know this namespace's
@@ -114,6 +116,26 @@ dead (the same mount-lease terminality check `GC`'s heartbeat floor uses) does
 `reconcileStaleCreator` let a fresh opener steal the row onto its own fence and finish the two steps
 above itself.
 
+A failed cold admission (any first mutating access that wrote the `Creating` row) often has no opener
+coming back for its row. The `GC` leader therefore also removes a `Creating` row whose creator's mount
+slot certifies that the creator's writer epoch cannot finish it (a later writer epoch, a `GC` fence or a clean farewell). It does so in
+the catalog cleanup each round runs before its fold (from a pool's second round on), with one exact
+compare-and-swap on the catalog. Nothing can be published under
+a `Creating` row, so the row owns no data; its `_ckpt` is left to the namespace janitor. An opener that
+takes the row over at a later epoch, or a `DROP` that cancels it, wins the swap first, and the
+cleanup leaves the row to it.
+
+A cold admission that fails after it wrote the row, on a server that keeps running, leaves the row under
+that server's live writer epoch. No certificate covers that epoch, so the `GC` leader keeps the row. The
+creating mount removes it itself: every tick of its `GC` scheduler, leader or follower, scans the catalog
+and cancels up to 16 rows that carry its exact live creator fence and whose name has no admission in flight
+on that server. The idle check is repeated inside the catalog's write lane, and the cancel is the same exact
+compare-and-swap as the flip to `Live`, so at most one of them lands. A retry that resumes the row before the
+cancel finishes the creation; a retry that loses creates the namespace under a fresh `life_id`. The scan is
+one catalog `GET` per tick on a healthy store. Each cancel can add its own catalog `GET` and a conditional write, and a refused
+write one more `GET`. A read-only mount, a mount with `GC` disabled and a stopped scheduler run no such pass: the row then stays until the server restarts or `GC` fences its mount slot; see
+[`Creating` rows in the catalog](/antalya/cas/operations/debugging#creating-catalog-rows).
+
 ### Removal {#removal}
 
 Dropping a table (`DROP TABLE`, and every operation that reduces to it) calls
@@ -124,6 +146,36 @@ currently observed `GC` round), then appends **one** ref-log transaction that re
 committed and precommit binding and ends with a terminal `RemoveNamespace` op. Removal is never
 refused by an admission check — Constraint 13 in the catalog's own spec — it always succeeds once
 the fence holds.
+
+When the drop fails before the row is `Removing`, what happens to the lane depends on whether a write was sent:
+
+- No attempt of the `Live -> Removing` write was sent (for example a failed catalog read or
+  `gc/state` read, a lost lease, or a row that changed before the write): nothing can land. The lane
+  reopens if a fresh read still shows the original `Live` row under the same mount fence, and no
+  earlier attempt on this runtime left a write that may still land.
+- An attempt was sent and the row is not proven `Removing`: the write may have reached the store and
+  may still land. The lane stays closed, even if a fresh read shows the original `Live` row.
+
+A runtime acquired for a row that is already `Removing` (a presence probe, a retried `DROP TABLE`)
+refuses writes from the moment it exists with "is Removing" and serves no reads. A failed removal does
+not reopen it.
+
+A lane closed by an unresolved removal write has two ways out: a retried `DROP TABLE` that completes
+the removal, or a remount of the disk (a server restart, or the self-remount after a lost lease). A
+remount reopens the lane but does not cancel the write. Until one of the two happens:
+
+- Writes to the table fail with a retry-later error that says "a removal write may still land".
+- Reads see the table as absent, although the catalog row can still be `Live`.
+- The ref-table cache does not evict the table, because a fresh runtime would start with the lane open.
+- The server logs `the outcome of its Live -> Removing catalog write is unknown` once per drop attempt
+  that ends this way.
+
+If the write lands after a remount, the row becomes `Removing` while the table keeps accepting writes
+and serving reads. The stop comes when an admission reads the row: a restart, a remount, a
+`DROP TABLE`; on the server that is the `GC` leader, also its next `GC` round. An eviction of the
+runtime or a presence probe is not a reliable stop. From then on writes fail with "is Removing" and
+reads see no files. Without a terminal record `GC` does not erase the row and deletes none of the
+table's live data; it still cleans what the table itself dropped, as for a live table.
 
 Nothing is deleted by the writer at this point. No blob, no manifest, no ref-log object physically
 disappears here — only pointers move, exactly like an ordinary [`DROP TABLE`](/antalya/cas/architecture/part-lifecycle#operation-mapping)
@@ -150,7 +202,7 @@ proven its ref history is fully drained.
 |---|---|---|
 | Catalog row (`cas/ref_catalog` entry) | `GC` phase 2, `pre_fold_ref_drain` | The round after the fold that sealed cleanup evidence for this life |
 | Part manifest bodies | Ordinary owner-removal ([phase 15](/antalya/cas/architecture/garbage-collection#the-round)) for anything that had a committed or precommit binding, the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep) for anything that never got that far | As each owning ref is dropped by the removal transaction itself, independent of the catalog row |
-| Blob bodies | The ordinary condemn/graduate/delete pipeline | Whenever the manifests that named them stop being live, same as any other blob |
+| Blob bodies | The ordinary pipeline: condemn, delete the body, remove the intent | Whenever the manifests that named them stop being live, same as any other blob |
 | Ref stream/state objects (`_log`, `_snap`, `_ckpt`, `_files`) under the dead `life_id` | The perpetual namespace janitor ([phase 16](/antalya/cas/architecture/garbage-collection#the-round)) | Best-effort, in bounded `LIST` pages under a per-round time budget, whenever it next lists a key whose `life_id` a fresh catalog cut no longer names — independent of, and not gated on, catalog-row deletion |
 
 The janitor is leak-only: it never fails a round, never blocks progress on an unreadable key, and a

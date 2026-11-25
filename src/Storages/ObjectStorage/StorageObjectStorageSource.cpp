@@ -107,6 +107,7 @@ namespace DB
 namespace FailPoints
 {
 extern const char object_storage_source_pause_before_virtual_columns[];
+extern const char swarm_mode_before_task_request[];
 }
 
 namespace ErrorCodes
@@ -178,10 +179,16 @@ namespace
         return path.substr(0, position);
     }
 
+    String getObjectStorageHash(const IObjectStorage & object_storage)
+    {
+        const String description = object_storage.getDescription();
+        return sipHash128String(description.substr(0, description.find('?')) + '\0' + object_storage.getObjectsNamespace());
+    }
+
     String getPageCachePathForObjectStorage(const RelativePathWithMetadata & object_info, const ObjectStoragePtr & object_storage)
     {
         if (object_storage->getType() != ObjectStorageType::Web)
-            return "s3:" + object_info.getPath();
+            return fmt::format("s3:{}:{}", getObjectStorageHash(*object_storage), object_info.getPath());
 
         if (!object_info.read_source_index)
             return "web:" + object_info.getPath();
@@ -1073,7 +1080,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfoPtr & object_
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
-StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader()
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(bool prefetch_input_format)
 {
     return createReader(
         0,
@@ -1089,7 +1096,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         max_block_size,
         parser_shared_resources,
         format_filter_info,
-        need_only_count);
+        need_only_count,
+        prefetch_input_format);
 }
 
 StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(
@@ -1106,7 +1114,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     size_t max_block_size,
     FormatParserSharedResourcesPtr parser_shared_resources,
     FormatFilterInfoPtr format_filter_info,
-    bool need_only_count)
+    bool need_only_count,
+    bool prefetch_input_format)
 {
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
@@ -1708,6 +1717,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (effective_need_only_count)
             input_format->needOnlyCount();
 
+        if (prefetch_input_format)
+            input_format->prefetch();
+
         builder.init(Pipe(input_format));
 
         if (!identity_partition_columns.empty())
@@ -1922,7 +1934,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
 std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
 {
-    return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+    return create_reader_scheduler([=, this] { return createReader(/* prefetch_input_format */ true); }, Priority{});
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
@@ -1931,7 +1943,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings,
-    bool allow_page_cache)
+    bool allow_page_cache,
+    bool pin_to_metadata_etag)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
@@ -2060,7 +2073,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// Pin the read to the object generation seen here (etag from the LIST/HEAD): a GET with a
     /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ or
     /// AZURE_OBJECT_CHANGED_DURING_READ instead of torn cross-generation data.
-    if (validate_etag_on_read && object_info.metadata.has_value())
+    /// `pin_to_metadata_etag` is independent of the backend setting: a caller that will cache the
+    /// bytes under this etag cannot opt out of the pin.
+    if (object_info.metadata.has_value() && (validate_etag_on_read || pin_to_metadata_etag))
         stored_object.etag = object_info.metadata->etag;
     pipeline.setSource(object_storage, StoredObjects{stored_object}, modified_read_settings);
 
@@ -2075,6 +2090,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         else
         {
             SipHash hash;
+            hash.update(getObjectStorageHash(*object_storage));
             hash.update(object_info.getPath());
             hash.update(object_info.metadata->etag);
 
@@ -2534,8 +2550,15 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
 {
     while (true)
     {
-        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
-        /// must not be followed by another task request.
+        /// Test-only pause before the next task request. A concurrent `SYSTEM STOP SWARM MODE`
+        /// must complete before this worker asks the initiator for another task.
+        fiu_do_on(FailPoints::swarm_mode_before_task_request, {
+            FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_request);
+        });
+
+        /// Recheck after each `retry_after_us` wait. The read-task callback checks again under
+        /// the admission lock before it sends, so a stop that lands after this check still
+        /// does not produce a request.
         if (!getContext()->isSwarmModeEnabled())
         {
             LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");

@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasToolDeadline.h>
+#include <Common/ThreadPool_fwd.h>
 
 #include <array>
 #include <chrono>
@@ -14,10 +16,23 @@
 namespace DB::Cas
 {
 
-/// Optional progress sink for `runFsck`: called periodically during the listing and reachability
-/// walk so a long scan over a large/slow pool is visibly progressing (not hung). `phase` names the
-/// current step; `objects`/`pages` are running counts. Default {} = no progress (existing callers).
-using FsckProgress = std::function<void(std::string_view phase, uint64_t objects, uint64_t pages)>;
+/// What a progress call reports about a phase: its start, a tick inside it, or its normal end.
+enum class FsckProgressStep : uint8_t
+{
+    Start,
+    Tick,
+    End,
+};
+
+/// Optional progress sink for `runFsck`, so a long scan over a large or slow pool visibly progresses. A phase is one
+/// part of the scan that issues store requests in proportion to the pool. `done` counts `unit` items the phase has
+/// handled (0 on `Start`); `seconds` is the phase's wall time so far (0 on `Start`). Ticks follow item counts, not time.
+/// Called only on the thread that called `runFsck`. The sink only observes: an exception it throws is logged once per
+/// phase and dropped, the phase then calls it only for its end line, and it never changes the report. Default {} = no progress.
+using FsckProgress = std::function<void(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)>;
+
+/// The stderr line for one progress call, without a trailing newline.
+String formatFsckProgress(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds);
 
 /// Classification assigned to each object examined by `runFsck`.
 ///
@@ -33,31 +48,31 @@ enum class FsckClass : uint8_t
     /// The GC pipeline deletes present-but-unreferenced blobs in explicit stages, so these classes
     /// distinguish expected in-flight work from an object outside the GC view. They are labels only,
     /// never inputs to reachability.
-    PendingGc,     /// listed in the retired set (condemned / delete_pending) — deletion is scheduled; EXPECTED
+    PendingGc,     /// has a `candidate` or `pending` row for the body present now — deletion is scheduled; EXPECTED. A
+                   /// `pending` row is counted here only after its deletion intent was read and found.
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
-                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
+                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content).
+                   /// Also a key under `blobs/` that is not a blob key of this pool
     StaleEdge,     /// every source edge the GC snapshot still holds on this blob names a manifest that no
                    /// longer exists anywhere in the pool, so the matching `-1` can never fold: the blob's
                    /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
                    /// full rebuild of the in-degree state can. ERROR — never an `AwaitingGc` "expected"
                    /// backlog, which is exactly the label that used to hide it.
-    CorruptedRun,  /// a GC source-edge run's whole-file seal checksum (`RunRef::checksum`) disagrees with
-                   /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
-                   /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
-                   /// fail closed on the same mismatch. ERROR
-    /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
-    /// object; the row's `key` identifies the exact log where the walk stopped or the checkpoint-named
-    /// snapshot base whose required triple could not be validated.
-    ChainBroken,   /// the exact checkpoint authority is durably inconsistent: its required snapshot-base
-                   /// triple is corrupt, or a ref-log id is absent below its confirmed frontier. Ids are
-                   /// dense `1..T` within `(namespace, epoch)` (INV-1), so neither is a stream end. ERROR
+    CorruptedRun,  /// a GC source-edge run, or the fold seal naming it, that a GC round refuses as corrupt
+                   /// bookkeeping; the note says why. ERROR
+    /// The two verdicts of the ref-stream walk. They are about a NAMESPACE, not an object; the row's `key`
+    /// identifies the exact log where the walk stopped or the checkpoint-named snapshot base whose
+    /// required triple could not be validated.
+    ChainBroken,   /// the chain ends below a listed log, or its snapshot base, a record or a link on it is
+                   /// corrupt while `_ckpt` is unchanged. ERROR
     Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
                    /// crossing, an undecodable body, or unstable authority/transport). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
-                   /// silence as a proof.
+                   /// silence as a proof. Also an unreferenced blob of a GC shard whose snapshot rows were not
+                   /// read: the refusal or the unread snapshot is the finding, and the blob is not examined.
     LifelessKey,   /// a namespace-tree key the `Layout` parsers refuse (a malformed/non-canonical shape,
-                   /// including the un-incarnated Stage A layout), OR a catalog incarnation that is
+                   /// including the un-incarnated layout), OR a catalog incarnation that is
                    /// ambiguous or otherwise unreadable. Neither a current writer nor the catalog's own
                    /// reverse life index can produce this key's meaning, so it belongs to no namespace
                    /// and no per-namespace verdict can carry it. ERROR
@@ -67,6 +82,41 @@ enum class FsckClass : uint8_t
                    /// exact-deleting a `Removing` catalog row and the perpetual `NamespaceJanitor`
                    /// reaching this key on a later bounded page -- inert debris, not damage. Reported
                    /// as a soft finding: NOT in `kFsckHardFindings`, does not fail the report.
+    /// The five verdicts on a deletion intent (`blob-intents/`). The key names the blob incarnation the
+    /// intent warns about; the verdict compares it with the body now at the blob's key. An intent outlives
+    /// its body until GC removes it, so a missing body is the normal state of a deleted blob. The first
+    /// three need the per-intent reads of a verifying scan (`verify_intents`); a plain scan classifies an
+    /// intent from its key alone.
+    IntentCurrent,   /// the body present now is the incarnation the intent names
+    IntentReplaced,  /// the body present now is another incarnation; GC removes this intent later
+    IntentBodyGone,  /// no body at the blob's key; GC removes the intent in a later round
+    IntentMalformed, /// the key is not an intent key, or (verifying scan) the bytes are not the intent record. ERROR
+    IntentUnread,    /// a read or a `HEAD` failed, the body's token has no canonical identity, or a `pending` row stayed
+                     /// inconclusive: the scan could not verify what it was asked to. ERROR
+    /// A `pending` row is the one state in which GC deletes a body without re-reading the intent, so the
+    /// intent of every `pending` row is read.
+    PendingWithoutIntent,  /// a `pending` row, its intent absent, the body present with the row's token: GC would
+                           /// delete a body no writer is warned about. ERROR
+    PendingIntentAbsent,   /// a `pending` row, its intent absent, the body absent or another token: the row is about
+                           /// to become `standing` or to move; nothing is at risk
+    PendingTokenRejected,  /// a `pending` row whose token has no canonical identity: no intent key exists for it
+    StandingPresent,       /// a `standing` row, the body present with the row's token: GC records it and deletes
+                           /// nothing; the intent is present, so a writer publishes fresh
+    /// A `.meta` object left from the marker protocol. Nothing reads it; `cas-migrate-pool` removes it
+    /// and `--fix legacy-markers` can.
+    LegacyMarker,
+};
+
+/// One `Creating` catalog row, left by an interrupted or in-progress cold admission of its namespace, and
+/// what its creator's mount slot says about it. GC cancels the row only when the slot is `Terminal`.
+struct FsckCreatingRow
+{
+    String ns;
+    String creator_root;
+    uint64_t writer_epoch = 0;
+    /// No value when the slot read failed; `slot_read_error` then says why.
+    std::optional<CreatorSlotStatus> slot;
+    String slot_read_error;
 };
 
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
@@ -88,8 +138,7 @@ struct FsckObject
 /// total of all present-but-unreferenced objects, including the GC pipeline classes and manifest debris,
 /// and is intentionally retained as one monotone number for residual-settling monitoring. The detailed
 /// `objects` list is populated according to the scan's `detail` mode. In partial mode all counters are
-/// lower bounds over the portion walked before the deadline; `clean` must not be used as a claim about
-/// the unvisited part of the pool.
+/// lower bounds over the portion walked before the deadline, and `clean` is false.
 struct FsckReport
 {
     uint64_t reachable = 0;
@@ -99,26 +148,49 @@ struct FsckReport
     uint64_t unreachable = 0;
     uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
     uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
-    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
+    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly), and keys under `blobs/` that are no blob key
     /// Blobs whose every remaining source edge names a manifest that no longer exists — permanently
     /// stuck at a nonzero in-degree, unreclaimable by the incremental GC. A hard ERROR (see
     /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
-    /// per manifest body, and the cheap summary path must stay request-for-request unchanged.
+    /// per manifest body, which the summary path does not pay.
     uint64_t stale_edge = 0;
+    /// Stale-edge candidates that a later read of the GC snapshot no longer shows: a GC round committed after the
+    /// scan's first read and folded all their edges. Counted apart and not a finding, so the report stays clean.
+    uint64_t stale_edge_superseded = 0;
 
-    /// The per-hash `.meta` descriptor sibling of a blob body:
-    /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.
-    /// ADVISORY, not a hard finding: GC deletes the body FIRST and then drops the `.meta` on a bounded,
-    /// error-suppressed advisory pool that runs strictly after (and may drop the op — see `CasGc`), so a
-    /// single raw LIST legitimately observes a body-less `.meta` mid-graduation and NO finite grace makes
-    /// a persistent one hard evidence. Counted and reported; excluded from `clean()`.
-    uint64_t meta_without_body = 0;   /// a `.meta` object with no body — INV-META-BODY advisory
-    uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or interrupted-birth
-                                       /// artifact; benign, NOT a dangle
+    /// Deletion intents under `blob-intents/` (see the `Intent*` classes of `FsckClass`). `intent_malformed`
+    /// and `intent_unread` are hard findings; the others are informational. A scan with a namespace scope
+    /// lists no intents and leaves them all at zero.
+    uint64_t intents_listed = 0;      /// intents whose key parses (a plain scan counts them and reads none)
+    uint64_t intent_current = 0;     /// the next three only in a verifying scan
+    uint64_t intent_replaced = 0;
+    uint64_t intent_body_gone = 0;
+    uint64_t intent_malformed = 0;
+    /// Reads or `HEAD`s of a deletion intent or its body that failed, and a GC snapshot not read: its fold seal is
+    /// absent under an unchanged `gc/state`, `gc/state` moved at every read, or `gc/state` is below generation 4. A hard
+    /// finding: the scan could not verify what it was asked to, and a refused prefix would otherwise read as a clean pool.
+    uint64_t intent_unread = 0;
+    String intent_unread_reason;     /// the first failure: error code and message, shortened
+    bool intents_verified = false;   /// the scan ran the per-intent verification
 
-    /// GC source-edge runs whose whole-file seal checksum did not match the stored bytes. Cataloged
-    /// with the run key in `objects`; the audit CONTINUES — a read-only auditor
-    /// enumerates all problems in one pass rather than aborting on the first corrupt run.
+    /// `pending` rows whose present body is the row's incarnation (see the `Pending*` classes of `FsckClass`).
+    /// `pending_without_intent` is a hard finding.
+    uint64_t pending_without_intent = 0;
+    uint64_t pending_intent_absent = 0;
+    uint64_t pending_token_rejected = 0;
+    /// `standing` rows over a body that is present with the row's token. Counted apart from `pending_gc`:
+    /// advisory, the report stays clean.
+    uint64_t standing_present = 0;
+
+    /// `.meta` objects of the marker protocol found under `blobs/`: debris, informational. The pairing
+    /// of bodies with markers no longer exists. `legacy_markers_deleted` counts the ones a fix run removed.
+    uint64_t legacy_marker = 0;
+    uint64_t legacy_markers_deleted = 0;
+    uint64_t legacy_markers_changed = 0;   /// replaced between the fix's `HEAD` and its delete, and left
+
+    /// Fold seals and GC source-edge runs a GC round refuses as corrupt, under a `gc/state` that did not move while
+    /// they were read. Cataloged with the key and the reason in `objects`. A refused shard is read no further; the
+    /// audit goes on with the next shard.
     uint64_t corrupted_runs = 0;
 
     /// The arithmetic ref-stream walk (spec §7). fsck reads each namespace's stream by EXACT KEY from
@@ -128,7 +200,7 @@ struct FsckReport
     /// `chain_broken` counts namespaces with a proven hole (see `FsckClass::ChainBroken`) and is a HARD
     /// ERROR: part of `clean`, and the command exits nonzero on it. `unchecked` counts namespaces the
     /// walk could not prove either way; it is COVERAGE, not a finding, so it
-    /// is reported and printed but does not make a report unclean — exactly like `partial`. A pool with
+    /// is reported and printed but does not make a report unclean. A pool with
     /// nothing wrong reads `chain_broken=0 unchecked=0`, so `unchecked` is never a resting state.
     ///
     /// `ref_records_walked` is how many ref-log records the walk actually read and proved, summed over
@@ -156,13 +228,23 @@ struct FsckReport
     uint64_t namespace_janitor_pending_bytes = 0;
     uint64_t namespace_janitor_pending_lives = 0;   /// distinct life ids counted above
 
+    /// Every `Creating` row in the scan's scope, listed in summary mode too, as there are few. Soft.
+    std::vector<FsckCreatingRow> creating_rows;
+    /// The `creating_rows` whose slot is `Terminal`: the next GC round cancels them.
+    uint64_t stalled_creating = 0;
+    /// The other `creating_rows`: GC does not cancel them while their slot says what it says.
+    uint64_t creating_unproven = 0;
+    /// The whole catalog, whatever the namespace scope, holds rows and every one is `Creating`. GC then has
+    /// no namespace to walk and deletes nothing.
+    bool catalog_has_no_walkable_row = false;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
     uint64_t distinct_blobs = 0;
 
     /// Set when the scan hit its deadline in partial mode: counts cover only what was walked
-    /// before the deadline — a lower bound, not the pool truth.
+    /// before the deadline — a lower bound, not the pool truth, so `clean` is false.
     bool partial = false;
     String partial_reason;
 
@@ -172,11 +254,10 @@ struct FsckReport
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
 
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
-    /// GC backlog classes do not make a report unclean, and `meta_without_body` is advisory (see its
-    /// field: GC's body-then-meta delete ordering makes a body-less `.meta` a legitimate transient with
-    /// no finite hard horizon); a partial report only covers the visited subset. `stale_edge` is a hard
-    /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
-    /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
+    /// GC backlog classes do not make a report unclean, and neither do the informational intent classes
+    /// or `legacy_marker`. A partial report is never clean: it covers only the visited subset. `stale_edge` is a
+    /// hard finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
+    /// stale edges.
     /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
     /// walk proved nothing about those namespaces, which is a statement about COVERAGE, and folding it
     /// in here would make "cannot prove" indistinguishable from "found broken".
@@ -193,7 +274,7 @@ struct FsckHardFinding
 };
 
 /// THE HARD FINDINGS, and the single authority on what they are. `FsckReport::clean` is computed from
-/// this list, so adding a term means adding a row here.
+/// this list and from `partial`, so adding a finding means adding a row here.
 ///
 /// The name is the one the text summary line and the SQL result column both use, which is what lets a
 /// test check a rendering surface by iterating this list instead of restating its contents.
@@ -208,6 +289,9 @@ inline constexpr std::array kFsckHardFindings{
     FsckHardFinding{"stale_edge", &FsckReport::stale_edge},
     FsckHardFinding{"chain_broken", &FsckReport::chain_broken},
     FsckHardFinding{"lifeless_keys", &FsckReport::lifeless_keys},
+    FsckHardFinding{"intent_malformed", &FsckReport::intent_malformed},
+    FsckHardFinding{"intent_unread", &FsckReport::intent_unread},
+    FsckHardFinding{"pending_without_intent", &FsckReport::pending_without_intent},
 };
 
 /// TRIPWIRE. A hard finding has to reach three CODE surfaces, and each has been forgotten at least once:
@@ -241,7 +325,7 @@ inline constexpr std::array kFsckHardFindings{
 /// than once, about the exit set -- and nothing here can break a build over them. (No count is given,
 /// for the same reason the paragraph above gives none: nobody keeping a tally of restatements can
 /// promise its own count will not go stale next.) They are a fourth surface, unfenced by construction.
-static_assert(kFsckHardFindings.size() == 5,
+static_assert(kFsckHardFindings.size() == 8,
     "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
     "Before updating this count, render it in ALL THREE code surfaces: `formatFsckSummary`'s line, "
     "`CommandFsck::executeImpl`'s nonzero-exit set, and `contentAddressedFsckColumns` + "
@@ -251,6 +335,8 @@ static_assert(kFsckHardFindings.size() == 5,
 
 inline bool FsckReport::clean() const
 {
+    if (partial)
+        return false;
     for (const FsckHardFinding & finding : kFsckHardFindings)
         if (this->*finding.value != 0)
             return false;
@@ -258,17 +344,24 @@ inline bool FsckReport::clean() const
 }
 
 /// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and
-/// diff it against a raw object listing. The operation is read-only; `detail` populates per-object rows.
-/// `deadline`, if set, bounds the WHOLE scan: it is checked between list pages and reachability
-/// refs, throwing `TIMEOUT_EXCEEDED` if exceeded (a slow-but-progressing scan surfaces a clear
-/// error instead of an opaque hang) — unless `partial_on_deadline` is set, in which case the
-/// accumulated lower-bound counts are returned instead, flagged via `FsckReport::partial`. A single
-/// LIST page stuck in S3-client retries is bounded separately by the disk's S3 retry/timeout
-/// settings, not here. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
-/// prefix and skips the pool-wide unreachable classification (dangling-only mode).
+/// diff it against a raw object listing. The operation is read-only unless `fix` is set; `detail`
+/// populates per-object rows. A plain scan classifies deletion intents from the listing alone; it reads
+/// the intent of each `pending` row. `verify_intents` adds, per intent, a `GET` of its bytes and a
+/// `HEAD` of its body (two requests per intent) for the `Intent*` verdicts. `fix_legacy_markers` deletes each legacy
+/// marker found with `removeLegacyMarkers`, through the scan's own read-only open (no mount, no lease), and needs a
+/// scan without `namespace_prefix`, `fix_concurrency` markers at a time. It is the scan's only repair: nothing deletes an
+/// intent or a body.
+/// `deadline` bounds the WHOLE scan, each request's retries included, and throws `TIMEOUT_EXCEEDED` when it passes —
+/// unless `partial_on_deadline` is set, in which case the accumulated lower-bound counts are returned instead,
+/// flagged via `FsckReport::partial`. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
+/// prefix and skips the pool-wide unreachable classification (dangling-only mode). `read_creator_slots` reads the
+/// mount slot of each `Creating` row's creator, once per creator and epoch, to fill `creating_rows`,
+/// `stalled_creating` and `creating_unproven`; without it they stay empty and no slot is read.
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
-                   std::optional<std::chrono::steady_clock::time_point> deadline = {},
-                   bool partial_on_deadline = false, const String & namespace_prefix = {});
+                   const ToolDeadline & deadline = {},
+                   bool partial_on_deadline = false, const String & namespace_prefix = {},
+                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1,
+                   bool read_creator_slots = false);
 
 /// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
 /// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
@@ -281,5 +374,40 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// printed, never omitted: "absent" and "zero" are different facts, and consumers (e.g. the harness's
 /// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
+
+/// The note on blobs inside the normal GC deletion pipeline, or empty when there are none. No trailing newline.
+String formatFsckPipelineNote(const FsckReport & report);
+
+/// The note on one `Creating` row: its creator, the slot status and what GC does about it. No trailing newline.
+String formatFsckCreatingRow(const FsckCreatingRow & row);
+
+/// A count of `FsckReport` as both report surfaces render it: its key on the summary line, and its column of
+/// `SYSTEM CAS FSCK`, when it has one, with the column's position after the `disk` column.
+struct FsckField
+{
+    std::string_view summary_key;
+    std::string_view sql_column;   /// empty: not a column
+    size_t sql_position = 0;
+    uint64_t (*value)(const FsckReport &) = nullptr;
+};
+
+/// The `SYSTEM CAS FSCK` columns after `disk`, in column order.
+std::vector<FsckField> fsckSqlColumns();
+
+struct LegacyMarkerRemoval
+{
+    uint64_t deleted = 0;
+    uint64_t changed = 0;   /// replaced between its `HEAD` and the delete, and left
+};
+
+/// The one removal of legacy markers, for `cas-migrate-pool` and `cas-fsck --fix legacy-markers`. Of `keys` it deletes
+/// only those `Layout::parseLegacyMarkerKey` accepts, each by a `HEAD` and a delete conditional on the token that `HEAD`
+/// saw, as many at a time as `io_pool` has threads; a marker replaced in between is left and counted. No server of generation 4
+/// reads a marker, so servers may run meanwhile. A refused or unanswered delete, or a `deadline` that expired before a
+/// `HEAD` or a delete, throws with the count deleted so far; a rerun continues. `on_progress` gets the running count
+/// after each batch and before a throw.
+LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, ThreadPool & io_pool,
+                                        const ToolDeadline & deadline = {},
+                                        const std::function<void(uint64_t)> & on_progress = {});
 
 }

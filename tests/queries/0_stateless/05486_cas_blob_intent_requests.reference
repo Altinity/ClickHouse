@@ -1,0 +1,7 @@
+condemning round: acquired_lease condemned intent_confirmed bodies_deleted = ok
+bodies deleted by the rounds: ok
+compatibility names: ok
+new content	ok
+duplicate	ok
+duplicate after the condemning round	ok
+duplicate after the body delete	ok

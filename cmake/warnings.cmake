@@ -12,7 +12,11 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 # Control maximum size of stack frames. It can be important if the code is run in fibers with small stack size.
 # Only in release build because debug has too large stack frames.
 if ((NOT CMAKE_BUILD_TYPE_UC STREQUAL "DEBUG") AND (NOT SANITIZE))
-    add_warning(frame-larger-than=65536)
+    if (ARCH_PPC64LE)
+        add_warning(frame-larger-than=131072)
+    else ()
+        add_warning(frame-larger-than=65536)
+    endif ()
 endif ()
 
 # Add some warnings that are not available even with -Wall -Wextra -Wpedantic.
@@ -60,13 +64,12 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
     # references to the container's elements would be invalidated.
     no_warning(lifetime-safety-invalidation)
 endif ()
-if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 24)
+if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
     # Too many false positives: it flags the pervasive idiom of taking a raw pointer out
     # of a `unique_ptr`, moving the owner into a container and returning the pointer -
     # the storage is on the heap and outlives the local, and the diagnostic text itself
     # concedes it "could be a false positive as the storage may have been moved".
-    # Nothing links clang 24 today except the Emscripten build (its clang is ahead of the
-    # default toolchain); re-evaluate when the default toolchain catches up.
+    # Emitted from clang 23 on, alongside the three related diagnostics suppressed above.
     no_warning(lifetime-safety-return-stack-addr-moved)
 endif ()
 if (ARCH_E2K)

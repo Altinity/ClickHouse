@@ -40,7 +40,7 @@ CasManifestReader::CasManifestReader(
             manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 }
 
-std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const ManifestId & id)
+std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const ManifestId & id, OnMemoryLimit on_memory_limit)
 {
     /// One id names one content forever (minted once, written once, only ever deleted), so a cached
     /// decode is served without any request.
@@ -53,7 +53,7 @@ std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const 
     /// as an exception. The `GET` alone carries the absence signal, so no `HEAD` precedes it.
     const String key = layout.manifestKey(id);
     CasOperation op = requests.admit();
-    std::optional<Object> object = op.read(key, Retry::standard());
+    std::optional<Object> object = op.read(key, Retry::standard(), on_memory_limit);
     if (!object)
     {
         if (event_sink)

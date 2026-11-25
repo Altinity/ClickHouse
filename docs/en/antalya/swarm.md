@@ -466,5 +466,6 @@ connections drain.
 | `object_storage_max_nodes` | Cap on how many hosts from that cluster run a given query. `0` = all. |
 | `object_storage_remote_initiator` | Run the cluster query on a random swarm node instead of coordinating from the client-facing initiator. |
 | `object_storage_remote_initiator_cluster` | Cluster used only to pick that remote initiator. When empty, `object_storage_cluster` is used. |
+| `allow_object_storage_cluster_distributed_join` | Experimental. Send a whole `JOIN` over `DataLake` catalog tables to the cluster of its driving table. A query that cannot be sent uses `object_storage_cluster_join_mode`. |
 | `object_storage_cluster_join_mode` | How to rewrite `JOIN`s when workers cannot see the right-hand table: `allow` (initiator-local join), `local` (deprecated alias of `allow`), `global`. |
 | `lock_object_storage_task_distribution_ms` | How long a free worker waits before stealing another node's files. Higher values favor cache locality. Default `500`. |

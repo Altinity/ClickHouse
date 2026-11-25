@@ -19,13 +19,17 @@ enum class ObjectStorageRetryProfile : uint8_t
 
 /// A per-request override of retry behavior for an object storage call: which retry profile to use,
 /// the per-attempt budget and connect cap the storage's single-attempt client must honour, and the
-/// caller's own attempt number (0 = unset) so the HTTP client sees a reissue as attempt ≥ 2.
+/// caller's own attempt number (0 = unset) so the HTTP client sees a reissue as attempt ≥ 2, and whether a
+/// listing prefetches its next page.
 struct ObjectStorageControlRequest
 {
     ObjectStorageRetryProfile profile = ObjectStorageRetryProfile::Default;
     uint64_t attempt_timeout_ms = 0;
     uint64_t connect_timeout_cap_ms = 0;
     size_t attempt_number = 0;
+    /// A listing that stops after the page it was asked for sets this to false: the next page is then
+    /// requested only when the consumer steps past the current one. Storages without lazy paging ignore it.
+    bool prefetch_next_page = true;
 };
 
 }

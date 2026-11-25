@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 
 
 namespace Poco::Net
@@ -616,6 +617,9 @@ protected:
     /// Set for CREATE queries a Replicated database replays from a definition it already stored.
     /// Such a definition describes existing state, so validation that may reject a new one must not run.
     bool is_recovery_from_stored_metadata = false;
+    /// Set while analyzing expressions that are executed later in the background, without a user:
+    /// mutations and the expressions stored in a table definition.
+    bool is_analyzing_background_expressions = false;
     /// True when this context belongs to the inner query of an expanded view.
     /// Positional arguments inside views must be resolved even on remote/secondary nodes where
     /// enable_positional_arguments would otherwise be skipped (views are expanded on remote nodes,
@@ -820,6 +824,7 @@ public:
     /// present to be able to add, remove or update warnings from the table
     enum class WarningType
     {
+        AI_FUNCTION_IN_BACKGROUND_OPERATION,
         AST_FUZZER_IS_ENABLED,
         AVAILABLE_DISK_SPACE_TOO_LOW_FOR_DATA,
         AVAILABLE_DISK_SPACE_TOO_LOW_FOR_LOGS,
@@ -1261,6 +1266,7 @@ public:
     /// For the resets of a statement that also changes `profile`: `changes_applied_first` decides their constraints.
     void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source);
     void clampToSettingsConstraints(SettingsChanges & changes, SettingSource source);
+    void clampToSettingsConstraintsRejectingInvalidChanges(SettingsChanges & changes, SettingSource source);
     void checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const;
 
     /// Reset settings to default value
@@ -1849,7 +1855,14 @@ public:
     /// Provides storage disks
     DiskPtr getDisk(const String & name) const;
     using DiskCreator = std::function<DiskPtr(const DisksMap & disks_map)>;
+    /// Returns the disk `name`, creating it with `creator` if it does not exist yet. The creator runs
+    /// without the storage lock and gets a snapshot of the disks. Concurrent calls for the same name
+    /// share one creation: the calling creator gets the disk or rethrows its own exception, the others
+    /// get the disk or a copy of the exception. A failed creation is not remembered. The creator must
+    /// not call `getOrCreateDisk` for its own name: it would wait for itself.
     DiskPtr getOrCreateDisk(const String & name, DiskCreator creator) const;
+    /// For tests: the number of requests waiting for a creation of the disk `name` started by another request.
+    size_t getDiskCreationWaitersForTest(const String & name) const;
 
     StoragePoliciesMap getPoliciesMap() const;
     DisksMap getDisksMap() const;
@@ -1857,6 +1870,8 @@ public:
 
     /// Provides storage politics schemes
     StoragePolicyPtr getStoragePolicy(const String & name) const;
+    /// Returns `nullptr` instead of throwing when the policy is not configured.
+    StoragePolicyPtr tryGetStoragePolicy(const String & name) const;
 
     StoragePolicyPtr getStoragePolicyFromDisk(const String & disk_name) const;
 
@@ -1890,6 +1905,10 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
+    /// Shared lock for one swarm task send. The read-task callback holds it only across the
+    /// enabled check and `sendReadTaskRequest`. The response read does not. `stopSwarmMode`
+    /// and `startSwarmMode` take it exclusively.
+    std::shared_lock<SharedMutex> lockSwarmMode() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
@@ -1899,6 +1918,9 @@ public:
 
     bool isRecoveryFromStoredMetadata() const { return is_recovery_from_stored_metadata; }
     void setRecoveryFromStoredMetadata(bool value) { is_recovery_from_stored_metadata = value; }
+
+    bool isAnalyzingBackgroundExpressions() const { return is_analyzing_background_expressions; }
+    void setAnalyzingBackgroundExpressions(bool value) { is_analyzing_background_expressions = value; }
 
     bool isViewInnerQuery() const { return is_view_inner_query; }
     void setIsViewInnerQuery(bool value) { is_view_inner_query = value; }
@@ -2129,6 +2151,7 @@ private:
     void checkSettingsConstraintsWithLock(SettingsChanges & changes, SettingSource source);
 
     void clampToSettingsConstraintsWithLock(SettingsChanges & changes, SettingSource source);
+    void clampToSettingsConstraintsRejectingInvalidChangesWithLock(SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraintsWithLock(const AlterSettingsProfileElements & profile_elements, SettingSource source) const;
 
     void clampToSettingsConstraintsWithLock(SettingsChanges & changes, SettingSource source) const;
@@ -2152,6 +2175,8 @@ private:
     StoragePolicySelectorPtr getStoragePolicySelector(std::lock_guard<std::mutex> & lock) const;
 
     DiskSelectorPtr getDiskSelector(std::lock_guard<std::mutex> & lock) const;
+    /// Like `DiskSelector::get`, but says so when the disk is still being created by `getOrCreateDisk`.
+    DiskPtr getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const;
 
     DisksMap getDisksMap(std::lock_guard<std::mutex> & lock) const;
 

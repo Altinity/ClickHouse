@@ -42,6 +42,9 @@ std::unique_ptr<StdStreamFromReadBuffer> createS3UploadBody(
 ///
 /// `copy_mode = NativeOnly` forbids the client-side read-write fallback. If native copy is disabled
 /// or cannot complete, the failure is propagated instead.
+///
+/// `object_creation_client`, when set, sends `CopyObject` and `CompleteMultipartUpload`; it requires
+/// `NativeOnly`, because the read-write fallback would write through the retrying client.
 void copyS3File(
     std::shared_ptr<const S3::Client> src_s3_client,
     const String & src_bucket,
@@ -56,7 +59,8 @@ void copyS3File(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
-    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
+    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default,
+    std::shared_ptr<const S3::Client> object_creation_client = nullptr);
 
 /// Copies exactly `[src_offset, src_offset + src_size)` of a LARGER source object of size `src_object_size`.
 ///

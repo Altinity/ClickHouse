@@ -1,9 +1,11 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -16,7 +18,8 @@ class Layout;
 /// `_pool_meta` — the pool identity and the pool-wide constants that every reader and writer must
 /// agree on. The text representation is a header line followed by one JSON body object:
 /// {"pool_id":"<32hex>","blob_header_len":<blob_header_len>,"gc_shards":<gc_shards>,
-///  "min_reader_generation":<min_reader_generation>,"algos_used":["<algo-word>",...]}.
+///  "min_reader_generation":<min_reader_generation>,"algos_used":["<algo-word>",...]
+///  [,"token_dialect":"<etag|generation|emulated>"]}.
 ///
 /// The persisted object is authoritative after creation. On reopen, `createOrValidate` uses its
 /// `blob_header_len` and reader-generation floor rather than replacing them with local configuration;
@@ -31,6 +34,9 @@ struct PoolMeta
     /// Every hash algorithm ever admitted, encoded as `static_cast<uint8_t>(BlobHashAlgo)`, in strictly
     /// increasing order. Admission only appends a new algorithm to this durable set.
     std::vector<uint8_t> algos_used;
+    /// The token dialect every blob identity of the pool is spelled in. Present iff
+    /// `min_reader_generation >= G_BLOB_INTENTS`; the decoder enforces it, the encoder writes what is set.
+    std::optional<Dialect> token_dialect;
 
     /// Creates the pool metadata if `_pool_meta` is absent, or validates and possibly admits the
     /// configured hash algorithm if it already exists. Initial creation validates the supplied header
@@ -59,6 +65,11 @@ struct PoolMeta
     /// never lowers it, returns the resulting meta. Separate from hash admission, which returns without
     /// writing once the algorithm is admitted.
     static PoolMeta raiseMinReaderGeneration(CasOperation & op, const Layout & layout, uint64_t generation);
+
+    /// Read-modify-write to floor `G_BLOB_INTENTS` with the dialect of `op`'s backend recorded, in one write. A body
+    /// already at that floor with that dialect is left as it is; one with another dialect is refused with
+    /// `BAD_ARGUMENTS`. Returns whether this call wrote.
+    static bool raiseToGeneration4(CasOperation & op, const Layout & layout);
 
     /// Convenience for single-shard callers. Production pool opening passes the configured value to
     /// the explicit overload above; this preserves compact single-shard codec/unit fixtures.

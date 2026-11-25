@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace DB::Cas;
@@ -42,6 +44,14 @@ BuildPrefix buildPrefix(uint64_t seq)
     return BuildPrefix{.writer_epoch = kBuildEpoch, .build_sequence = seq};
 }
 
+/// A fold cursor names a record GC read; without a snapshot above it, that record is still there.
+void seedCursorAt(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId cursor,
+                  std::optional<RefHold> hold = std::nullopt)
+{
+    seedFoldCursorForTest(backend, layout, ns, cursor, hold);
+    fixture::writeRefLogRaw(backend, layout, RefLogTxn{ns.string(), cursor, {}, std::nullopt});
+}
+
 /// A pool with ONE eligible-but-unowned manifest body under build sequence 5: the shape the sweep is
 /// meant to reclaim, so that every test below differs only in the durable fold state.
 struct OrphanFixture
@@ -51,9 +61,9 @@ struct OrphanFixture
     RootNamespace ns{"00/aa@cas@"};
     ManifestRef orphan = ref(5, 0xAB);
 
-    OrphanFixture()
+    explicit OrphanFixture(uint64_t gc_fold_max_defer_rounds = 8)
     {
-        store = openPoolForTest(backend);
+        store = openPoolForTest(backend, gc_fold_max_defer_rounds);
         /// This fixture has no ref transaction, but it is a normal empty catalog life rather than the
         /// deliberate missing-checkpoint corruption shape. State that empty recovery frontier before
         /// exercising the independent sweep-deletion premise.
@@ -104,7 +114,7 @@ struct UndecodableOrphanFixture
 TEST(CASSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
 {
     OrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -124,7 +134,7 @@ TEST(CASSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
     OrphanFixture f;
     /// A cursor at `{2, 1}` is in an epoch strictly above the build's. An epoch is left ONLY over its
     /// consumed `EpochSeal`, so this cursor is durable proof that every epoch-1 record is folded.
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -143,7 +153,7 @@ TEST(CASSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
     const RefHold hold{.reason = HoldReason::GapBelowWitness,
                        .offending_position = RefTxnId{kBuildEpoch + 1, 4},
                        .retry_count = 2, .next_retry_round = 9};
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 3}, hold);
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 3}, hold);
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -204,12 +214,114 @@ TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
     EXPECT_TRUE(reason.empty());
 }
 
+/// `{0, 0}` is a legal sealed cursor: the namespace is live and its ref log is still empty. The premise
+/// retains, and its message must say there is no position instead of rendering one.
+TEST(CASSweepDeletionPremise, AnEmptyRefStreamCursorRetainsWithoutAPosition)
+{
+    OrphanFixture f;
+    NamespaceFoldView view;
+    RefCoverage cov;
+    cov.classification = CoverageClass::Unchanged;
+    cov.last_folded_ref_id = RefTxnId{};
+    view.coverage = cov;
+
+    String reason;
+    SweepRetainClass retain_class = SweepRetainClass::None;
+    EXPECT_FALSE(manifestDeletionPremise(view, ManifestKey{f.orphanKey(), buildPrefix(5)}, &reason, &retain_class));
+    EXPECT_EQ(retain_class, SweepRetainClass::UnconsumedSeal);
+    EXPECT_NE(reason.find("sealed cursor is at none"), String::npos) << reason;
+}
+
+TEST(CASSweepDeletionPremise, TheCursorPageRetainsDebrisOfANamespaceThatFoldedNothing)
+{
+    OrphanFixture f;
+    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{});
+
+    const ManifestSweepResult page = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    EXPECT_EQ(page.deleted, 0u);
+    EXPECT_EQ(page.retained_unconsumed_seal, 1u);
+    EXPECT_TRUE(f.orphanExists());
+
+    std::vector<String> warnings;
+    EXPECT_EQ(sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings), 0u);
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("not consumed"), String::npos) << warnings[0];
+    EXPECT_TRUE(f.orphanExists());
+}
+
+/// The shape a crash between staging a manifest and the table's first precommit leaves: debris under a
+/// live namespace whose ref log is empty. Every round must complete, not only the first.
+TEST(CASSweepDeletionPremise, ConsecutiveRoundsSurviveAnOrphanOfAnEmptyRefStream)
+{
+    OrphanFixture f(/*gc_fold_max_defer_rounds*/0);
+    uint64_t now_ms = 1000;
+    Gc gc(f.store, hexToU128("00000000000000000000000000000001"), [&] { return now_ms; });
+    uint64_t pages_listed = 0;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase)
+    {
+        if (phase.phase == "orphan_sweep")
+            pages_listed += phase.metrics.at("orphan_manifest_sweep_page_listed");
+    });
+
+    const RoundReport first = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(first.acquired_lease);
+    ASSERT_FALSE(first.deferred);
+    for (int i = 0; i < 2; ++i)
+    {
+        now_ms += f.store->poolConfig().orphan_manifest_sweep_interval_sec * 1000;
+        EXPECT_NO_THROW(runRegularRoundReclaiming(gc)) << "round " << i + 2;
+    }
+    EXPECT_EQ(pages_listed, 3u);
+    EXPECT_TRUE(f.orphanExists());
+
+    /// Positive control: the adopted seal carries a zero cursor and the manifest is eligible, so the
+    /// rounds above reached the premise rather than skipping the sweep.
+    const ManifestSweepResult page = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    EXPECT_EQ(page.retained_unconsumed_seal, 1u);
+}
+
+/// The retention summary's total covers every class the "most of them" figure ranks, the work-budget class
+/// included (otherwise the line reads "2 of 1"), and the `orphan_sweep` phase row reports that class too.
+TEST(CASSweepDeletionPremise, TheRetentionSummaryAndPhaseRowCountTheWorkBudgetClass)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_round_sweep_namespace_budget = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
+    for (const char * name : {"00/aa@cas@", "00/bb@cas@", "00/cc@cas@"})
+    {
+        const RootNamespace ns{name};
+        casAdmitRecoverableEntry(*backend, layout, ns);
+        writeManifestRaw(*backend, layout, ns, ref(5, 0xAB), {blobEntryFor("a", DB::UInt128(1))});
+    }
+
+    ScopedLogCapture capture("CasGc", "information");
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_FALSE(report.deferred);
+
+    /// One namespace gets a view and is retained for lack of coverage; the two beyond the cap are
+    /// retained on the work budget, and the phase row carries both counts.
+    const auto sweep_phase = std::find_if(phases.begin(), phases.end(),
+        [](const GcPhaseRecord & phase) { return phase.phase == "orphan_sweep"; });
+    ASSERT_NE(sweep_phase, phases.end());
+    ASSERT_TRUE(sweep_phase->metrics.contains("retained_work_budget"));
+    EXPECT_EQ(sweep_phase->metrics.at("retained_work_budget"), 2u);
+    EXPECT_EQ(sweep_phase->metrics.at("retained_no_coverage"), 1u);
+    EXPECT_EQ(capture.count("retained 3 manifest body(ies) this pass, most of them (2 of 3) for 'work_budget_exhausted'"), 1u)
+        << capture.captured();
+}
+
 /// Both sweep paths call the ONE predicate: the cursor-paced page must refuse the same body the
 /// per-namespace sweep refuses, for the same reason.
 TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 {
     OrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
     const ManifestSweepResult held = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(held.deleted, 0u);
@@ -217,7 +329,7 @@ TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
     EXPECT_TRUE(f.orphanExists());
 
     /// Consume the seal and the very same page deletes it.
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
     const ManifestSweepResult freed = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(freed.deleted, 1u);
     EXPECT_FALSE(f.orphanExists());
@@ -227,7 +339,7 @@ TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 TEST(CASSweepDeletionPremise, AnUndecodableManifestDoesNotWedgeTheCursorPage)
 {
     UndecodableOrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     /// A payload-zone banner that no longer matches its entry path: the exact shape the reproducer
     /// produced -- built by hand, because a correct encoder never emits a banner that disagrees with
@@ -314,7 +426,7 @@ TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     const ManifestRef ref_a = ref(5, 0xA1);
     casAdmitRecoverableEntry(*backend, layout, ns_a);
     writeManifestRaw(*backend, layout, ns_a, ref_a, {blobEntryFor("a", DB::UInt128(1))});
-    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
 
     /// Namespace B: a HELD row whose cursor is well above the build's epoch, so rule (1) is satisfied
     /// and the hold is demonstrably what retained it.
@@ -325,7 +437,7 @@ TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     const RefHold hold{.reason = HoldReason::BodyUndecodable,
                        .offending_position = RefTxnId{kBuildEpoch + 1, 9},
                        .retry_count = 1, .next_retry_round = 4};
-    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
+    seedCursorAt(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
 
     setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
@@ -371,7 +483,7 @@ TEST(CASSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
     const ManifestRef third = ref(5, 0xAD);
     writeManifestRaw(*f.backend, f.store->layout(), f.ns, second, {blobEntryFor("b", DB::UInt128(2))});
     writeManifestRaw(*f.backend, f.store->layout(), f.ns, third, {blobEntryFor("c", DB::UInt128(3))});
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     const ManifestSweepResult first = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(first.deleted, 1u);
@@ -473,6 +585,141 @@ TEST(CASSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgin
             << "candidate " << i << " must survive: it was never proven safe to delete";
 }
 
+namespace
+{
+
+/// A writer that stays ahead of the reader: every GET of a ref log under `log_prefix` first appends the
+/// next record of epoch 1, until `max_appends`.
+class AppendOnRefLogReadBackend final : public CountingBackend
+{
+public:
+    void arm(Layout layout_, RootNamespace ns_, String log_prefix_, uint64_t next_sequence_, uint64_t max_appends_)
+    {
+        std::lock_guard lock(append_mutex);
+        layout = std::move(layout_);
+        ns = std::move(ns_);
+        log_prefix = std::move(log_prefix_);
+        next_sequence = next_sequence_;
+        max_appends = max_appends_;
+    }
+
+    void disarm()
+    {
+        std::lock_guard lock(append_mutex);
+        log_prefix.clear();
+    }
+
+    uint64_t appends() const
+    {
+        std::lock_guard lock(append_mutex);
+        return appended;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        /// The append itself reads through this backend; those reads must not append or re-lock.
+        static thread_local bool appending = false;
+        if (!appending)
+        {
+            std::lock_guard lock(append_mutex);
+            if (!log_prefix.empty() && key.starts_with(log_prefix) && appended < max_appends)
+            {
+                const uint64_t sequence = next_sequence++;
+                appending = true;
+                try
+                {
+                    fixture::writeRefLogRaw(*this, *layout, RefLogTxn{ns.string(), RefTxnId{kBuildEpoch, sequence},
+                        publishCommittedOps("live" + std::to_string(sequence), ref(10000 + sequence, 1)), std::nullopt});
+                }
+                catch (...)
+                {
+                    appending = false;
+                    throw;
+                }
+                appending = false;
+                ++appended;
+            }
+        }
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    mutable std::mutex append_mutex;
+    std::optional<Layout> layout;
+    RootNamespace ns{"unset"};
+    String log_prefix;
+    uint64_t next_sequence = 0;
+    uint64_t max_appends = 0;
+    uint64_t appended = 0;
+};
+
+}
+
+/// The owner replay of a generation 3 chain has no stored end and follows records appended while it runs.
+/// The round's recovery budget stops it: the namespace is retained, nothing of it is deleted, and a later
+/// round over a quiet writer completes it.
+TEST(CASSweepDeletionPremise, OwnerReplayRacingAWriterStopsAtTheRecoveryBudget)
+{
+    auto backend = std::make_shared<AppendOnRefLogReadBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef orphan = ref(5, 0xAB);
+    casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+
+    /// A tail longer than the read-ahead window, so a hinted GET never runs past the end.
+    constexpr uint64_t kInitialTail = 16;
+    for (uint64_t sequence = 1; sequence <= kInitialTail; ++sequence)
+    {
+        std::vector<RefOp> ops = publishCommittedOps("seed" + std::to_string(sequence), ref(1000 + sequence, 1));
+        if (sequence == 1)
+            ops.insert(ops.begin(), namespaceBirthOp());
+        fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{kBuildEpoch, sequence}, ops, std::nullopt});
+    }
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(
+            layout.refCkptKey(life), encodeRefCkptAtGeneration(refCkptOf(kBuildEpoch), G_REF_CHAIN), Retry::standard())));
+    }
+    writeManifestRaw(*backend, layout, ns, orphan, {blobEntryFor("a", DB::UInt128(1))});
+    /// Past epoch 1's seal, so the orphan is deletable once the namespace's view is complete.
+    seedCursorAt(*backend, layout, ns, RefTxnId{kBuildEpoch + 1, 1});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
+    const String orphan_key = layout.manifestKey(ManifestId{ns, orphan});
+    const auto orphan_exists = [&]
+    {
+        OperationForTest op(*backend);
+        return (*op).head(orphan_key, Retry::once()).has_value();
+    };
+
+    /// Far above the budget plus the read-ahead window: reaching it means the walk was not stopped.
+    constexpr uint64_t kMaxAppends = 2000;
+    constexpr uint64_t kRecoveryOps = 50;
+    /// The hinted GETs the reader sends ahead of the record the budget charged.
+    constexpr uint64_t kReadAheadSlack = 8;
+    backend->arm(layout, ns, layout.namespaceStreamPrefix(life) + "_log/", kInitialTail + 1, kMaxAppends);
+    {
+        GcRoundWorkBudget budget;
+        budget.max_sweep_recovery_ops = kRecoveryOps;
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10, &budget);
+        EXPECT_LE(backend->appends(), kRecoveryOps + kReadAheadSlack) << "the owner replay read past the round's recovery budget";
+        EXPECT_EQ(result.deleted, 0u);
+        EXPECT_EQ(result.retained_work_budget, 1u);
+        EXPECT_TRUE(orphan_exists());
+    }
+
+    backend->disarm();
+    {
+        GcRoundWorkBudget budget;
+        budget.max_sweep_recovery_ops = kMaxAppends;
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10, &budget);
+        EXPECT_EQ(result.retained_work_budget, 0u);
+        EXPECT_EQ(result.deleted, 1u);
+        EXPECT_FALSE(orphan_exists());
+    }
+}
+
 /// The per-page NAMESPACE cap. Two otherwise-independently-deletable
 /// namespaces share one page; with `max_sweep_namespaces = 1`, only the first namespace this page
 /// touches gets a protection view built at all -- the second is retained under the work-budget cause,
@@ -493,8 +740,8 @@ TEST(CASSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
     writeManifestRaw(*backend, layout, ns_b, ref_b, {blobEntryFor("b", DB::UInt128(2))});
     /// Both namespaces satisfy rule (1) (cursor past the build's own epoch) and have no committed tail
     /// at all (`_ckpt.committed_through` unset), so absent the namespace cap BOTH would delete.
-    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
-    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
     setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
     GcRoundWorkBudget budget;

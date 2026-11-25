@@ -203,9 +203,9 @@ class Info:
             assert branch
             ref_param = f"REF={branch}"
         path = Settings.S3_REPORT_BUCKET
-        for bucket, endpoint in Settings.S3_BUCKET_TO_HTTP_ENDPOINT.items():
+        for bucket, config in (Settings.S3_EXTERNAL_BUCKETS or {}).items():
             if bucket in path:
-                path = path.replace(bucket, endpoint)
+                path = path.replace(bucket, config["http_endpoint"])
                 break
         workflow_name = workflow_name or self.env.WORKFLOW_NAME
         res = f"https://{path}/{Path(Settings.HTML_PAGE_FILE).name}?{ref_param}&sha={sha}&name_0={urllib.parse.quote(workflow_name, safe='')}"
@@ -223,9 +223,9 @@ class Info:
             assert branch
             ref_param = f"REF={branch}"
         path = Settings.S3_REPORT_BUCKET
-        for bucket, endpoint in Settings.S3_BUCKET_TO_HTTP_ENDPOINT.items():
+        for bucket, config in (Settings.S3_EXTERNAL_BUCKETS or {}).items():
             if bucket in path:
-                path = path.replace(bucket, endpoint)
+                path = path.replace(bucket, config["http_endpoint"])
                 break
         res = f"https://{path}/{Path(Settings.HTML_PAGE_FILE).name}?{ref_param}&sha={sha}&name_0={urllib.parse.quote(workflow_name, safe='')}"
         if job_name:

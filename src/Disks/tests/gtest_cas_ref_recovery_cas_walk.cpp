@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -25,12 +26,15 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 /// Stage A task 6: recovery is `_ckpt` + an ARITHMETIC tail + a seal CAS-walk, and it installs nothing
@@ -54,6 +58,7 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 }
 
@@ -65,6 +70,8 @@ extern const Event CASRefRecoveryEpochSealAdopted;
 extern const Event CASRefRecoveryStragglerAdopted;
 extern const Event CASRefRecoveryCancelled;
 extern const Event CASRefCheckpointPublished;
+extern const Event CASRefCheckpointStamped;
+extern const Event CASRefAppendTombstoneWritten;
 }
 
 using namespace DB::Cas;
@@ -76,6 +83,7 @@ using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
 using DB::Cas::tests::rearmMountFenceAfterAnomalyForTest;
+using DB::Cas::tests::tombstoneTxn;
 using DB::Cas::tests::writeRefSnapshotRaw;
 
 namespace
@@ -91,14 +99,14 @@ ManifestRef manifestRef(uint64_t epoch, uint64_t build_sequence, uint32_t ordina
 std::optional<CkptSample> readCkptForTest(const BackendPtr & backend, const Layout & layout,
                                           const NamespaceLifeId & life)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return readCkpt(op, layout, life);
 }
 
 CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Layout & layout)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return CasRefCatalog::read(op, layout);
 }
@@ -107,7 +115,7 @@ CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Lay
 bool replaceForTest(const BackendPtr & backend, const String & key, const String & bytes,
                     const Etag & expected)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return std::holds_alternative<Committed>(op.replace(key, bytes, expected, Retry::standard()));
 }
@@ -357,6 +365,68 @@ public:
     }
 };
 
+/// Records `(method, key)` of every exact read, head, write and delete, in order. A write without a
+/// precondition is `PUT`, one with a precondition is `CAS`.
+class JournalingBackend : public HidingListBackend
+{
+public:
+    std::vector<std::pair<String, String>> journal() const
+    {
+        std::lock_guard lock(journal_mutex);
+        return entries;
+    }
+
+    void clearJournal()
+    {
+        std::lock_guard lock(journal_mutex);
+        entries.clear();
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        record("GET", key);
+        return HidingListBackend::read(key, access);
+    }
+
+    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        record("HEAD", key);
+        return HidingListBackend::head(key, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        DB::Cas::TransportAccess & access) override
+    {
+        record(expected_value ? "CAS" : "PUT", key);
+        return HidingListBackend::write(key, bytes, expected_value, access);
+    }
+
+    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
+                                        DB::Cas::TransportAccess & access) override
+    {
+        record("DELETE", key);
+        return HidingListBackend::remove(key, expected_value, access);
+    }
+
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
+    {
+        for (const DB::Cas::WriteOnceKey & key : keys)
+            record("DELETE", key.str());
+        HidingListBackend::removeManyWriteOnce(keys, access);
+    }
+
+private:
+    void record(const char * method, const String & key)
+    {
+        std::lock_guard lock(journal_mutex);
+        entries.emplace_back(method, key);
+    }
+
+    mutable std::mutex journal_mutex;
+    std::vector<std::pair<String, String>> entries;
+};
+
 
 /// More injected failures than the engine's own retry window can make attempts, on a clock that
 /// advances at least a millisecond per pause: a call meeting this fault must end at its DEADLINE,
@@ -401,10 +471,34 @@ PoolPtr openWalkPool(const std::shared_ptr<BackendT> & backend, PoolConfig confi
 /// the seal chain must cross.
 void burnEpochsUpTo(const BackendPtr & backend, const Layout & layout, uint64_t target_live_epoch)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     for (uint64_t e = 1; e < target_live_epoch; ++e)
-        allocateWriterEpoch(op, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });
+        allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
+}
+
+/// The clean farewell of `epoch` by this fixture's server, carrying `last_unclean_epoch`: the next claim
+/// takes the marker over from it.
+void seedCleanFarewell(Backend & backend, const Layout & layout, uint64_t epoch, uint64_t last_unclean_epoch)
+{
+    const PoolConfig config = walkTestConfig();
+    const MountLease farewell{
+        .server_uuid = config.server_id, .writer_epoch = epoch, .hostname = "h", .pid = 1, .started_at_ms = 1,
+        .seq = 1, .expires_at_ms = 1, .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
+        .gc_fenced = false, .write_attempt_id = UInt128(epoch), .last_unclean_epoch = last_unclean_epoch};
+    createAt(backend, layout.mountKey(config.server_root_id), encodeMountLease(farewell));
+}
+
+/// The fenced, expired body of `epoch` by this fixture's server: an unclean end, so the next claim's marker
+/// is `epoch`.
+void seedFencedSlot(Backend & backend, const Layout & layout, uint64_t epoch)
+{
+    const PoolConfig config = walkTestConfig();
+    const MountLease fenced{
+        .server_uuid = config.server_id, .writer_epoch = epoch, .hostname = "h", .pid = 1, .started_at_ms = 1,
+        .seq = 1, .expires_at_ms = 1, .min_active_build_sequence = 0, .gc_fenced = true,
+        .write_attempt_id = UInt128(epoch), .last_unclean_epoch = epoch - 1};
+    createAt(backend, layout.mountKey(config.server_root_id), encodeMountLease(fenced));
 }
 
 /// One ordinary transaction at `id`, publishing `ref` (prepending the birth op when `birth`).
@@ -454,9 +548,9 @@ void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns,
 /// Seeds the `_ckpt` a real namespace birth would have created, so recovery can ground its walk at the
 /// namespace's `life_epoch` without consulting the (untrusted) listing. Raw, because these fixtures
 /// never run a birth through the append lane.
-void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
+void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt, uint32_t generation = 1)
 {
-    createAt(backend, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt));
+    createAt(backend, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(ckpt, generation));
 }
 
 RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_through = std::nullopt)
@@ -491,7 +585,9 @@ NamespaceLifeId catalogLife(const BackendPtr & backend, const Layout & layout, c
     throw std::runtime_error("test namespace has no catalog life");
 }
 
-NamespaceLifeId strandOneUnfrontieredSuccessor(
+/// Publishes "a", then makes the install of "b" fail after its log is durable: the lane is
+/// `NeedsRecovery` with the attempt retained, and the durable `{1,2}` is not acknowledged.
+NamespaceLifeId strandOneDurableUnacknowledgedAppend(
     const std::shared_ptr<HidingListBackend> & backend, const PoolPtr & store, const Layout & layout,
     const RootNamespace & ns)
 {
@@ -506,23 +602,26 @@ NamespaceLifeId strandOneUnfrontieredSuccessor(
             return ops;
         }, RootMutationOrigin::Writer, RootMutationKind::Publish);
 
-    /// The frontier publication reissues an ambiguous replace until its own retry window closes, so
-    /// the fault has to outlast the call and the clock the window is read from has to move for the call
-    /// to end at all.
-    auto clock = VirtualRetryClock::installOn(store);
-    const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    /// Re-allowing allocations for the throw: `std::rethrow_exception` allocates, and the install region
+    /// denies allocations in debug builds.
+    auto planned_failure = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "install probe"));
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([planned_failure, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(planned_failure);
+    });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
         store->appendRefOps(ns, MutationScope::ref("b"),
             [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
             RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
-    backend->ambiguous_cas_count = 0;
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the reissues must pace through the injected sleep, never a real one";
-    EXPECT_LE(clock->longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
+    store->setInstallRegionProbeForTest(nullptr);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 2})).has_value());
     return life;
 }
 
@@ -651,11 +750,11 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
     const auto ckpt_before = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_before);
 
@@ -664,7 +763,7 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
 
     const auto ckpt_after = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_after);
-    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag)
+    EXPECT_EQ(tokenText(ckpt_after->etag), tokenText(ckpt_before->etag))
         << "an unchanged checkpoint makes the missing committed id corruption, not a shorter stream";
 }
 
@@ -682,11 +781,11 @@ TEST(CASRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), uncommitted_snapshot_id,
             {committedRow("laundered", manifestRef(1, 2, 1))}));
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
 
     auto store = openWalkPool(backend);
     backend->resetCounts();
@@ -723,7 +822,7 @@ TEST(CASRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
         /// A clone starts empty: constructing the normal fixture would pre-seed independent pool-meta
         /// bytes before this loop could copy the source's identical durable image.
         auto backend = std::make_shared<HidingListBackend>(/*seed_pool_meta=*/false);
-        CasRequests seed_requests(seed, Fence::open());
+        CasRequests seed_requests(seed, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation seed_op = seed_requests.admit();
         String cursor;
         do
@@ -832,7 +931,7 @@ TEST(CASRefRecoveryCasWalk, DuplicateCatalogLifeIsCorruptionBeforeColdRuntimeAdm
     const Layout layout("p");
     const RootNamespace ns{"srv1/ambiguous_life_a"};
     auto store = openWalkPool(backend);
-    const NamespaceLifeId life = strandOneUnfrontieredSuccessor(backend, store, layout, ns);
+    const NamespaceLifeId life = strandOneDurableUnacknowledgedAppend(backend, store, layout, ns);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const CasRefCatalog::Snapshot sampled = readCatalogForTest(backend, layout);
@@ -873,7 +972,7 @@ TEST(CASRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInst
         ASSERT_TRUE(sampled);
         RefCkpt advanced = sampled->ckpt;
         advanced.committed_through = concurrent_frontier;
-        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkpt(advanced), sampled->etag));
+        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(advanced, 1), sampled->etag));
     };
 
     auto store = openWalkPool(backend);
@@ -1019,219 +1118,48 @@ TEST(CASRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{1, 3}));
 }
 
-TEST(CASRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingPastIt)
-{
-    struct Case
-    {
-        String suffix;
-        uint64_t live_epoch;
-        RefTxnId occupant;
-        RefTxnId forbidden_successor;
-        bool occupant_is_seal;
-    };
-    const std::vector<Case> cases{
-        {"seal", 3, {1, 2}, {2, 1}, true},
-        {"straggler", 2, {1, 2}, {1, 3}, false},
-    };
-
-    for (const Case & test_case : cases)
-    {
-        SCOPED_TRACE(test_case.suffix);
-        auto backend = std::make_shared<LateMaterializeBackend>();
-        const Layout layout("p");
-        const RootNamespace ns{"srv1/occupied_frontier_" + test_case.suffix};
-        const RefTxnId initial_frontier{1, 1};
-
-        burnEpochsUpTo(backend, layout, test_case.live_epoch);
-        seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
-        seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
-        const NamespaceLifeId life = catalogLife(backend, layout, ns);
-        backend->late_key = layout.refLogKey(life, test_case.occupant);
-        const RefLogTxn occupant = test_case.occupant_is_seal
-            ? makeSealTxn(ns, test_case.occupant)
-            : makeOrdinaryTxn(ns, test_case.occupant, "late", /*birth=*/false);
-        backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(occupant));
-
-        /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the
-        /// Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so a
-        /// by-reference capture of a local would dangle.
-        auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-        PoolConfig config = walkTestConfig();
-        config.boot_ms_fn = [fake_now]
-        {
-            return fake_now->load();
-        };
-        config.cas_request_budget.recovery_retry_budget_ms = 1;
-        config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
-        config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
-        auto store = openWalkPool(backend, config);
-        store->setCasRetrySleepForTest([fake_now](uint64_t ms)
-        {
-            *fake_now += ms;
-        });
-
-        backend->ambiguous_cas_substr = layout.refCkptKey(life);
-        backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
-
-        EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, test_case.occupant)));
-        EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, test_case.forbidden_successor)))
-            << "recovery advanced before exact _ckpt certified the occupied object";
-        EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
-        EXPECT_FALSE(store->refTableRecoveredForTest(ns));
-    }
-}
-
-/// Two BURNED epochs -- mounted, never written to, and abandoned. `CasPool`'s epoch allocator mints and
-/// never reclaims, so this is the normal shape of a pool that has restarted a few times, not an
-/// anomaly. Each empty epoch is closed by its own sequence-1 seal, and each carries the previous seal as
-/// its `prev_epoch_seal`: the chain is what makes a MISSING epoch detectable, which arithmetic within an
-/// epoch cannot do.
-TEST(CASRefRecoveryCasWalk, TwoBurnedEmptyEpochsProduceTwoChainedSequenceOneSeals)
+/// A recovery whose generation 3 stamp does not resolve sends no tombstone and installs nothing: the
+/// tombstone may follow only a stamp that landed.
+TEST(CASRefRecoveryCasWalk, UnresolvedRecoveryStampWritesNoTombstoneAndInstallsNothing)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
-    const RootNamespace ns{"srv1/burned"};
+    const RootNamespace ns{"srv1/unresolved_recovery_stamp"};
 
-    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/4);
-    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 1}));
+    burnEpochsUpTo(backend, layout, 2);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-
-    auto store = openWalkPool(backend);
-    ASSERT_TRUE(store);
-    ASSERT_EQ(store->liveWriterEpoch(), 4u);
-
-    ASSERT_EQ(store->listRefs(ns).size(), 1u);
-
-    const auto seal1 = readLogTxn(*backend, layout, ns, RefTxnId{1, 2});
-    ASSERT_TRUE(seal1.has_value()) << "epoch 1 closes at {1,2}";
-    EXPECT_EQ(seal1->prev_epoch_seal, std::nullopt);
-
-    const auto seal2 = readLogTxn(*backend, layout, ns, RefTxnId{2, 1});
-    ASSERT_TRUE(seal2.has_value()) << "empty epoch 2 still closes -- at its sequence 1";
-    EXPECT_TRUE(refLogTxnIsEpochSeal(*seal2));
-    EXPECT_EQ(seal2->prev_epoch_seal, std::optional<RefTxnId>(RefTxnId{1, 2}))
-        << "a sequence-1 seal MUST name the seal that closed the previous epoch";
-
-    const auto seal3 = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
-    ASSERT_TRUE(seal3.has_value()) << "empty epoch 3 closes too";
-    EXPECT_EQ(seal3->prev_epoch_seal, std::optional<RefTxnId>(RefTxnId{2, 1}));
-
-    EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{4, 1}).has_value())
-        << "epoch 4 is LIVE -- sealing it would close the epoch this mount writes in";
-    EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{3, 1}));
-}
-
-TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNextEpochSeal)
-{
-    auto backend = std::make_shared<HidingListBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/seal_frontier_before_next"};
-    const RefTxnId initial_frontier{1, 1};
-    const RefTxnId first_seal{1, 2};
-    const RefTxnId second_seal{2, 1};
-    const RefTxnId cold_remount_frontier{3, 1};
-
-    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/3);
-    seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
-    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 1}));
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+    const String tombstone_key = layout.refLogKey(life, RefTxnId{1, 2});
 
     /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the Pool
-    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
-    /// by-reference capture of a local would dangle.
+    /// can outlive this stack frame, so a by-reference capture of a local would dangle.
     auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config = walkTestConfig();
-    config.boot_ms_fn = [fake_now]
-    {
-        return fake_now->load();
-    };
+    config.boot_ms_fn = [fake_now] { return fake_now->load(); };
     config.cas_request_budget.recovery_retry_budget_ms = 1;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
     auto store = openWalkPool(backend, config);
-    ASSERT_EQ(store->liveWriterEpoch(), 3u);
-    store->setCasRetrySleepForTest([fake_now](uint64_t ms)
-    {
-        *fake_now += ms;
-    });
+    ASSERT_EQ(store->liveWriterEpoch(), 2u);
+    store->setCasRetrySleepForTest([fake_now](uint64_t ms) { *fake_now += ms; });
 
-    backend->ambiguous_cas_substr = layout.refCkptKey(life);
+    backend->ambiguous_cas_substr = ckpt_key;
     backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
+    backend->resetCounts();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
-
-    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, first_seal)))
-        << "the first recovery seal became durable before its frontier attempt";
-    EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, second_seal)))
-        << "recovery may not create a second object while the first is still above exact _ckpt";
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
-    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
-
-    /// Restart cold, without the failed mount's `NeedsRecovery` attempt. The first seal is durable but
-    /// still outside `_ckpt`; the remount must recover and certify it before it may create `{2,1}`.
+    const int stamp_attempts = kFaultsBeyondTheRetryWindow - backend->ambiguous_cas_count;
     backend->ambiguous_cas_count = 0;
-    store.reset();
-    auto cold_store = openWalkPool(backend);
-    ASSERT_EQ(cold_store->liveWriterEpoch(), 4u);
-    ASSERT_EQ(cold_store->listRefs(ns).size(), 1u);
-    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, second_seal)));
-    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, cold_remount_frontier)));
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, cold_remount_frontier);
-}
 
-/// A straggler is not an exception to the recovered-successor rule. When it materializes in the seal
-/// slot, recovery adopts it as the one object above its accepted checkpoint and must certify that exact
-/// frontier before it can create the following seal at the new `T+1`.
-TEST(CASRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingItsFollowingSeal)
-{
-    auto backend = std::make_shared<LateMaterializeBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/straggler_frontier_before_seal"};
-    const RefTxnId initial_frontier{1, 1};
-    const RefTxnId straggler{1, 2};
-    const RefTxnId following_seal{1, 3};
-
-    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/2);
-    seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
-    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
-    const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    backend->late_key = layout.refLogKey(life, straggler);
-    backend->late_bytes = sealObject(FormatId::RefLog,
-        encodeRefLogTxn(makeOrdinaryTxn(ns, straggler, "late", /*birth=*/false)));
-
-    /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the Pool
-    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
-    /// by-reference capture of a local would dangle.
-    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-    PoolConfig config = walkTestConfig();
-    config.boot_ms_fn = [fake_now]
-    {
-        return fake_now->load();
-    };
-    config.cas_request_budget.recovery_retry_budget_ms = 1;
-    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
-    config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
-    auto store = openWalkPool(backend, config);
-    store->setCasRetrySleepForTest([fake_now](uint64_t ms)
-    {
-        *fake_now += ms;
-    });
-
-    backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
-
-    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, straggler)))
-        << "the straggler occupied the recovery seal slot";
-    EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, following_seal)))
-        << "recovery may not create a seal after an adopted straggler above exact _ckpt";
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
-    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
-
-    backend->ambiguous_cas_count = 0;
-    ASSERT_EQ(store->listRefs(ns).size(), 2u);
-    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, following_seal)));
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, following_seal);
+    EXPECT_GE(stamp_attempts, 1) << "the stamp was sent";
+    EXPECT_EQ(backend->writeCount(tombstone_key), 0u) << "no tombstone follows a stamp that did not resolve";
+    EXPECT_FALSE(readAt(*backend, tombstone_key));
+    const auto ckpt = readAt(*backend, ckpt_key);
+    ASSERT_TRUE(ckpt);
+    ASSERT_TRUE(sniffHeaderLine(ckpt->bytes).has_value());
+    EXPECT_EQ(sniffHeaderLine(ckpt->bytes)->v, 1u) << "the ambiguous stamp did not land";
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "nothing is installed";
 }
 
 /// GENESIS. A namespace born at epoch 5 has no epochs 1-4 of its own: they are not "empty epochs it
@@ -1352,7 +1280,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
     const CatalogEntry successor = replaceCatalogLifeForTest(backend, layout, predecessor, UInt128{0x5152});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    createAt(*backend, layout.refCkptKey(successor_life), encodeRefCkpt(lifeEpochCkpt(2)));
+    createAt(*backend, layout.refCkptKey(successor_life), encodeRefCkptAtGeneration(lifeEpochCkpt(2), 1));
     const auto successor_ckpt_before = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_before);
     store->invalidateRemovedCatalogLife(predecessor_life);
@@ -1372,7 +1300,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
         << "no predecessor checkpoint CAS may be sent after exact retirement";
     const auto predecessor_ckpt_after = readAt(*backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after);
-    EXPECT_EQ(predecessor_ckpt_after->etag, predecessor_ckpt_before->etag);
+    EXPECT_EQ(tokenText(predecessor_ckpt_after->etag), tokenText(predecessor_ckpt_before->etag));
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the detached predecessor result was installed";
     EXPECT_EQ(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "the detached predecessor reached the recovery publication point";
@@ -1382,22 +1310,20 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
             << "predecessor recovery retargeted storage I/O into successor key " << key;
     const auto successor_ckpt_after = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_after);
-    EXPECT_EQ(successor_ckpt_after->etag, successor_ckpt_before->etag);
+    EXPECT_EQ(tokenText(successor_ckpt_after->etag), tokenText(successor_ckpt_before->etag));
     EXPECT_EQ(successor_ckpt_after->bytes, successor_ckpt_before->bytes);
 }
 
-/// Bump point 1 of the trio's two interior seams: AFTER the slot-occupy landed, BEFORE the `_ckpt` CAS.
-/// The seal is durable (it was written under a generation that was still valid), but the checkpoint must
-/// NOT advance and nothing may be installed. This is the seam a single "check the fence at entry" would
-/// miss entirely.
-TEST(CASRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoCheckpoint)
+/// Bump AFTER the tombstone landed and BEFORE the install. The tombstone is durable (it was written under a
+/// generation that was still valid), but nothing may be installed and no `_ckpt` write follows it.
+TEST(CASRefRecoveryCasWalk, FenceBumpedAfterTheTombstoneInstallsNothingAndWritesNoCkpt)
 {
     auto backend = std::make_shared<PutHookBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/bump_after_seal"};
 
     burnEpochsUpTo(backend, layout, /*target_live_epoch=*/2);
-    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 1}));
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1), 3);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
 
     auto store = openWalkPool(backend);
@@ -1410,19 +1336,22 @@ TEST(CASRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
     backend->on_key = [&] { rearmMountFenceAfterAnomalyForTest(store); };
 
     EXPECT_ANY_THROW(store->listRefs(ns));
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+    EXPECT_TRUE(readLogTxn(*backend, layout, ns, RefTxnId{1, 2}).has_value()) << "the tombstone is durable";
 
     const auto ckpt_after = readCkptForTest(backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_after.has_value());
-    EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::nullopt)
-        << "the seal is durable but the checkpoint must not record it under a generation that moved";
-    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag) << "no CAS was sent at all";
+    EXPECT_EQ(tokenText(ckpt_after->etag), tokenText(ckpt_before->etag)) << "no `_ckpt` write follows the tombstone";
+
+    backend->on_key = nullptr;
+    fenceOutMountForRemount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry through the remounted runtime installs normally";
 }
 
-/// Bump point 2: AFTER the `_ckpt` CAS, BEFORE the install. The checkpoint advance is harmless (the
-/// merge is a semantic maximum, so the retry re-derives the same or a greater value), but the STATE must
-/// not be published: this runtime's view belongs to a dead incarnation. Today there is no such recheck
-/// at all -- that gap is the whole reason this test exists.
-TEST(CASRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState)
+/// Bump AFTER the generation 3 stamp landed and BEFORE the tombstone: the stamp is harmless, the
+/// tombstone is refused before it is sent, and nothing is installed.
+TEST(CASRefRecoveryCasWalk, FenceBumpedAfterTheStampWritesNoTombstoneAndInstallsNothing)
 {
     auto backend = std::make_shared<PutHookBackend>();
     const Layout layout("p");
@@ -1435,17 +1364,17 @@ TEST(CASRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    /// The `_ckpt` CAS is the LAST write recovery performs, so hooking it fires strictly between the
-    /// checkpoint advance and the install recheck.
     backend->watched_substr = "/_ckpt";
     backend->on_key = [&] { rearmMountFenceAfterAnomalyForTest(store); };
 
-    EXPECT_ANY_THROW(store->listRefs(ns)) << "the install recheck must refuse a result from a moved generation";
+    EXPECT_ANY_THROW(store->listRefs(ns)) << "a recovery whose generation moved must install nothing";
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
 
     const auto ckpt_after = readCkptForTest(backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_after.has_value());
-    EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::optional<RefTxnId>(RefTxnId{1, 2}))
-        << "the checkpoint advance already landed and is harmless -- the merge is a semantic maximum";
+    EXPECT_EQ(ckpt_after->ckpt.generation, 3u) << "the stamp landed before the generation moved";
+    EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{1, 2}).has_value())
+        << "no tombstone is sent under a generation that moved";
 
     backend->on_key = nullptr;
     fenceOutMountForRemount(*backend, layout.mountKey("test"));
@@ -1685,221 +1614,34 @@ TEST(CASRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
         << "only a completed recovery install returns the lane to Ready";
 }
 
-TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAndPublishesItsFrontier)
-{
-    auto backend = std::make_shared<HidingListBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/recovery_one_successor"};
-    auto store = openWalkPool(backend);
-
-    ASSERT_NO_THROW(store->appendRefOps(ns, MutationScope::ref("a"),
-        [](const RefTableState & state)
-        {
-            std::vector<RefOp> ops;
-            if (state.getLifecycle() != RefLifecycle::Live)
-                ops.push_back(namespaceBirthOp());
-            for (const RefOp & op : publishCommittedOps("a", manifestRef(1, 1, 1)))
-                ops.push_back(op);
-            return ops;
-        }, RootMutationOrigin::Writer, RootMutationKind::Publish));
-
-    const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    const String ckpt_key = layout.refCkptKey(life);
-    ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
-    auto clock = VirtualRetryClock::installOn(store);
-    backend->ambiguous_cas_substr = ckpt_key;
-    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
-    {
-        store->appendRefOps(ns, MutationScope::ref("b"),
-            [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
-            RootMutationOrigin::Writer, RootMutationKind::Publish);
-    });
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the reissues must pace through the injected sleep, never a real one";
-    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    ASSERT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 2})))
-        << "the sole deterministic successor must be durable before recovery";
-    ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
-
-    backend->ambiguous_cas_count = 0;
-    const auto refs = store->listRefs(ns);
-
-    EXPECT_TRUE(refs.contains("b"));
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 2}))
-        << "the successor is not installable until the current admitted fence publishes its frontier";
-}
-
-TEST(CASRefRecoveryCasWalk, ColdWriterRecoveryPublishesOneExactUnfrontieredSuccessorBeforeSealing)
+/// A restart has no in-memory attempt: the cold writer finds the durable unacknowledged append on the
+/// chain, and its first append closes the epoch after it. A `NeedsRecovery` lane holds nothing in flight,
+/// so the farewell is clean and the read writes nothing.
+TEST(CASRefRecoveryCasWalk, ColdWriterRecoveryAdoptsTheDurableUnacknowledgedAppendBeforeItsTombstone)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/recovery_cold_successor"};
     auto store = openWalkPool(backend);
-    const NamespaceLifeId life = strandOneUnfrontieredSuccessor(backend, store, layout, ns);
+    const NamespaceLifeId life = strandOneDurableUnacknowledgedAppend(backend, store, layout, ns);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     store.reset();
-    std::vector<RefCkpt> checkpoint_cas_bodies;
-    backend->before_cas_put = [&](const String & key, const String & bytes, const std::optional<String> &)
-    {
-        if (key == layout.refCkptKey(life))
-            checkpoint_cas_bodies.push_back(decodeRefCkpt(bytes));
-    };
 
-    /// A remount/process restart has no in-memory `RefAppendAttempt`; the writer recovery entry point
-    /// still owns its one exact F+1 adoption duty from the durable checkpoint and log alone.
     auto cold_store = openWalkPool(backend);
+    ASSERT_EQ(cold_store->liveEpochPairForTest(), (LiveEpochPair{2, 0}));
     const auto refs = cold_store->listRefs(ns);
 
     EXPECT_TRUE(refs.contains("b"));
     EXPECT_EQ(cold_store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_TRUE(std::any_of(checkpoint_cas_bodies.begin(), checkpoint_cas_bodies.end(),
-        [](const RefCkpt & ckpt) { return ckpt.committed_through == std::make_optional(RefTxnId{1, 2}); }))
-        << "the exact F+1 frontier must publish before the remount seals its dead epoch";
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 3}));
-}
-
-TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochOnlyCheckpoint)
-{
-    auto backend = std::make_shared<HidingListBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/recovery_first_unfrontiered"};
-    auto store = openWalkPool(backend);
-
-    /// Create the catalog life explicitly, then retain exactly the checkpoint fragment published by
-    /// production birth before its first log. This makes `{1,1}` the first durable transaction above a
-    /// readable checkpoint whose `committed_through` is absent.
-    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
-    const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(lifeEpochCkpt(1)));
-    ASSERT_TRUE(readCkptForTest(backend, layout, life)->ckpt.life_epoch);
-    ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
-
-    auto clock = VirtualRetryClock::installOn(store);
-    backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
-    {
-        store->appendRefOps(ns, MutationScope::ref("a"),
-            [](const RefTableState & state)
-            {
-                std::vector<RefOp> ops;
-                if (state.getLifecycle() != RefLifecycle::Live)
-                    ops.push_back(namespaceBirthOp());
-                for (const RefOp & op : publishCommittedOps("a", manifestRef(1, 1, 1)))
-                    ops.push_back(op);
-                return ops;
-            }, RootMutationOrigin::Writer, RootMutationKind::Publish);
-    });
-    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    ASSERT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 1})));
-    ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
-    ASSERT_FALSE(readAt(*backend, layout.refSnapshotKey(life, RefTxnId{1, 1})))
-        << "the grounding test must exercise the exact log successor, not a hinted snapshot";
-
-    backend->ambiguous_cas_count = 0;
-    const auto refs = store->listRefs(ns);
-
-    EXPECT_TRUE(refs.contains("a"));
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
-}
-
-TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPrivateCandidate)
-{
-    auto backend = std::make_shared<HidingListBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/recovery_checkpoint_moves"};
-    auto store = openWalkPool(backend);
-    const NamespaceLifeId life = strandOneUnfrontieredSuccessor(backend, store, layout, ns);
-    const String ckpt_key = layout.refCkptKey(life);
-    const RefLogTxn later = makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/false);
-    bool injected = false;
-
-    /// Recovery has fetched `{1,2}` and proved `{1,3}` absent. Another admitted writer can then append
-    /// `{1,3}` and publish its frontier before recovery's own checkpoint CAS. The stale private
-    /// candidate contains only `b`; it must restart and replay `c`, not accept an `IdenticalSkip` and
-    /// install below the exact checkpoint it just observed.
-    /// The hook captures locals declared after the store, and the store's teardown still performs
-    /// checkpoint writes, so the hook is cleared before those locals die.
-    SCOPE_EXIT({ backend->before_cas_put = {}; });
-    backend->before_cas_put = [&](const String & key, const String &, const std::optional<String> & expected)
-    {
-        if (injected || key != ckpt_key)
-            return;
-        injected = true;
-        ASSERT_TRUE(expected);
-        createAt(*backend, layout.refLogKey(life, later.txn_id),
-                 sealObject(FormatId::RefLog, encodeRefLogTxn(later)));
-        OperationForTest op(*backend);
-        const auto current = (*op).read(key, Retry::once());
-        ASSERT_TRUE(current);
-        /// `expected` is the raw transport value the publisher is presenting; `PersistedEtag::capture`
-        /// re-derives the same raw value from the minted incarnation, so the two compare.
-        ASSERT_EQ(PersistedEtag::capture(current->etag).value, *expected);
-        const RefCkpt advanced = mergeCkpt(
-            decodeRefCkpt(current->bytes),
-            RefCkpt{.life_epoch = std::nullopt,
-                    .committed_through = later.txn_id,
-                    .checkpoint_snapshot_id = std::nullopt,
-                    .last_epoch_seal = std::nullopt});
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(key, encodeRefCkpt(advanced), current->etag, Retry::once())));
-    };
-
-    const auto refs = store->listRefs(ns);
-
-    EXPECT_TRUE(injected);
-    EXPECT_TRUE(refs.contains("b"));
-    EXPECT_TRUE(refs.contains("c")) << "recovery must restart from the newer exact frontier";
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, later.txn_id);
-}
-
-TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterExactCheckpointReread)
-{
-    auto backend = std::make_shared<HidingListBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/recovery_two_successors"};
-    auto store = openWalkPool(backend);
-
-    ASSERT_NO_THROW(store->appendRefOps(ns, MutationScope::ref("a"),
-        [](const RefTableState & state)
-        {
-            std::vector<RefOp> ops;
-            if (state.getLifecycle() != RefLifecycle::Live)
-                ops.push_back(namespaceBirthOp());
-            for (const RefOp & op : publishCommittedOps("a", manifestRef(1, 1, 1)))
-                ops.push_back(op);
-            return ops;
-        }, RootMutationOrigin::Writer, RootMutationKind::Publish));
-
-    const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    const String ckpt_key = layout.refCkptKey(life);
-    auto clock = VirtualRetryClock::installOn(store);
-    backend->ambiguous_cas_substr = ckpt_key;
-    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
-    {
-        store->appendRefOps(ns, MutationScope::ref("b"),
-            [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
-            RootMutationOrigin::Writer, RootMutationKind::Publish);
-    });
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the reissues must pace through the injected sleep, never a real one";
-    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-
-    const RefLogTxn second_successor = makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/false);
-    createAt(*backend, layout.refLogKey(life, second_successor.txn_id),
-             sealObject(FormatId::RefLog, encodeRefLogTxn(second_successor)));
-    backend->ambiguous_cas_count = 0;
-
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}))
-        << "corruption must not launder either successor into the frontier";
+    EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3})));
+    cold_store->appendRefOps(ns, MutationScope::ref("c"),
+        [](const RefTableState &) { return publishCommittedOps("c", manifestRef(2, 1, 1)); },
+        RootMutationOrigin::Writer, RootMutationKind::Publish);
+    const auto tombstone = readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}));
+    ASSERT_TRUE(tombstone);
+    const RefLogTxn decoded = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns.string(), RefTxnId{1, 3});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(decoded));
+    EXPECT_EQ(decoded.next_epoch, std::optional<uint64_t>{2});
 }
 
 TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheRetainedSuccessorSlot)
@@ -1908,7 +1650,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
     const Layout layout("p");
     const RootNamespace ns{"srv1/recovery_different_successor"};
     auto store = openWalkPool(backend);
-    const NamespaceLifeId life = strandOneUnfrontieredSuccessor(backend, store, layout, ns);
+    const NamespaceLifeId life = strandOneDurableUnacknowledgedAppend(backend, store, layout, ns);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const String successor_key = layout.refLogKey(life, RefTxnId{1, 2});
@@ -1922,9 +1664,11 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
             original->etag, Retry::once())));
     }
 
+    const auto ckpt_before = readCkptForTest(backend, layout, life);
+    ASSERT_TRUE(ckpt_before);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
+    EXPECT_EQ(tokenText(readCkptForTest(backend, layout, life)->etag), tokenText(ckpt_before->etag)) << "a refused recovery writes no `_ckpt`";
 }
 
 TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorSeal)
@@ -1933,28 +1677,27 @@ TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorS
     const Layout layout("p");
     const RootNamespace ns{"srv1/recovery_successor_seal"};
     auto store = openWalkPool(backend);
-    const NamespaceLifeId life = strandOneUnfrontieredSuccessor(backend, store, layout, ns);
+    const NamespaceLifeId life = strandOneDurableUnacknowledgedAppend(backend, store, layout, ns);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const RefTxnId successor_id{1, 2};
     const String successor_key = layout.refLogKey(life, successor_id);
     const auto original = readAt(*backend, successor_key);
     ASSERT_TRUE(original);
-    const RefLogTxn successor_seal = makeSealTxn(ns, successor_id);
+    const RefLogTxn successor_tombstone = tombstoneTxn(ns.string(), successor_id, 2);
     {
         OperationForTest op(*backend);
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(successor_key,
-            sealObject(FormatId::RefLog, encodeRefLogTxn(successor_seal)),
+            sealObject(FormatId::RefLog, encodeRefLogTxn(successor_tombstone)),
             original->etag, Retry::once())));
     }
 
     const auto refs = store->listRefs(ns);
 
-    EXPECT_FALSE(refs.contains("b")) << "the old writer's retained ordinary bytes lost at the sealed slot";
+    EXPECT_FALSE(refs.contains("b")) << "the old writer's retained ordinary bytes lost at the tombstone's slot";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(successor_id));
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, successor_id);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.last_epoch_seal, successor_id);
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed)
+        << "the tombstone names an epoch above this mount's: the lane is deposed";
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -2194,3 +1937,1474 @@ TEST(CASRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredece
 /// C++ virtual dispatch), not a claim any production change could falsify. `PutHookBackend` and
 /// `HidingListBackend` are still exercised together, on real recovery-walk scenarios, elsewhere in this
 /// file (search for `PutHookBackend>`).
+
+/// The request sequence of writer recovery over an old-format `_ckpt`, a log above its frontier and two
+/// epochs that never wrote the namespace: the walk to the first absent key, the stamp, one tombstone
+/// that names the live epoch, and the final compare.
+TEST(CASRefRecoveryCasWalk, RecoveryRequestSequenceStampsThenWritesOneTombstone)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/request_sequence"};
+
+    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/4);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
+
+    auto store = openWalkPool(backend);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String log_key = layout.refLogKey(life, RefTxnId{1, 1});
+    const String stream_prefix = log_key.substr(0, log_key.find("_log/"));
+    const String ckpt_key = layout.refCkptKey(life);
+
+    backend->clearJournal();
+    const uint64_t stamped_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped];
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
+    EXPECT_EQ(store->listRefs(ns).size(), 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped] - stamped_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed] - sealed_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 0u);
+
+    std::vector<std::pair<String, String>> requests;
+    for (const auto & [method, key] : backend->journal())
+    {
+        if (key == ckpt_key)
+            requests.emplace_back(method, "_ckpt");
+        else if (key.starts_with(stream_prefix))
+            requests.emplace_back(method, key.substr(stream_prefix.size()));
+    }
+    const std::vector<std::pair<String, String>> expected{
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000001-0000000000000001.zst"},
+        {"GET", "_log/0000000000000001-0000000000000002.zst"},
+        {"GET", "_log/0000000000000001-0000000000000003.zst"},
+        {"GET", "_log/0000000000000001-0000000000000004.zst"},
+        {"CAS", "_ckpt"},
+        {"PUT", "_log/0000000000000001-0000000000000004.zst"},
+        {"GET", "_ckpt"},
+    };
+    EXPECT_EQ(requests, expected);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+}
+
+/// ---------------------------------------------------------------------------------------------
+/// Generation 3: one-request append, forward-linked tombstones, uniform genesis
+/// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+RefCkpt gen3Ckpt(uint64_t life_epoch, std::optional<RefTxnId> snapshot = std::nullopt)
+{
+    return RefCkpt{.life_epoch = life_epoch, .committed_through = std::nullopt,
+                   .checkpoint_snapshot_id = snapshot, .last_epoch_seal = std::nullopt};
+}
+
+/// One positive append that publishes `ref`, prepending the birth on a never-born stream.
+RefTxnId publishRefForTest(const PoolPtr & store, const RootNamespace & ns, const String & ref, ManifestRef manifest)
+{
+    return store->appendRefOps(ns, MutationScope::ref(ref),
+        [ref, manifest](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(namespaceBirthOp());
+            for (const RefOp & op : publishCommittedOps(ref, manifest))
+                ops.push_back(op);
+            return ops;
+        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
+}
+
+/// Writes `txn` at its key with the header `encodeRefLogTxn` stamps.
+void createTxnAt(Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefLogTxn & txn)
+{
+    createAt(backend, layout.refLogKey(life, txn.txn_id), sealObject(FormatId::RefLog, encodeRefLogTxn(txn)));
+}
+
+uint32_t storedLogHeader(Backend & backend, const Layout & layout, const NamespaceLifeId & life, RefTxnId id)
+{
+    const auto got = readAt(backend, layout.refLogKey(life, id));
+    if (!got)
+        return 0;
+    const auto header = sniffHeaderLine(openObject(FormatId::RefLog, got->bytes));
+    return header ? header->v : 0;
+}
+
+uint32_t storedCkptHeader(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    const auto got = readAt(backend, layout.refCkptKey(life));
+    if (!got)
+        return 0;
+    const auto header = sniffHeaderLine(got->bytes);
+    return header ? header->v : 0;
+}
+
+std::optional<RefLogTxn> readLogTxnOfLife(Backend & backend, const Layout & layout, const NamespaceLifeId & life, RefTxnId id)
+{
+    const auto got = readAt(backend, layout.refLogKey(life, id));
+    if (!got)
+        return std::nullopt;
+    return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), life.ns.string(), id);
+}
+
+bool isTombstoneTo(const std::optional<RefLogTxn> & txn, uint64_t next_epoch)
+{
+    return txn && refLogTxnIsEpochSeal(*txn) && txn->next_epoch == std::optional<uint64_t>{next_epoch};
+}
+
+/// Every log id of `life` whose epoch lies in `[from, to]`.
+std::vector<RefTxnId> logIdsInEpochs(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
+                                     uint64_t from, uint64_t to)
+{
+    OperationForTest op(backend);
+    std::vector<RefTxnId> ids;
+    String cursor;
+    do
+    {
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
+        for (const ListedKey & listed : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(listed.key);
+            if (parsed && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch >= from
+                && parsed->txn_id.writer_epoch <= to)
+                ids.push_back(parsed->txn_id);
+        }
+        cursor = page.next_cursor;
+    } while (!cursor.empty());
+    return ids;
+}
+
+/// Allocates `n` durable writer epochs past whatever is already allocated.
+void burnMoreEpochs(const BackendPtr & backend, const Layout & layout, uint64_t n)
+{
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    CasOperation op = requests.admit();
+    for (uint64_t i = 0; i < n; ++i)
+        allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
+}
+
+/// Two logs `{1,1}` (birth of "a") and `{1,2}` ("b") under a generation 3 `_ckpt` of life epoch 1.
+NamespaceLifeId seedTwoRecordChain(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+{
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedCkpt(*backend, layout, ns, gen3Ckpt(1), 3);
+    return catalogLife(backend, layout, ns);
+}
+
+}
+
+TEST(CASRefWriterTombstone, LaneStampMismatchNeedsRecovery)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/lane_stamp_mismatch"};
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1), 1);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+    const auto writes_to_ns = [&]
+    {
+        size_t n = 0;
+        for (const auto & [method, key] : backend->journal())
+            n += (method == "PUT" || method == "CAS") && (key == ckpt_key || key.starts_with(log_prefix)) ? 1 : 0;
+        return n;
+    };
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 1u);
+    backend->clearJournal();
+    EXPECT_TRUE(store->listRefs(ns).empty());
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+    EXPECT_EQ(writes_to_ns(), 0u) << "a recovery whose chain is in the live epoch writes nothing";
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 1u);
+
+    bool armed = true;
+    backend->before_cas_put = [&](const String & key, const String &, const std::optional<String> &)
+    {
+        if (!armed || key != ckpt_key)
+            return;
+        armed = false;
+        const auto current = readAt(*backend, ckpt_key);
+        ASSERT_TRUE(current);
+        ASSERT_TRUE(replaceForTest(backend, ckpt_key, encodeRefCkptAtGeneration(lifeEpochCkpt(1), 1), current->etag));
+    };
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "a", manifestRef(1, 1, 1)); });
+    backend->before_cas_put = nullptr;
+    EXPECT_FALSE(armed);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 1, 1).empty()) << "no log is written before the stamp";
+
+    backend->clearJournal();
+    publishRefForTest(store, ns, "a", manifestRef(1, 1, 1));
+    const auto journal = backend->journal();
+    const auto stamp = std::find(journal.begin(), journal.end(), std::make_pair(String("CAS"), ckpt_key));
+    const auto first_log = std::find_if(journal.begin(), journal.end(),
+        [&](const auto & entry) { return entry.first == "PUT" && entry.second.starts_with(log_prefix); });
+    ASSERT_NE(stamp, journal.end());
+    ASSERT_NE(first_log, journal.end());
+    EXPECT_LT(stamp - journal.begin(), first_log - journal.begin());
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 3u);
+}
+
+TEST(CASRefWriterTombstone, LaneStampUnresolvedNeedsRecovery)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/lane_stamp_unresolved"};
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1), 1);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 1u);
+    EXPECT_TRUE(store->listRefs(ns).empty());
+
+    backend->ambiguous_cas_substr = layout.refCkptKey(life);
+    backend->ambiguous_cas_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "a", manifestRef(1, 1, 1)); });
+    EXPECT_EQ(backend->ambiguous_cas_count, 0);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 1, 1).empty());
+
+    publishRefForTest(store, ns, "a", manifestRef(1, 1, 1));
+    EXPECT_TRUE(store->listRefs(ns).contains("a"));
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 3u);
+}
+
+TEST(CASRefWriterTombstone, FirstAppendOfAnEpochWritesTombstoneThenHead)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/tombstone_then_head"};
+    burnEpochsUpTo(backend, layout, 4);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    publishRefForTest(store, ns, "c", manifestRef(4, 1, 1));
+
+    const auto tombstone = readLogTxn(*backend, layout, ns, RefTxnId{1, 3});
+    EXPECT_TRUE(isTombstoneTo(tombstone, 4));
+    EXPECT_EQ(storedLogHeader(*backend, layout, life, RefTxnId{1, 3}), 3u);
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{4, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    EXPECT_EQ(storedLogHeader(*backend, layout, life, RefTxnId{4, 1}), 3u);
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 3).empty());
+}
+
+TEST(CASRefWriterAppendLane, FirstHeadAfterATombstonePreviewsAndAppendsWithItsBacklink)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/head_previews"};
+    burnEpochsUpTo(backend, layout, 4);
+    seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    EXPECT_NO_THROW(publishRefForTest(store, ns, "c", manifestRef(4, 1, 1)));
+    EXPECT_NO_THROW(publishRefForTest(store, ns, "d", manifestRef(4, 2, 1)));
+    const auto second = readLogTxn(*backend, layout, ns, RefTxnId{4, 2});
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->prev_epoch_seal, std::nullopt);
+    EXPECT_TRUE(store->listRefs(ns).contains("d"));
+}
+
+TEST(CASRefWriterTombstone, BacklinkSkipsEpochsThatNeverOpenedTheNamespace)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/backlink_skips"};
+    burnEpochsUpTo(backend, layout, 6);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+    publishRefForTest(store, ns, "c", manifestRef(6, 1, 1));
+
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 6));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{6, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 5).empty());
+}
+
+TEST(CASRefWriterTombstone, TombstoneOnlyEpochIsClosedAtItsFirstSlot)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/tombstone_only_epoch"};
+    burnEpochsUpTo(backend, layout, 6);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+    createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 3}, 4));
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+    publishRefForTest(store, ns, "c", manifestRef(6, 1, 1));
+
+    const auto closing = readLogTxn(*backend, layout, ns, RefTxnId{4, 1});
+    EXPECT_TRUE(isTombstoneTo(closing, 6));
+    ASSERT_TRUE(closing);
+    EXPECT_EQ(closing->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{6, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{4, 1}));
+}
+
+TEST(CASRefWriterTombstone, LatePredecessorAppendIsAdoptedAndTheTombstoneMovesOneSlot)
+{
+    auto backend = std::make_shared<LateMaterializeBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/late_append_adopted"};
+    burnEpochsUpTo(backend, layout, 4);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+    backend->late_key = layout.refLogKey(life, RefTxnId{1, 3});
+    backend->late_bytes = sealObject(FormatId::RefLog,
+        encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{1, 3}, "late", /*birth=*/false)));
+
+    auto store = openWalkPool(backend);
+    const auto refs = store->listRefs(ns);
+    EXPECT_TRUE(backend->late_key.empty()) << "the late append must land between the read and the create";
+    EXPECT_TRUE(refs.contains("late"));
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 4}), 4));
+}
+
+TEST(CASRefWriterTombstone, LatePredecessorTombstoneIsAdoptedAndTheNextOneLinksToIt)
+{
+    auto backend = std::make_shared<LateMaterializeBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/late_tombstone_adopted"};
+    burnEpochsUpTo(backend, layout, 6);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+    backend->late_key = layout.refLogKey(life, RefTxnId{1, 3});
+    backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(tombstoneTxn(ns.string(), RefTxnId{1, 3}, 4)));
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_TRUE(backend->late_key.empty());
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 4));
+    const auto next = readLogTxn(*backend, layout, ns, RefTxnId{4, 1});
+    EXPECT_TRUE(isTombstoneTo(next, 6));
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+}
+
+TEST(CASRefWriterTombstone, NewerTombstoneClosesTheLane)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/newer_tombstone_append"};
+    burnEpochsUpTo(backend, layout, 4);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    publishRefForTest(store, ns, "c", manifestRef(4, 1, 1));
+    ASSERT_TRUE(readLogTxn(*backend, layout, ns, RefTxnId{4, 1}));
+    createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{4, 2}, 7));
+
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishRefForTest(store, ns, "d", manifestRef(4, 2, 1)); });
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
+
+    const RootNamespace recovered_ns{"srv1/newer_tombstone_recovery"};
+    const NamespaceLifeId recovered_life = seedTwoRecordChain(backend, layout, recovered_ns);
+    createTxnAt(*backend, layout, recovered_life, tombstoneTxn(recovered_ns.string(), RefTxnId{1, 3}, 7));
+    const uint64_t writes = backend->writeTotal();
+    EXPECT_EQ(store->listRefs(recovered_ns).size(), 2u);
+    EXPECT_EQ(store->laneStateForTest(recovered_ns), RefLaneState::Closed);
+    EXPECT_EQ(backend->writeTotal(), writes) << "a recovery that finds the chain in a later epoch writes nothing";
+}
+
+TEST(CASRefWriterTombstone, TerminalOccupantEndsTheStream)
+{
+    auto backend = std::make_shared<LateMaterializeBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/terminal_occupant"};
+    burnEpochsUpTo(backend, layout, 4);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+    RefLogTxn removal;
+    removal.ns = ns.string();
+    removal.txn_id = RefTxnId{1, 3};
+    removal.ops = {DB::Cas::tests::ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "a", manifestRef(1, 1, 1u)}, std::nullopt),
+                   DB::Cas::tests::ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "b", manifestRef(1, 2, 1u)}, std::nullopt),
+                   removeNamespaceOp()};
+    backend->late_key = layout.refLogKey(life, RefTxnId{1, 3});
+    backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(removal));
+
+    auto store = openWalkPool(backend);
+    EXPECT_TRUE(store->listRefs(ns).empty());
+    EXPECT_TRUE(backend->late_key.empty());
+    EXPECT_TRUE(store->refTableRecoveredForTest(ns));
+    const auto occupant = readLogTxn(*backend, layout, ns, RefTxnId{1, 3});
+    ASSERT_TRUE(occupant);
+    EXPECT_FALSE(refLogTxnIsEpochSeal(*occupant));
+    EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{1, 4})) << "no key after a terminal record";
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 4).empty());
+}
+
+TEST(CASRefWriterRecovery, DeadEpochIsSealedInOneWriteWithoutACkptWrite)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/dead_epoch_one_write"};
+    burnEpochsUpTo(backend, layout, 4);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 2},
+        {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1))}));
+    seedCkpt(*backend, layout, ns, gen3Ckpt(1, RefTxnId{1, 2}), 3);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    backend->resetCounts();
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    EXPECT_EQ(backend->getCount(ckpt_key), 2u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 3})), 1u);
+    EXPECT_EQ(backend->writeCount(layout.refLogKey(life, RefTxnId{1, 3})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 3u) << "two of the cold admission, one confirmation";
+    EXPECT_EQ(backend->writeCount(ckpt_key), 0u);
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 4));
+}
+
+TEST(CASRefWriterRecovery, UnresolvedTombstoneInstallsNothing)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/unresolved_tombstone"};
+    burnEpochsUpTo(backend, layout, 2);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, ns, gen3Ckpt(1), 3);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    PoolConfig config = walkTestConfig();
+    config.boot_ms_fn = [fake_now] { return fake_now->load(); };
+    auto store = openWalkPool(backend, config);
+    store->setCasRetrySleepForTest([fake_now](uint64_t ms) { *fake_now += ms; });
+    backend->ambiguous_put_substr = layout.refLogKey(life, RefTxnId{1, 2});
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+    EXPECT_GE(backend->ambiguous_put_attempts.load(), 1u);
+}
+
+TEST(CASRefWriterRecovery, StampsCkptBeforeTheFirstNewWrite)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    burnEpochsUpTo(backend, layout, 4);
+
+    const RootNamespace framed{"srv1/stamp_framed"};
+    seedTxn(*backend, layout, framed, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, framed, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedCkpt(*backend, layout, framed, lifeEpochCkpt(1, RefTxnId{1, 2}), 1);
+    const NamespaceLifeId framed_life = catalogLife(backend, layout, framed);
+
+    const RootNamespace bare{"srv1/stamp_bare"};
+    seedTxn(*backend, layout, bare, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, bare, lifeEpochCkpt(1), 1);
+    const NamespaceLifeId bare_life = catalogLife(backend, layout, bare);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    backend->clearJournal();
+    EXPECT_EQ(store->listRefs(framed).size(), 2u);
+
+    const auto journal = backend->journal();
+    const String ckpt_key = layout.refCkptKey(framed_life);
+    const auto stamp = std::find(journal.begin(), journal.end(), std::make_pair(String("CAS"), ckpt_key));
+    const auto tombstone = std::find(journal.begin(), journal.end(),
+        std::make_pair(String("PUT"), layout.refLogKey(framed_life, RefTxnId{1, 3})));
+    ASSERT_NE(stamp, journal.end());
+    ASSERT_NE(tombstone, journal.end());
+    EXPECT_LT(stamp - journal.begin(), tombstone - journal.begin());
+    EXPECT_EQ(storedCkptHeader(*backend, layout, framed_life), 3u);
+    const auto stamped = readCkptForTest(backend, layout, framed_life);
+    ASSERT_TRUE(stamped);
+    RefCkpt expected = gen3Ckpt(1);
+    expected.generation = 3;
+    EXPECT_EQ(stamped->ckpt, expected) << "the stamp keeps life_epoch and drops the old frontier";
+
+    EXPECT_EQ(store->listRefs(bare).size(), 1u);
+    EXPECT_EQ(storedCkptHeader(*backend, layout, bare_life), 3u) << "the stamp compares the generation, not the fields";
+}
+
+TEST(CASRefWriterRecovery, RestartsWhenTheBaseMovesUnderTheWalk)
+{
+    auto backend = std::make_shared<GetSeamBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/base_moves_under_walk"};
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+    backend->watched_substr = layout.refLogKey(life, RefTxnId{1, 3});
+    backend->on_key = [&](const String &)
+    {
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 2},
+            {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1))}));
+        const auto current = readCkptForTest(backend, layout, life);
+        ASSERT_TRUE(current);
+        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life),
+            encodeRefCkptAtGeneration(gen3Ckpt(1, RefTxnId{1, 2}), 3), current->etag));
+    };
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 1u);
+    const auto refs = store->listRefs(ns);
+    EXPECT_FALSE(backend->on_key);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 1u);
+    EXPECT_EQ(refs.size(), 2u);
+    EXPECT_TRUE(refs.contains("a"));
+    EXPECT_TRUE(refs.contains("b"));
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::make_optional(RefTxnId{1, 2}));
+}
+
+TEST(CASRefWriterRecovery, RestartsWhenTheBaseMovesUnderTheTombstoneCreate)
+{
+    const Layout layout("p");
+    {
+        auto backend = std::make_shared<AfterGetHookBackend>();
+        const RootNamespace ns{"srv1/base_moves_under_tombstone"};
+        burnEpochsUpTo(backend, layout, 4);
+        const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+        size_t fired = 0;
+        backend->watched_key = layout.refLogKey(life, RefTxnId{1, 3});
+        backend->after_get = [&]
+        {
+            ++fired;
+            createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/false));
+            createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{1, 4}, "d", /*birth=*/false));
+            writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 4},
+                {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1)),
+                 committedRow("c", manifestRef(1, 3, 1)), committedRow("d", manifestRef(1, 4, 1))}));
+            const auto current = readCkptForTest(backend, layout, life);
+            ASSERT_TRUE(current);
+            ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life),
+                encodeRefCkptAtGeneration(gen3Ckpt(1, RefTxnId{1, 4}), 3), current->etag));
+            OperationForTest op(*backend);
+            ASSERT_EQ((*op).removeCurrent(layout.refLogKey(life, RefTxnId{1, 3}), Retry::once()), Removal::Removed);
+        };
+
+        auto store = openWalkPool(backend);
+        ASSERT_EQ(store->liveWriterEpoch(), 4u);
+        const auto refs = store->listRefs(ns);
+        EXPECT_EQ(fired, 1u);
+        EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 1u);
+        EXPECT_TRUE(refs.contains("c"));
+        EXPECT_TRUE(refs.contains("d"));
+        EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 5}), 4));
+    }
+    {
+        auto backend = std::make_shared<AfterGetHookBackend>();
+        const RootNamespace ns{"srv1/base_stays_under_tombstone"};
+        burnEpochsUpTo(backend, layout, 4);
+        seedTwoRecordChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+        EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+        EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 4));
+    }
+}
+
+TEST(CASRefWriterRecovery, FollowsOldSealsByPlusOneAndLinksAfterThem)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/old_seals_then_tombstone"};
+    burnEpochsUpTo(backend, layout, 5);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1), 1);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    createAt(*backend, layout.refLogKey(life, RefTxnId{1, 2}),
+        sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(makeSealTxn(ns, RefTxnId{1, 2}), 1)));
+    createAt(*backend, layout.refLogKey(life, RefTxnId{2, 1}),
+        sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(makeSealTxn(ns, RefTxnId{2, 1}, RefTxnId{1, 2}), 1)));
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 5u);
+    publishRefForTest(store, ns, "b", manifestRef(5, 1, 1));
+
+    const auto closing = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    EXPECT_TRUE(isTombstoneTo(closing, 5));
+    ASSERT_TRUE(closing);
+    EXPECT_EQ(closing->prev_epoch_seal, std::make_optional(RefTxnId{2, 1}));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{5, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{3, 1}));
+}
+
+TEST(CASRefWriterGenesis, BirthInALaterEpochSealsTheCreationSlotAndWritesNoCkpt)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/birth_in_later_epoch"};
+    burnEpochsUpTo(backend, layout, 2);
+    NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    {
+        auto creator = openWalkPool(backend);
+        ASSERT_EQ(creator->liveWriterEpoch(), 2u);
+        life = creator->namespaceLife(ns);
+    }
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 3u);
+    const auto created = readCkptForTest(backend, layout, life);
+    ASSERT_TRUE(created);
+    EXPECT_EQ(created->ckpt.life_epoch, std::optional<uint64_t>{2});
+    burnMoreEpochs(backend, layout, 2);
+    const uint64_t ckpt_writes = backend->writeCount(layout.refCkptKey(life));
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 5u);
+    publishRefForTest(store, ns, "a", manifestRef(5, 1, 1));
+
+    const auto genesis = readLogTxnOfLife(*backend, layout, life, RefTxnId{2, 1});
+    EXPECT_TRUE(isTombstoneTo(genesis, 5));
+    ASSERT_TRUE(genesis);
+    EXPECT_EQ(genesis->prev_epoch_seal, std::nullopt);
+    const auto birth = readLogTxnOfLife(*backend, layout, life, RefTxnId{5, 1});
+    ASSERT_TRUE(birth);
+    EXPECT_EQ(birth->prev_epoch_seal, std::make_optional(RefTxnId{2, 1}));
+    EXPECT_EQ(backend->writeCount(layout.refCkptKey(life)), ckpt_writes);
+    EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.life_epoch, std::optional<uint64_t>{2});
+}
+
+TEST(CASRefWriterGenesis, LateBirthOfAPredecessorIsAdoptedOrRefused)
+{
+    const Layout layout("p");
+    {
+        auto backend = std::make_shared<LateMaterializeBackend>();
+        const RootNamespace ns{"srv1/late_birth_adopted"};
+        burnEpochsUpTo(backend, layout, 5);
+        DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+        seedCkpt(*backend, layout, ns, gen3Ckpt(2), 3);
+        const NamespaceLifeId life = catalogLife(backend, layout, ns);
+        backend->late_key = layout.refLogKey(life, RefTxnId{2, 1});
+        backend->late_bytes = sealObject(FormatId::RefLog,
+            encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{2, 1}, "late", /*birth=*/true)));
+
+        auto store = openWalkPool(backend);
+        ASSERT_EQ(store->liveWriterEpoch(), 5u);
+        EXPECT_TRUE(store->listRefs(ns).contains("late"));
+        EXPECT_TRUE(backend->late_key.empty());
+        EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{2, 2}), 5));
+    }
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/late_birth_refused"};
+        burnEpochsUpTo(backend, layout, 2);
+        DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+        seedCkpt(*backend, layout, ns, gen3Ckpt(2), 3);
+        const NamespaceLifeId life = catalogLife(backend, layout, ns);
+
+        auto store = openWalkPool(backend);
+        ASSERT_EQ(store->liveWriterEpoch(), 2u);
+        EXPECT_TRUE(store->listRefs(ns).empty());
+        createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{2, 1}, 5));
+        expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishRefForTest(store, ns, "late", manifestRef(2, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
+        EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{2, 1}), 5));
+    }
+}
+
+TEST(CASRefWriterGenesis, RecreatedNamespaceStartsItsOwnChain)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/recreated"};
+    burnEpochsUpTo(backend, layout, 2);
+
+    NamespaceLifeId first = DB::Cas::tests::fixture::fixtureLife(ns);
+    {
+        auto store = openWalkPool(backend);
+        ASSERT_EQ(store->liveWriterEpoch(), 2u);
+        publishRefForTest(store, ns, "a", manifestRef(2, 1, 1));
+        first = catalogLife(backend, layout, ns);
+        store->dropNamespace(ns);
+    }
+    const auto snapshotOfLife = [&](const NamespaceLifeId & life)
+    {
+        std::map<String, String> objects;
+        OperationForTest op(*backend);
+        String cursor;
+        do
+        {
+            const ListPage page = (*op).list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
+            for (const ListedKey & listed : page.keys)
+                objects[listed.key] = readAt(*backend, listed.key).value().bytes;
+            cursor = page.next_cursor;
+        } while (!cursor.empty());
+        if (const auto ckpt = readAt(*backend, layout.refCkptKey(life)))
+            objects[layout.refCkptKey(life)] = ckpt->bytes;
+        return objects;
+    };
+    const auto first_objects = snapshotOfLife(first);
+    ASSERT_FALSE(first_objects.empty());
+
+    /// What the GC erase does to the catalog row once the terminal record is folded.
+    {
+        const CasRefCatalog::Snapshot catalog = readCatalogForTest(backend, layout);
+        RefCatalog without = catalog.catalog;
+        std::erase_if(without.entries, [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        ASSERT_TRUE(catalog.etag);
+        ASSERT_TRUE(replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(without), *catalog.etag));
+    }
+    burnMoreEpochs(backend, layout, 1);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    publishRefForTest(store, ns, "b", manifestRef(4, 1, 1));
+    const NamespaceLifeId second = catalogLife(backend, layout, ns);
+    EXPECT_NE(second.incarnation, first.incarnation);
+    EXPECT_NE(layout.refCkptKey(second), layout.refCkptKey(first));
+    EXPECT_EQ(storedCkptHeader(*backend, layout, second), 3u);
+    EXPECT_EQ(readCkptForTest(backend, layout, second)->ckpt.life_epoch, std::optional<uint64_t>{4});
+    const auto first_log = readAt(*backend, layout.refLogKey(second, RefTxnId{4, 1}));
+    ASSERT_TRUE(first_log);
+    const RefLogTxn birth = decodeRefLogTxn(openObject(FormatId::RefLog, first_log->bytes), ns.string(), RefTxnId{4, 1});
+    EXPECT_EQ(birth.prev_epoch_seal, std::nullopt);
+    EXPECT_EQ(snapshotOfLife(first), first_objects) << "no key of the first life changed";
+}
+
+namespace
+{
+
+/// Chain `{1,1}`, `{1,2}`, `T{1,3}->4`, live epoch 6: recovery's tombstone goes to `{4,1}` with backlink
+/// `{1,3}`. Right after the walk reads `{4,1}` absent, `H{4,1}<-{1,4}` lands there, a head that names
+/// another tombstone, or with `undecodable` a transaction of id `{4,2}`, which does not decode at that key.
+/// With `move_base`, a stray `T{1,4}->4`, `{4,2}` and a snapshot at `{4,2}` land too, and `_ckpt` is
+/// replaced to name that snapshot.
+struct NonChainingOccupant
+{
+    std::shared_ptr<AfterGetHookBackend> backend = std::make_shared<AfterGetHookBackend>();
+    Layout layout{"p"};
+    RootNamespace ns;
+    NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    size_t fired = 0;
+
+    NonChainingOccupant(const String & name, bool move_base, bool undecodable = false)
+        : ns(name)
+    {
+        burnEpochsUpTo(backend, layout, 6);
+        life = seedTwoRecordChain(backend, layout, ns);
+        createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 3}, 4));
+        backend->watched_key = layout.refLogKey(life, RefTxnId{4, 1});
+        backend->after_get = [this, move_base, undecodable]
+        {
+            ++fired;
+            if (move_base)
+                createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 4}, 4));
+            if (undecodable)
+                createAt(*backend, layout.refLogKey(life, RefTxnId{4, 1}), sealObject(FormatId::RefLog,
+                    encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{4, 2}, "x", /*birth=*/false))));
+            else
+                createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{4, 1}, "c", /*birth=*/false, RefTxnId{1, 4}));
+            if (!move_base)
+                return;
+            createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{4, 2}, "d", /*birth=*/false));
+            writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{4, 2},
+                {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1)),
+                 committedRow("c", manifestRef(4, 1, 1)), committedRow("d", manifestRef(4, 2, 1))}));
+            const auto current = readCkptForTest(backend, layout, life);
+            ASSERT_TRUE(current);
+            ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life),
+                encodeRefCkptAtGeneration(gen3Ckpt(1, RefTxnId{4, 2}), 3), current->etag));
+        };
+    }
+};
+
+}
+
+TEST(CASRefWriterRecovery, OccupantThatDoesNotChainRestartsWhenTheBaseMoved)
+{
+    NonChainingOccupant fixture("srv1/non_chaining_occupant_base_moved", /*move_base=*/true);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    std::map<String, Resolved> refs;
+    ASSERT_NO_THROW(refs = store->listRefs(fixture.ns));
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 1u);
+    EXPECT_TRUE(refs.contains("c"));
+    EXPECT_TRUE(refs.contains("d"));
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{4, 3}), 6))
+        << "the restarted walk closes the chain above the new base";
+}
+
+TEST(CASRefWriterRecovery, OccupantThatDoesNotChainIsCorruptionUnderAnUnchangedBase)
+{
+    NonChainingOccupant fixture("srv1/non_chaining_occupant_same_base", /*move_base=*/false);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(fixture.ns); });
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 0u) << "an unchanged base is a verdict, not a restart";
+    EXPECT_FALSE(store->refTableRecoveredForTest(fixture.ns));
+}
+
+TEST(CASRefWriterRecovery, OccupantThatDoesNotDecodeRestartsWhenTheBaseMoved)
+{
+    NonChainingOccupant fixture("srv1/undecodable_occupant_base_moved", /*move_base=*/true, /*undecodable=*/true);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    std::map<String, Resolved> refs;
+    ASSERT_NO_THROW(refs = store->listRefs(fixture.ns));
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 1u);
+    EXPECT_TRUE(refs.contains("d"));
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{4, 3}), 6));
+}
+
+TEST(CASRefWriterRecovery, OccupantThatDoesNotDecodeIsCorruptionUnderAnUnchangedBase)
+{
+    NonChainingOccupant fixture("srv1/undecodable_occupant_same_base", /*move_base=*/false, /*undecodable=*/true);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(fixture.ns); });
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 0u);
+    EXPECT_FALSE(store->refTableRecoveredForTest(fixture.ns));
+}
+
+namespace
+{
+
+/// Chain `{1,1}`, `{1,2}`, then `{1,3}`, a record that chains but carries a second birth, so applying it
+/// fails. With `move_base`, right after the walk reads `{1,3}`, a snapshot at `{1,3}` lands and `_ckpt`
+/// is replaced to name it.
+struct UnappliableWalkedRecord
+{
+    std::shared_ptr<AfterGetHookBackend> backend = std::make_shared<AfterGetHookBackend>();
+    Layout layout{"p"};
+    RootNamespace ns;
+    NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    size_t fired = 0;
+
+    UnappliableWalkedRecord(const String & name, bool move_base)
+        : ns(name)
+    {
+        burnEpochsUpTo(backend, layout, 6);
+        life = seedTwoRecordChain(backend, layout, ns);
+        createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/true));
+        backend->watched_key = layout.refLogKey(life, RefTxnId{1, 3});
+        backend->after_get = [this, move_base]
+        {
+            ++fired;
+            if (!move_base)
+                return;
+            writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 3},
+                {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1)),
+                 committedRow("c", manifestRef(1, 3, 1))}));
+            const auto current = readCkptForTest(backend, layout, life);
+            ASSERT_TRUE(current);
+            ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life),
+                encodeRefCkptAtGeneration(gen3Ckpt(1, RefTxnId{1, 3}), 3), current->etag));
+        };
+    }
+};
+
+}
+
+TEST(CASRefWriterRecovery, WalkedRecordThatDoesNotApplyRestartsWhenTheBaseMoved)
+{
+    UnappliableWalkedRecord fixture("srv1/unappliable_walked_record_base_moved", /*move_base=*/true);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    std::map<String, Resolved> refs;
+    ASSERT_NO_THROW(refs = store->listRefs(fixture.ns));
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 1u);
+    EXPECT_TRUE(refs.contains("c"));
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{1, 4}), 6))
+        << "the restarted walk closes the chain above the new base";
+}
+
+TEST(CASRefWriterRecovery, WalkedRecordThatDoesNotApplyIsCorruptionUnderAnUnchangedBase)
+{
+    UnappliableWalkedRecord fixture("srv1/unappliable_walked_record_same_base", /*move_base=*/false);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(fixture.ns); });
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 0u) << "an unchanged base is a verdict, not a restart";
+    EXPECT_FALSE(store->refTableRecoveredForTest(fixture.ns));
+    EXPECT_FALSE(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{1, 4}));
+}
+
+namespace
+{
+
+/// The fixture of `DeadEpochIsSealedInOneWriteWithoutACkptWrite`: `{1,1}`, `{1,2}`, a snapshot at `{1,2}` and a
+/// generation 3 `_ckpt` naming it.
+NamespaceLifeId seedSnapshotBasedChain(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+{
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 2},
+        {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1))}));
+    seedCkpt(*backend, layout, ns, gen3Ckpt(1, RefTxnId{1, 2}), 3);
+    return catalogLife(backend, layout, ns);
+}
+
+/// The sealed bytes of `T{id}->next_epoch` without a backlink, as the lane writes them.
+String tombstoneBytes(const RootNamespace & ns, RefTxnId id, uint64_t next_epoch)
+{
+    return sealObject(FormatId::RefLog, encodeRefLogTxn(tombstoneTxn(ns.string(), id, next_epoch)));
+}
+
+}
+
+TEST(CASRefWriterRecovery, CleanPredecessorCostsSixReadsAndNoWrite)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/clean_predecessor_reads"};
+    burnEpochsUpTo(backend, layout, 4);
+    seedCleanFarewell(*backend, layout, 3, 0);
+    const NamespaceLifeId life = seedSnapshotBasedChain(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{4, 0}));
+    backend->resetCounts();
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    EXPECT_EQ(backend->getCount(ckpt_key), 2u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 3})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 3u) << "two of the cold admission, one confirmation";
+    EXPECT_EQ(backend->getTotal(), 8u) << "no GET of any other key";
+    EXPECT_EQ(backend->writeCount(layout.refLogKey(life, RefTxnId{1, 3})), 0u);
+    EXPECT_EQ(backend->writeCount(ckpt_key), 0u);
+    EXPECT_EQ(backend->putTotal(), 0u) << "a recovery after a clean end of the chain's epoch creates nothing";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+}
+
+TEST(CASRefWriterRecovery, UncleanPredecessorSealsBeforeInstall)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/unclean_predecessor_seals"};
+    burnEpochsUpTo(backend, layout, 4);
+    const NamespaceLifeId life = seedSnapshotBasedChain(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{4, 3})) << "no slot: every earlier epoch counts as unclean";
+    backend->resetCounts();
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    EXPECT_EQ(backend->getCount(ckpt_key), 2u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, RefTxnId{1, 2})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 3})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 3u);
+    EXPECT_EQ(backend->getTotal(), 8u) << "no GET of any other key";
+    EXPECT_EQ(backend->writeCount(layout.refLogKey(life, RefTxnId{1, 3})), 1u);
+    EXPECT_EQ(backend->putTotal(), 1u);
+    EXPECT_EQ(backend->writeCount(ckpt_key), 0u);
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 4));
+}
+
+TEST(CASRefWriterRecovery, EagerRuleSurvivesACleanEpochThatNeverReadTheNamespace)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/eager_through_clean_epoch"};
+    burnEpochsUpTo(backend, layout, 3);
+    /// Epoch 2 never touched the namespace and ended cleanly, so it passes on epoch 1's unclean end.
+    seedCleanFarewell(*backend, layout, 2, 1);
+    seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 1}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 3));
+}
+
+TEST(CASRefWriterRecovery, UncleanReaderIsSealedByTheNextReaderAndTheWriterLinksThroughIt)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/unclean_reader_sealed"};
+    burnEpochsUpTo(backend, layout, 3);
+    /// Reader 2 ended uncleanly without touching the namespace.
+    seedFencedSlot(*backend, layout, 2);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    {
+        auto reader = openWalkPool(backend);
+        ASSERT_EQ(reader->liveEpochPairForTest(), (LiveEpochPair{3, 2}));
+        EXPECT_EQ(reader->listRefs(ns).size(), 2u);
+        EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 3))
+            << "the chain's epoch 1 is at or below the marker 2, so reader 3 seals it";
+    }   /// a clean farewell carrying marker 2
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{4, 2}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{3, 1}))
+        << "the chain's epoch 3 is above the marker 2, so the read in epoch 4 writes nothing";
+    publishRefForTest(store, ns, "c", manifestRef(4, 1, 1));
+
+    const auto closing = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    EXPECT_TRUE(isTombstoneTo(closing, 4));
+    ASSERT_TRUE(closing);
+    EXPECT_EQ(closing->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{4, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{3, 1}));
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 2).empty());
+}
+
+TEST(CASRefWriterGenesis, EagerRuleSealsANeverBornStream)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/eager_never_born"};
+    burnEpochsUpTo(backend, layout, 4);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+    seedCkpt(*backend, layout, ns, gen3Ckpt(2), 3);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{4, 3}));
+    EXPECT_TRUE(store->listRefs(ns).empty());
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{2, 1}), 4));
+}
+
+TEST(CASRefWriterTombstone, BacklinkSkipsEpochsThatOnlyRead)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/backlink_skips_readers"};
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_EQ(backend->writeCount(layout.refLogKey(life, RefTxnId{1, 3})), 0u) << "the read writes nothing";
+
+    /// The tombstone and the head come from one batch, so the head's preview sees the tombstone.
+    EXPECT_NO_THROW(publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)));
+    const auto tombstone = readLogTxn(*backend, layout, ns, RefTxnId{1, 3});
+    EXPECT_TRUE(isTombstoneTo(tombstone, 3));
+    ASSERT_TRUE(tombstone);
+    EXPECT_EQ(tombstone->prev_epoch_seal, std::nullopt);
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 2).empty());
+    EXPECT_TRUE(store->listRefs(ns).contains("c"));
+}
+
+TEST(CASRefWriterTombstone, AmbiguousTombstoneWedgesAndBlocksTheHead)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/ambiguous_lane_tombstone"};
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    auto clock = VirtualRetryClock::installOn(store);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
+    backend->ambiguous_put_substr = layout.refLogKey(life, RefTxnId{1, 3});
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+    EXPECT_GE(backend->ambiguous_put_attempts.load(), 1u);
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns));
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty()) << "no head while the tombstone is unresolved";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 0u);
+
+    backend->ambiguous_put_substr.clear();
+    publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 1u)
+        << "the tombstone the wedge resolution made durable is the lane's";
+    const auto tombstone = readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}));
+    ASSERT_TRUE(tombstone);
+    EXPECT_EQ(tombstone->bytes, tombstoneBytes(ns, RefTxnId{1, 3}, 3));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+}
+
+TEST(CASRefWriterTombstone, DetachedRuntimeInARemountWindowWritesNoTombstone)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/detached_remount_window"};
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    struct Window
+    {
+        std::weak_ptr<Pool> store;
+        bool fired = false;
+        uint64_t live_epoch = 0;
+        bool old_runtime_cached = false;
+        int publish_code = 0;
+        std::vector<RefTxnId> logs_after_publish;
+    };
+    auto window = std::make_shared<Window>();
+    PoolConfig config = walkTestConfig();
+    config.remount_epoch_published_hook_for_test = [window, backend, layout, ns, life]
+    {
+        const PoolPtr pool = window->store.lock();
+        if (!pool)
+            return;
+        window->fired = true;
+        window->live_epoch = pool->liveEpochPairForTest().writer_epoch;
+        window->old_runtime_cached = pool->refTableRecoveredForTest(ns);
+        std::thread publisher([&]
+        {
+            try
+            {
+                publishRefForTest(pool, ns, "c", manifestRef(3, 1, 1));
+            }
+            catch (const DB::Exception & e)
+            {
+                window->publish_code = e.code();
+            }
+        });
+        publisher.join();
+        window->logs_after_publish = logIdsInEpochs(*backend, layout, life, 1, 4);
+    };
+
+    auto store = openWalkPool(backend, config);
+    window->store = store;
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    fenceOutMountForRemount(*backend, layout.mountKey("test"));
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    ASSERT_TRUE(window->fired);
+    EXPECT_EQ(window->live_epoch, 4u) << "the hook runs after the new epoch is published";
+    EXPECT_TRUE(window->old_runtime_cached) << "and before the old runtime is detached";
+    EXPECT_EQ(window->publish_code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_EQ(window->logs_after_publish, (std::vector<RefTxnId>{RefTxnId{1, 1}, RefTxnId{1, 2}}))
+        << "no tombstone naming the new epoch, and no head";
+}
+
+TEST(CASRefWriterTombstone, LateRecoveryTombstoneOfAnEarlierBuildIsAdopted)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/late_recovery_tombstone"};
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+
+    /// An unresolved recovery tombstone of epoch 2 that landed after epoch 2's clean farewell.
+    createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 3}, 2));
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 3).empty());
+
+    publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    const auto closing = readLogTxn(*backend, layout, ns, RefTxnId{2, 1});
+    EXPECT_TRUE(isTombstoneTo(closing, 3));
+    ASSERT_TRUE(closing);
+    EXPECT_EQ(closing->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{2, 1}));
+    EXPECT_TRUE(store->listRefs(ns).contains("c"));
+}
+
+TEST(CASRefWriterTombstone, WedgedTombstoneThatMeetsAnEarlierTombstoneNeedsRecovery)
+{
+    const Layout layout("p");
+    const auto wedge_the_tombstone = [&](const std::shared_ptr<HidingListBackend> & backend, const RootNamespace & ns)
+    {
+        burnEpochsUpTo(backend, layout, 3);
+        seedCleanFarewell(*backend, layout, 2, 0);
+        const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        VirtualRetryClock::installOn(store);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+        backend->ambiguous_put_substr = layout.refLogKey(life, RefTxnId{1, 3});
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_TRUE(store->refLaneWedgedForTest(ns));
+        backend->ambiguous_put_substr.clear();
+        return std::make_pair(store, life);
+    };
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/wedged_tombstone_meets_earlier"};
+        const auto [store, life] = wedge_the_tombstone(backend, ns);
+        createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 3}, 2));
+
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+        EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+
+        publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+        const auto closing = readLogTxn(*backend, layout, ns, RefTxnId{2, 1});
+        EXPECT_TRUE(isTombstoneTo(closing, 3));
+        ASSERT_TRUE(closing);
+        EXPECT_EQ(closing->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+        EXPECT_TRUE(store->listRefs(ns).contains("c"));
+    }
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/wedged_tombstone_meets_later"};
+        const auto [store, life] = wedge_the_tombstone(backend, ns);
+        createTxnAt(*backend, layout, life, tombstoneTxn(ns.string(), RefTxnId{1, 3}, 5));
+
+        expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
+        EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 2, 5).empty());
+    }
+}
+
+namespace
+{
+
+/// The clean-predecessor fixture with a generation 2 `_ckpt` whose frontier is `{1,2}`: live epoch 3, chain
+/// epoch 1, marker 0, so the read is lazy and the lane's first write must stamp `_ckpt` first.
+NamespaceLifeId seedOldCheckpointChain(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+{
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}), 2);
+    return catalogLife(backend, layout, ns);
+}
+
+/// The index of the first journal entry equal to `(method, key)`, or `nullopt`.
+std::optional<size_t> journalIndex(const std::vector<std::pair<String, String>> & journal, const String & method,
+                                   const String & key)
+{
+    const auto it = std::find(journal.begin(), journal.end(), std::make_pair(method, key));
+    if (it == journal.end())
+        return std::nullopt;
+    return static_cast<size_t>(it - journal.begin());
+}
+
+/// An ordinary transaction of id `{1,4}` stored at `{1,3}`: it does not decode at that key.
+String undecodableAtTheTombstoneSlot(const RootNamespace & ns)
+{
+    return sealObject(FormatId::RefLog, encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{1, 4}, "x", /*birth=*/false)));
+}
+
+}
+
+TEST(CASRefWriterTombstone, LaneTombstoneFollowsTheStampOfAnOldCheckpoint)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/lane_tombstone_stamp"};
+    const NamespaceLifeId life = seedOldCheckpointChain(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    backend->clearJournal();
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    for (const auto & [method, key] : backend->journal())
+        EXPECT_FALSE((method == "PUT" || method == "CAS") && (key == ckpt_key || key.starts_with(layout.namespaceStreamPrefix(life))))
+            << "the read writes nothing: " << method << " " << key;
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 2u);
+
+    backend->clearJournal();
+    const uint64_t stamped_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped];
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
+    publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped] - stamped_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed] - sealed_before, 0u);
+    const auto journal = backend->journal();
+    const auto stamp = journalIndex(journal, "CAS", ckpt_key);
+    const auto tombstone = journalIndex(journal, "PUT", layout.refLogKey(life, RefTxnId{1, 3}));
+    const auto head = journalIndex(journal, "PUT", layout.refLogKey(life, RefTxnId{3, 1}));
+    ASSERT_TRUE(stamp);
+    ASSERT_TRUE(tombstone);
+    ASSERT_TRUE(head);
+    EXPECT_LT(*stamp, *tombstone) << "the stamp precedes the tombstone";
+    EXPECT_LT(*tombstone, *head);
+    for (size_t i = *tombstone + 1; i < *head; ++i)
+        EXPECT_NE(journal[i], (std::pair<String, String>{"GET", ckpt_key})) << "no `_ckpt` read between the tombstone and the head";
+    EXPECT_EQ(storedCkptHeader(*backend, layout, life), 3u);
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 3));
+}
+
+TEST(CASRefWriterTombstone, LaneTombstoneStampMismatchOrUnresolvedNeedsRecoveryWithoutACreate)
+{
+    const Layout layout("p");
+    const auto expect_no_create = [&](const std::shared_ptr<JournalingBackend> & backend, const PoolPtr & store,
+                                      const RootNamespace & ns, const NamespaceLifeId & life)
+    {
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+        const auto journal = backend->journal();
+        EXPECT_FALSE(journalIndex(journal, "PUT", layout.refLogKey(life, RefTxnId{1, 3}))) << "no tombstone create";
+        EXPECT_FALSE(journalIndex(journal, "PUT", layout.refLogKey(life, RefTxnId{3, 1}))) << "no head create";
+        auto ids = logIdsInEpochs(*backend, layout, life, 1, 3);
+        std::sort(ids.begin(), ids.end());
+        EXPECT_EQ(ids, (std::vector<RefTxnId>{RefTxnId{1, 1}, RefTxnId{1, 2}}));
+    };
+    {
+        auto backend = std::make_shared<JournalingBackend>();
+        const RootNamespace ns{"srv1/lane_tombstone_stamp_mismatch"};
+        const NamespaceLifeId life = seedOldCheckpointChain(backend, layout, ns);
+        const String ckpt_key = layout.refCkptKey(life);
+        auto store = openWalkPool(backend);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+        bool armed = true;
+        backend->before_cas_put = [&](const String & key, const String &, const std::optional<String> &)
+        {
+            if (!armed || key != ckpt_key)
+                return;
+            armed = false;
+            const auto current = readAt(*backend, ckpt_key);
+            ASSERT_TRUE(current);
+            ASSERT_TRUE(replaceForTest(backend, ckpt_key, encodeRefCkptAtGeneration(lifeEpochCkpt(1, RefTxnId{1, 2}), 2),
+                current->etag));
+        };
+        backend->clearJournal();
+        expect_no_create(backend, store, ns, life);
+        backend->before_cas_put = nullptr;
+        EXPECT_FALSE(armed) << "the stamp met the replaced token";
+    }
+    {
+        auto backend = std::make_shared<JournalingBackend>();
+        const RootNamespace ns{"srv1/lane_tombstone_stamp_unresolved"};
+        const NamespaceLifeId life = seedOldCheckpointChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+        backend->ambiguous_cas_substr = layout.refCkptKey(life);
+        backend->ambiguous_cas_count = 1;
+        backend->clearJournal();
+        expect_no_create(backend, store, ns, life);
+        EXPECT_EQ(backend->ambiguous_cas_count, 0);
+    }
+}
+
+TEST(CASRefWriterTombstone, UndecodableOccupantOfTheSlotFaultsTheLane)
+{
+    const Layout layout("p");
+    /// At the tombstone's own create.
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/undecodable_at_tombstone_create"};
+        burnEpochsUpTo(backend, layout, 3);
+        seedCleanFarewell(*backend, layout, 2, 0);
+        const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+        const String garbage = undecodableAtTheTombstoneSlot(ns);
+        createAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}), garbage);
+
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
+        EXPECT_FALSE(store->mayMutate()) << "the impossible-interference reaction must fence this mount closed";
+        EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u);
+        EXPECT_EQ(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}))->bytes, garbage);
+        EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty());
+    }
+    /// At the resolution of a wedged tombstone.
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/undecodable_at_tombstone_wedge"};
+        burnEpochsUpTo(backend, layout, 3);
+        seedCleanFarewell(*backend, layout, 2, 0);
+        const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        VirtualRetryClock::installOn(store);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+        backend->ambiguous_put_substr = layout.refLogKey(life, RefTxnId{1, 3});
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+        backend->ambiguous_put_substr.clear();
+        const String garbage = undecodableAtTheTombstoneSlot(ns);
+        createAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}), garbage);
+
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
+        EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+        EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty());
+    }
+    /// At an ordinary append, unchanged: the chain epoch is the live one.
+    {
+        auto backend = std::make_shared<HidingListBackend>();
+        const RootNamespace ns{"srv1/undecodable_at_ordinary_append"};
+        const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+        auto store = openWalkPool(backend);
+        ASSERT_EQ(store->liveWriterEpoch(), 1u);
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);
+        createAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}), undecodableAtTheTombstoneSlot(ns));
+
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishRefForTest(store, ns, "c", manifestRef(1, 3, 1)); });
+        EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
+    }
+}
+
+TEST(CASRefWriterTombstone, TombstoneInstallRefusedAfterItsCreateNeedsRecoveryAndTheHeadLinksToIt)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/tombstone_install_refused"};
+    burnEpochsUpTo(backend, layout, 3);
+    seedCleanFarewell(*backend, layout, 2, 0);
+    const NamespaceLifeId life = seedTwoRecordChain(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+
+    /// The admission is lost between the create and the install hold: the lease deadline is reached.
+    Pool * const pool = store.get();
+    store->setCarveHookForTest([pool](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase == CasRefLedger::CarvePhaseForTest::PostDurableTombstoneInstall)
+            pool->setMountDeadline(pool->bootMsNow());
+    });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
+    store->setCarveHookForTest(nullptr);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 3)) << "the tombstone is durable";
+    EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty());
+
+    store->setMountDeadline(store->bootMsNow() + 600'000);
+    publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    const auto head = readLogTxn(*backend, layout, ns, RefTxnId{3, 1});
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->prev_epoch_seal, std::make_optional(RefTxnId{1, 3}));
+    auto ids = logIdsInEpochs(*backend, layout, life, 1, 3);
+    std::sort(ids.begin(), ids.end());
+    EXPECT_EQ(ids, (std::vector<RefTxnId>{RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 3}, RefTxnId{3, 1}}))
+        << "no second tombstone";
+    EXPECT_TRUE(store->listRefs(ns).contains("c"));
+}
