@@ -7,7 +7,7 @@
 -- the same as the cluster read in 05812. The fail points make the Ping fail; the insert must still
 -- finish and write rows. `DistributedConnectionFailTry` shows that the Ping ran.
 
-INSERT INTO FUNCTION file(currentDatabase() || '_05813_data.tsv', 'TSV', 'x UInt8')
+INSERT INTO FUNCTION file('05813_ping_pooled_connection_data.tsv', 'TSV', 'x UInt8')
 SELECT number FROM numbers(3)
 SETTINGS engine_file_truncate_on_insert = 1;
 
@@ -16,7 +16,7 @@ CREATE TABLE dst_05813 (x UInt8) ENGINE = Distributed('test_cluster_two_shards',
 
 -- Fill the connection pool, so the next insert takes pooled connections.
 INSERT INTO dst_05813
-SELECT * FROM fileCluster('test_cluster_two_shards', currentDatabase() || '_05813_data.tsv', 'TSV', 'x UInt8')
+SELECT * FROM fileCluster('test_cluster_two_shards', '05813_ping_pooled_connection_data.tsv', 'TSV', 'x UInt8')
 SETTINGS parallel_distributed_insert_select = 2;
 TRUNCATE TABLE dst_05813_local;
 
@@ -27,7 +27,7 @@ SELECT ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnect
 SYSTEM ENABLE FAILPOINT unresponsive_pooled_connection;
 
 INSERT INTO dst_05813
-SELECT * FROM fileCluster('test_cluster_two_shards', currentDatabase() || '_05813_data.tsv', 'TSV', 'x UInt8')
+SELECT * FROM fileCluster('test_cluster_two_shards', '05813_ping_pooled_connection_data.tsv', 'TSV', 'x UInt8')
 SETTINGS parallel_distributed_insert_select = 2;
 
 SYSTEM DISABLE FAILPOINT unresponsive_pooled_connection;
@@ -51,7 +51,7 @@ SELECT ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnect
 SYSTEM ENABLE FAILPOINT pooled_connection_ping_timeout;
 
 INSERT INTO dst_05813
-SELECT * FROM fileCluster('test_cluster_two_shards', currentDatabase() || '_05813_data.tsv', 'TSV', 'x UInt8')
+SELECT * FROM fileCluster('test_cluster_two_shards', '05813_ping_pooled_connection_data.tsv', 'TSV', 'x UInt8')
 SETTINGS parallel_distributed_insert_select = 2;
 
 SYSTEM DISABLE FAILPOINT pooled_connection_ping_timeout;
