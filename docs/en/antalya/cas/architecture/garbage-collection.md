@@ -849,10 +849,7 @@ cursor denotes an unfinished traversal; its next page can run on the next ordina
 An empty cursor means no traversal is in progress. At EOF, the round records a completion time
 sampled near commit in UTC milliseconds; `0` means unknown or never recorded. Legacy state without
 this timestamp resumes a nonempty cursor or permits a first traversal for an empty cursor on the next
-ordinary fold. The reader ignores the former `orphan_manifest_sweep_active` and
-`orphan_manifest_sweep_started_at_ms` keys in three-field state. The intermediate three-field
-reader cannot read completion-only state, so rollback to it is unsupported. Renewal and takeover
-preserve the cursor and timestamp; rebuild resets both.
+ordinary fold. Lease renewal and takeover preserve the cursor and timestamp. Rebuild resets both.
 
 A zero clock sample near commit preserves the previous completion timestamp, including an unknown
 value of `0`. The round still adopts the page's cursor through the same state `CAS`. If the page

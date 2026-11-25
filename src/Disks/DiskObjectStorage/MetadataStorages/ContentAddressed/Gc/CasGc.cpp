@@ -4386,7 +4386,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     reduce_timer.emplace(phase_sink, "fold_reduce");
 
     std::vector<BlobSourceRetirement> orphan_source_retirements;
-    if (run_orphan_manifest_sweep && !suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
+    if (run_orphan_manifest_sweep && !suppress_destructive)
     {
         result.orphan_sweep = planManifestCursorPage(
             *store,

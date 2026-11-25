@@ -46,11 +46,6 @@ as zero. The completion timestamp is sampled near the `gc/state` commit and chan
 reaches EOF. It does not mean that all later manifest body deletions succeeded. A zero LIST budget
 disables the sweep without clearing the cursor or completion timestamp.
 
-The previous three-field schedule also stored `orphan_manifest_sweep_active` and
-`orphan_manifest_sweep_started_at_ms`. This reader ignores those keys in old objects and keeps the
-cursor and completion timestamp. The intermediate three-field reader rejects a new completion-only
-object as an incomplete schedule group; rollback to that intermediate reader is unsupported.
-
 Authoritative per-format traits (type string, family, compression policy, caps) live
 in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.
 
