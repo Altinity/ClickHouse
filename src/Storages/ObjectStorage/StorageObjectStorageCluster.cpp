@@ -787,7 +787,11 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     auto probe = std::make_shared<ObjectStorageClusterReadProbe>();
     Stopwatch watch;
     const char * reason = "task count exceeded threshold";
+    bool exhausted = false;
 
+    /// The budget is checked before every `next` and once more after the last one. A `next` call that is
+    /// already running cannot be interrupted, so planning can take longer than the budget by one call
+    /// (for example one `ListObjects` page).
     while (true)
     {
         if (probe_ms > 0 && watch.elapsedMilliseconds() >= probe_ms)
@@ -799,8 +803,18 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
         auto object = iterator->next(0);
         if (!object)
         {
-            probe->read_locally = true;
-            reason = "task list exhausted";
+            exhausted = true;
+            /// A listing that ends after the deadline is not a small one: the budget is the only
+            /// limit on how long the initiator is allowed to wait for it.
+            if (probe_ms > 0 && watch.elapsedMilliseconds() >= probe_ms)
+            {
+                reason = "probe time budget exceeded";
+            }
+            else
+            {
+                probe->read_locally = true;
+                reason = "task list exhausted";
+            }
             break;
         }
 
@@ -814,8 +828,8 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     probe->snapshot_version = iterator->getSnapshotVersion();
 
     /// A finished iterator must not stay attached: its `estimatedKeysCount` can be "unknown", which would
-    /// make a small local read start as many streams as a full listing.
-    if (!probe->read_locally)
+    /// make a small local read start as many streams as a full listing. Its tasks are all in `pulled`.
+    if (!exhausted)
         probe->iterator = std::move(iterator);
 
     LOG_TRACE(

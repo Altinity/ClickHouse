@@ -9293,7 +9293,11 @@ Does not apply to `object_storage_remote_initiator` or to writes.
 )", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_cluster_local_read_probe_ms, 50, R"(
 Time budget, in milliseconds, for deciding `object_storage_cluster_local_read_max_tasks`.
-`0` means no limit. If the budget runs out before the task list ends, the query stays on the cluster.
+`0` means no limit. If the task list does not end inside the budget, the query stays on the cluster.
+The budget is checked between listing calls, not inside them: a call that has already started is not interrupted,
+so planning can take longer than the budget by one listing call, for example one `ListObjects` page
+(`list_object_keys_size` keys) or one metadata read of a data lake table.
+The listing done by the check is reused by the distributed read, so this time is not spent twice.
 )", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
