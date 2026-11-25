@@ -202,6 +202,11 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
                 pending_objects_info.push(std::move(copy_object_info));
             }
         }
+        else
+        {
+            /// The format cannot be split: the whole file is one task. Dropping it would lose its rows.
+            pending_objects_info.push(std::move(last_object_info));
+        }
     }
 
     auto result = pending_objects_info.front();
