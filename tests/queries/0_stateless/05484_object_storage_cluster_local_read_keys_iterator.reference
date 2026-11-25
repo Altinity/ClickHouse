@@ -1,0 +1,9 @@
+one key in braces
+1	1
+two keys in braces
+2	3	4
+glob with keys taken from the _path filter
+1	1
+05484_brace_one	0
+05484_brace_two	0
+05484_glob_path_filter	0

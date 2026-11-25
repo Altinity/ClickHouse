@@ -1140,7 +1140,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (object_info->getPath().empty())
             return {};
-        if (!object_info->getObjectMetadata())
+        /// A `skip_object_metadata` placeholder (`is_fetched = false`) has `size_bytes = 0` and `is_size_known = true`.
+        /// It is not a real size: without a fetch it would be taken for an empty file and skipped below.
+        /// It reaches here when the cluster local-read probe reuses its listing.
+        if (const auto & current_metadata = object_info->relative_path_with_metadata.metadata;
+            !current_metadata || !current_metadata->is_fetched)
         {
             bool with_tags = read_from_format_info.requested_virtual_columns.contains("_tags");
             const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
