@@ -102,7 +102,12 @@ public:
     std::string getName() const override { return "FakeDriverStorage"; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
-        const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
+        const ActionsDAG::Node *,
+        const ActionsDAG *,
+        const ContextPtr &,
+        ClusterPtr,
+        StorageMetadataPtr,
+        std::shared_ptr<IObjectIterator>) const override
     {
         return {};
     }
@@ -131,7 +136,12 @@ public:
     bool isSnapshotPinnedByTableFunction(const ASTPtr &) const override { return true; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
-        const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
+        const ActionsDAG::Node *,
+        const ActionsDAG *,
+        const ContextPtr &,
+        ClusterPtr,
+        StorageMetadataPtr,
+        std::shared_ptr<IObjectIterator>) const override
     {
         return {};
     }
