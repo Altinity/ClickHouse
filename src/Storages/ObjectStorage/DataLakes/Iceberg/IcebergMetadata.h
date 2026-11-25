@@ -75,7 +75,8 @@ public:
         ObjectStoragePtr object_storage_,
         StorageObjectStorageConfigurationPtr configuration_,
         Iceberg::PersistentTableComponents && persistent_components_,
-        ContextPtr context_);
+        ContextPtr context_,
+        std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata_ = std::nullopt);
 
     ~IcebergMetadata() override;
 
@@ -114,6 +115,9 @@ public:
         LoggerPtr metadata_logger);
 
     bool supportsUpdate() const override { return true; }
+
+    void update(const ContextPtr & context) override;
+
     bool supportsWrites() const override { return true; }
     bool supportsParallelInsert() const override { return true; }
     bool supportsTruncate() const override { return true; }
@@ -129,7 +133,7 @@ public:
         ContextPtr local_context) const;
 
     static bool supportsTotalRows(ContextPtr, ObjectStorageType) { return true; }
-    std::optional<size_t> totalRows(ContextPtr Local_context) const override;
+    std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const override;
     static bool supportsTotalBytes(ContextPtr, ObjectStorageType) { return true; }
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
 
@@ -271,7 +275,7 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
-    static Iceberg::PersistentTableComponents initializePersistentTableComponents(
+    static std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
         StorageObjectStorageConfigurationPtr configuration,
         IcebergMetadataFilesCachePtr cache_ptr,
@@ -354,6 +358,11 @@ private:
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
 
+    mutable std::mutex cached_latest_metadata_mutex;
+    mutable std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata TSA_GUARDED_BY(cached_latest_metadata_mutex);
+
+    Iceberg::MetadataFileWithInfo fetchLatestMetadata(const ContextPtr & context, bool force_fetch_latest_metadata) const;
+
     void backgroundMetadataPrefetcherThread();
 
     void alterPartitionDropImpl(
@@ -362,6 +371,11 @@ private:
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & storage_id);
 };
+
+/// Find the partition spec / schema object by id inside a metadata JSON document.
+/// Throws METADATA_MISMATCH if not found.
+Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & metadata, Int64 spec_id);
+Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & metadata, Int64 schema_id);
 }
 
 #endif

@@ -84,6 +84,10 @@ EXCLUDE=(
     # Unsupported `VARIANT` specification version and one-sided null leaves, on purpose.
     05306_variant_unsupported_version.parquet
     05307_variant_one_sided_null.parquet
+    # `INT96` timestamps outside the `DateTime64(9)` range (throws with the default `date_time_overflow_behavior`), tested by 05443.
+    05443_int96_out_of_range.parquet
+    # `INT96` timestamp on the lower boundary day of the `DateTime64(9)` range, tested by 05444.
+    05444_int96_lower_boundary.parquet
 )
 
 for NAME in $(find "$DATA_DIR" -type f \( -iname '*.parquet' -o -iname '*.parquet.gz' \) -print0 | xargs -0 -n 1 basename | LC_ALL=C sort | grep -vFf <(printf '%s\n' "${EXCLUDE[@]}")); do

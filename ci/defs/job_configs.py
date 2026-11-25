@@ -559,8 +559,11 @@ class JobConfigs:
         ),
         Job.ParamSet(
             parameter=BuildTypes.PPC64LE,
-            provides=[ArtifactNames.CH_PPC64LE],
-            runs_on=RunnerLabels.ARM_LARGE,
+            provides=[
+                ArtifactNames.CH_PPC64LE,
+                ArtifactNames.CH_PPC64LE_GH,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
         ),
         Job.ParamSet(
             parameter=BuildTypes.AMD_COMPAT,
@@ -634,6 +637,18 @@ class JobConfigs:
             provides=[ArtifactNames.CH_WASM_PARSER],
             runs_on=RunnerLabels.ARM_LARGE,
         ),
+    )
+    smoke_test_ppc64le = Job.Config(
+        name=JobNames.SMOKE_TEST_PPC64LE,
+        runs_on=RunnerLabels.FUNC_TESTER_AMD,
+        command="python3 ./ci/jobs/smoke_test_ppc64le.py",
+        digest_config=Job.CacheDigestConfig(
+            include_paths=[
+                "./ci/jobs/smoke_test_ppc64le.py",
+            ],
+        ),
+        requires=[ArtifactNames.CH_PPC64LE_GH],
+        timeout=900,
     )
     install_check_jobs = Job.Config(
         name=JobNames.INSTALL_TEST,
@@ -1698,7 +1713,7 @@ class JobConfigs:
     docker_server = Job.Config(
         name=JobNames.DOCKER_SERVER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1708,13 +1723,18 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.DEB_AMD_RELEASE,
+            ArtifactNames.DEB_ARM_RELEASE,
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     docker_keeper = Job.Config(
         name=JobNames.DOCKER_KEEPER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1724,7 +1744,10 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     sqlancer_master_jobs = Job.Config(

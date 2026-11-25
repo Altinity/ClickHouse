@@ -1,10 +1,14 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <base/types.h>
+#include <iosfwd>
+#include <optional>
 #include <string_view>
 
 namespace DB::Cas
 {
+
+class CasOperation;
 
 /// Read-only decode-to-JSON dispatch for `clickhouse-disks cas-inspect` (and its unit tests): given
 /// any key that could live in a content-addressed pool plus the raw bytes stored at it, decode with
@@ -15,8 +19,8 @@ namespace DB::Cas
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
 /// `cas/ns/stream/` and `cas/ns/state/` roots, `/mount` and `/fold_seal` suffixes, the
-/// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`
-/// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
+/// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`,
+/// the `blob-intents/` keys and the `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
 /// `u128ToHex`), while a recorded incarnation's backend-native value renders as an escaped string
 /// beside its dialect word. Neither is exposed as an array of bytes or a raw struct dump.
 ///
@@ -24,7 +28,17 @@ namespace DB::Cas
 /// decode failure of a matched key (invalid header, corrupted bytes, future format version, ...)
 /// propagates as-is from the underlying `decode*` function (typically `CORRUPTED_DATA` or
 /// `UNKNOWN_FORMAT_VERSION`) — this function performs no fallback decode and swallows nothing.
+///
+/// `base_snapshot_id` is the `checkpoint_snapshot_id` of the life's `_ckpt`, when the caller read it: a
+/// log below it is printed as stored and noted "may be a stray", because cleanup may have emptied that
+/// key and a late create refilled it.
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
-                       const std::optional<NamespaceLifeId> & resolved_life = std::nullopt);
+                       const std::optional<NamespaceLifeId> & resolved_life = std::nullopt,
+                       const std::optional<RefTxnId> & base_snapshot_id = std::nullopt);
+
+/// The `checkpoint_snapshot_id` of `life`'s `_ckpt`, for `caInspectToJson`'s `base_snapshot_id`. A `_ckpt`
+/// this build cannot decode costs only the stray label: one line naming it goes to `diagnostics`.
+std::optional<RefTxnId> readInspectBaseSnapshotId(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                                  std::ostream & diagnostics);
 
 }

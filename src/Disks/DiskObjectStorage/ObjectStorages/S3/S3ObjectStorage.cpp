@@ -196,7 +196,8 @@ public:
         size_t max_list_size,
         bool with_tags_,
         const std::optional<std::string> & start_after_,
-        size_t attempt_seed_ = 0)
+        size_t attempt_seed_ = 0,
+        bool prefetch_next_batch_ = true)
         : IObjectStorageIteratorAsync(
             CurrentMetrics::ObjectStorageS3Threads,
             CurrentMetrics::ObjectStorageS3ThreadsActive,
@@ -209,6 +210,7 @@ public:
         , description(fmt::format("Bucket: {}, Prefix: {}", bucket_, path_prefix))
         , attempt_seed(attempt_seed_)
     {
+        prefetch_next_batch = prefetch_next_batch_;
         request->SetBucket(bucket_);
         request->SetPrefix(path_prefix);
         request->SetMaxKeys(static_cast<int>(max_list_size));
@@ -513,7 +515,8 @@ ObjectStorageIteratorPtr S3ObjectStorage::iterate(
     if (!max_keys)
         max_keys = settings_ptr->request_settings[S3RequestSetting::list_object_keys_size];
     return std::make_shared<S3IteratorAsync>(
-        uri.bucket, path_prefix, clientForRetryProfile(request), max_keys, with_tags, start_after, request.attempt_number);
+        uri.bucket, path_prefix, clientForRetryProfile(request), max_keys, with_tags, start_after, request.attempt_number,
+        request.prefetch_next_page);
 }
 
 void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
@@ -828,12 +831,20 @@ void S3ObjectStorage::pinConditionalOpsGenerationDialect(bool expect_generation_
     pinned_generation_dialect.store(expect_generation_tokens ? 1 : 0);
 }
 
-std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
+std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled(const ObjectStorageControlRequest & control_request) const
 {
     S3::GetBucketVersioningRequest request;
     request.SetBucket(uri.bucket);
 
-    auto outcome = client.get()->GetBucketVersioning(request);
+    /// Nothing reissues this probe, so its one attempt must not run under the adaptive first-attempt
+    /// timeouts, which would turn a slow answer into "unknown".
+    const auto used_client = control_request.profile == ObjectStorageRetryProfile::SingleAttempt
+        ? getSingleAttemptClient(
+              control_request.attempt_timeout_ms,
+              control_request.connect_timeout_cap_ms,
+              /*disable_adaptive_timeouts=*/true)
+        : client.get();
+    auto outcome = used_client->GetBucketVersioning(request);
     if (!outcome.IsSuccess())
     {
         /// The caller only learns "unknown"; the reason is what the operator needs to act on.

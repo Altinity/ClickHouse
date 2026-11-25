@@ -180,10 +180,10 @@ private:
     bool replacement_fired = false;
 };
 
-std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
+std::vector<std::tuple<String, String, String>> snapshotPrefixObjects(
     InMemoryBackend & backend, const String & prefix)
 {
-    std::vector<std::tuple<String, String, Etag>> objects;
+    std::vector<std::tuple<String, String, String>> objects;
     auto requests = openRequestsForTest(backend);
     auto op = requests.admit();
     String cursor;
@@ -195,7 +195,7 @@ std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
             const auto got = op.read(listed.key, Retry::once());
             if (!got)
                 throw std::runtime_error("prefix snapshot fixture: listed object disappeared");
-            objects.emplace_back(listed.key, got->bytes, got->etag);
+            objects.emplace_back(listed.key, got->bytes, tokenText(got->etag));
         }
         if (page.next_cursor.empty())
             return objects;
@@ -287,7 +287,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
     /// A throwaway open-fence operation, for the two `CasRefCatalog` calls below only: this fixture
     /// writes everything else directly against `backend` via the raw-write helpers, unrelated to any
     /// mount fence.
-    CasRequests requests(victim.poolBackendPtr(), Fence::open());
+    CasRequests requests(victim.poolBackendPtr(), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     /// Final physical ids are pool-wide. The generic raw-write helper intentionally uses one shared
@@ -380,14 +380,14 @@ protected:
     }
 
     /// The owner, epoch and mount objects, bytes and incarnation.
-    std::vector<std::optional<std::pair<String, Etag>>> controlObjects() const
+    std::vector<std::optional<std::pair<String, String>>> controlObjects() const
     {
         OperationForTest op(*victim_backend);
-        std::vector<std::optional<std::pair<String, Etag>>> objects;
+        std::vector<std::optional<std::pair<String, String>>> objects;
         for (const String & key : {layout.ownerKey("victim"), layout.epochKey("victim"), layout.mountKey("victim")})
         {
             const auto got = (*op).read(key, Retry::once());
-            objects.push_back(got ? std::optional(std::pair(got->bytes, got->etag)) : std::nullopt);
+            objects.push_back(got ? std::optional(std::pair(got->bytes, tokenText(got->etag))) : std::nullopt);
         }
         return objects;
     }
@@ -566,7 +566,7 @@ TEST_F(CASDecommission, RefusesIdWithSlash)
 
     const auto owner_after = (*raw_op).read(layout.ownerKey("shard-01/replica-a"), Retry::once());
     ASSERT_TRUE(owner_after.has_value());
-    EXPECT_EQ(owner_after->etag, owner_before->etag);
+    EXPECT_EQ(tokenText(owner_after->etag), tokenText(owner_before->etag));
     EXPECT_FALSE((*raw_op).head(layout.mountKey("shard-01/replica-a"), Retry::once()).has_value());
     EXPECT_FALSE((*raw_op).head(layout.epochKey("shard-01/replica-a"), Retry::once()).has_value());
 }
@@ -1391,7 +1391,7 @@ TEST_F(CASDecommission, UnconfirmedFarewellIsNotRetired)
 {
     auto backend = startVictim(std::make_shared<FenceBeforeFarewellBackend>());
     backend->arm();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "warning");
 
     const auto report = run("admin");
 
@@ -1793,8 +1793,8 @@ public:
 };
 
 /// The tombstone write lands, GC fences the admin's body, and the write's answer is lost; the owner then
-/// cannot be read for `unreadable_ms` of the fake clock, longer than the write's own retry window, so the
-/// write gives up after sending.
+/// cannot be read for `unreadable_ms` of the fake clock, longer than the admin's lease that bounds the write's
+/// retries, so the write gives up after sending.
 class OwnerUnreadableAfterTombstoneBackend : public InMemoryBackend
 {
 public:
@@ -2008,7 +2008,7 @@ TEST_F(CASDecommission, FencedAdminFailsInsteadOfRemounting)
     tombstoneOwner();
     fenceSlot();
     admin->tripMountLost();   /// what the renewer does when it finds its body fenced
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "warning");
     EXPECT_FALSE(admin->tryRemountOnce());
     EXPECT_EQ(admin->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_NE(capture.captured().find("lost its admin claim and does not remount"), String::npos) << capture.captured();
@@ -2137,7 +2137,7 @@ TEST_F(CASDecommission, TombstoneWriteThatGaveUpAfterSendingIsConfirmed)
     auto backend = startVictim(std::make_shared<OwnerUnreadableAfterTombstoneBackend>());
     auto clock = farClock();
     backend->clock = clock;
-    backend->unreadable_ms = 100'000;   /// longer than the tombstone write retries
+    backend->unreadable_ms = 100'000;   /// longer than the admin lease
 
     EXPECT_THROW(runOnClock("a1", clock), DB::Exception);
 
@@ -2194,7 +2194,7 @@ TEST_F(CASDecommission, OwnerThatMovedOnIsNotReportedRetired)
 TEST_F(CASDecommission, RetirementLogsTheUuidAndLife)
 {
     auto backend = startVictim();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "information");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "information");
 
     const auto report = run("a1");
 
@@ -2276,7 +2276,7 @@ TEST_F(CASDecommission, FailedConfirmKeepsTheDrainError)
 {
     auto backend = startVictim(std::make_shared<DrainThenConfirmFailBackend>());
     backend->onWriteCommitted(layout.ownerKey("victim"), [&] { backend->arm(); });
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "warning");
 
     try
     {
@@ -2295,7 +2295,7 @@ TEST_F(CASDecommission, FailedConfirmKeepsTheDrainError)
 TEST_F(CASDecommission, OpenLogsTheSkippedProbe)
 {
     auto backend = startVictim();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "information");
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "information");
     auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
     EXPECT_NE(capture.captured().find("capability probe was skipped"), String::npos) << capture.captured();
 }
@@ -2536,9 +2536,9 @@ TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
     const auto control_objects = [&](Backend & backend)
     {
         OperationForTest op(backend);
-        std::vector<Etag> etags;
+        std::vector<String> etags;
         for (const String & key : {layout.ownerKey("victim"), layout.epochKey("victim"), layout.mountKey("victim")})
-            etags.push_back((*op).read(key, Retry::once())->etag);
+            etags.push_back(tokenText((*op).read(key, Retry::once())->etag));
         return etags;
     };
     for (const ServerRootLeftover leftover :
@@ -2583,7 +2583,7 @@ TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
             case ServerRootLeftover::None:
                 FAIL();
         }
-        const std::vector<Etag> before = control_objects(*backend);
+        const std::vector<String> before = control_objects(*backend);
 
         try
         {
@@ -2836,7 +2836,7 @@ TEST(CASRejoin, DelayedLowerEpochClaimAfterRejoinIsRefused)
             expectThrowsCode(ErrorCodes::ABORTED, [&] { claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life); });
         else
             EXPECT_EQ(claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life).kind, MountClaimResult::ForeignOwner);
-        EXPECT_EQ((*op).read(layout.mountKey("victim"), Retry::once())->etag, before->etag);
+        EXPECT_EQ(tokenText((*op).read(layout.mountKey("victim"), Retry::once())->etag), tokenText(before->etag));
     }
 }
 

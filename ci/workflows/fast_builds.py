@@ -44,11 +44,16 @@ workflow = Workflow.Config(
             )
             for job in builds_for_release_branch
         ],
+        *[
+            job.set_run_after(BLOCKING_BUILD_JOBS)
+            for job in JobConfigs.special_build_jobs
+            if "ppc64le" in job.name
+        ],
+        JobConfigs.smoke_test_ppc64le,
         JobConfigs.docker_server,
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
         *AltinityJobConfigs.sign_release_jobs,
-        AltinityJobConfigs.source_upload_job,
         *[
             job
             for job in FUNCTIONAL_TESTS_JOBS

@@ -75,7 +75,7 @@ def _gc_bookkeeping(*nodes):
         )
         deleted += int(
             n.query(
-                "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
+                "SELECT sum(objects_deleted + manifests_deleted + entries_bodies_deleted) "
                 "FROM system.cas_gc_log WHERE event_type = 'Finish'"
             ).strip()
             or 0

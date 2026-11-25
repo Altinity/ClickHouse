@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <set>
 #include <string_view>
+#include <utility>
 
 namespace DB::ErrorCodes
 {
@@ -23,8 +24,8 @@ TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
         "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
         "cas_ref_ckpt", "cas_ref_catalog", "cas_gc_maintenance_state", "cas_part_manifest",
         "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb", "cas_gc_outcomes",
-        "cas_owner", "cas_epoch", "cas_mount_lease"};
-    ASSERT_EQ(expected.size(), 17u);
+        "cas_owner", "cas_epoch", "cas_mount_lease", "cas_blob_intent"};
+    ASSERT_EQ(expected.size(), 18u);
 
     std::set<std::string_view> actual;
     for (const auto id : allRegisteredFormatIds())
@@ -48,7 +49,7 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
 {
     for (auto id : allRegisteredFormatIds())
     {
-        if (id == FormatId::RefLog)
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt || id == FormatId::BlobIntent)
             continue;
         const auto cps = changePoints(id);
         ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
@@ -62,23 +63,53 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
     EXPECT_EQ(roster_cps.front().min_reader, 1u);
 }
 
+TEST(CASFormat, BlobIntentIsBornAtGenerationFour)
+{
+    const auto points = changePoints(FormatId::BlobIntent);
+    ASSERT_EQ(points.size(), 1u);
+    EXPECT_EQ(points.front().generation, G_BLOB_INTENTS);
+    EXPECT_EQ(points.front().min_reader, G_BLOB_INTENTS);
+    EXPECT_EQ(static_cast<uint16_t>(FormatId::BlobIntent), 26);
+}
+
 TEST(CASFormat, CurrentVersionsAreGBuild)
 {
     EXPECT_EQ(currentWriterVersion(), G_BUILD);
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
 }
 
-TEST(CASFormat, RefLogHistoryRecordsTheOwnerMoveGeneration)
+TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 {
-    const auto cps = changePoints(FormatId::RefLog);
-    ASSERT_EQ(cps.size(), 2u);
-    EXPECT_EQ(cps.back().generation, 2u);
-    EXPECT_EQ(cps.back().min_reader, 2u) << "a Move-bearing log is meaningless to a generation-1 reader";
+    EXPECT_EQ(G_REF_CHAIN, 3u);
+    EXPECT_EQ(G_BUILD, G_BLOB_INTENTS);
+    EXPECT_EQ(currentReadCeiling(), G_BUILD);
+
+    const auto pair = [](const FormatChangePoint & cp) { return std::make_pair(cp.generation, cp.min_reader); };
+    using Pair = std::pair<uint16_t, uint16_t>;
+
+    const auto log_cps = changePoints(FormatId::RefLog);
+    ASSERT_EQ(log_cps.size(), 3u);
+    EXPECT_EQ(pair(log_cps[1]), Pair(2, 2)) << "a Move-bearing log is meaningless to a generation-1 reader";
+    EXPECT_EQ(pair(log_cps.back()), Pair(3, 3));
+
+    const auto ckpt_cps = changePoints(FormatId::RefCkpt);
+    ASSERT_EQ(ckpt_cps.size(), 2u);
+    EXPECT_EQ(pair(ckpt_cps.front()), Pair(1, 1));
+    EXPECT_EQ(pair(ckpt_cps.back()), Pair(3, 3));
+
+    for (auto id : allRegisteredFormatIds())
+    {
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt || id == FormatId::BlobIntent)
+            continue;
+        const auto cps = changePoints(id);
+        ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
+        EXPECT_EQ(pair(cps.front()), Pair(1, 1)) << "FormatId " << static_cast<int>(id);
+    }
 }
 
 TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
 {
-    EXPECT_EQ(G_BUILD, 2u);
+    EXPECT_EQ(G_BUILD, 4u);
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
     EXPECT_EQ(G_WRITE_FLOOR, 1u);
 }

@@ -404,17 +404,17 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openRecordingStorage(
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
 
-    out_object_storage = std::make_shared<RecordingObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    out_object_storage = ownedByDirectory(
+        std::make_shared<RecordingObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 
-    auto settings = makeSettingsForTest(
-        "test", std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique));
+    const auto scratch = std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique);
+    auto settings = makeSettingsForTest("test", scratch);
     /// A GC round touches `cas/ref_catalog`, `cas/ns/stream/` and `cas/manifests/`, so with the
     /// background scheduler enabled these zeros would hold only because the first tick (60s) outlives the
     /// test. A timer is not a fence.
     settings[DB::ContentAddressedSetting::gc_enabled] = false;
-    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        out_object_storage, "pool", "srv1", "", nullptr, settings);
+    auto storage = ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(out_object_storage, "pool", "srv1", "", nullptr, settings), scratch);
     storage->startup();
     return storage;
 }
@@ -542,7 +542,7 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     const auto catalog_after_removal = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_removal);
     EXPECT_EQ(catalog_after_removal->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after_removal->etag, catalog_before->etag)
+    EXPECT_EQ(tokenText(catalog_after_removal->etag), tokenText(catalog_before->etag))
         << "the mandatory catalog must remain byte-for-byte and token-for-token unchanged";
 
     /// Not vacuous: the SAME operations on the same table after a write do reach the file, so the zeros
@@ -557,5 +557,5 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     const auto catalog_after_birth = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_birth);
     EXPECT_NE(catalog_after_birth->bytes, catalog_after_removal->bytes);
-    EXPECT_NE(catalog_after_birth->etag, catalog_after_removal->etag);
+    EXPECT_NE(tokenText(catalog_after_birth->etag), tokenText(catalog_after_removal->etag));
 }

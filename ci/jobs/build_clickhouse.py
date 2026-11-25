@@ -98,6 +98,73 @@ class JobStages(metaclass=MetaClasses.WithIter):
     UPLOAD_PROFILE_DATA = "profile"
 
 
+def check_ppc64le_build(build_root):
+    asm_path = os.path.join(
+        current_directory,
+        "contrib/llvm-project/libunwind/src/UnwindRegistersSave.S",
+    )
+    ninja_path = os.path.join(build_root, "build.ninja")
+
+    try:
+        with open(asm_path, encoding="utf-8") as asm_file:
+            asm = asm_file.read()
+    except OSError as error:
+        print(f"Could not read libunwind source {asm_path}: {error}")
+        return False
+
+    restored = (
+        "  xxswapd n, n            ;\\\n"
+        "  stxvd2x n, 0, 4         ;\\\n"
+        "  xxswapd n, n            ;\\"
+    )
+    if restored not in asm:
+        print(f"ppc64le unw_getcontext fix is missing from {asm_path}")
+        return False
+
+    # CMAKE_CXX_FLAGS in CMakeCache.txt stays empty. The real flags are on the ninja FLAGS lines.
+    frame_flag = "-Wframe-larger-than=131072"
+    asm_input = "libunwind/src/UnwindRegistersSave.S"
+    found_frame = False
+    found_asm = False
+    found_altivec = False
+    found_sse2 = False
+    try:
+        with open(ninja_path, encoding="utf-8", errors="replace") as ninja:
+            for line in ninja:
+                if "FLAGS" not in line and asm_input not in line:
+                    continue
+                if not found_frame and frame_flag in line:
+                    found_frame = True
+                if not found_asm and asm_input in line:
+                    found_asm = True
+                if "FLAGS" in line:
+                    if "-maltivec" in line and (
+                        "-mcpu=power8" in line or "-mcpu=power9" in line
+                    ):
+                        found_altivec = True
+                    if "-D__SSE2__" in line or "-DNO_WARN_X86_INTRINSICS" in line:
+                        found_sse2 = True
+    except OSError as error:
+        print(f"Could not read {ninja_path}: {error}")
+        return False
+    if not found_altivec:
+        print(f"{ninja_path} FLAGS lines are missing ppc64le AltiVec flags")
+        return False
+    if found_sse2:
+        print(
+            f"{ninja_path} FLAGS lines still define __SSE2__ or NO_WARN_X86_INTRINSICS"
+        )
+        return False
+    if not found_frame:
+        print(f"{frame_flag} is not in {ninja_path}")
+        return False
+    if not found_asm:
+        print(f"{asm_input} is not a build input in {ninja_path}")
+        return False
+    print("ppc64le build checks passed")
+    return True
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="ClickHouse Build Job")
     parser.add_argument(
@@ -215,9 +282,23 @@ def upload_thinlto_cache(s3_path, flavour):
     print(
         f"ThinLTO cache archive: {os.path.getsize(thinlto_cache_archive) / (1 << 30):.1f} GiB"
     )
-    S3.copy_file_to_s3(
-        s3_path=s3_path, local_path=thinlto_cache_archive, with_rename=True
-    )
+    # The cache only speeds up the next build, so a failed upload must not fail this one.
+    # Retry once, since Hetzner timeouts are usually short.
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        try:
+            S3.copy_file_to_s3(
+                s3_path=s3_path, local_path=thinlto_cache_archive, with_rename=True
+            )
+            break
+        except Exception as e:
+            print(
+                f"WARNING: ThinLTO cache upload failed (attempt {attempt}/{attempts}): {e}"
+            )
+            if attempt < attempts:
+                Utils.sleep(60)
+    else:
+        print("WARNING: ThinLTO cache was not uploaded, the next build will be slower")
     os.remove(thinlto_cache_archive)
     return True
 
@@ -257,6 +338,11 @@ def setup_build_caches_env(info):
             print("NOTE: Using custom AWS credentials for sccache")
         else:
             os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
+            if not os.environ.get("SCCACHE_BUCKET"):
+                # NOTE (strtgbb): fork PRs and local runs have no S3_ARTIFACT_BUCKET
+                print("NOTE: sccache bucket unset, reading altinity-build-artifacts read-only")
+                os.environ["SCCACHE_BUCKET"] = "altinity-build-artifacts"
+                os.environ["SCCACHE_S3_READ_ONLY"] = "true"
         # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
         os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
         os.environ.pop("AWS_ACCESS_KEY_ID", None)
@@ -518,6 +604,16 @@ def main():
                 shutil.copy2(ninja_log_seed, f"{build_dir}/.ninja_log")
                 print(f"Pre-seeded .ninja_log from {ninja_log_seed}")
             Shell.check("ninja --version", verbose=True)
+
+    if res and build_type == BuildTypes.PPC64LE and JobStages.BUILD in stages:
+        results.append(
+            Result.from_commands_run(
+                name="ppc64le build check",
+                command=check_ppc64le_build,
+                command_kwargs={"build_root": build_dir},
+            )
+        )
+        res = results[-1].is_ok()
 
     # Activate FIPS-permissive config for OpenSSL
     os.environ["OPENSSL_CONF"] = "/etc/ssl/openssl.cnf"

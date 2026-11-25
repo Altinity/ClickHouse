@@ -14,9 +14,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/Pipe.h>
 #include <Interpreters/Context.h>
+#include <IO/ReadHelpers.h>
 #include <Common/assert_cast.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -29,6 +31,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INVALID_STATE;
+}
+
+UUID casServerIdToUuid(const UInt128 & server_id)
+{
+    /// `UUID(server_id)` would swap the 64-bit halves: the id keeps the text's digits in numeric order.
+    return parseFromString<UUID>(Cas::u128ToHex(server_id));
 }
 
 StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const StorageID & table_id_)
@@ -51,7 +59,7 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"state", std::make_shared<DataTypeString>(), "Mount slot state: live, expired, terminated, fenced, retired or corrupt."},
         {"is_leader", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 if this server's GC scheduler holds this disk's leadership lease. NULL on rows describing other servers' mounts."},
         {"pending_reclaim", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt64>()), "Cumulative condemned-minus-deleted backlog observed by this process's GC on this disk. NULL on rows describing other servers' mounts."},
-        {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it never led). NULL on rows describing other servers' mounts."},
+        {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last completed a round as leader on this server. NULL until the first such round and on rows describing other servers' mounts."},
         {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk. NULL on rows describing other servers' mounts."},
         {"lifecycle", std::make_shared<DataTypeString>(), "This server's content-addressed pool lifecycle for the disk (non-gated snapshot, always populated so a not-live disk stays visible): live, not_live, identity_lost, vanished, constructing (never started) or shutdown (torn down)."},
         {"lifecycle_reason", std::make_shared<DataTypeString>(), "The enum-clean sub-state word: replaced or forgotten for a vanished disk, lease_expired for a not_live disk whose mount lease has too little time left to admit a write while its renewal keeps retrying. Empty for every other lifecycle (so lifecycle || '(' || lifecycle_reason || ')' reads e.g. vanished(forgotten))."},
@@ -202,7 +210,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                 {
                     col_disk->insert(disk_name);
                     col_srid->insert(m.srid);
-                    assert_cast<ColumnUUID &>(*col_uuid).insertValue(UUID(m.lease.server_uuid));
+                    assert_cast<ColumnUUID &>(*col_uuid).insertValue(casServerIdToUuid(m.lease.server_uuid));
                     col_host->insert(m.lease.hostname);
                     col_pid->insert(m.lease.pid);
                     col_epoch->insert(m.lease.writer_epoch);
@@ -221,7 +229,10 @@ Pipe StorageSystemContentAddressedMounts::read(
                     {
                         col_is_leader->insert(static_cast<UInt8>(health->is_leader));
                         col_pending->insert(health->pending_reclaim);
-                        col_last_success->insert(health->last_success_age_seconds);
+                        if (health->ever_succeeded)
+                            col_last_success->insert(health->last_success_age_seconds);
+                        else
+                            col_last_success->insertDefault();
                         col_wedged->insert(health->wedged_namespace_count);
                     }
                     else

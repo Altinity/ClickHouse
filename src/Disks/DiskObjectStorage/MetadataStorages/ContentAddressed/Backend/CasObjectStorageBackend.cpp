@@ -147,17 +147,19 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// evidence of a versioned bucket, its usual cause is a credential without permission to read the
 /// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
 /// mount proceeds with a warning that names what was not verified and how the operator can verify it.
+/// The probe uses this backend's control-plane profile, because the default client would retry a failed
+/// attempt with SDK backoff, outside the mount's attempt budget.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != Dialect::Generation)
         return;
 
-    const auto versioned = object_storage->isBucketVersioningEnabled();
+    const auto versioned = object_storage->isBucketVersioningEnabled(controlRequest(/*attempt_no=*/0));
     if (!versioned.has_value())
     {
         LOG_WARNING(getLogger("CasObjectStorageBackend"),
             "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
-            "request failed, e.g. the credential lacks permission to read the bucket configuration, "
+            "request failed, e.g. it timed out or the credential lacks permission to read the bucket configuration, "
             "or this backend cannot answer it). Mounting anyway. If versioning IS enabled on this "
             "bucket, token-exact DELETEs archive noncurrent generations instead of reclaiming storage "
             "and GC silently stops reclaiming space. Confirm by hand that versioning is disabled, or "
@@ -316,6 +318,17 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
     auto buf = object_storage->writeObject(
         StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, std::max<size_t>(1, bytes.size()), ws);
     buf->write(bytes.data(), bytes.size());
+
+    /// An `If-Match` write of a key that was deleted meanwhile answers 404, which
+    /// `finalizeConditionalWrite` maps to a lost precondition: an ordinary answer, as for the GET in
+    /// `readUnder`. Without the scope the HTTP client logs it at Error, and a stateless test whose
+    /// stderr is checked fails on the log line alone. The request runs on this thread:
+    /// `conditionalWriteSettings` turns the parallel part upload off. An `If-None-Match` write names
+    /// no existing object, so a 404 there stays loud.
+    std::optional<Expect404ResponseScope> absent_key_is_a_lost_precondition;
+    if (!ws.object_storage_write_if_match.empty())
+        absent_key_is_a_lost_precondition.emplace();
+
     if (finalizeConditionalWriteInstrumented(*buf) == detail::ConditionalWriteOutcome::PreconditionLost)
         return std::unexpected(RawConflict{});
 
@@ -489,8 +502,9 @@ String ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
     return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/true);
 }
 
-void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size)
+void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const StreamingBlobPublication & publication, ReadBuffer & payload)
 {
+    const String & envelope = publication.fresh_envelope;
     if (object_storage->getType() != ObjectStorageType::Local)
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
@@ -510,21 +524,14 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     /// or long source aborts on the temporary file, which is then removed.
     try
     {
-        auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(
+            StoredObject(temporary_object),
+            WriteMode::Rewrite,
+            /*attributes=*/std::nullopt,
+            blob_publication_detail::blobWriteBufferSize(envelope.size() + publication.payload_size));
         out->write(envelope.data(), envelope.size());
-        const auto copy_result = blob_publication_detail::copyBlobPayloadBounded(payload, *out, payload_size);
-        if (!copy_result.exact(payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                key,
-                payload_size);
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(payload, *out, publication, key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
     }
     catch (...)
     {
@@ -900,8 +907,7 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
         if (mode != Mode::Native)
         {
             /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
-            emuPublishBlobAtomically(
-                request.destination_key, streaming->fresh_envelope, *payload, streaming->payload_size);
+            emuPublishBlobAtomically(request.destination_key, *streaming, *payload);
             return;
         }
 
@@ -911,31 +917,11 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
-            DBMS_DEFAULT_BUFFER_SIZE,
+            blob_publication_detail::blobWriteBufferSize(streaming->fresh_envelope.size() + streaming->payload_size),
             blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
-        try
-        {
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming->payload_size);
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        if (!copy_result.exact(streaming->payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, *out, *streaming, request.destination_key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published");
         return;
     }
 
@@ -1129,7 +1115,10 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     static constexpr size_t max_store_page = 1'000'000;
     const size_t store_page = cursor.empty() ? std::min(limit, max_store_page) + 1 : 0;
     RawListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, request);
+    /// The page ends at its sentinel; a prefetched next page would be a request nobody reads.
+    ObjectStorageControlRequest page_request = request;
+    page_request.prefetch_next_page = false;
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, page_request);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();

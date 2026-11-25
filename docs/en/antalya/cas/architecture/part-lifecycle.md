@@ -53,7 +53,6 @@ sequenceDiagram
     end
     PW->>PW: merge upload results on the owning thread, one no-throw swap
     TX->>PW: promote
-    PW->>S3: GET and validate the precommit manifest body
     PW->>S3: append ref-log txn: retire old committed, Precommit to Committed, SetPublishedAt
     Note over PW: commit durable, then retire the build sequence
     end
@@ -71,7 +70,12 @@ one ref-log `Move` of the committed ref (see [replication](replication.md)).
 
 **Step 1 — `stageManifest`.** Caps (see the
 [manifests-and-refs page](/antalya/cas/architecture/manifests-and-refs#part-manifests)) are
-checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`; the body goes out
+checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`. The encoder refuses
+a bad or duplicate entry path (such as a `..` segment), which no writer builds (`LOGICAL_ERROR`), and
+a line over the line cap, which an oversized legal input can produce (`LIMIT_EXCEEDED`). The sealed body is then decoded
+with the readers' own decoder, so nothing a reader would reject is written; such a body fails with
+`CORRUPTED_DATA` before any object exists. The decode also records the blob leaves that `promote`
+checks. The body goes out
 with a conditional create and no preliminary `HEAD`. Blob publication is different; manifests
 remain small write-once metadata objects. Both a definite failure and an unresolved
 outcome throw retry-later.
@@ -90,12 +94,13 @@ calling thread only submits and joins, never occupies a pool slot, so a pool of 
 to a correct serial run and can never deadlock. The contract is merge-nothing: if any task threw,
 nothing is merged and the first error in dispatch order is rethrown. Results are folded into the
 dependency set on the owning thread, into a copy, committed by one no-throw swap. Every physical
-task starts with blob `HEAD`; a present body with a `Clean` marker or a completed publication yields an
+task starts with blob `HEAD`; a present body without a deletion intent or a completed publication yields an
 explicit `Materialized` proof. A trusted source manifest instead yields `TrustedManifest` without
 blob I/O. Pool size is the
-server setting `cas_blob_upload_pool_size` (default 16).
+server setting `cas_blob_upload_pool_size` (default 64).
 
-**Step 4 — `promote`.** Reads and revalidates the precommit manifest body once; sets the commit
+**Step 4 — `promote`.** Sends no manifest request: the leaves recorded by `stageManifest` are the
+dependency set. It sets the commit
 state to Uncertain before the append — past that point, failure is no longer proof of the negative
 — then checks that the precommit is still the live owner and validates explicit dependency proofs.
 `Materialized` leaves are edge-protected; `TrustedManifest` leaves are trusted through the durable
@@ -121,8 +126,8 @@ leave only a precommit binding.
 | C7 | A later part throws after earlier parts published | A partial multi-part commit | Precise rollback: drop only the refs this call created, matching the exact manifest — never clobbers a concurrent writer's repoint |
 | C8 | Transaction destroyed uncommitted | Open builds | Destructor abandons every build |
 | C9 | Namespace dropped mid-build | — | One atomic flag; every further op fails closed at the alive check |
-| C10 | `promote` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref. A restart before that drop brings the part back on `MergeTree`; on `ReplicatedMergeTree` the part has no Keeper entry and startup detaches it as `ignored_<part>`. The client sees `is durable but was not acknowledged`, and the message says the write may still take effect |
-| C11 | `precommitAdd` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable precommit binding this server has not installed | The next ref-log recovery installs the binding; the part is never published. `abandon`, else the stale-precommit sweep, removes it. The client sees `is durable but was not acknowledged` with `the part is never published` |
+| C10 | `promote` ref-log `PUT` committed, then the install was refused: the mount fence or the install admission failed after the create, or the table changed before installation | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref. A restart before that drop brings the part back on `MergeTree`; on `ReplicatedMergeTree` the part has no Keeper entry and startup detaches it as `ignored_<part>`. The client sees `is durable but was not acknowledged`. When the install was refused at the admission, the message says the write may still take effect; when the table changed before installation, it says only that the lane needs recovery. If a successor's tombstone already holds the slot, the `PUT` conflicts instead and nothing is durable: the client sees `INVALID_STATE` with `was CLOSED by a successor's`, the write was never acknowledged and the lane is closed |
+| C11 | `precommitAdd` ref-log `PUT` committed, then the install was refused, as in C10 | A durable precommit binding this server has not installed | The next ref-log recovery installs the binding; the part is never published. `abandon`, else the stale-precommit sweep, removes it. The client sees `is durable but was not acknowledged` with `the part is never published`. A conflict with a successor's tombstone gives the same result as in C10 |
 
 What each client-visible message means, and when a retry is safe, is in
 [CAS commit errors](/antalya/cas/operations/troubleshooting#cas-commit-errors).

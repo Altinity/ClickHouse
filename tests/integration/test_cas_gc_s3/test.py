@@ -1,3 +1,4 @@
+import re
 import time
 
 import pytest
@@ -13,6 +14,19 @@ STORAGE_POLICY = "cas_gc_s3"
 # proof checks BOTH: a dropped table must leave neither content blobs nor part footers behind.
 BLOBS_PREFIX = "cas_gc_data/blobs/"
 PARTS_PREFIX = "cas_gc_data/parts/"
+BLOB_INTENTS_PREFIX = "cas_gc_data/blob-intents/"
+
+# What `system.blob_storage_log` records per reclaimed blob: the intent `PUT` that condemns it, the body `DELETE`
+# that reclaims it and the intent `DELETE` that follows. The `HEAD`s of the two decisions are not logged there.
+LOGGED_REQUESTS_PER_RECLAIMED_BLOB = {
+    ("Upload", "intent"): 1,
+    ("Delete", "body"): 1,
+    ("Delete", "intent"): 1,
+}
+
+# A blob body key or a deletion intent key, reduced to the blob's `<algo>/<shard>/<hex>` path.
+BLOB_BODY_PATH = re.compile(r"(?:^|/)blobs/(?P<blob>[^/]+/[0-9a-f]{2}/[0-9a-f]+)$")
+BLOB_INTENT_PATH = re.compile(r"(?:^|/)blob-intents/(?P<blob>[^/]+/[0-9a-f]{2}/[0-9a-f]+)/[^/]+/[0-9a-f]+$")
 
 # Enough rows / inserts to materialise several distinct blobs in the pool.
 NUM_ROWS = 100000
@@ -39,7 +53,7 @@ DESTRUCTIVE_PHASES = (
 def start_cluster():
     cluster.add_instance(
         "node",
-        main_configs=["configs/storage_conf.xml"],
+        main_configs=["configs/storage_conf.xml", "configs/blob_storage_log.xml"],
         with_rustfs=True,
         stay_alive=True,
     )
@@ -49,6 +63,13 @@ def start_cluster():
         yield cluster
     finally:
         cluster.shutdown()
+
+
+def list_keys(prefix):
+    objects = cluster.rustfs_client.list_objects(
+        cluster.rustfs_bucket, prefix, recursive=True
+    )
+    return {o.object_name for o in objects}
 
 
 def count_prefix(prefix):
@@ -186,4 +207,83 @@ def test_gc_reclaims_dropped_blobs():
     )
     assert suppressed_phases == 0, (
         "a destructive phase reported itself suppressed on a pool whose frontier was complete"
+    )
+
+
+def test_gc_requests_per_reclaimed_blob():
+    """
+    The requests the pool's GC logs per reclaimed blob are exactly the three the intent protocol sends.
+
+    `system.blob_storage_log` records uploads and deletes, not `HEAD`s: the intent `PUT`, the body `DELETE` and the
+    intent `DELETE`. A fourth request means a repeated create or delete; a missing one means the body or its
+    intent was removed some other way. Every blob of this test's own table is counted, and each was reclaimed.
+    """
+    node = cluster.instances["node"]
+
+    node.query("DROP TABLE IF EXISTS cas_gc_requests SYNC")
+    node.query(
+        "CREATE TABLE cas_gc_requests (id Int64, data String) ENGINE = MergeTree() ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(STORAGE_POLICY)
+    )
+
+    blobs_before = list_keys(BLOBS_PREFIX)
+    for i in range(3):
+        node.query(
+            "INSERT INTO cas_gc_requests "
+            "SELECT number + {offset}, toString(number + {offset}) FROM numbers({rows})".format(
+                offset=(1 + i) * 10**9, rows=NUM_ROWS
+            )
+        )
+    created_keys = list_keys(BLOBS_PREFIX) - blobs_before
+    assert created_keys, "the inserts created no blob"
+    created = {
+        BLOB_BODY_PATH.search(key).group("blob") for key in created_keys
+    }
+
+    # The window starts before the drop: nothing the insert logged is counted.
+    window_start = int(node.query("SELECT toUnixTimestamp64Micro(now64(6))").strip())
+    node.query("DROP TABLE cas_gc_requests SYNC")
+
+    def intents_of_created():
+        return {
+            key
+            for key in list_keys(BLOB_INTENTS_PREFIX)
+            if (m := BLOB_INTENT_PATH.search(key)) and m.group("blob") in created
+        }
+
+    # Reclaimed: every body gone and every intent of those bodies removed, so the whole ledger has been spent.
+    for _ in range(RECLAIM_RETRIES):
+        if not (list_keys(BLOBS_PREFIX) & created_keys) and not intents_of_created():
+            break
+        time.sleep(RECLAIM_SLEEP)
+    assert not (list_keys(BLOBS_PREFIX) & created_keys), "bodies were not reclaimed"
+    assert not intents_of_created(), "intents of the reclaimed bodies were not removed"
+
+    node.query("SYSTEM FLUSH LOGS")
+    rows = node.query(
+        "SELECT event_type, remote_path FROM system.blob_storage_log "
+        "WHERE toUnixTimestamp64Micro(event_time_microseconds) >= {} "
+        "AND event_type IN ('Upload', 'Delete') AND error_code = 0 "
+        "FORMAT TSV".format(window_start)
+    )
+    requests = {blob: {} for blob in created}
+    for row in rows.splitlines():
+        event_type, remote_path = row.split("\t")
+        body = BLOB_BODY_PATH.search(remote_path)
+        intent = BLOB_INTENT_PATH.search(remote_path)
+        match = body or intent
+        if not match or match.group("blob") not in requests:
+            continue
+        kind = (event_type, "body" if body else "intent")
+        counts = requests[match.group("blob")]
+        counts[kind] = counts.get(kind, 0) + 1
+
+    assert requests, "the inserts created no blob"
+    wrong = {
+        blob: counts
+        for blob, counts in requests.items()
+        if counts != LOGGED_REQUESTS_PER_RECLAIMED_BLOB
+    }
+    assert not wrong, "logged requests per reclaimed blob differ from {}: {}".format(
+        LOGGED_REQUESTS_PER_RECLAIMED_BLOB, wrong
     )

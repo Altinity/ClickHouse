@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
+#include "cas_publication_test_support.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -14,6 +15,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <Common/SipHash.h>
+#include <base/hex.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/Exception.h>
@@ -50,6 +52,8 @@ namespace DB::ErrorCodes
 
 namespace
 {
+
+using DB::Cas::tests::EtagFaithfulPublicationBackend;
 
 /// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
 
@@ -126,7 +130,8 @@ std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool nati
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported);
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported), root);
 }
 
 /// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::Cas::CaContentWriteBuffer`'s
@@ -220,98 +225,6 @@ public:
     }
 };
 
-/// Models an ETag store faithfully enough for the staged-envelope regressions: a blob token is a
-/// deterministic digest of the complete object bytes, so copying the same staging object again would
-/// reproduce the same token. Each script injects a different ambiguity transition from the design.
-class EtagFaithfulPublicationBackend final : public DB::Cas::InMemoryBackend
-{
-public:
-    enum class FaultScript : uint8_t
-    {
-        CopyLandsThenCondemned,
-        CopyLandsThenDeletedBeforeAbsentRetry,
-        FirstCondemnedStreamLandsThenDeleted,
-    };
-
-    explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
-
-    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        std::optional<DB::Cas::Backend::RawMeta> result = DB::Cas::InMemoryBackend::head(key, access);
-        if (result && isBlobBodyKey(key))
-        {
-            const auto body = DB::Cas::InMemoryBackend::read(key, access);
-            chassert(body.has_value());
-            result->value = sipHash128String(body->bytes);
-        }
-        return result;
-    }
-
-    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
-                                        DB::Cas::TransportAccess & access) override
-    {
-        if (!isBlobBodyKey(key))
-            return DB::Cas::InMemoryBackend::remove(key, expected_value, access);
-
-        const auto current = head(key, access);
-        if (!current)
-            return DB::Cas::Backend::RawRemoval::Gone;
-        if (current->value != expected_value)
-            return DB::Cas::Backend::RawRemoval::Mismatch;
-        return DB::Cas::InMemoryBackend::remove(key, DB::Cas::InMemoryBackend::head(key, access)->value, access);
-    }
-
-    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
-    {
-        const bool is_copy = std::holds_alternative<DB::Cas::VerbatimStagedBlobPublication>(request.publication);
-        if (is_copy)
-            ++copy_publications;
-        else
-            ++streaming_publications;
-
-        if (!fault_fired
-            && ((script == FaultScript::CopyLandsThenCondemned && is_copy)
-                || (script == FaultScript::CopyLandsThenDeletedBeforeAbsentRetry && is_copy)
-                || (script == FaultScript::FirstCondemnedStreamLandsThenDeleted && !is_copy)))
-        {
-            fault_fired = true;
-            DB::Cas::InMemoryBackend::publish(request, access);
-            queued_delete_token = head(request.destination_key, access)->value;
-            /// The test wants to replay this exact captured value later as a delete precondition, to
-            /// prove a retag defeats it. `Etag` is never constructible from a raw string, so the only
-            /// way to hold a replayable one is to mint it -- through a nested admitted operation, over
-            /// this same backend instance -- at the exact moment the raw value above was observed.
-            {
-                DB::Cas::tests::OperationForTest mint_op(*this);
-                const auto meta = (*mint_op).head(request.destination_key, DB::Cas::Retry::once());
-                if (meta)
-                    queued_delete_etag = meta->etag;
-            }
-
-            if (script != FaultScript::CopyLandsThenCondemned)
-                first_delete = remove(request.destination_key, queued_delete_token, access);
-
-            throw Poco::TimeoutException("ETag-faithful staged publication response lost");
-        }
-
-        DB::Cas::InMemoryBackend::publish(request, access);
-    }
-
-    FaultScript script;
-    bool fault_fired = false;
-    size_t copy_publications = 0;
-    size_t streaming_publications = 0;
-    String queued_delete_token;
-    std::optional<DB::Cas::Etag> queued_delete_etag;
-    DB::Cas::Backend::RawRemoval first_delete{};
-
-private:
-    static bool isBlobBodyKey(const String & key)
-    {
-        return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
-    }
-};
-
 DB::Cas::PoolPtr openStagingPool(const std::shared_ptr<RecordingStagingBackend> & b)
 {
     return DB::Cas::Pool::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -388,8 +301,12 @@ TEST(CASS3Staging, StagedCopyCondemnedRetryRetagsBeforeQueuedDelete)
     const String staging_key = "p/staging/mount1/etag-condemned.tmp";
     const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{101});
     createAt(*backend, staging_key, staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 31);
+    {
+        /// The copy will land with this store's content token, and that incarnation is already condemned.
+        const auto identity = DB::Cas::canonicalIdentity(DB::Cas::Dialect::Emulated, sipHash128String(staging_bytes));
+        ASSERT_TRUE(identity.has_value());
+        createAt(*backend, store->layout().blobIntentKey(ref, *identity), DB::Cas::blobIntentRecord());
+    }
     auto build = precommittedBuildFor(
         store, DB::Cas::RootNamespace{"srv1/etag-condemned"}, "part",
         DB::Cas::tests::u128Of(payload), payload.size());
@@ -460,8 +377,7 @@ TEST(CASS3Staging, FirstCondemnedAttemptThenAbsentRetryNeverRecopies)
     const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{303});
     createAt(*backend, staging_key, staging_bytes);
     createAt(*backend, store->layout().blobKey(ref), staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 37);
+    DB::Cas::tests::plantIntentForCurrentBody(*backend, store->layout(), DB::Cas::tests::legacyMetaTestRef(DB::Cas::tests::u128Of(payload)));
     /// Captured through a real admitted operation, so it is a genuinely replayable `Etag` -- never
     /// constructible from a bare raw value -- for the later mismatch check below.
     DB::Cas::Etag original_staged_etag = [&]
@@ -690,7 +606,7 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
     EXPECT_EQ(got->bytes, staging_bytes);
 }
 
-/// (b) Blob key already exists and is `Clean` ⇒ the writer observes it without publication.
+/// (b) Blob key already exists with no intent ⇒ the writer observes it without publication.
 TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
@@ -713,7 +629,6 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
         *backend,
         blob_key,
         stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{0xBB}));
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, payload.size());
     const auto before = headAt(*backend, blob_key);
     ASSERT_TRUE(before.has_value());
 
@@ -729,13 +644,13 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     /// The existing incarnation is untouched: same token, same bytes.
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
 
     /// Observing the existing incarnation records materialized evidence without retaining its token.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
 }
 
-/// (c) Blob key exists but is CONDEMNED ⇒ the writer republishes its OWN staging PAYLOAD
+/// (c) Blob key exists and its incarnation has an intent ⇒ the writer republishes its OWN staging PAYLOAD
 /// under a FRESH-tagged envelope header — NEVER a read/copy of the condemned blob key
 /// and the replacement body DIFFERS from the condemned incarnation
 /// (INV-NO-RETURN: a verbatim copy would reproduce identical bytes ⇒ identical ETag ⇒ the queued
@@ -768,8 +683,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// produced (the writer's OWN create, later observed condemned). This is the adversarial shape: a
     /// verbatim republication WOULD reproduce these identical bytes ⇒ identical ETag ⇒ collision.
     createAt(*backend, blob_key, staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), hash, /*condemn_round=*/5);
+    DB::Cas::tests::plantIntentForCurrentBody(*backend, store->layout(), DB::Cas::tests::legacyMetaTestRef(hash));
     const auto before = headAt(*backend, blob_key);
     ASSERT_TRUE(before.has_value());
 
@@ -778,7 +692,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
         blob_id,
         reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
 
-    /// A present `Condemned` destination selects exactly one retagged streaming publication. It never
+    /// A present destination under an intent selects exactly one retagged streaming publication. It never
     /// attempts the verbatim-copy transport.
     ASSERT_EQ(backend->copy_calls.size(), 1u);
     EXPECT_FALSE(backend->copy_calls[0].server_side_copy);
@@ -792,7 +706,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->etag, before->etag);
+    EXPECT_NE(tokenText(after->etag), tokenText(before->etag));
 
     const auto got = readAt(*backend, blob_key);
     ASSERT_TRUE(got.has_value());
@@ -809,11 +723,9 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     EXPECT_EQ(got->bytes.substr(header_len), payload);              /// payload preserved
     EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
 
-    /// The republication recorded materialized evidence and flipped the meta back to `Clean`.
+    /// The republication recorded materialized evidence; the fresh incarnation has no intent.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
-    const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
-    ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);
+    EXPECT_FALSE(DB::Cas::tests::objectPresent(*backend, *DB::Cas::tests::intentKeyOfCurrentBody(*backend, store->layout(), blob_id)));
 }
 
 /// ===========================================================================================
@@ -841,8 +753,10 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
     auto settings = DB::Cas::tests::makeSettingsForTest(server_root_id, scratch);
     settings[DB::ContentAddressedSetting::staging_backend] = "s3";
     settings.validate();
-    return std::make_shared<DB::ContentAddressedMetadataStorage>(
-        object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings);
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(
+            object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings),
+        scratch);
 }
 
 /// Mirrors gtest_ca_wiring.cpp's helper of the same shape.
@@ -1247,9 +1161,13 @@ class FakeGenerationObjectStorage final : public DB::LocalObjectStorage
 public:
     using DB::LocalObjectStorage::LocalObjectStorage;
 
+    /// Report the S3 ETag dialect instead: a token is a digest of the object's bytes, so the same bytes
+    /// written or copied again carry the same token, as on S3 without KMS. Set before `startup`.
+    bool content_derived_etags = false;
+
     DB::ObjectStorageType getType() const override { return DB::ObjectStorageType::S3; }
-    bool conditionalOpsUseGenerationTokens() const override { return true; }
-    std::optional<bool> isBucketVersioningEnabled() const override { return false; }
+    bool conditionalOpsUseGenerationTokens() const override { return !content_derived_etags; }
+    std::optional<bool> isBucketVersioningEnabled(const DB::ObjectStorageControlRequest &) const override { return false; }
     bool supportsRetryProfile(DB::ObjectStorageRetryProfile) const override { return true; }
     bool supportsCopyMode(DB::ObjectStorageCopyMode mode) const override
     {
@@ -1316,7 +1234,7 @@ public:
             return std::nullopt;
         DB::ObjectMetadata metadata;
         metadata.size_bytes = it->second.bytes.size();
-        metadata.etag = std::to_string(it->second.generation);
+        metadata.etag = tokenOf(it->second);
         return metadata;
     }
 
@@ -1362,7 +1280,7 @@ public:
         DB::SmallObjectDataWithMetadata result;
         result.data = it->second.bytes;
         result.metadata.size_bytes = it->second.bytes.size();
-        result.metadata.etag = "\"" + std::to_string(it->second.generation) + "\"";
+        result.metadata.etag = transportTokenOf(it->second);
         return result;
     }
 
@@ -1379,6 +1297,12 @@ public:
             objects.erase(object.remote_path);
     }
 
+    /// S3 sends an unconditional delete under every retry profile; the intent probe and GC use it.
+    void removeObjectsIfExistUnderProfile(const DB::StoredObjects & objects_to_remove, const DB::ObjectStorageControlRequest &) override
+    {
+        removeObjectsIfExist(objects_to_remove);
+    }
+
     /// `path` is a bare CAS-relative prefix (e.g. `"pool/"` or `"pool/_probe/<hex>"`) -- exactly what
     /// `Backend::list`'s Native-mode path passes through unchanged (it applies no prefix stripping of
     /// its own there) and expects back on every listed key. A plain string-prefix scan over the
@@ -1393,7 +1317,7 @@ public:
                 continue;
             DB::ObjectMetadata metadata;
             metadata.size_bytes = entry.bytes.size();
-            metadata.etag = std::to_string(entry.generation);
+            metadata.etag = tokenOf(entry);
             children.push_back(std::make_shared<DB::RelativePathWithMetadata>(key, std::move(metadata)));
             if (max_keys != 0 && children.size() >= max_keys)
                 break;
@@ -1410,7 +1334,7 @@ public:
             result.outcome = DB::ConditionalRemoveOutcome::NotFound;
             return result;
         }
-        if (std::to_string(it->second.generation) != etag)
+        if (tokenOf(it->second) != etag)
         {
             result.outcome = DB::ConditionalRemoveOutcome::TokenMismatch;
             return result;
@@ -1424,9 +1348,9 @@ public:
     /// stores `bytes` and mints the next generation. Throws an `S3Exception` naming `PreconditionFailed`
     /// on a lost condition -- the one signal `finalizeConditionalWrite` classifies as
     /// `ConditionalWriteOutcome::PreconditionLost` rather than an ordinary failure.
-    /// Returns the generation it minted, the way a real store returns it in the write response: the
-    /// backend attributes the write to that generation and nothing reads it back.
-    uint64_t commitConditionalWrite(const std::string & key, const std::string & bytes,
+    /// Returns the new object's token as a real store returns it in the write response: the backend
+    /// attributes the write to that token and nothing reads it back.
+    std::string commitConditionalWrite(const std::string & key, const std::string & bytes,
                                  const std::string & if_none_match, const std::string & if_match)
     {
         std::lock_guard lock(mutex);
@@ -1435,13 +1359,37 @@ public:
         if (!if_none_match.empty() && exists_now)
             throw DB::S3Exception("FakeGenerationObjectStorage: if-none-match precondition failed",
                                    Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
-        if (!if_match.empty() && (!exists_now || std::to_string(it->second.generation) != if_match))
+        if (!if_match.empty() && (!exists_now || tokenOf(it->second) != if_match))
             throw DB::S3Exception("FakeGenerationObjectStorage: if-match precondition failed",
                                    Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
 
-        const uint64_t generation = next_generation++;
-        objects[key] = Entry{bytes, generation};
-        return generation;
+        Entry & entry = objects[key];
+        entry = Entry{bytes, next_generation++};
+        return transportTokenOf(entry);
+    }
+
+    /// A same-store copy of the stored bytes, counted per destination key.
+    void copyObject( /// NOLINT
+        const DB::StoredObject & object_from,
+        const DB::StoredObject & object_to,
+        const DB::ReadSettings & /*read_settings*/,
+        const DB::WriteSettings & /*write_settings*/,
+        std::optional<DB::ObjectAttributes> /*object_to_attributes*/ = {}) override
+    {
+        std::lock_guard lock(mutex);
+        auto it = objects.find(object_from.remote_path);
+        if (it == objects.end())
+            throw DB::S3Exception("FakeGenerationObjectStorage: copy source does not exist",
+                                   Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+        Entry copy{it->second.bytes, next_generation++};
+        objects[object_to.remote_path] = std::move(copy);
+        ++copies_to[object_to.remote_path];
+    }
+
+    std::map<std::string, size_t> copiesByDestination() const
+    {
+        std::lock_guard lock(mutex);
+        return copies_to;
     }
 
 private:
@@ -1450,6 +1398,19 @@ private:
         std::string bytes;
         uint64_t generation;
     };
+
+    std::string tokenOf(const Entry & entry) const
+    {
+        if (content_derived_etags)
+            return getHexUIntLowercase(sipHash128(entry.bytes.data(), entry.bytes.size()));
+        return std::to_string(entry.generation);
+    }
+
+    /// The token as the SDK's ETag field carries it: quoted for a GCS generation.
+    std::string transportTokenOf(const Entry & entry) const
+    {
+        return content_derived_etags ? tokenOf(entry) : "\"" + tokenOf(entry) + "\"";
+    }
 
     /// Buffers the whole body in memory (like `FakeStagingSink` above) so the entry is committed exactly
     /// once, at `finalize`, and only after the precondition has been checked.
@@ -1482,7 +1443,7 @@ private:
         void finalizeImpl() override
         {
             next();
-            committed_generation = "\"" + std::to_string(storage.commitConditionalWrite(key, buffered, if_none_match, if_match)) + "\"";
+            committed_generation = storage.commitConditionalWrite(key, buffered, if_none_match, if_match);
         }
 
     private:
@@ -1496,6 +1457,7 @@ private:
 
     mutable std::mutex mutex;
     std::map<std::string, Entry> objects;
+    std::map<std::string, size_t> copies_to;
     uint64_t next_generation = 1;
 };
 
@@ -1510,7 +1472,7 @@ std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForT
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FakeGenerationObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FakeGenerationObjectStorage>(std::move(settings)), root);
 }
 
 }
@@ -1572,6 +1534,96 @@ TEST(CASDecommissionStaging, StagingDrainRemovesWhatTheWriterStagedUnderTheNativ
 
     EXPECT_EQ(report.staging_objects_removed, 1u) << "the drain did not see the writer's key space";
     EXPECT_FALSE(object_storage->exists(DB::StoredObject(leaked)));
+}
+
+namespace
+{
+
+struct AliasedStagedBlobCommit
+{
+    std::map<std::string, size_t> copies_by_destination;
+    std::string deleted_token;
+    std::optional<DB::ObjectMetadata> body_after_commit;
+    DB::ConditionalRemoveOutcome replayed_delete{};
+    std::string payload_after_commit;
+};
+
+/// Writes `data.bin` into part `written` with S3 staging, hardlinks it into part `aliased` in the same
+/// transaction, and commits on an ETag store. Right after the first part publishes, the body and its
+/// marker are deleted the way GC deletes them (the body `If-Match` its token), so the second part
+/// finds the blob absent and publishes it again. The deleted token is then replayed as a delete.
+AliasedStagedBlobCommit commitAliasedStagedBlob(
+    const std::string & mount, const std::string & written, const std::string & aliased)
+{
+    auto object_storage = makeFakeGenerationObjectStorageForTest();
+    object_storage->content_derived_etags = true;
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, mount);
+    metadata_storage->startup();
+
+    const std::string table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = metadata_storage->createTransaction();
+    writeThroughS3Transaction(
+        dynamic_cast<DB::ContentAddressedTransaction &>(*tx), table + written + "/data.bin", std::string(300, 'q'));
+    tx->createHardLink(table + written + "/data.bin", table + aliased + "/data.bin");
+
+    AliasedStagedBlobCommit result;
+    std::string blob_key;
+    const std::string published_first = std::min(written, aliased);
+    metadata_storage->setAfterPromoteHookForTest(
+        metadata_storage->route(*DB::Cas::parsePartFilePath(table + published_first + "/data.bin"))->refKey(),
+        [&]
+        {
+            const auto copies = object_storage->copiesByDestination();
+            ASSERT_EQ(copies.size(), 1u) << "the first publication of a staged blob copies it verbatim";
+            blob_key = copies.begin()->first;
+            result.deleted_token = object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false)->etag;
+            ASSERT_EQ(
+                object_storage->removeObjectIfTokenMatches(DB::StoredObject(blob_key), result.deleted_token).outcome,
+                DB::ConditionalRemoveOutcome::Removed);
+            object_storage->removeObjectIfExists(DB::StoredObject(blob_key + ".meta"));
+        });
+
+    tx->commit(DB::NoCommitOptions{});
+
+    result.copies_by_destination = object_storage->copiesByDestination();
+    if (blob_key.empty())
+        return result;
+    result.body_after_commit = object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false);
+    if (result.body_after_commit)
+    {
+        auto body = object_storage->readObject(DB::StoredObject(blob_key), DB::ReadSettings{}, {}, false, false);
+        std::string bytes;
+        DB::readStringUntilEOF(bytes, *body);
+        result.payload_after_commit = bytes.substr(metadata_storage->poolForTest()->poolMeta().blob_header_len);
+    }
+    result.replayed_delete
+        = object_storage->removeObjectIfTokenMatches(DB::StoredObject(blob_key), result.deleted_token).outcome;
+    return result;
+}
+
+void expectOneVerbatimCopyAndAFreshToken(const AliasedStagedBlobCommit & commit)
+{
+    ASSERT_EQ(commit.copies_by_destination.size(), 1u);
+    EXPECT_EQ(commit.copies_by_destination.begin()->second, 1u)
+        << "one staging object may be copied verbatim to the blob key at most once";
+    ASSERT_TRUE(commit.body_after_commit.has_value());
+    EXPECT_NE(commit.body_after_commit->etag, commit.deleted_token)
+        << "the republished body must not carry the token of the body GC deleted";
+    EXPECT_EQ(commit.payload_after_commit, std::string(300, 'q'));
+    EXPECT_EQ(commit.replayed_delete, DB::ConditionalRemoveOutcome::TokenMismatch)
+        << "a replay of the delete for the old token must not remove the republished body";
+}
+
+}
+
+TEST(CASS3Staging, StagedCopyOfAPendingBlobHardlinkedIntoALaterPartHappensOnce)
+{
+    expectOneVerbatimCopyAndAFreshToken(commitAliasedStagedBlob("mountAliasLater", "all_1_1_0", "all_2_2_0"));
+}
+
+TEST(CASS3Staging, StagedCopyOfAPendingBlobHardlinkedIntoAnEarlierPartHappensOnce)
+{
+    expectOneVerbatimCopyAndAFreshToken(commitAliasedStagedBlob("mountAliasEarlier", "all_2_2_0", "all_1_1_0"));
 }
 
 #endif

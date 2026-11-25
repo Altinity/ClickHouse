@@ -429,7 +429,10 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
 }
 
 Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
-    const String & namespace_name, const String & table_name, Poco::JSON::Object::Ptr new_snapshot)
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr new_snapshot,
+    const std::map<String, String> & properties_to_set)
 {
     if (!new_snapshot)
         return nullptr;
@@ -474,6 +477,16 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
         set_snapshot->set("type", "branch");
         set_snapshot->set("snapshot-id", new_snapshot->getValue<Int64>("snapshot-id"));
         updates->add(set_snapshot);
+    }
+    if (!properties_to_set.empty())
+    {
+        Poco::JSON::Object::Ptr set_properties = new Poco::JSON::Object;
+        set_properties->set("action", "set-properties");
+        Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
+        for (const auto & [key, value] : properties_to_set)
+            properties->set(key, value);
+        set_properties->set("updates", properties);
+        updates->add(set_properties);
     }
     request_body->set("updates", updates);
 
@@ -2751,7 +2764,18 @@ bool RestCatalog::createTable(
 }
 
 
-bool RestCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const
+bool RestCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    return updateMetadataAndProperties(namespace_name, table_name, new_metadata_path, new_snapshot, /* properties_to_set */ {}, auth_token);
+}
+
+bool RestCatalog::updateMetadataAndProperties(
+    const String & namespace_name,
+    const String & table_name,
+    const String & /*new_metadata_path*/,
+    Poco::JSON::Object::Ptr new_snapshot,
+    const std::map<String, String> & properties_to_set,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     loadConfigIfNeeded(auth_token);
 
@@ -2764,7 +2788,7 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     const auto state_snapshot = getStateSnapshot();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
 
-    auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot);
+    auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot, properties_to_set);
 
     try
     {

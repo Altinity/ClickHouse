@@ -1,0 +1,4 @@
+<clickhouse>
+    <!-- The upstream image rejects the fork-only `cas_log` and `cas_gc_log` sections of config.xml (UNKNOWN_ELEMENT_IN_CONFIG). -->
+    <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
+</clickhouse>

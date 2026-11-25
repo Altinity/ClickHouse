@@ -87,7 +87,7 @@ private:
     bool armed = false;
 };
 
-BlobRef blobRefOf(const DB::UInt128 & hash)
+BlobRef blobRefOfHash(const DB::UInt128 & hash)
 {
     return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)};
 }
@@ -106,7 +106,7 @@ bool headExists(Backend & backend, const String & key)
 
 bool blobPresent(Backend & backend, const Layout & layout, const DB::UInt128 & hash)
 {
-    return headExists(backend, layout.blobKey(blobRefOf(hash)));
+    return headExists(backend, layout.blobKey(blobRefOfHash(hash)));
 }
 
 /// Whether ANY run the newest fold seal references carries a `RunMarker::Condemned` row for `hash`. This is where
@@ -123,18 +123,10 @@ bool condemnedInSealedRuns(Backend & backend, const Layout & layout, const DB::U
     for (const RunRef & r : seal.blob_target_runs)
     {
         auto reader = openSourceEdgeRun(*operation, r.key);
-        String k;
-        String p;
-        while (reader.next(k, p))
-        {
-            BlobRef ref;
-            UInt128 sid;
-            SourceEdgeKeyCodec::parse(k, ref, sid);
-            if (p.empty() || runMarkerFromByte(p[0], "CAS test source-edge run") != RunMarker::Condemned)
-                continue;
-            if (ref.digest.toU128() == hash)
+        SourceEdgeRecord rec;
+        while (reader.next(rec))
+            if (rec.marker == RunMarker::Condemned && rec.ref.digest.toU128() == hash)
                 return true;
-        }
     }
     return false;
 }
@@ -152,9 +144,8 @@ String publishAtReturningManifestKey(
                                                          .manifest_ordinal = 1}});
 }
 
-/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers go through
-/// `publishCkpt`, which merges by semantic maximum and additionally refuses a `life_epoch` below the
-/// durable one; this helper instead makes the fixture's one admissible recovery frontier explicit.
+/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers are `createCkptAtCreation`
+/// and `publishCkptSnapshot`; this helper instead makes the fixture's one admissible recovery frontier explicit.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
     writeRecoverableCkptForRawFixture(backend, layout, ns, ckpt);
@@ -244,8 +235,6 @@ TEST(CASRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
 
     EXPECT_FALSE(condemnedInSealedRuns(*backend, layout, DB::UInt128(2)))
         << "the hidden owner's blob was condemned — that is acked data scheduled for deletion";
-    EXPECT_FALSE(loadMetaForTest(*backend, layout, DB::UInt128(2)).has_value())
-        << "a rebuild condemns nothing, so it publishes no condemn marker";
 
     /// And it survives the pipeline: rounds run, nothing reclaims it.
     for (int i = 0; i < 4; ++i)
@@ -613,9 +602,9 @@ TEST(CASRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChai
     {
         return object.cls == FsckClass::ChainBroken && object.key == missing_key;
     }), 1u) << "the present ordinary 1-3 cannot close epoch 1, so arithmetic continuation requires 1-4";
-    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "checkpoint requires id 1-4"), 1u)
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "log 1-4 is absent"), 1u)
         << "the verdict must expose that the claimed ordinary predecessor did not authorize a crossing";
-    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "inclusive frontier 2-1"), 1u)
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "checkpoint frontier 2-1"), 1u)
         << "the verdict must name the authority that made the absence a proven chain break";
 }
 

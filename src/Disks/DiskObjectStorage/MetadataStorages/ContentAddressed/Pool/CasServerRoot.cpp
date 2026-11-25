@@ -11,6 +11,7 @@
 #include <Core/UUID.h>
 #include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <magic_enum.hpp>
@@ -93,8 +94,13 @@ MountClaimResult racedDoubleStart(const Observation & seen)
 
 uint64_t defaultBootMs()
 {
+#if defined(OS_DARWIN)
+    constexpr clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+    constexpr clockid_t clock_id = CLOCK_BOOTTIME;
+#endif
     struct timespec ts{};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
+    clock_gettime(clock_id, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
@@ -891,17 +897,25 @@ uint64_t allocateWriterEpoch(
         Retry::standard());
 
     /// Non-convergence used to be `CORRUPTED_DATA`, on the reasoning that a hundred lost conditional
-    /// writes really is evidence of something wrong. The bound is a wall-clock deadline now, and ninety
-    /// seconds of a throttled store is not evidence of anything, so `orThrow`'s retry-later class is
+    /// writes really is evidence of something wrong. The bound is a wall-clock deadline now, and a whole request
+    /// window of a throttled store is not evidence of anything, so `orThrow`'s retry-later class is
     /// the honest verdict. Both fail closed at `Pool::open`.
     orThrow(std::move(result), fmt::format("CAS server-root '{}' writer_epoch allocation", srid));
     return allocated;
 }
 
-namespace
+uint64_t lastUncleanEpochAfter(const std::optional<MountLease> & predecessor, MountPriorState prior, uint64_t claimer_epoch)
 {
-/// Build a fresh mount-lease body for (uuid, epoch) with the given seq, stamped from `now_ms`.
-MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms)
+    /// Without a slot nothing tells which earlier epochs ended cleanly, so every one of them counts as unclean.
+    if (!predecessor)
+        return claimer_epoch - 1;
+    if (prior == MountPriorState::Clean && predecessor->last_unclean_epoch)
+        return *predecessor->last_unclean_epoch;
+    return predecessor->writer_epoch;
+}
+
+MountLease makeMountBody(
+    UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms, uint64_t last_unclean_epoch)
 {
     return MountLease{
         .server_uuid = uuid,
@@ -912,8 +926,12 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
         .seq = seq,
         .expires_at_ms = now_ms + ttl_ms,
         .write_attempt_id = newMountWriteAttemptId(),
+        .last_unclean_epoch = last_unclean_epoch,
     };
 }
+
+namespace
+{
 
 /// Mirrors `mountDoubleStartMessage`'s identity fields. The mount-audit sink is not yet installed
 /// during `Pool::open`, so at first-open these refusal messages are the only holder-identity
@@ -1000,7 +1018,8 @@ MountClaimResult claimMount(
     /// Absent → fresh claim.
     if (!got)
     {
-        const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms);
+        const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms,
+                                              lastUncleanEpochAfter(std::nullopt, MountPriorState::None, our_epoch));
         if (const std::optional<Observation> raced
                 = conflictOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
                                   fmt::format("CAS mount slot claim of '{}'", key)))
@@ -1081,11 +1100,16 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
-    const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
+    const bool proven_dead = proven_dead_incarnation && identicalToken(*proven_dead_incarnation, got->etag);
+    const bool unsafe_authorized = unsafe_reclaim_authorization && identicalToken(*unsafe_reclaim_authorization, got->etag);
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
-        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
+        const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
+                                     : clean_marker       ? MountPriorState::Clean
+                                     : proven_dead        ? MountPriorState::UncleanObserved
+                                                           : MountPriorState::UncleanUnsafe;
+        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms,
+                                              lastUncleanEpochAfter(existing, prior, our_epoch));
         if (const std::optional<Observation> raced
                 = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
                                   fmt::format("CAS mount slot reclaim of '{}'", key)))
@@ -1093,10 +1117,6 @@ MountClaimResult claimMount(
             /// reclaim. Fail closed, and report what the write's resolve read observed rather than
             /// `got->etag`, which that mismatch just proved stale.
             return racedDoubleStart(*raced);
-        const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
-                                     : clean_marker       ? MountPriorState::Clean
-                                     : proven_dead        ? MountPriorState::UncleanObserved
-                                                           : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
             existing.server_uuid != our_uuid ? "terminal body of another server_uuid, the owner is ours — reclaimed"
             : existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
@@ -1275,7 +1295,7 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!observed || !identicalToken(*observed, *current_etag))
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
@@ -1385,13 +1405,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
+                const bool stable = it != obs.end() && identicalToken(it->second.etag, observed->etag)
                     && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
                     /// A sample from before this read would count the walk to the slot as time watched.
-                    if (it == obs.end() || it->second.etag != observed->etag)
+                    if (it == obs.end() || !identicalToken(it->second.etag, observed->etag))
                         obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
@@ -1546,8 +1566,8 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 namespace
 {
 
-/// The three clock-free certificates `isCreatorFenceTerminal` recognises, plus `None` for a live body
-/// that carries none of them -- see the function's header doc for what each one proves and why
+/// The three clock-free certificates `isCreatorFenceTerminal` recognises, plus `None` when none of
+/// them applies to this epoch -- see the function's header doc for what each one proves and why
 /// `fence_generation` is not among them.
 enum class FenceCertificate : uint8_t
 {
@@ -1559,12 +1579,15 @@ enum class FenceCertificate : uint8_t
 
 FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fence_writer_epoch)
 {
+    if (lease.writer_epoch > fence_writer_epoch)
+        return FenceCertificate::SupersededEpoch;
+    /// A lower epoch is an older incarnation: its fence or farewell says nothing about this one.
+    if (lease.writer_epoch < fence_writer_epoch)
+        return FenceCertificate::None;
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
     if (lease.isCleanRelease())
         return FenceCertificate::CleanFarewell;
-    if (lease.writer_epoch != fence_writer_epoch)
-        return FenceCertificate::SupersededEpoch;
     return FenceCertificate::None;
 }
 
@@ -1573,9 +1596,15 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
                             uint64_t writer_epoch, const Retry & policy)
 {
+    return probeCreatorSlot(op, layout, server_root_id, writer_epoch, policy) == CreatorSlotStatus::Terminal;
+}
+
+CreatorSlotStatus probeCreatorSlot(CasOperation & op, const Layout & layout, const String & server_root_id,
+                                   uint64_t writer_epoch, const Retry & policy)
+{
     const auto got = op.read(layout.mountKey(server_root_id), policy);
     if (!got)
-        return false;   /// absence proves nothing about liveness -- see the header doc
+        return CreatorSlotStatus::Absent;   /// absence proves nothing about liveness -- see the header doc
 
     MountLease lease;
     try
@@ -1584,7 +1613,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     }
     catch (...)
     {
-        return false;   /// undecodable -- fail closed, never wave through
+        return CreatorSlotStatus::Undecodable;   /// fail closed, never wave through
     }
 
     /// EXHAUSTIVE switch, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
@@ -1596,19 +1625,19 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     /// is safe).
     /// The initializer is dead: the exhaustive switch below assigns every enumerator, and a future
     /// enumerator left unassigned fails the build via `-Wswitch`, not this value.
-    bool terminal = false;
+    CreatorSlotStatus status = CreatorSlotStatus::Live;
     switch (classifyFenceCertificate(lease, writer_epoch))
     {
         case FenceCertificate::None:
-            terminal = false;
+            status = CreatorSlotStatus::Live;
             break;
         case FenceCertificate::GcFenced:
         case FenceCertificate::CleanFarewell:
         case FenceCertificate::SupersededEpoch:
-            terminal = true;
+            status = CreatorSlotStatus::Terminal;
             break;
     }
-    return terminal;
+    return status;
 }
 
 /// The farewell's FLOOR, not its whole budget: a departing mount is holding shutdown open, so the
@@ -1631,8 +1660,8 @@ constexpr uint64_t kFarewellSlackMs = 2'000;
 MountLeaseRenewer::MountLeaseRenewer(
     CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
-    uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-    std::function<uint64_t()> min_active_build_sequence_fn_,
+    uint64_t writer_epoch_, uint64_t last_unclean_epoch_, std::chrono::milliseconds ttl_,
+    std::function<uint64_t()> now_ms_fn_, std::function<uint64_t()> min_active_build_sequence_fn_,
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
@@ -1642,13 +1671,45 @@ MountLeaseRenewer::MountLeaseRenewer(
     , srid(srid_)
     , server_uuid(server_uuid_)
     , writer_epoch(writer_epoch_)
+    , last_unclean_epoch(last_unclean_epoch_)
     , ttl(ttl_)
     , now_ms_fn(std::move(now_ms_fn_))
     , min_active_build_sequence_fn(std::move(min_active_build_sequence_fn_))
     , event_sink(std::move(event_sink_))
     , lease_safety_margin(lease_safety_margin_)
     , boot_ms_fn(boot_ms_fn_ ? std::move(boot_ms_fn_) : defaultBootMs)
+    , slot_ownership(std::make_shared<MountSlotOwnership>(server_uuid_, writer_epoch_))
 {
+}
+
+void MountSlotOwnership::landed(const Etag & etag)
+{
+    std::lock_guard lock(mutex);
+    last_etag = etag;
+}
+
+void MountSlotOwnership::attempting(UInt128 write_attempt_id)
+{
+    std::lock_guard lock(mutex);
+    in_flight_attempt_id = write_attempt_id;
+}
+
+void MountSlotOwnership::attemptEnded()
+{
+    std::lock_guard lock(mutex);
+    in_flight_attempt_id.reset();
+}
+
+bool MountSlotOwnership::holds(const Object & slot) const
+{
+    const MountLease lease = decodeMountLease(slot.bytes);
+    /// A fence keeps our pair and `write_attempt_id` yet revokes the lease; a farewell gives it up.
+    if (lease.gc_fenced || lease.isCleanRelease() || !lease.isHeldBy(server_uuid, writer_epoch))
+        return false;
+    /// The pair alone is not enough: another writer of the same pair leaves a different ETag.
+    std::lock_guard lock(mutex);
+    return (last_etag && sameVersion(slot.etag, *last_etag))
+        || (in_flight_attempt_id && lease.write_attempt_id == *in_flight_attempt_id);
 }
 
 String MountLeaseRenewer::encodeBody(
@@ -1668,6 +1729,7 @@ String MountLeaseRenewer::encodeBody(
         .expires_at_ms = expires_at_ms,
         .min_active_build_sequence = min_active_build_sequence,
         .write_attempt_id = write_attempt_id,
+        .last_unclean_epoch = last_unclean_epoch,
     });
 }
 
@@ -1784,6 +1846,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
         ? std::numeric_limits<uint64_t>::max()
         : attempt_start_boot_ms + ttl_ms;
     renewer_state = MountLeaseRenewerState::Active;
+    slot_ownership->landed(etag);
     return attempt_start_boot_ms;
 }
 
@@ -1960,6 +2023,9 @@ MountRenewResult MountLeaseRenewer::renewOn(
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
+    /// One `attempting` covers every resend of the loop below: they carry the same attempt id.
+    slot_ownership->attempting(write_attempt_id);
+    SCOPE_EXIT(slot_ownership->attemptEnded());
     CasOperation op = plane.admit(environment.live);
     /// Counted here rather than taken from one engine call: the background renewal may span several.
     uint32_t attempts_sent = 0;
@@ -2006,7 +2072,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 /// safe because a call with an unclear attempt returns `Conflict` only once the token
                 /// moved, so this call left no copy of ours that could land.
                 const Object * seen = std::get_if<Object>(&conflict->seen);
-                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                if (!seen || !sameVersion(seen->etag, expected) || seen->bytes != last_body)
                     break;
                 pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
             }
@@ -2031,6 +2097,9 @@ MountRenewResult MountLeaseRenewer::renewOn(
     {
         seq = next_seq;
         last_etag = std::move(committed->etag);
+        /// Runs before the scope guard ends the attempt: the in-flight id covers the landed body until
+        /// the ETag replaces it.
+        slot_ownership->landed(*last_etag);
         last_body = body;
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
         const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
@@ -2139,6 +2208,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         .expires_at_ms = wall_ms,
         .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
+        .last_unclean_epoch = last_unclean_epoch,
     });
     /// The farewell is admitted on `open_requests` (see `release`, which calls this via `open_requests.admit()`),
     /// so its own reservation -- attempt plus the read that settles it, `reservedFor(0, 2)` in

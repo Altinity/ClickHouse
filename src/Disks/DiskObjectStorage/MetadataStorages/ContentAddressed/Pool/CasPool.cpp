@@ -16,6 +16,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
+#include <Common/Stopwatch.h>
 #include <Common/thread_local_rng.h>
 #include <base/scope_guard.h>
 #include <fmt/format.h>
@@ -38,6 +39,7 @@ namespace ErrorCodes
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int INVALID_STATE;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -45,6 +47,8 @@ namespace ProfileEvents
 {
     extern const Event CASPartFolderManifestGets;
     extern const Event CASRemountAttempts;
+    extern const Event CASRelinkConfirmRefusedSlotMoved;
+    extern const Event CASRelinkConfirmRefusedSlotUnreadable;
     extern const Event CASRemountSucceeded;
     extern const Event CASRemountFailed;
     extern const Event CASRemountHeldTransient;
@@ -76,6 +80,19 @@ namespace
 {
 
 std::atomic<uint64_t> remount_attempt_sequence{0};
+
+/// `claimMount` builds every `Claimed` body with the marker; a body without it fails the mount as an
+/// ordinary refusal instead of escaping as `std::bad_optional_access`.
+uint64_t claimedLastUncleanEpoch(const MountClaimResult & claim, const String & srid)
+{
+    if (!claim.body)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount '{}': the mount claim succeeded but returned no lease body", srid);
+    if (!claim.body->last_unclean_epoch)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount '{}': the claimed mount lease carries no `last_unclean_epoch`", srid);
+    return *claim.body->last_unclean_epoch;
+}
 
 /// What a mount that skipped the capability battery did not prove about its store. Said once per open at
 /// the default level, because nothing else tells an operator the checks did not run.
@@ -120,7 +137,7 @@ struct LifecycleGate
 
 /// Authoritative, cache-bypassing evaluation of the §2 verdict table. Reads ONLY; never claims,
 /// allocates, or writes. `expected_pool_id`/`expected_blob_header_len` are the identity this Pool
-/// established at open — the comparison is over those two fields ONLY ([B6]); `algos_used` and
+/// established at open — the comparison is over those two fields ONLY; `algos_used` and
 /// `min_reader_generation` are legally mutable and are deliberately not compared (the format gate is the
 /// decode itself succeeding).
 LifecycleGate probePoolLifecycleGate(
@@ -159,7 +176,7 @@ LifecycleGate probePoolLifecycleGate(
         {
             /// `_pool_meta` is authoritatively gone. Require the OTHER sentinel (the owner anchor) to be
             /// conclusively absent too before declaring identity lost — any surviving sentinel, or an
-            /// undecidable owner probe, keeps us transient (throw-when-uncertain). rev.8: BOTH sentinels
+            /// undecidable owner probe, keeps us transient (throw-when-uncertain). BOTH sentinels
             /// authoritatively absent ⇒ `IdentityLost` (a fail-loud terminal state), regardless of whatever
             /// else remains under the prefix. Erasure is never PROVEN by the system — only asserted by the
             /// operator's `FORGET` — so there is no prefix-emptiness leg here.
@@ -192,13 +209,13 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     , lease_requests(
           pool_backend,
           Fence::open(),
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -215,7 +232,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [](uint64_t) {}},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : openPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
     /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a
@@ -246,6 +263,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           mount_requests, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
           config.server_root_id,
           [this] { return liveWriterEpoch(); },
+          [this] { return mount_runtime.liveEpochPair(); },
           [this] { return refAppendFenceOk(); },
           [this] { return mount_runtime.fenceGeneration(); },
           [this] { return bootMsNow(); },
@@ -340,7 +358,7 @@ void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t de
 
 String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
 {
-    /// The [D5] per-reason detail (spec §1) — named once here so the typed error and the introspection
+    /// The per-reason detail (spec §1) — named once here so the typed error and the introspection
     /// snapshot always agree. No `content-addressed pool '<id>' ` prefix (callers add it if they want one).
     switch (lc)
     {
@@ -358,7 +376,7 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
             /// The forgotten detail carries the operator's decommission TIMESTAMP, threaded through
             /// `enterVanished`'s reason by `forgetDisk` (`vanishedReason()`). A forced-for-test
             /// `VanishedForgotten` (no real FORGET ran) has no stored reason, so fall back to the static
-            /// [D5] text — it still names the sub-state and keeps "erasure was NOT verified".
+            /// text — it still names the sub-state and keeps "erasure was NOT verified".
             const String & reason = mount_runtime.vanishedReason();
             if (!reason.empty())
                 return reason;
@@ -405,29 +423,53 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
     return snap;
 }
 
+void requireGeneration4Pool(const PoolMeta & meta, Dialect backend_dialect, PoolOpenPurpose purpose)
+{
+    if (meta.min_reader_generation < G_BLOB_INTENTS && purpose == PoolOpenPurpose::Read)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS pool meta: pool is at reader generation {}, this build reads only generation {}; inspect it with the "
+            "build that writes it (its `cas-fsck`), or migrate it first: stop every server of the pool, then run `{}`",
+            meta.min_reader_generation, G_BLOB_INTENTS, kMigratePoolCommandLine);
+    if (meta.min_reader_generation < G_BLOB_INTENTS)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS pool meta: pool is at reader generation {}, this build needs {}; stop every server of the pool, then run `{}`",
+            meta.min_reader_generation, G_BLOB_INTENTS, kMigratePoolCommandLine);
+    if (!meta.token_dialect)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: token_dialect is missing at reader generation {}",
+            meta.min_reader_generation);
+    if (*meta.token_dialect != backend_dialect)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS pool records token dialect '{}', this disk uses '{}': identities are not comparable",
+            dialectWord(*meta.token_dialect), dialectWord(backend_dialect));
+}
+
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
-    if (!config.read_only)
+    if (config.read_only)
+        validateCasRequestWindow(config.cas_request_budget);
+    else
         validateWritableMountTiming(config);
 
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
     /// decorator only delegates and counts; it changes no behavior (read-only opens stay write-free).
-    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
 
     /// FAIL-CLOSED: the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
     Layout layout(config.pool_prefix);
     /// The whole bootstrap runs on an OPEN fence: there is no mount lease yet, and the claim below is
     /// what establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, {}, nullptr, config.cas_request_budget.request_window_ms);
     bool initialize_empty_catalog = false;
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
-    /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
+    /// open must never mutate the pool it inspects; fsck writes nothing here, and deletes only `.meta`
+    /// markers under an explicit `--fix legacy-markers`, so skip it. (Pool meta below is
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
     if (!config.read_only)
     {
-        /// (0) [C4][D2] Zero-write residual check FIRST — before ANY probe write. `pool_prefix` is
+        /// (0) Zero-write residual check FIRST — before ANY probe write. `pool_prefix` is
         /// EXCLUSIVELY CAS-owned; `createOrValidate` below may mint a fresh `_pool_meta` only over a
         /// genuinely empty prefix. The MUTATING capability battery must run AFTER this proof (it writes
         /// `_probe/` debris, which would itself make the prefix look non-empty), and the emptiness
@@ -436,12 +478,29 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
         /// partially-erased pool" hole: a missing `_pool_meta` over residual data now fails startup loud
         /// with zero writes, instead of minting a fresh identity on top of the old objects.
         CasOperation residual_op = bootstrap_requests.admit();
-        switch (probePoolBootstrapResidual(residual_op, layout))
+        std::optional<String> pool_meta_bytes;
+        switch (probePoolBootstrapResidual(residual_op, layout, pool_meta_bytes))
         {
             case BootstrapResidual::PoolMetaPresent:
+                /// The battery and the algorithm admission below write; a pool this build cannot serve is refused first.
+                if (!pool_meta_bytes)
+                {
+                    std::optional<Object> got = residual_op.read(layout.poolMetaKey(), Retry::standard());
+                    if (!got)
+                        throw Exception(ErrorCodes::INVALID_STATE,
+                            "content-addressed pool '{}' (prefix '{}'): `{}` is listed but its read finds nothing; its "
+                            "generation is unknown, so the open writes nothing",
+                            config.server_root_id, config.pool_prefix, layout.poolMetaKey());
+                    pool_meta_bytes = std::move(got->bytes);
+                }
+                requireGeneration4Pool(decodePoolMeta(*pool_meta_bytes), residual_op.backendDialect());
                 break;   /// authoritative existing pool; its catalog is mandatory below.
             case BootstrapResidual::EmptyOrProbeOnly:
             case BootstrapResidual::CanonicalEmptyCatalogOnly:
+                if (layout.poolPrefix().size() > Layout::maxPoolPrefixBytesForBlobIntents())
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "pool prefix of {} bytes leaves no room for blob intent keys; the limit is {}",
+                        layout.poolPrefix().size(), Layout::maxPoolPrefixBytesForBlobIntents());
                 initialize_empty_catalog = true;
                 break;   /// proven-new or canonical catalog-only pre-meta bootstrap state.
             case BootstrapResidual::ResidualWithoutMeta:
@@ -524,6 +583,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
             CasOperation probe_op = bootstrap_requests.admit();
             runCapabilityProbe(probe_op, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+            /// A writable mount may run GC, which creates and deletes intents; its writers read them.
+            runIntentPrefixProbe(probe_op, layout, IntentPrefixRights::ReadWrite);
         }
         else
         {
@@ -558,13 +619,16 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// zero-write residual proof above, so minting a missing `_pool_meta` is safe. A read-only/observe
     /// open never ran that proof (and there is no truly-read-only backend — `openPoolView` opens the same
     /// writable object storage and only sets `read_only`), so it must NEVER mint: an absent meta fails
-    /// closed instead (spec §2 [C4][D2]).
+    /// closed instead (spec §2).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
         meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo,
         /*allow_new=*/config.blob_hash_allow_new && !config.read_only,   /// an observe open validates, never admits
         /*allow_mint=*/!config.read_only,
-        /*initial_min_reader_generation=*/G_REF_MOVE);
+        /*initial_min_reader_generation=*/mount_reader_floor);
+    requireGeneration4Pool(meta, meta_op.backendDialect(), config.read_only ? PoolOpenPurpose::Read : PoolOpenPurpose::Write);
+    LOG_INFO(getLogger("CasPool"), "CAS pool `{}`: reader generation {}, token dialect {}",
+        layout.poolPrefix(), meta.min_reader_generation, dialectWord(*meta.token_dialect));
     config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
@@ -590,21 +654,39 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     if (!store->config.read_only)
         mountWritable(store, store->config.server_id, MountClaimPolicy::WaitForExpiry);
 
-    if (!store->config.read_only && store->meta.min_reader_generation < G_REF_MOVE)
-    {
-        /// One-way, so it is done only by a node that has actually mounted (identity and lease held) and
-        /// can therefore emit owner moves; from here on a generation-1 build refuses to mount this pool.
-        CasOperation raise_op = store->gc_requests.admit();
-        const uint64_t floor_before = store->meta.min_reader_generation;
-        const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, store->pool_layout, G_REF_MOVE);
-        LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed pool '{}': min_reader_generation raised {} -> {}; generation-1 readers can no longer mount this pool",
-            u128ToHex(store->meta.pool_id), floor_before, raised.min_reader_generation);
-        /// Only the floor is written: background workers started by `mountWritable` already read the rest of `meta`.
-        store->meta.min_reader_generation = raised.min_reader_generation;
-    }
-
     return store;
+}
+
+PoolPtr Pool::openForMigration(BackendPtr backend, PoolConfig config)
+{
+    validateCasRequestWindow(config.cas_request_budget);
+    config.read_only = true;
+    config.background_watermark = false;
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
+
+    const Layout layout(config.pool_prefix);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, nullptr, config.cas_request_budget.request_window_ms);
+    CasOperation meta_op = bootstrap_requests.admit();
+    const std::optional<Object> stored = meta_op.read(layout.poolMetaKey(), Retry::standard());
+    if (!stored)
+        throwNoPoolToMigrate(config);
+    PoolMeta meta = decodePoolMeta(stored->bytes);
+    if (meta.min_reader_generation < G_WRITE_FLOOR)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "CAS pool meta: reader generation {} is below {}",
+            meta.min_reader_generation, G_WRITE_FLOOR);
+    config.gc_shards = meta.gc_shards;
+
+    PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
+    store->setEventSink(std::move(store->config.event_sink));
+    return store;
+}
+
+void Pool::throwNoPoolToMigrate(const PoolConfig & config)
+{
+    throw Exception(ErrorCodes::INVALID_STATE,
+        "content-addressed pool '{}' (prefix '{}'): no _pool_meta, so there is no pool to migrate",
+        config.server_root_id, config.pool_prefix);
 }
 
 MountIncarnation Pool::captureMountIncarnation() const
@@ -619,12 +701,27 @@ MountIncarnation Pool::captureMountIncarnation() const
     return MountIncarnation{.writer_epoch = writer_epoch, .fence_generation = generation};
 }
 
+void Pool::raiseReaderFloorToRefChain()
+{
+    constexpr uint64_t generation = G_REF_CHAIN;
+    if (meta.min_reader_generation >= generation)
+        return;
+    CasOperation raise_op = gc_requests.admit();
+    const uint64_t floor_before = meta.min_reader_generation;
+    const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, pool_layout, generation);
+    LOG_WARNING(getLogger("CasPool"),
+        "Content-addressed pool '{}': min_reader_generation raised {} -> {}; readers below generation {} can no longer mount this pool",
+        u128ToHex(meta.pool_id), floor_before, raised.min_reader_generation, generation);
+    /// Only the floor is written: the rest of `meta` is already what the pool opened with.
+    meta.min_reader_generation = raised.min_reader_generation;
+}
+
 void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)
 {
     /// === Mount-safety startup protocol ===
     /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
-    /// the mount lease (liveness) → re-read the owner → install the renewer + arm the local write fence
-    /// → anchor the watermark. owner / epoch / mount / watermark are BOOTSTRAP-CONTROL writes: they
+    /// the mount lease (liveness) → re-read the owner → install the renewer
+    /// → arm the local write fence → anchor the watermark. owner / epoch / mount / watermark are BOOTSTRAP-CONTROL writes: they
     /// establish the very right to write and run BEFORE the write fence gates ordinary data/ref/manifest
     /// mutations. Fail closed throughout.
     /// Shared by `open` (`policy = WaitForExpiry`, `our_uuid = config.server_id`) and
@@ -697,8 +794,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
     /// routes through `mount_runtime.waitSleep` (which itself routes through
     /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
-    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- and since the
-    /// post-reclaim materialization grace was retired, this observation poll is the only one left.
+    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on. This observation poll is
+    /// the only one.
     const auto sleep_ms = [s = store.get()](uint64_t ms) { s->mount_runtime.waitSleep(ms); };
     /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
     /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
@@ -742,9 +839,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
     /// loop to classify (and log) an unclean reclaim.
     MountPriorState claimed_prior = MountPriorState::None;
+    /// The `last_unclean_epoch` the adopted claim wrote, published with the epoch below.
+    uint64_t claimed_last_unclean_epoch = 0;
     /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
     /// `break` so the arm below can detect a claim that consumed the lease TTL and re-anchor before
-    /// arming (rev.4 Phase B, round-3 finding 2).
+    /// arming.
     uint64_t claim_anchor_boot_ms = 0;
     constexpr int max_fence_recoveries = 3;
     for (int fence_recovery = 0; ; ++fence_recovery)
@@ -839,6 +938,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
         }
         claimed_prior = claim.prior;
+        claimed_last_unclean_epoch = claimedLastUncleanEpoch(claim, srid);
 
         /// The owner may have moved since the claim began: a tombstone, a rollback or a rejoin. Nothing
         /// below runs under an owner this process did not start under.
@@ -851,7 +951,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// -- which ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard --
         /// AND wires its `minActive` build-watermark reader, its event sink, and the fence-coupling
         /// runtime-owned synchronous renewal driver, all captured on `mount_runtime`.
-        store->mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
+        store->mount_runtime.installRenewer(our_uuid, writer_epoch, claimed_last_unclean_epoch, now_ms);
         try
         {
             claim_anchor_boot_ms = store->mount_runtime.startRenewer();
@@ -882,14 +982,14 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean".
     ///
-    /// THIS NO LONGER WAITS. The `materialization_grace_ms` (`T_mat`) sleep that used to sit here bought
-    /// one thing: time for that straggler to land (or exhaust its retries) BEFORE this incarnation began
-    /// trusting its recovery LISTINGS. Recovery does not trust listings any more. It walks each ref
-    /// stream arithmetically from `_ckpt` and closes every dead epoch with an in-band `EpochSeal` at
-    /// `{E, T+1}`, written as a conditional create -- so the straggler's own conditional create loses to
-    /// an occupied slot no matter when it arrives, and a wait can only make startup slower, never safer.
-    /// What survives is the CLASSIFICATION and saying it out loud: an unclean predecessor is worth an
-    /// operator-visible line, and the exhaustive switch is worth keeping as the build-time guard.
+    /// There is no wait here. Recovery does not trust listings: it walks each ref stream from `_ckpt` and
+    /// closes a chain that ends in an epoch that may have ended uncleanly (`last_unclean_epoch`) with a
+    /// tombstone in the slot after its last record, written as a conditional create. A straggler's own
+    /// conditional create then loses to the occupied slot whenever it arrives. After a clean end the lanes
+    /// were drained before the farewell; a recovery tombstone may still be in flight, but only into a chain
+    /// at or below `last_unclean_epoch`, which this claim inherits and never lowers, so recovery seals that
+    /// chain too. What this classification keeps is an operator-visible line for an unclean predecessor,
+    /// and the exhaustive switch as the build-time guard.
     bool unclean_reclaim = false;
     switch (claimed_prior)
     {
@@ -943,21 +1043,22 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     {
         /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
         /// successor may have legally started reclaiming). Re-anchor with ONE fresh conditional lease
-        /// write -- it fails closed (Phase A classification) if anything took the slot meanwhile -- and
-        /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
+        /// write -- it fails closed if anything took the slot meanwhile -- and arm from the new attempt's
+        /// anchor.
         ///
-        /// The unbounded operator-configured wait this guard was written for (`T_mat`) is gone, so
-        /// reaching it now means the claim's adoption write outran the safe lease window
+        /// Reaching this means the claim's adoption write outran the safe lease window
         /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
         /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
         /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
         /// refuse to start.
+        const uint64_t since_claim_ms = now_boot_ms > claim_anchor_boot_ms ? now_boot_ms - claim_anchor_boot_ms : 0;
         LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed mount {}: the mount claim consumed the lease TTL ({} ms) before the write "
-            "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
+            "Content-addressed mount {}: the open took {} ms since the mount claim, which left too little of the "
+            "lease TTL ({} ms) to arm the write fence; re-writing the lease first",
+            srid, since_claim_ms, ttl_ms_u);
         claim_anchor_boot_ms = store->mount_runtime.renewRenewerForStartupOnce();
     }
-    store->mount_runtime.setLiveWriterEpoch(writer_epoch);
+    store->mount_runtime.setLiveWriterEpoch(writer_epoch, claimed_last_unclean_epoch);
     store->armMountFence(
         our_uuid,
         writer_epoch,
@@ -977,7 +1078,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
 
 PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
 {
-    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
     validateServerRootId(victim_srid);
 
     config.server_root_id = victim_srid;
@@ -992,7 +1093,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     logSkippedCapabilityProbe(
         victim_srid, config.pool_prefix, fmt::format("decommission of pool member '{}'", victim_srid));
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
-    /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
+    /// (background_watermark=false), but an unrenewed claim (one mount lease TTL) aborts any long drain midway.
     config.background_watermark = true;
     /// Bounded by the lease, like the startup re-anchor: an admin claim that cannot renew ends rather than
     /// pauses.
@@ -1011,7 +1112,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// with `config.boot_ms_fn`: a retry loop bound to a frozen test clock that only a fake sleep
     /// advances would otherwise retry forever against this engine's default REAL sleep, which never
     /// calls it -- the deadline it measures against would never appear to elapse.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, nullptr, config.cas_request_budget.request_window_ms);
     CasOperation owner_op = bootstrap_requests.admit();
     std::optional<UInt128> victim_uuid = readOwnerUuid(owner_op, layout, victim_srid);
     if (!victim_uuid)
@@ -1039,11 +1141,12 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// Decommission operates on an EXISTING pool member (an owner anchor / mount lease was just found), so
     /// `_pool_meta` must already be present. It never bootstraps: `allow_mint=false` so an absent meta
     /// (a partially-erased pool whose owner anchor survives) fails closed with INVALID_STATE rather than
-    /// minting a fresh identity here (spec §2 [C4][D2]).
+    /// minting a fresh identity here (spec §2).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
         meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, /*allow_new=*/false,   /// a tool never admits a new algorithm
         /*allow_mint=*/false);
+    requireGeneration4Pool(meta, meta_op.backendDialect());
     config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
@@ -1102,8 +1205,10 @@ Pool::~Pool()
         mount_runtime.stopBackgroundWorkers();
     }, "CAS pool teardown: stopping background workers");
 
-    /// 2. The farewell marker the renewer's `release` writes is a certificate that no in-flight ref-log
-    /// conditional PUT from this incarnation can land after it. A successor treats it as proof of a
+    /// 2. The farewell marker the renewer's `release` writes is a certificate that no append or lane
+    /// tombstone of this incarnation can land after it. A recovery tombstone with an unknown outcome is not
+    /// drained; it targets a chain at or below `last_unclean_epoch`, which the successor inherits and seals
+    /// too. A successor treats the marker as proof of a
     /// clean death (`MountPriorState::Clean`, no observation wait needed). Writing it without an actual
     /// drain would be a protocol-safety bug: an uncertain PUT this incarnation is still resolving could
     /// land after the successor already reclaimed and started mutating. `drainRefLanesForShutdown` is
@@ -1178,6 +1283,14 @@ bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
     return true;
 }
 
+void Pool::cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requested)
+{
+    /// The pass keeps the mount fence but backs off on the open plane's sleep, which `beginTeardown` wakes;
+    /// the mount plane's sleep would hold a scheduler join for a whole pause.
+    ref_ledger.cancelIdleOwnCreatingRows(
+        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.pause(ms); }, stop_requested);
+}
+
 void Pool::beginTeardown() noexcept
 {
     {
@@ -1218,7 +1331,7 @@ void Pool::setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
 {
-    /// Hazard C6: FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
+    /// FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
     /// MUST run on the admin/query thread — never a pool thread, whose join of itself would deadlock. The
     /// guard is a programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the
     /// right severity, not a release fail-close.
@@ -1289,7 +1402,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
 
     /// (6) Publish the terminal state + WARN, under remount serialization — matching the natural-transition
     /// contract. Every pool thread is already joined, so taking `remount_mutex` here cannot self-deadlock.
-    /// `reason` is the [D5] message (with the operator's decommission timestamp) that
+    /// `reason` is the message (with the operator's decommission timestamp) that
     /// `throwIfLifecycleTerminal` surfaces to store-class callers.
     {
         std::lock_guard g(remount_mutex);
@@ -1412,7 +1525,7 @@ bool Pool::tryRemountOnce()
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
 
-    /// ==== Step 0 (rev.7 §2): pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
+    /// ==== Step 0: pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
     /// A remount attempt means the lease is presumed lost, so first ensure we are at least transient
     /// (production reaches here already transient via `tripMountLost`; a direct/forced call may still be
     /// `Live`). Then authoritatively probe the pool sentinels and dispatch per the §2 verdict table. Only
@@ -1460,13 +1573,13 @@ bool Pool::tryRemountOnce()
         switch (gate.verdict)
         {
             case LifecycleGateVerdict::Recover:
-                /// [D3] no auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
+                /// No auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
                 /// bring the disk back — the state is terminal; only a restart recovers.
                 if (mount_runtime.lifecycle() == PoolLifecycle::IdentityLost)
                     return false;
                 break;   /// fall through to the existing fresh-incarnation recovery.
             case LifecycleGateVerdict::Replaced:
-                /// NOT while a FORGET is in progress (spec §9 rev.8 item 7). `forgetDisk` publishes the
+                /// NOT while a FORGET is in progress (spec §9). `forgetDisk` publishes the
                 /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount worker;
                 /// a `tryRemountOnce` already IN FLIGHT — one that passed the step-0 `isVanished()` gate
                 /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
@@ -1482,7 +1595,7 @@ bool Pool::tryRemountOnce()
                 return false;
             case LifecycleGateVerdict::IdentityLost:
                 /// Both sentinels authoritatively absent. Enter `IdentityLost` once (from `TransientNotLive`);
-                /// a repeat probe while already `IdentityLost` is a no-op. rev.8: `IdentityLost` is a
+                /// a repeat probe while already `IdentityLost` is a no-op. `IdentityLost` is a
                 /// fail-loud TERMINAL state — the remount worker self-exits at its next boundary (see
                 /// `CasMountRuntime::remountTerminal`), so there is no demoted observer.
                 if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)
@@ -1592,26 +1705,22 @@ bool Pool::tryRemountOnce()
             OwnerExpectation{.server_uuid = our_uuid, .owner_life = recorded_owner_life, .retired = RetiredOwnerPolicy::Refuse},
             writer_epoch, emit_mount_event);
 
-        /// NO WAIT HERE, AND THE ASSERT IS WHAT REPLACES IT. This used to pay `materialization_grace_ms`
-        /// whenever this incarnation's own ref lanes had not provably settled before the fence tripped:
-        /// an unresolved (still-wedged) ref-log conditional `PUT` from the dying epoch could otherwise
-        /// land after recovery began trusting its listings. Recovery no longer trusts listings — it walks
-        /// arithmetically and closes every epoch below the live one with an in-band `EpochSeal` at
-        /// `{E, T+1}`, so the wedged `PUT` loses its own conditional create to that seal and the wait
-        /// bought nothing but latency on every fence recovery.
+        /// No wait here: a wedged ref-log conditional `PUT` from the dying epoch loses its create to the
+        /// tombstone that recovery writes in the slot after the chain's last record, when the chain ends in
+        /// an epoch at or below `last_unclean_epoch`. This remount claims over its own fenced body, so that
+        /// marker is the dying epoch.
         ///
-        /// That replacement has ONE precondition, and it is this one: the incarnation we are about to
-        /// install must outrank the dying one. If the epoch did not strictly advance, the straggler's
-        /// slot is not "below the live epoch", nothing seals it, and the hole the wait used to paper over
-        /// reopens silently. `allocateWriterEpoch` mints from a durable monotone counter, so this holds by
-        /// construction — which is exactly why it is worth asserting rather than assuming: it fails the
-        /// build's own tests the moment someone reuses an epoch across a remount.
+        /// The one precondition is that the incarnation we are about to install outranks the dying one. If
+        /// the epoch did not strictly advance, the straggler's chain does not end below the live epoch and
+        /// recovery writes no tombstone. `allocateWriterEpoch` mints from a durable monotone counter, so
+        /// this holds by construction; the assert makes a reused epoch across a remount fail the tests.
         chassert(writer_epoch > mount_runtime.liveWriterEpoch());
 
         /// The persistent renewal worker is parked before this callback is entered, so renewer
         /// replacement cannot race any synchronous lease operation.
         step = "renewer_install";
-        mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
+        const uint64_t last_unclean_epoch = claimedLastUncleanEpoch(claim, srid);
+        mount_runtime.installRenewer(our_uuid, writer_epoch, last_unclean_epoch, now_ms);
         step = "renewer_start";
         uint64_t remount_anchor_boot_ms = mount_runtime.startRenewer();
 
@@ -1623,12 +1732,14 @@ bool Pool::tryRemountOnce()
         ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
         ///    accessors) equal to it.
         step = "publish_writer_epoch";
-        mount_runtime.setLiveWriterEpoch(writer_epoch);
+        mount_runtime.setLiveWriterEpoch(writer_epoch, last_unclean_epoch);
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
+        if (config.remount_epoch_published_hook_for_test)
+            config.remount_epoch_published_hook_for_test();
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
         ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
-        ///    the outgoing incarnation WRITES -- its seal CAS-walk mints epoch seals and advances the
-        ///    `_ckpt` -- so it must be stopped at this boundary rather than caught one site at a time
+        ///    the outgoing incarnation may WRITE -- stamp `_ckpt` and create a tombstone -- so it must be
+        ///    stopped at this boundary rather than caught one site at a time
         ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
         ///    so a cancelled walk unwinds while its runtime is still attached, and strictly before the
         ///    re-arm so no old-generation write can straddle it.
@@ -1861,9 +1972,9 @@ PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
 
 /// The manifest read path (readManifest / readManifestShared / locate) + its decode cache live in
 /// the `manifest_reader` component (Pool/CasManifestReader.h); these are thin delegates.
-std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id)
+std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id, OnMemoryLimit on_memory_limit)
 {
-    return manifest_reader.readManifestShared(id);
+    return manifest_reader.readManifestShared(id, on_memory_limit);
 }
 
 PartManifest Pool::readManifest(const ManifestId & id)
@@ -2139,6 +2250,101 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
     });
 }
 
+std::optional<CasRefLedger::PinnedResolution> Pool::resolveRefPinned(const RootNamespace & ns, const String & ref_name)
+{
+    return ref_ledger.resolveRefPinned(ns, ref_name);
+}
+
+ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const
+{
+    /// One attempt: the peer that asked waits on its own timeout and retries the fetch from its queue.
+    return confirmUnderSlot(
+               ns, ref_name, [&] { return ConfirmVerdict{ref_ledger.confirmExactRef(ns, ref_name, manifest_ref)}; }, Retry::once())
+        .answer;
+}
+
+ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                     const ManifestRef & manifest_ref) const
+{
+    const uint64_t started_ms = bootMsNow();
+    const uint64_t window_ms = config.cas_request_budget.request_window_ms;
+    const uint64_t deadline_ms = window_ms > std::numeric_limits<uint64_t>::max() - started_ms
+        ? std::numeric_limits<uint64_t>::max() : started_ms + window_ms;
+    /// Every pass repeats the ownership capture, the ledger snapshot and the slot read. The destination's reference is durable
+    /// before the first pass and GC deletes a body only on an untouched zero of a complete cut, so a later full pass proves the
+    /// same ownership overlap as an earlier one. An exact name and token may legitimately reappear after a move away and back.
+    const Retry slot_read_policy = Retry::standard().cappedAt(deadline_ms);
+    for (uint32_t pass = 1;; ++pass)
+    {
+        throwIfConfirmTornDown(ns, ref_name);
+        const ConfirmVerdict verdict = confirmUnderSlot(
+            ns, ref_name, [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
+            slot_read_policy);
+        if (verdict.answer != ConfirmAnswer::Unknown || verdict.refusal == ConfirmVerdict::Refusal::OneWay
+            || ref_ledger.pinnedTableRetired(table, ns))
+            return verdict.answer;
+        const uint64_t now_ms = bootMsNow();
+        if (now_ms >= deadline_ms)
+            return verdict.answer;
+        throwIfConfirmTornDown(ns, ref_name);
+        /// Teardown does not wake this pause, and no query cancellation reaches this layer.
+        mount_requests.pause(std::min(Retry::backoff(pass), deadline_ms - now_ms));
+        /// A pass whose slot read could not finish by the deadline would fail on the read instead of refusing.
+        if (!mount_requests.admit().oneAttemptFitsBefore(deadline_ms))
+            return verdict.answer;
+    }
+}
+
+void Pool::throwIfConfirmTornDown(const RootNamespace & ns, const String & ref_name) const
+{
+    if (teardownBegun())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS copy-source confirm of ref '{}' in namespace '{}': teardown began while waiting to confirm it",
+            ref_name, ns.string());
+}
+
+ConfirmVerdict Pool::confirmUnderSlot(const RootNamespace & ns, const String & ref_name,
+                                      const std::function<ConfirmVerdict()> & ledger_snapshot,
+                                      const Retry & slot_read_policy) const
+{
+    /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
+    /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
+    /// `RemountBetweenCaptureAndSnapshotAnswersUnknown` pins it.
+    const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
+    if (confirm_after_ownership_capture_hook_for_test)
+        confirm_after_ownership_capture_hook_for_test();
+    const ConfirmVerdict verdict = ledger_snapshot();
+    if (verdict.answer != ConfirmAnswer::Yes)
+        return verdict;
+    if (confirm_after_ledger_snapshot_hook_for_test)
+        confirm_after_ledger_snapshot_hook_for_test();
+    bool held = false;
+    if (ownership)
+    {
+        try
+        {
+            held = mount_runtime.slotHeldBy(*ownership, slot_read_policy, [this] { return !teardownBegun(); });
+        }
+        catch (...)
+        {
+            throwIfConfirmTornDown(ns, ref_name);
+            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+            throw;
+        }
+        /// A read that finished after teardown began answers for a mount that is going away.
+        throwIfConfirmTornDown(ns, ref_name);
+    }
+    if (!held)
+    {
+        ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotMoved);
+        static const LoggerPtr log = getLogger("CasRefLedger");
+        LOG_TRACE(log, "Relink confirm for ref '{}' in namespace '{}' is unknown: the mount slot read does not show this "
+                  "mount's current lease", ref_name, ns.string());
+        return {ConfirmAnswer::Unknown, ConfirmVerdict::Refusal::Transient};
+    }
+    return {ConfirmAnswer::Yes};
+}
+
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)
 {
     return ref_ledger.namespaceLife(ns);
@@ -2232,11 +2438,6 @@ uint64_t Pool::wedgedAdmittedGenerationForTest(const RootNamespace & ns)
 std::optional<RefTxnId> Pool::lastEpochSealForTest(const RootNamespace & ns)
 {
     return ref_ledger.lastEpochSealForTest(ns);
-}
-
-void Pool::setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal)
-{
-    ref_ledger.setLastEpochSealForTest(ns, seal);
 }
 
 RefLaneState Pool::laneStateForTest(const RootNamespace & ns)

@@ -116,18 +116,20 @@ void StorageFileCluster::updateQueryToSendIfNeeded(
     DB::ASTPtr & query,
     const StorageSnapshotPtr & storage_snapshot,
     const DB::ContextPtr & context,
-    bool /*make_cluster_function*/)
+    bool /*make_cluster_function*/,
+    bool add_structure_and_format)
 {
     auto * table_function = extractTableFunctionFromSelectQuery(query);
     if (!table_function)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected SELECT query from table function fileCluster, got '{}'", query->formatForErrorMessage());
 
-    TableFunctionFileCluster::updateStructureAndFormatArgumentsIfNeeded(
-        table_function,
-        storage_snapshot->metadata->getColumns().getAll().toNamesAndTypesDescription(),
-        format_name,
-        context
-    );
+    if (add_structure_and_format)
+        TableFunctionFileCluster::updateStructureAndFormatArgumentsIfNeeded(
+            table_function,
+            storage_snapshot->metadata->getColumns().getAll().toNamesAndTypesDescription(),
+            format_name,
+            context
+        );
 }
 
 class FileTaskIterator : public TaskIterator

@@ -146,8 +146,7 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
-# NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
-CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
+CLICKHOUSE_CI_MIN_TESTED_VERSION = "25.3"
 
 # `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
 # of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
@@ -2258,6 +2257,7 @@ class ClickHouseCluster:
         ipv4_address=None,
         ipv6_address=None,
         with_installed_binary=False,
+        installed_binary_supports_cas_logs=False,
         external_dirs=None,
         tmpfs=None,
         mem_limit=None,
@@ -2290,6 +2290,8 @@ class ClickHouseCluster:
         with_zookeeper - if True, add ZooKeeper configuration to configs and ZooKeeper instances to the cluster.
         with_zookeeper_secure - if True, add ZooKeeper Secure configuration to configs and ZooKeeper instances to the cluster.
         extra_configs - config files cannot put into config.d and users.d
+        installed_binary_supports_cas_logs - with `with_installed_binary`, keep the `cas_log` and `cas_gc_log`
+            sections of the main config. The binaries of other images reject them as unknown elements.
         """
 
         if self.is_up:
@@ -2406,6 +2408,7 @@ class ClickHouseCluster:
             ipv4_address=ipv4_address,
             ipv6_address=ipv6_address,
             with_installed_binary=with_installed_binary,
+            installed_binary_supports_cas_logs=installed_binary_supports_cas_logs,
             external_dirs=external_dirs,
             tmpfs=tmpfs or [],
             mem_limit=mem_limit,
@@ -3867,6 +3870,30 @@ class ClickHouseCluster:
                             input=password.encode(),
                         )
 
+    def _images_prefetched_and_present(self) -> bool:
+        """Whether this job pulled every image of this project and each is still in the daemon.
+
+        A reference this job did not pull may be a floating tag whose local copy is stale, and a
+        reference it did pull can still be gone (the image store is shared with everything else on
+        this daemon), so both questions are asked.
+
+        `docker image inspect` prints one id per reference it finds and nothing for one it does
+        not, so an equal count means none is missing. A non-zero exit or an empty enumeration
+        answers False.
+        """
+        prefetched = set(os.environ.get("CLICKHOUSE_TESTS_PREFETCHED_IMAGES", "").split())
+        if not prefetched:
+            return False
+        images = set(run_and_check(self.base_cmd + ["config", "--images"], nothrow=True).split())
+        if not images:
+            return False
+        if not images <= prefetched:
+            return False
+        found = run_and_check(
+            ["docker", "image", "inspect", "--format", "{{.Id}}"] + sorted(images), nothrow=True
+        ).split()
+        return len(found) == len(images)
+
     def start(self, connection_timeout=None):
         pytest_xdist_logging_to_separate_files.setup()
         logging.info("Running tests in {}".format(self.base_path))
@@ -3923,9 +3950,6 @@ class ClickHouseCluster:
 
             common_opts = ["--verbose", "up", "-d"]
 
-            images_pull_cmd = self.base_cmd + ["pull"]
-            # sometimes dockerhub/proxy can be flaky
-
             def logging_pulling_images(**kwargs):
                 if "exception" in kwargs:
                     logging.info(
@@ -3933,7 +3957,14 @@ class ClickHouseCluster:
                     )
 
             self.login_to_ecr()
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
+            # `docker compose pull` re-verifies every service image against the registry even when
+            # it is cached, so a transient registry failure fails a module that needed no download.
+            if self._images_prefetched_and_present():
+                logging.debug("Skipping `docker compose pull`: all images are present locally")
+            else:
+                # sometimes dockerhub/proxy can be flaky
+                images_pull_cmd = self.base_cmd + ["pull"]
+                retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -4465,10 +4496,6 @@ class ClickHouseCluster:
                 self.wait_ytsaurus_to_start()
 
             if self.with_letsencrypt_pebble and self.base_letsencrypt_pebble_cmd:
-                letsencrypt_pebble_pull_cmd = self.base_letsencrypt_pebble_cmd + ["pull"]
-                retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(
-                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=600
-                )
                 letsencrypt_pebble_start_cmd = self.base_letsencrypt_pebble_cmd + common_opts
                 run_and_check(letsencrypt_pebble_start_cmd)
                 self.wait_letsencrypt_pebble_to_start()
@@ -5191,6 +5218,7 @@ class ClickHouseInstance:
         ipv4_address=None,
         ipv6_address=None,
         with_installed_binary=False,
+        installed_binary_supports_cas_logs=False,
         external_dirs=None,
         tmpfs=None,
         mem_limit=None,
@@ -5365,6 +5393,7 @@ class ClickHouseInstance:
         self.ipv4_address = ipv4_address
         self.ipv6_address = ipv6_address
         self.with_installed_binary = with_installed_binary
+        self.installed_binary_supports_cas_logs = installed_binary_supports_cas_logs
         self.is_up = False
         self.config_root_name = config_root_name
         self.docker_init_flag = use_docker_init_flag
@@ -6571,6 +6600,12 @@ class ClickHouseInstance:
                 write_embedded_config(
                     "0_common_min_cpu_busy_time.xml", self.config_d_dir
                 )
+
+        # The main config comes from this checkout and has the Antalya-only `cas_log` and `cas_gc_log`
+        # sections. The binary of an older or upstream image rejects them as unknown elements and does not start.
+        # The sections stay removed if `restart_with_latest_version` later switches the instance to the tested binary.
+        if self.with_installed_binary and not self.installed_binary_supports_cas_logs:
+            write_embedded_config("0_common_remove_cas_logs.xml", self.config_d_dir)
 
         use_old_analyzer = os.environ.get("CLICKHOUSE_USE_OLD_ANALYZER") is not None
         use_distributed_plan = (

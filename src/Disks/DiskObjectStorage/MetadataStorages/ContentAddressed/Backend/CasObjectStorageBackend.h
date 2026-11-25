@@ -43,7 +43,7 @@ ConditionalWriteOutcome finalizeConditionalWrite(WriteBuffer & buf);
 /// and IObjectStorage::removeObjectIfTokenMatches. Tokens are backend ETags from getObjectMetadata.
 /// Trust is NEVER assumed: Cas::Probe validates enforcement per pool at open.
 ///
-/// EmulatedSingleProcess mode (LocalObjectStorage — tests and local development ONLY): the object
+/// EmulatedSingleProcess mode (LocalObjectStorage — tests and a single-node pool, with ONE process on the path): the object
 /// storage has no conditional ops, so this adapter provides EXACT token semantics itself with a
 /// process-wide mutex and an in-memory per-key token MINTED FROM the object's own etag (mtime-ns on
 /// LocalObjectStorage) — see emuMintToken. Every emulated token IS the object's current etag (not
@@ -51,7 +51,7 @@ ConditionalWriteOutcome finalizeConditionalWrite(WriteBuffer & buf);
 /// process restart, which a plain in-process counter cannot do (codex-review-triage §3.18, 19c): a
 /// counter restarts at 0 and can re-mint a value colliding with a persisted pre-restart delete token
 /// for a completely different incarnation, while a republished body's mtime is always later. Semantics
-/// otherwise hold within ONE process only — exactly what unit tests need.
+/// otherwise hold within ONE process only.
 class ObjectStorageBackend final : public Backend
 {
 public:
@@ -59,7 +59,7 @@ public:
 
     /// Construct a backend over `object_storage`. Native mode uses the storage's conditional
     /// operations and native token dialect; `EmulatedSingleProcess` serializes operations locally for
-    /// tests and local development. A Native generation-token store must use a single PUT because
+    /// tests and a single-node pool. A Native generation-token store must use a single PUT because
     /// its multipart completion path does not enforce the precondition.
     ///
     /// `single_attempt_control_plane` selects the SingleAttempt retry profile for the READ-class
@@ -208,6 +208,10 @@ public:
     /// Settings for an unconditional blob publication: each object-creating request goes out at most once.
     WriteSettings blobPublicationWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(/*attempt_no=*/1); }
+    std::expected<String, RawConflict> nativeConditionalPutForTest(const String & key, const String & bytes, const WriteSettings & ws)
+    {
+        return nativeConditionalPut(key, bytes, ws);
+    }
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
     /// Return the guarded per-key token-state size for expiry tests.
@@ -298,7 +302,7 @@ private:
     /// `key`, then renames it into place -- nothing is visible at the destination until the byte count
     /// has been validated, and the rename keeps publication atomic. Takes `emu_mutex` itself (for the
     /// rename + token-state bump only); the caller must NOT hold it.
-    void emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size);
+    void emuPublishBlobAtomically(const String & key, const StreamingBlobPublication & publication, ReadBuffer & payload);
     /// Caller holds emu_mutex: the token bookkeeping after a delete at `key`.
     void emuForgetDeletedToken(const String & key);
     /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —

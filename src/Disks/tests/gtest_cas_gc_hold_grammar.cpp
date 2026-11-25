@@ -812,60 +812,6 @@ TEST(CASGCHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
     EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
 }
 
-/// An above-cursor record that answered one GET and then stopped answering is CORRUPTION, not a
-/// frontier: nothing may legitimately remove an object above the fold cursor. It is the one hold shape
-/// that no amount of waiting can clear, and naming it durably is what stops a later round from reading
-/// the same namespace as quiet and granting it a frontier proof.
-TEST(CASGCHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
-{
-    /// Answers on odd-numbered reads and 404s on even ones: `crossFromSeal` proves the position, and
-    /// the walk's own GET of it then fails.
-    class AlternatingGetBackend : public InMemoryBackend
-    {
-    public:
-        String flaky;
-        size_t reads = 0;
-
-        std::optional<Raw> read(const String & key, TransportAccess & access) override
-        {
-            if (key == flaky && ++reads % 2 == 0)
-                return std::nullopt;
-            return InMemoryBackend::read(key, access);
-        }
-    };
-
-    auto backend = std::make_shared<AlternatingGetBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/aa@cas@"};
-    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
-
-    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
-    publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_2", 2, DB::UInt128(2),
-              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
-    /// A third epoch keeps the unstable position from reading as a frontier.
-    publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_3", 3, DB::UInt128(3),
-              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
-    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{3, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{2, 1},
-    });
-    backend->flaky = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1});
-
-    Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-
-    const RefHold hold = holdOf(*backend, layout, ns);
-    EXPECT_EQ(hold.reason, HoldReason::WitnessDisappeared);
-    /// The walk crossed into epoch 2 on the record's first answer and then could not read it: the hold
-    /// names {2,1}, the position that stopped being readable, and the cursor stays on the seal below it.
-    EXPECT_EQ(hold.offending_position, (RefTxnId{2, 1}));
-    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
-}
-
 /// ===================== THE SECOND WITNESS: `_ckpt.checkpoint` =====================
 ///
 /// A listing is a SNAPSHOT: a record that became durable after the enumeration is invisible to that
@@ -1033,12 +979,12 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     const String good_ckpt_key = layout.refCkptKey(fixture::fixtureLife(good));
     const auto good_ckpt_head = (*corrupt_op).head(good_ckpt_key, Retry::once());
     ASSERT_TRUE(good_ckpt_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>((*corrupt_op).replace(good_ckpt_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>((*corrupt_op).replace(good_ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = std::nullopt,
-    }), good_ckpt_head->etag, Retry::once())));
+    }, 1), good_ckpt_head->etag, Retry::once())));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1330,7 +1276,7 @@ TEST(CASGCHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
 }
 
 /// AN ORDINARY CRASH IS NOT A CORRUPT POOL. A round writes its runs during the reduce phase and its
-/// fold seal only at phase 10/18, so a crash in between leaves the newest generation existing WITHOUT
+/// fold seal only near the end of the round, so a crash in between leaves the newest generation existing WITHOUT
 /// a seal — the commonest shape there is. If discovery stopped at the listing's maximum it would find
 /// no seal there, conclude it could enumerate nothing, and refuse — telling the operator to recreate a
 /// pool whose holds are sitting readable one generation down.

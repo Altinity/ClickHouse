@@ -184,6 +184,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::optional<bool> ignore_extra_source_columns;
     /// Optional because of backwards compatibility. An absent value means the check is on.
     std::optional<bool> check_destination_schema_unchanged;
+    std::optional<UInt64> min_bytes_to_use_direct_io;
 
     /// this is a controversial setting. As far as I can infer from the iceberg docs, the transforms are always UTC.
     /// this setting allows to specify different timezones. Since it is already implemented, we must respect it.
@@ -238,6 +239,8 @@ struct ExportReplicatedMergeTreePartitionManifest
             json.set("ignore_extra_source_columns", *ignore_extra_source_columns);
         if (check_destination_schema_unchanged)
             json.set("check_destination_schema_unchanged", *check_destination_schema_unchanged);
+        if (min_bytes_to_use_direct_io)
+            json.set("min_bytes_to_use_direct_io", *min_bytes_to_use_direct_io);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -344,6 +347,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("iceberg_partition_timezone"))
         {
             manifest.iceberg_partition_timezone = json->getValue<String>("iceberg_partition_timezone");
+        }
+
+        if (json->has("min_bytes_to_use_direct_io"))
+        {
+            manifest.min_bytes_to_use_direct_io = json->getValue<UInt64>("min_bytes_to_use_direct_io");
         }
 
         return manifest;

@@ -71,16 +71,28 @@ public:
     /// function (`url`, `s3`, ...) that `parallel_replicas_for_cluster_engines` converted into this cluster
     /// storage into its `*Cluster` variant with the cluster name argument, so that the nodes take their read
     /// tasks from the initiator instead of reading every file on their own. Called by `read` and by the
-    /// distributed `INSERT ... SELECT` in `InterpreterInsertQuery`, which forwards the query the same way.
+    /// distributed `INSERT ... SELECT` in `InterpreterInsertQuery`.
+    /// A `SELECT` needs the structure and format so all nodes produce the initiator's header. For a forwarded
+    /// `INSERT ... SELECT`, leave the arguments as written: an omitted or `'auto'` structure then takes the
+    /// destination table's columns and `DEFAULT` expressions on each node.
+    /// Named engine-table sources must retain their declared schema when converted to functions.
+    /// `make_cluster_function` is independent: remote-initiator deferral keeps a plain function.
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
-        bool /*make_cluster_function*/) {}
+        bool /*make_cluster_function*/,
+        bool /*add_structure_and_format*/) {}
 
 protected:
     virtual void updateBeforeRead(const ContextPtr &) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(
+        ASTPtr & query_to_send,
+        SelectQueryInfo query_info,
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree = nullptr);
+    /// `DataLakeCatalog` tables need this to avoid resolving the catalog table a second time for the header.
+    virtual bool canReuseResolvedQueryTreeForHeader() const { return false; }
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 
@@ -184,7 +196,8 @@ private:
         ASTPtr & query_to_send,
         const SelectQueryInfo & query_info,
         const QueryTreeInfo & info,
-        const ContextPtr & context);
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree);
 };
 
 
