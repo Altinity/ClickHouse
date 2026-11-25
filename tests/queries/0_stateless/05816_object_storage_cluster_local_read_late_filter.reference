@@ -1,0 +1,15 @@
+plain filter, probe disabled
+2	3
+plain filter, probe over the limit
+2	3
+filter of the outer query, probe disabled
+2	3
+filter of the outer query, probe over the limit
+2	3
+set from a subquery, probe disabled
+2	3
+set from a subquery, probe over the limit
+2	3
+outer	1	1	1
+plain	1	1	1
+subquery	1	1	1
