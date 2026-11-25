@@ -162,7 +162,10 @@ void InterpreterDescribeQuery::fillColumnsFromSubqueryImpl(const ASTPtr & select
     SharedHeader sample_block;
     if (settings[Setting::allow_experimental_analyzer])
     {
+        /// Only the header is needed. An analysis does not read the storage, so it does not ask it for the
+        /// processing stage, which can list objects (`object_storage_cluster_local_read_max_tasks`).
         SelectQueryOptions select_query_options;
+        select_query_options.analyze();
         sample_block = InterpreterSelectQueryAnalyzer(select_query, current_context, select_query_options).getSampleBlock();
     }
     else
