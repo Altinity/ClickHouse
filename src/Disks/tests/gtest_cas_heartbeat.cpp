@@ -894,7 +894,7 @@ TEST(CASHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
 {
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-#define EXPECT_RENEWER_STATE_REJECTION(statement) EXPECT_DEATH({ statement; }, "allowed only in")
+#define EXPECT_RENEWER_STATE_REJECTION(statement) CAS_EXPECT_DEATH({ statement; }, "allowed only in")
 #else
 #define EXPECT_RENEWER_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
 #endif

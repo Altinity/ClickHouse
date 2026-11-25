@@ -72,6 +72,28 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
+namespace DB::Cas::tests
+{
+
+/// Call first inside a death statement. A dying child is dumped through the kernel's core handler even with a
+/// zero core limit when `core_pattern` is a pipe; a non-dumpable child skips that.
+inline void noCoreDump()
+{
+#if defined(__linux__)
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+}
+
+}
+
+/// `EXPECT_DEATH` / `ASSERT_DEATH` whose forked child first calls `noCoreDump`; the parent is untouched.
+#define CAS_EXPECT_DEATH(statement, matcher) EXPECT_DEATH({ ::DB::Cas::tests::noCoreDump(); statement; }, matcher)
+#define CAS_ASSERT_DEATH(statement, matcher) ASSERT_DEATH({ ::DB::Cas::tests::noCoreDump(); statement; }, matcher)
+
 /// Per-TU extern declarations for the `ContentAddressedSetting` entries this header's helpers use --
 /// the established pattern for `BaseSettings`-derived classes in this codebase (see e.g.
 /// `RegisterDiskCache.cpp`'s `namespace FileCacheSetting` block): the entries are DEFINED once in

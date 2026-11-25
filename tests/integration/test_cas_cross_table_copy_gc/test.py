@@ -178,20 +178,31 @@ class GcLoop(threading.Thread):
 
 
 def drain_gc(nodes):
-    """Rounds on every node until the leader reports no work twice in a row; returns the rounds run."""
-    quiet = 0
-    for rounds in range(1, DRAIN_MAX_ROUNDS + 1):
+    """Rounds on every node until the leader reports no work twice in a row; returns the rounds run.
+
+    The background scheduler is paused meanwhile. Manual and scheduled rounds share one deferral counter and
+    the ninth round folds. When the scheduler's period is a little shorter than this loop's, the scheduler
+    wins every fold and every manual round here reports `deferred`: the drain never sees a quiet round.
+    """
+    for node in nodes:
+        node.query("SYSTEM CAS GC STOP {}".format(DISK))
+    try:
+        quiet = 0
+        for rounds in range(1, DRAIN_MAX_ROUNDS + 1):
+            for node in nodes:
+                row = gc_round(node)
+                if not row["acquired_lease"] or row["deferred"]:
+                    continue
+                if sum(int(row[f]) for f in GC_WORK_FIELDS) == 0:
+                    quiet += 1
+                else:
+                    quiet = 0
+                if quiet >= DRAIN_QUIET_ROUNDS:
+                    return rounds
+        raise AssertionError("GC did not drain in {} rounds".format(DRAIN_MAX_ROUNDS))
+    finally:
         for node in nodes:
-            row = gc_round(node)
-            if not row["acquired_lease"] or row["deferred"]:
-                continue
-            if sum(int(row[f]) for f in GC_WORK_FIELDS) == 0:
-                quiet += 1
-            else:
-                quiet = 0
-            if quiet >= DRAIN_QUIET_ROUNDS:
-                return rounds
-    raise AssertionError("GC did not drain in {} rounds".format(DRAIN_MAX_ROUNDS))
+            node.query("SYSTEM CAS GC START {}".format(DISK))
 
 
 class Stats:

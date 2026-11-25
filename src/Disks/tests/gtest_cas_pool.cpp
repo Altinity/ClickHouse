@@ -3505,7 +3505,7 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-#define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_DEATH({ statement; }, "CAS mount runtime")
+#define EXPECT_RUNTIME_STATE_REJECTION(statement) CAS_EXPECT_DEATH({ statement; }, "CAS mount runtime")
 #else
 #define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
 #endif

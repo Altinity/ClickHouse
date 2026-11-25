@@ -948,7 +948,7 @@ TEST(CASSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
     /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
     /// (probability 2^-128 — the check documents the reservation).
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             DB::Cas::assertValidSourceEdgeId(UInt128{0});
@@ -1962,12 +1962,12 @@ TEST(CASThreeCursorMerge, NominationInASuppressedRoundIsALogicalError)
 TEST(CASThreeCursorMergeDeathTest, NominationWithoutATagIsALogicalError)
 {
     Layout layout{"pool"};
-    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); }, "carries no tag");
+    CAS_EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); }, "carries no tag");
 }
 
 TEST(CASThreeCursorMergeDeathTest, NominationInASuppressedRoundIsALogicalError)
 {
     Layout layout{"pool"};
-    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); }, "suppressed round");
+    CAS_EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); }, "suppressed round");
 }
 #endif

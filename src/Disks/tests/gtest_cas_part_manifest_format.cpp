@@ -1,4 +1,5 @@
 #include "cas_format_test_battery.h"
+#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
@@ -576,7 +577,7 @@ TEST(CASPartManifestFormat, EncodeRejectsMalformedEntryPaths)
 TEST(CASPartManifestFormatDeathTest, DuplicatePathRejectedOnEncode)
 {
     const PartManifest m = sampleWithDuplicatePath();
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             static_cast<void>(encodePartManifest(m));
             std::_Exit(0);
@@ -591,7 +592,7 @@ TEST(CASPartManifestFormatDeathTest, EncodeRejectsMalformedEntryPaths)
         SCOPED_TRACE(path);
         PartManifest m = manifestWithSinglePath("placeholder");
         m.entries[0].path = path;
-        EXPECT_DEATH(
+        CAS_EXPECT_DEATH(
             {
                 static_cast<void>(encodePartManifest(m));
                 std::_Exit(0);

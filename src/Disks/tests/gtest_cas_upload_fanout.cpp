@@ -566,7 +566,7 @@ TEST(CASUploadFanoutDeathTest, ConflictingDuplicateSizesAbort)
     c.source.size = c.declared_size;
 
     auto pool = makePool(4);
-    EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{a, c}, *pool); }, "");
+    CAS_EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{a, c}, *pool); }, "");
 }
 #endif
 
@@ -604,7 +604,7 @@ TEST(CASUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
     r.declared_size = r.source.size + 7;
 
     auto pool = makePool(2);
-    EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{r}, *pool); }, "");
+    CAS_EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{r}, *pool); }, "");
 }
 #endif
 

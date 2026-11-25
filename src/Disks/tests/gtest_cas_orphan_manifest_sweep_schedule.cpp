@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/tests/cas_test_helpers.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweepSchedule.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
@@ -144,7 +145,7 @@ TEST(CASOrphanManifestSweepSchedule, RejectsUnperformedOrInvalidProgress)
     {
         for (const uint64_t progress_at_ms : {0, 1000})
         {
-            EXPECT_DEATH(
+            CAS_EXPECT_DEATH(
                 {
                     DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
                     updateOrphanManifestSweepSchedule(state, decision, wrapped, progress_at_ms);
