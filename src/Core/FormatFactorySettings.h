@@ -229,7 +229,7 @@ Advanced tuning knob for the Parquet reader scheduler. The fraction of the Parqu
 )", 0) \
     DECLARE(Double, input_format_parquet_read_min_fill_ratio, 0, R"(
 Experimental. Anti-amplification guard for Parquet v3 read coalescing. Coalescing reads through gaps shorter than the seek threshold to save requests, but many such gaps can accumulate into a read task that is almost entirely unwanted filler - e.g. reading a tiny, scattered (RLE / near-constant) column drags in the neighbouring columns and turns a few KB of wanted data into hundreds of MB read. When set above 0, coalescing stops extending a task once it would be less than this fraction "wanted" (wanted bytes / total span). Tasks with only a little filler (below 64 KiB, or less for small seek thresholds) are never limited. Range 0..1; 0 disables. Trades more, smaller requests for fewer bytes on sparse reads. Disabled by default.
-)", 0) \
+)", EXPERIMENTAL) \
     DECLARE(Bool, input_format_parquet_page_filter_push_down, true, R"(
 Skip pages using min/max values from column index.
 )", 0) \
