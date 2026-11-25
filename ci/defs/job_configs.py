@@ -1325,6 +1325,15 @@ class JobConfigs:
             for total_batches in (4,)
             for batch in range(1, total_batches + 1)
         ],
+        *[
+            Job.ParamSet(
+                parameter=f"amd_binary, distributed plan, {batch}/{total_batches}",
+                runs_on=RunnerLabels.AMD_MEDIUM,
+                requires=[ArtifactNames.CH_AMD_BINARY_GH],
+            )
+            for total_batches in (4,)
+            for batch in range(1, total_batches + 1)
+        ],
     )
     integration_test_jobs_non_required = common_integration_test_job_config.parametrize(
         *[
