@@ -2536,15 +2536,13 @@ bool RestCatalog::getTableMetadataImpl(
         if (object->has("metadata-location") && !object->get("metadata-location").isEmpty())
         {
             auto metadata_location = object->get("metadata-location").extract<String>();
-            result.setDataLakeSpecificProperties(DataLakeSpecificProperties{ .iceberg_metadata_file_location = metadata_location });
+            result.setDataLakeSpecificProperties(DataLakeSpecificProperties{
+                .iceberg_metadata_file_location = metadata_location, .iceberg_table_uuid = table_uuid});
         }
     }
 
     if (!table_uuid.empty())
-    {
         result.setTableUUID(table_uuid);
-        result.setIcebergTableUUID(table_uuid);
-    }
 
     return true;
 }

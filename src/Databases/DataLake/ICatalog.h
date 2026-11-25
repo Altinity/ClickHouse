@@ -64,6 +64,10 @@ enum class DataLakeTableFormat : uint8_t
 struct DataLakeSpecificProperties
 {
     std::string iceberg_metadata_file_location;
+    /// The `table-uuid` of the Iceberg metadata file at that location, empty if the catalog does not report it.
+    /// Unlike `TableMetadata::getTableUUID`, which is whatever identifier the catalog uses for the table
+    /// (Unity returns its own table id there), this is the uuid inside the metadata file.
+    std::string iceberg_table_uuid;
 };
 
 /// A class representing table metadata,
@@ -112,10 +116,6 @@ public:
 
     void setTableUUID(const std::string & uuid_) { table_uuid = uuid_; }
     std::optional<std::string> getTableUUID() const { return table_uuid; }
-    /// The `table-uuid` field of the Iceberg metadata file the catalog returned. Unlike `getTableUUID`, which is
-    /// whatever identifier the catalog uses for the table, this is guaranteed to be the uuid inside that file.
-    void setIcebergTableUUID(const std::string & uuid_) { iceberg_table_uuid = uuid_; }
-    std::optional<std::string> getIcebergTableUUID() const { return iceberg_table_uuid; }
     void setTableFormat(DataLakeTableFormat format) { table_format = format; }
     DataLakeTableFormat getTableFormat() const { return table_format; }
 
@@ -174,7 +174,6 @@ private:
 
     std::string reason_why_table_is_not_readable;
     std::optional<std::string> table_uuid;
-    std::optional<std::string> iceberg_table_uuid;
     DataLakeTableFormat table_format = DataLakeTableFormat::UNKNOWN;
 
     bool is_default_readable_table = true;

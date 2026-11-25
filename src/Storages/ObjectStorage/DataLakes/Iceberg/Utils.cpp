@@ -1592,7 +1592,6 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
     if (metadata_cache)
     {
         return metadata_cache->getOrSetLatestMetadataVersion(
-            *object_storage,
             table_path,
             table_uuid,
             load_fn,

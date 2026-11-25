@@ -148,19 +148,11 @@ public:
         : Base(cache_policy, CurrentMetrics::IcebergMetadataFilesCacheBytes, CurrentMetrics::IcebergMetadataFilesCacheFiles, max_size_in_bytes, max_count, size_ratio)
     {}
 
-    /// The key of an entry must say which storage the file was read from. The table uuid and the path are not
-    /// enough: they are reported by a catalog (or given in a query), so another catalog with a storage of its
-    /// own could otherwise fill the entry that a table of the same uuid and path on this storage will later hit.
-    /// The parts are joined with `\0`, which a uuid, a path and a storage description never contain, so that
-    /// different (storage, uuid, path) triples cannot produce the same key.
-    static String getStorageIdentity(const IObjectStorage & object_storage)
-    {
-        return object_storage.getDescription() + '\0' + object_storage.getObjectsNamespace() + '\0' + object_storage.getCommonKeyPrefix();
-    }
-
+    /// The storage is part of the key: the uuid and the path are reported by a catalog (or given in a query),
+    /// so a table on another storage must not be able to fill the entry that this table will later hit.
     static String getKey(const IObjectStorage & object_storage, const String & table_uuid, const String & data_path)
     {
-        return getStorageIdentity(object_storage) + '\0' + table_uuid + '\0' + data_path;
+        return object_storage.getDescription() + '\0' + object_storage.getObjectsNamespace() + '\0' + table_uuid + '\0' + data_path;
     }
 
     template <typename LoadFunc>
@@ -207,18 +199,8 @@ public:
     }
 
     template <typename LoadFunc>
-    LatestMetadataVersionPtr getOrSetLatestMetadataVersion(
-        const IObjectStorage & object_storage,
-        const String & table_path,
-        const std::optional<String> & table_uuid,
-        LoadFunc && load_fn,
-        time_t tolerated_staleness_ms)
+    LatestMetadataVersionPtr getOrSetLatestMetadataVersion(const String & table_path, const std::optional<String> & table_uuid, LoadFunc && load_fn, time_t tolerated_staleness_ms)
     {
-        /// Both keys are scoped by the storage, for the same reason as in `getKey`.
-        const String storage_identity = getStorageIdentity(object_storage);
-        const String path_key = storage_identity + '\0' + table_path;
-        const String uuid_key = table_uuid ? storage_identity + '\0' + *table_uuid : String{};
-
         /// This caching method for latest metadata version:
         /// 1.    Takes two keys to reference a table - path and [optional] uuid
         /// 2.    Probes the cache only if stale values are tolerated - sometimes we just have to force the latest value from the remote catalog and to cache it
@@ -238,7 +220,7 @@ public:
         /// tolerated_staleness_ms=0 would mean that a non-cached value is required
         if (tolerated_staleness_ms > 0)
         {
-            const String & data_path = table_uuid ? uuid_key : path_key;
+            const String & data_path = table_uuid ? *table_uuid : table_path;
             auto found = Base::get(data_path);
 
             if (found)
@@ -265,9 +247,9 @@ public:
         cell->latest_metadata = load_fn();
         cell->cached_at = std::chrono::system_clock::now();
 
-        Base::set(path_key, std::make_shared<IcebergMetadataFilesCacheCell>(cell));
+        Base::set(table_path, std::make_shared<IcebergMetadataFilesCacheCell>(cell));
         if (table_uuid)
-            Base::set(uuid_key, std::make_shared<IcebergMetadataFilesCacheCell>(cell));
+            Base::set(*table_uuid, std::make_shared<IcebergMetadataFilesCacheCell>(cell));
 
         return cell;
     }
