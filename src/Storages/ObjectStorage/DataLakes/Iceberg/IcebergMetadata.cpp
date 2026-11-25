@@ -301,13 +301,15 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
                 Iceberg::f_table_uuid);
         }
     }
-    if (known_table_uuid && known_table_uuid != table_uuid)
+    /// `table-uuid` is optional in a format version 1 metadata file. A file without it cannot contradict the
+    /// catalog, and such a table is opened with `table_uuid` empty exactly as it is without a catalog uuid.
+    if (known_table_uuid && table_uuid && *known_table_uuid != *table_uuid)
         throw Exception(
             ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
             "Iceberg table-uuid '{}' returned by the catalog doesn't match the one in metadata file '{}': '{}'",
             *known_table_uuid,
             metadata_file_path,
-            table_uuid.value_or(""));
+            *table_uuid);
     /// With a known uuid `getMetadataJSONObject` has already stored the entry.
     if (cache_ptr && table_uuid && !known_table_uuid)
         cache_ptr->getOrSetTableMetadata(
