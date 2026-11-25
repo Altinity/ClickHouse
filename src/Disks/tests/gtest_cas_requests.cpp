@@ -51,9 +51,11 @@ namespace DB::ErrorCodes
 {
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
+extern const int CANNOT_ALLOCATE_MEMORY;
 extern const int CAS_DELETE_MARKER;
 extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int S3_ERROR;
 extern const int NETWORK_ERROR;
 }
@@ -73,6 +75,8 @@ using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::expectBytes;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::expectThrowsCodeWithMessage;
+using DB::Cas::tests::JournalVerb;
+using DB::Cas::tests::messageOf;
 
 namespace
 {
@@ -243,7 +247,7 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
     const Etag landed = std::get<Committed>(committed).etag;
     const auto returned = orThrow(std::move(committed), "create");
     ASSERT_TRUE(returned.has_value());
-    EXPECT_EQ(*returned, landed);
+    EXPECT_EQ(tokenText(*returned), tokenText(landed));
     EXPECT_FALSE(orThrow(WriteResult{Declined{ProvenAbsent{}}}, "declined").has_value());
 
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
@@ -294,17 +298,17 @@ TEST(CASBackendPrimitives, InMemoryWriteReadRemoveRoundTripThroughOneOperation)
     const std::optional<Object> r = op.read("k", Retry::once());
     ASSERT_TRUE(r);
     EXPECT_EQ(r->bytes, "v1");
-    EXPECT_EQ(r->etag, *w1);
+    EXPECT_EQ(tokenText(r->etag), tokenText(*w1));
 
     const std::optional<Meta> h = op.head("k", Retry::once());
     ASSERT_TRUE(h);
     EXPECT_EQ(h->size, 2u);
-    EXPECT_EQ(h->etag, *w1);
+    EXPECT_EQ(tokenText(h->etag), tokenText(*w1));
 
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "v2", Retry::once())));   /// must be absent
     const std::optional<Etag> w3 = orThrow(op.replace("k", "v2", *w1, Retry::once()), "replace");
     ASSERT_TRUE(w3);
-    EXPECT_NE(*w3, *w1);                                  /// incarnations never repeat
+    EXPECT_NE(tokenText(*w3), tokenText(*w1));                                  /// incarnations never repeat
 
     EXPECT_EQ(op.remove("k", *w1, Retry::once()), Removal::Mismatch);
     EXPECT_EQ(op.remove("k", *w3, Retry::once()), Removal::Removed);
@@ -329,7 +333,7 @@ TEST(CASBackendPrimitives, ListSurfacesTheIncarnationAndPaginates)
     EXPECT_EQ(page.keys[0].key, "p/a");
     EXPECT_EQ(page.keys[0].size, 10u);
     ASSERT_TRUE(page.keys[0].etag.has_value());
-    EXPECT_EQ(*page.keys[0].etag, *a);
+    EXPECT_EQ(tokenText(*page.keys[0].etag), tokenText(*a));
     EXPECT_TRUE(page.next_cursor.empty());
 
     const ListPage first = op.list("p/", "", 1, Retry::once());
@@ -711,10 +715,10 @@ TEST(CASRequests, CreateThenReplaceThenRemove)
     const auto seen = op.read("k", Retry::standard());
     ASSERT_TRUE(seen.has_value());
     EXPECT_EQ(seen->bytes, "v1");
-    EXPECT_EQ(seen->etag, first);
+    EXPECT_EQ(tokenText(seen->etag), tokenText(first));
 
     const Etag second = *orThrow(op.replace("k", "v2", first, Retry::standard()), "replace");
-    EXPECT_NE(second, first);
+    EXPECT_NE(tokenText(second), tokenText(first));
 
     EXPECT_EQ(op.remove("k", first, Retry::standard()), Removal::Mismatch);    /// the incarnation is stale
     EXPECT_EQ(op.remove("k", second, Retry::standard()), Removal::Removed);
@@ -1501,7 +1505,7 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     ASSERT_TRUE(rival_etag.has_value());
     const auto * meta_seen = std::get_if<Meta>(&conflict->seen);
     ASSERT_NE(meta_seen, nullptr);
-    EXPECT_EQ(meta_seen->etag, *rival_etag);
+    EXPECT_EQ(tokenText(meta_seen->etag), tokenText(*rival_etag));
     EXPECT_EQ(meta_seen->size, String("theirs").size());
     EXPECT_EQ(backend->getTotal(), 1u);
 }
@@ -1528,6 +1532,51 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsRei
     EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
+namespace
+{
+
+/// Quotes the token in every write's answer, as a store may quote an ETag in a write's answer and not in a read's; a
+/// precondition spelled that way reaches the store unquoted.
+class QuotedWriteAnswersBackend : public CountingBackend
+{
+public:
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        std::optional<String> sent = expected_value;
+        if (sent && sent->size() >= 2 && sent->front() == '"' && sent->back() == '"')
+            sent = sent->substr(1, sent->size() - 2);
+        auto answer = CountingBackend::write(key, bytes, sent, access);
+        if (answer)
+            answer = "\"" + *answer + "\"";
+        return answer;
+    }
+};
+
+}
+
+/// The resolve read spells the precondition's version without the quotes of the write's answer: the version is
+/// unchanged, so the write is reissued, not reported as a conflict.
+TEST(CASRequests, AmbiguousReplaceWhoseResolveSpellsThePreconditionUnquotedIsReissued)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<QuotedWriteAnswersBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    ASSERT_NE(tokenText(seen), tokenText(op.head("k", Retry::standard())->etag))
+        << "fixture: the write's answer and the read's spell the token differently";
+    backend->resetCounts();
+
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr) << "the resolve read was taken for another writer's version";
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_EQ(backend->writeTotal(), 2u);
+    EXPECT_EQ(backend->getTotal(), 1u);
+}
+
 TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEquality)
 {
     /// The key already holds exactly the bytes we are about to write, so byte equality alone can never
@@ -1550,7 +1599,7 @@ TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEqua
         /// never made; the reissue is what actually put these bytes there under a new incarnation.
         EXPECT_EQ(committed->attempts_sent, 2u);
         EXPECT_FALSE(committed->resolved_by_read);
-        EXPECT_NE(committed->etag, seen);
+        EXPECT_NE(tokenText(committed->etag), tokenText(seen));
         EXPECT_EQ(backend->writeTotal(), 2u);
         EXPECT_EQ(backend->getTotal(), 1u);
         EXPECT_EQ(clock.sleeps.size(), 1u);
@@ -1594,7 +1643,7 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict
     const auto * occupant = std::get_if<Object>(&conflict->seen);
     ASSERT_NE(occupant, nullptr);
     EXPECT_EQ(occupant->bytes, "theirs");
-    EXPECT_NE(occupant->etag, stale);
+    EXPECT_NE(tokenText(occupant->etag), tokenText(stale));
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 1u);
     /// The count the conflict reports is the count the transport saw, not a constant that happens to
@@ -1999,6 +2048,107 @@ TEST(CASRequests, ADeterministicLocalFailureSurfacesUnchangedWithoutAReissue)
     EXPECT_TRUE(clock.sleeps.empty());
 }
 
+namespace
+{
+
+std::exception_ptr memoryLimitFault()
+{
+    return std::make_exception_ptr(DB::Exception(
+        DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: would use 1.22 MiB"));
+}
+
+}
+
+TEST(CASRequests, AReadThatAsksPropagatesTheMemoryLimitWithoutAnotherAttempt)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "create");
+    backend->resetCounts();
+    backend->failNextReadWith("k", memoryLimitFault());
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
+
+    const String message = messageOf(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&]
+    {
+        (void)op.read("k", Retry::standard(), OnMemoryLimit::Propagate);
+    });
+
+    EXPECT_EQ(message, "Query memory limit exceeded: would use 1.22 MiB");
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 0u);
+}
+
+TEST(CASRequests, AReadThatDoesNotAskStillReissuesTheMemoryLimit)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "create");
+    backend->resetCounts();
+    backend->failNextReadWith("k", memoryLimitFault());
+
+    const auto seen = op.read("k", Retry::standard());
+
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->bytes, "v");
+    EXPECT_EQ(backend->getTotal(), 2u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+TEST(CASRequests, AReadThatAsksStillReissuesEveryOtherFault)
+{
+    const std::vector<std::exception_ptr> faults{
+        std::make_exception_ptr(Poco::TimeoutException("the read timed out")),
+        std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "mmap failed")),
+    };
+    for (const auto & fault : faults)
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        orThrow(op.create("k", "v", Retry::standard()), "create");
+        backend->resetCounts();
+        backend->failNextReadWith("k", fault);
+
+        const auto seen = op.read("k", Retry::standard(), OnMemoryLimit::Propagate);
+
+        ASSERT_TRUE(seen.has_value());
+        EXPECT_EQ(seen->bytes, "v");
+        EXPECT_EQ(backend->getTotal(), 2u);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+    }
+}
+
+/// A write settles a refused precondition by reading the occupant; that read keeps reissuing.
+TEST(CASRequests, ASettlingReadThatRunsOutOfMemoryStillReadsTheOccupant)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "old", Retry::standard()), "create");
+    backend->clearJournal();
+    backend->failNextReadWith("k", memoryLimitFault());
+
+    WriteResult result = op.create("k", "new", Retry::standard());
+
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    const auto * occupant = std::get_if<Object>(&conflict->seen);
+    ASSERT_NE(occupant, nullptr);
+    EXPECT_EQ(occupant->bytes, "old");
+    const auto journal = backend->journal();
+    ASSERT_EQ(journal.size(), 3u);
+    EXPECT_EQ(journal[0].verb, JournalVerb::Write);
+    EXPECT_EQ(journal[1].verb, JournalVerb::Read);
+    EXPECT_EQ(journal[2].verb, JournalVerb::Read);
+}
+
 TEST(CASRequests, ATransportTimeoutIsReissuedAndALocalFailureIsNot)
 {
     {
@@ -2342,6 +2492,108 @@ TEST(CASRequests, AMissingBucketOnAReadIsReissuedToTheDeadline)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
     EXPECT_GT(backend->getTotal(), 1u) << "the read ended on its first attempt instead of reissuing";
     EXPECT_GE(clock.now - start, 85'000u) << "the policy's own deadline is what must end this read";
+}
+
+namespace
+{
+
+/// The message of the exception `f` throws; fails the test when it does not throw `NETWORK_ERROR`.
+template <typename F>
+String retryLaterMessageOf(F && f)
+{
+    try
+    {
+        f();
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+        return e.message();
+    }
+    ADD_FAILURE() << "no exception";
+    return {};
+}
+
+}
+
+/// A read that gives up says it was a read: no write was involved, and the code stays `NETWORK_ERROR`.
+TEST(CASRequests, AReadThatGivesUpIsReportedAsAReadNotAWrite)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_BUCKET, "NoSuchBucket"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.read("k", Retry::standard()); });
+
+    EXPECT_NE(message.find("read of 'k'"), String::npos) << message;
+    EXPECT_NE(message.find("gave up at the policy deadline after "), String::npos) << message;
+    EXPECT_NE(message.find("retrying later"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_GT(backend->getTotal(), 1u) << "positive control: the read was reissued before it gave up";
+}
+
+/// The same give-up for a request that is not a read names its own verb: a delete never claims to be a read.
+TEST(CASRequests, ARequestThatGivesUpNamesItsOwnVerb)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.probeSentinel("k", Retry::within(0)); });
+
+    EXPECT_NE(message.find("probeSentinel of 'k'"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_EQ(message.find("read of"), String::npos) << message;
+}
+
+/// A write that gives up keeps its wording.
+TEST(CASRequests, AWriteThatGivesUpKeepsItsWriteWording)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)orThrow(op.create("k", "v", Retry::within(0)), "create"); });
+
+    EXPECT_EQ(message, "CAS write could not be committed (create: gave up at the policy deadline after zero attempt(s)); retrying later");
+}
+
+/// A read refused for lack of lease budget names the lease and does not claim a write.
+TEST(CASRequests, AReadRefusedForLackOfLeaseBudgetIsNotReportedAsAWrite)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    Fence fence{[] { return uint64_t{0}; }, [](uint64_t, uint64_t) { return Fence::Admit::NoBudget; }, [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.read("k", Retry::standard()); });
+
+    EXPECT_NE(message.find("no lease budget"), String::npos) << message;
+    EXPECT_NE(message.find("read of 'k'"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_EQ(backend->getTotal(), 0u) << "positive control: the refusal came before any request";
+}
+
+/// The same refusal of a write keeps the write wording and the lease deadline.
+TEST(CASRequests, AWriteRefusedForLackOfLeaseBudgetKeepsItsWriteWording)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    Fence fence{[] { return uint64_t{0}; }, [](uint64_t, uint64_t) { return Fence::Admit::NoBudget; }, [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)orThrow(op.create("k", "v", Retry::standard()), "create"); });
+
+    EXPECT_NE(message.find("CAS write could not be committed"), String::npos) << message;
+    EXPECT_NE(message.find("gave up at the lease deadline"), String::npos) << message;
 }
 
 /// The kept half of the same classification: a key miss IS an answer about the object, so reissuing it
@@ -3425,7 +3677,7 @@ TEST(CASRequests, ReservationIsTheEnvelopeThroughInstrumentedBackend)
     };
     FakeClock clock;
     auto inner = std::make_shared<EnvelopeBackend>();
-    auto wrapped = std::make_shared<InstrumentedBackend>(inner);
+    auto wrapped = std::make_shared<InstrumentedBackend>(inner, "p");
     ASSERT_EQ(wrapped->attemptTimeoutMs(), 5000u);
     ASSERT_EQ(wrapped->attemptEnvelopeMs(), 7000u) << "InstrumentedBackend must forward the envelope, not fall back to the bare attempt timeout";
     auto requests = makeRequests(wrapped, clock);

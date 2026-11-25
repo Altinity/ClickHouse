@@ -141,7 +141,7 @@ TEST(CASSlotOccupy, PreExistingKeyConflictsWithExactBytesAndIncarnationInTwoRequ
     const Object * occupant = conflictObject(result);
     ASSERT_TRUE(occupant != nullptr) << "the settling read must have named the occupant";
     EXPECT_EQ(occupant->bytes, "occupant-bytes");
-    EXPECT_EQ(occupant->etag, seeded_incarnation);
+    EXPECT_EQ(tokenText(occupant->etag), tokenText(seeded_incarnation));
 
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
@@ -350,7 +350,7 @@ TEST(CASSlotOccupy, OwnLandedAmbiguousWriteIsObservedOnTheNextAttempt)
     const Object * occupant = conflictObject(second);
     ASSERT_TRUE(occupant != nullptr);
     EXPECT_EQ(occupant->bytes, "my-bytes");
-    EXPECT_EQ(occupant->etag, landed_incarnation) << "both calls must observe the SAME landed incarnation";
+    EXPECT_EQ(tokenText(occupant->etag), tokenText(landed_incarnation)) << "both calls must observe the SAME landed incarnation";
     EXPECT_EQ(backend->writeTotal(), 2u);
     EXPECT_EQ(backend->getCount("k"), 2u);
 }

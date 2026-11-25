@@ -52,7 +52,7 @@ public:
     using FoldSignature = decltype(&Gc::fold);
     using ExpectedFoldSignature = Gc::FoldResult (Gc::*)(
         GcState &, std::optional<Etag> &, RoundReport &, uint64_t, const RefPlan &, UniversePolicy,
-        GcRoundWorkBudget &);
+        GcRoundWorkBudget &, bool);
     using BuilderSignature = decltype(&buildRefWalkPlan);
     using ExpectedBuilderSignature = RefPlan (*)(RoundInput &&);
 
@@ -409,7 +409,7 @@ TEST(CASRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLo
     EXPECT_THROW(CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current) { return current; }), DB::Exception);
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
     EXPECT_EQ(after->bytes, before->bytes);
 
     const auto unique = CasRefCatalog::lifeIfCataloged(op, layout, RootNamespace{"c"});
@@ -1949,19 +1949,19 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return false; }),
+        op, layout, creating, [](const CreatorFence &) { return false; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     CatalogEntry stale = creating;
     stale.creator->writer_epoch = 2;
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, stale, [](const CreatorFence &) { return true; }),
+        op, layout, stale, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return true; }),
+        op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1);
@@ -1997,10 +1997,6 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     ordinary_scan.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{4, 4}}});
     ordinary_scan.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
-    ordinary_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
-    ordinary_scan.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
-    ordinary_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 9});
-    ordinary_scan.checkpoint_observations.emplace(UInt128{2}, RefTxnId{2, 9});
     ordinary_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 10});
     ordinary_scan.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 10});
 
@@ -2009,10 +2005,6 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     rebuild_scan.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{5, 5}}});
     rebuild_scan.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
-    rebuild_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
-    rebuild_scan.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
-    rebuild_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 11});
-    rebuild_scan.checkpoint_observations.emplace(UInt128{3}, RefTxnId{3, 11});
     rebuild_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 12});
     rebuild_scan.max_log_by_life.emplace(UInt128{3}, RefTxnId{3, 12});
 
@@ -2034,9 +2026,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_EQ(ordinary.lifeIds(), expected);
     EXPECT_EQ(rebuild.lifeIds(), expected);
 
-    EXPECT_TRUE(ordinary.row(UInt128{2}).listed_hint);
-    ASSERT_TRUE(ordinary.row(UInt128{2}).fold_state.coverage.hold);
-    EXPECT_EQ(ordinary.row(UInt128{2}).checkpoint_observation, (RefTxnId{2, 9}));
+    EXPECT_EQ(ordinary.droppedListedLives(), 2u);
     EXPECT_EQ(ordinary.row(UInt128{2}).tail_observation, (RefTxnId{2, 10}));
     const std::optional<RefCleanupEvidence> cleanup_evidence{
         RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}};
@@ -2045,9 +2035,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_FALSE(ordinary.contains(UInt128{1}));
     EXPECT_FALSE(ordinary.contains(UInt128{4}));
 
-    EXPECT_TRUE(rebuild.row(UInt128{3}).listed_hint);
-    ASSERT_TRUE(rebuild.row(UInt128{3}).fold_state.coverage.hold);
-    EXPECT_EQ(rebuild.row(UInt128{3}).checkpoint_observation, (RefTxnId{3, 11}));
+    EXPECT_EQ(rebuild.droppedListedLives(), 2u);
     EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
     EXPECT_FALSE(rebuild.contains(UInt128{1}));
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
@@ -2061,8 +2049,6 @@ TEST(CASGCStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
         .fold_state = {},
         .removal_started_round = 10,
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
 
     EXPECT_FALSE(stuckRemovalWarning(row, /*current_round=*/12, /*threshold_rounds=*/3, layout));
@@ -2088,8 +2074,6 @@ TEST(CASGCStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
         .fold_state = {},
         .removal_started_round = std::numeric_limits<uint64_t>::max(),
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
     EXPECT_FALSE(stuckRemovalWarning(row, 0, 1, layout));
 
@@ -2124,8 +2108,6 @@ TEST(CASGCStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
         .fold_state = {},
         .removal_started_round = 1,
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
     const uint64_t writes_before = backend->writeTotal();
     EXPECT_TRUE(stuckRemovalWarning(row, 11, 10, layout));
@@ -2370,7 +2352,7 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
     /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
     const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
-    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
               CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";

@@ -1441,6 +1441,278 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
+def test_object_storage_cluster_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` "
+            "SETTINGS object_storage_cluster = 'cluster_simple' FORMAT Null",
+            query_id=query_id,
+        )
+        == ""
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {CATALOG_NAME}.`{namespace}.{table_name}` AS t "
+            f"INNER JOIN {memory_table} AS m ON t.symbol = m.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_right_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_right_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_right_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {memory_table} AS m "
+            f"INNER JOIN {CATALOG_NAME}.`{namespace}.{table_name}` AS t ON m.symbol = t.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_right_in_subquery_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_right_in_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_right_in_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {memory_table} AS m "
+            f"INNER JOIN {CATALOG_NAME}.`{namespace}.{table_name}` AS t ON m.symbol = t.symbol "
+            "WHERE t.symbol IN (SELECT 'kek' FROM system.one) "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_secondary_query_returns_shard_identifiers(started_cluster):
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    test_ref = f"test_object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node1, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node2, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    assert (
+        node1.query(
+            f"SELECT symbol FROM remote('node2', '{CATALOG_NAME}', '{namespace}.{table_name}') "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node2.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node2.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE initial_query_id = '{query_id}' AND type = 'QueryFinish' "
+            "AND startsWith(query, 'SELECT') "
+            "AND position(query, 'iceberg') = 0 "
+            "AND position(query, 'system.query_log') = 0"
+        )
+        == "1\n"
+    )
+
+    node2.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+
+
+def test_object_storage_cluster_count_where_returns_filtered_rows(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_count_where_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    other = generate_record()
+    other["symbol"] = "other"
+    table.append(pa.Table.from_pylist([generate_record(), other]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_count_where_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT count() FROM {CATALOG_NAME}.`{namespace}.{table_name}` "
+            "WHERE symbol = 'kek' "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "1\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_union_all_returns_both_tables(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_union_{uuid.uuid4().hex}"
+    namespace = f"{test_ref}_namespace"
+    first_table_name = f"{test_ref}_first"
+    second_table_name = f"{test_ref}_second"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    first_table = create_table(catalog, namespace, first_table_name)
+    second = generate_record()
+    second["symbol"] = "lol"
+    first_table.append(pa.Table.from_pylist([generate_record()]))
+    second_table = create_table(catalog, namespace, second_table_name)
+    second_table.append(pa.Table.from_pylist([second]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_union_{uuid.uuid4().hex}"
+    result = node.query(
+        f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{first_table_name}` "
+        f"UNION ALL SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{second_table_name}` "
+        "SETTINGS object_storage_cluster = 'cluster_simple'",
+        query_id=query_id,
+    )
+    assert sorted(result.splitlines()) == ["kek", "lol"]
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "2\n"
+    )
+
+
 def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -1542,6 +1814,502 @@ def test_cluster_insert(started_cluster):
     )
     assert table_name not in node1.query(f"SHOW TABLES FROM {CATALOG_NAME}")
 
+
+def _setup_distributed_join_tables(started_cluster, nodes, test_ref):
+    """Three DataLake-catalog tables: a driver and two dimensions, so a query can have a nested JOIN
+    on the right-hand side rather than a single partner table."""
+    root_namespace = f"{test_ref}_namespace"
+    fact_table = f"{test_ref}_fact"
+    dim_table = f"{test_ref}_dim"
+    weight_table = f"{test_ref}_weight"
+
+    load_catalog_impl(started_cluster)
+    for node in nodes:
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node = nodes[0]
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, fact_table, "(tag Int32, name String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, dim_table, "(id Int32, city String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, weight_table, "(city String, weight Int32)"
+    )
+
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{fact_table}` VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{dim_table}` VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{weight_table}` VALUES ('berlin', 10), ('paris', 20), ('berlin', 5);",
+        settings=insert_settings,
+    )
+
+    return (
+        f"{CATALOG_NAME}.`{root_namespace}.{fact_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{dim_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{weight_table}`",
+    )
+
+
+def _assert_dispatched_whole(nodes, query_id):
+    """Checks the runtime invariants of a whole-query dispatch, from system.query_log:
+
+    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query;
+    2. it names no catalog table: the driver arrives as the one `*Cluster` table function, which reads the
+       initiator's file-task queue, and every other table as a plain table function, which reads in full;
+    3. every secondary query of this dispatch is that whole query. A partner table fanning out again from
+       a worker would show up as a further secondary query without the JOIN in it;
+    4. the driver and each partner table function name the metadata file the initiator resolved, through
+       `iceberg_metadata_file_path`. A worker resolves a partner on its own, so without it a commit during the
+       query would give different driver files different partner snapshots.
+    """
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+
+    whole_query = 0
+    for node in nodes:
+        whole_query += int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') != 0
+                  AND positionCaseInsensitive(query, 'group by') != 0
+                """
+            ).strip()
+        )
+    assert whole_query > 0, f"query {query_id} was not dispatched whole to the cluster"
+
+    for node in nodes:
+        misdirected = node.query(
+            f"""
+            SELECT query
+            FROM system.query_log
+            WHERE type = 'QueryStart' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND (countSubstringsCaseInsensitive(query, 'cluster(') != 1
+                   OR position(query, '{CATALOG_NAME}.') != 0)
+            """
+        ).strip()
+        assert misdirected == "", (
+            f"query {query_id}: a dispatched query on {node.name} does not have exactly one cluster table "
+            f"function, or names a catalog table: {misdirected}"
+        )
+
+        unpinned = node.query(
+            f"""
+            SELECT query
+            FROM system.query_log
+            WHERE type = 'QueryStart' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'join') != 0
+              AND countSubstrings(query, 'iceberg_metadata_file_path') < 2
+            """
+        ).strip()
+        assert unpinned == "", (
+            f"query {query_id}: a dispatched query on {node.name} does not pin both the driver and its partner "
+            f"with `iceberg_metadata_file_path`: {unpinned}"
+        )
+
+        partner_fanout = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') = 0
+                """
+            ).strip()
+        )
+        assert partner_fanout == 0, (
+            f"query {query_id}: a secondary query without the JOIN was issued on {node.name} -- "
+            "a table fanned out again instead of being read locally"
+        )
+
+
+def test_distributed_join_dispatch(started_cluster):
+    """allow_object_storage_cluster_distributed_join=1: a JOIN whose driving table is a DataLake-catalog
+    table is dispatched whole to the driver's cluster and finalized on the initiator.
+
+    Correctness is checked against the same queries with the setting off (ordinary local planning),
+    which is the oracle -- dispatch must not change results, only where the work happens.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, weight = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_{uuid.uuid4()}"
+    )
+
+    def run(query, distributed_join, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+            },
+        )
+
+    # The driver is the immediate leftmost table of the JOIN.
+    direct_driver = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    # The driver is buried in a see-through subquery on the JOIN's left, the aggregation sits on the
+    # enclosing query, and the right-hand side is itself a JOIN over a grouped subquery -- all of which
+    # every worker recomputes in full.
+    buried_driver = f"""
+        SELECT dims.city, count() AS c
+        FROM
+        (
+            SELECT tag, name
+            FROM {fact}
+            WHERE tag < 10
+        ) AS f
+        LEFT JOIN
+        (
+            SELECT d.id AS id, d.city AS city
+            FROM {dim} AS d
+            LEFT JOIN
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ) AS p ON d.city = p.city
+        ) AS dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    # The same shape written with CTEs rather than derived tables. The setting documents CTE support,
+    # and the analyzer represents a CTE as a QueryNode just like a derived table, but the serializer has to
+    # inline the CTE body for the worker to resolve it -- so this is worth exercising directly.
+    buried_driver_cte = f"""
+        WITH
+            f AS
+            (
+                SELECT tag, name
+                FROM {fact}
+                WHERE tag < 10
+            ),
+            p AS
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ),
+            dims AS
+            (
+                SELECT d.id AS id, d.city AS city
+                FROM {dim} AS d
+                LEFT JOIN p ON d.city = p.city
+            )
+        SELECT dims.city, count() AS c
+        FROM f
+        LEFT JOIN dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    for name, query in (
+        ("direct driver", direct_driver),
+        ("buried driver", buried_driver),
+        ("buried driver via CTE", buried_driver_cte),
+    ):
+        expected = run(query, 0)
+        assert expected == "berlin\t2\nparis\t1\n", f"{name} oracle result changed: {expected!r}"
+
+        query_id = uuid.uuid4().hex
+        assert run(query, 1, query_id=query_id) == expected, f"{name} differs under dispatch"
+        _assert_dispatched_whole(nodes, query_id)
+
+
+def test_distributed_join_dispatch_records_access_info(started_cluster):
+    """A dispatched query names table functions to the workers, so the initiator records the original
+    catalog tables and the columns read from them in system.query_log, for both sides of the JOIN and
+    also for tables inside subqueries and CTEs, which the header analysis does not plan."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, [node1, node2], f"test_distributed_join_access_{uuid.uuid4()}"
+    )
+
+    queries = {
+        "direct tables": f"""
+            SELECT d.city, count() AS c
+            FROM {fact} AS f
+            INNER JOIN {dim} AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in subqueries": f"""
+            SELECT d.city, count() AS c
+            FROM (SELECT tag FROM {fact}) AS f
+            INNER JOIN (SELECT id, city FROM {dim}) AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in CTEs": f"""
+            WITH f AS (SELECT tag FROM {fact}), d AS (SELECT id, city FROM {dim})
+            SELECT d.city, count() AS c
+            FROM f
+            INNER JOIN d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+    }
+
+    for name, query in queries.items():
+        query_id = uuid.uuid4().hex
+        node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": 1,
+            },
+        )
+        _assert_dispatched_whole([node1, node2], query_id)
+
+        node1.query("SYSTEM FLUSH LOGS system.query_log")
+
+        # `columns` holds `table.column` entries, so each side must have recorded at least the columns it was
+        # joined or grouped on.
+        tables = node1.query(
+            f"SELECT arrayStringConcat(tables, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        columns = node1.query(
+            f"SELECT arrayStringConcat(columns, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        for table, used_columns in ((fact, ("tag",)), (dim, ("id", "city"))):
+            assert table in tables, f"{name}: {table} is missing from query_log.tables: {tables!r}"
+            for column in used_columns:
+                assert f"{table}.{column}" in columns or f"{table}`.`{column}" in columns, (
+                    f"{name}: {table}.{column} is missing from query_log.columns: {columns!r}"
+                )
+
+
+def test_distributed_join_dispatch_aggregates_across_workers(started_cluster):
+    """Several workers read different driver files and each contributes to every group, so the initiator
+    has to merge partial aggregate states. count, sum and avg must match ordinary execution."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_workers_{uuid.uuid4()}"
+    )
+
+    # One INSERT writes one data file. Every file holds every tag, so a worker that reads any file has rows
+    # for both cities, and each city is aggregated from rows read by both workers.
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    extra_files = 19
+    for _ in range(extra_files):
+        node1.query(
+            f"INSERT INTO {fact} VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+            settings=insert_settings,
+        )
+    files = extra_files + 1
+
+    query = f"""
+        SELECT d.city, count() AS c, sum(f.tag) AS s, avg(f.tag) AS a
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def run(distributed_join, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+                # A worker that finishes its files may steal another worker's after this long. The default
+                # (500 ms) lets a fast worker take a slow starter's files, so that one contributes nothing.
+                # A worker only waits this long while the other still has files, so it does not slow the query.
+                "lock_object_storage_task_distribution_ms": 30000,
+            },
+        )
+
+    # berlin joins tags 1 and 3, paris joins tag 2.
+    expected = f"berlin\t{2 * files}\t{4 * files}\t2\nparis\t{files}\t{2 * files}\t2\n"
+    assert run(0) == expected, "oracle result changed"
+
+    query_id = uuid.uuid4().hex
+    assert run(1, query_id=query_id) == expected
+    _assert_dispatched_whole(nodes, query_id)
+
+    # Each worker returned a partial result with a row for both cities, so both of them contributed to
+    # each group. Without files for both workers, this fails instead of passing vacuously.
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+        partial_rows = node.query(
+            f"""
+            SELECT result_rows
+            FROM system.query_log
+            WHERE type = 'QueryFinish' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'group by') != 0
+            """
+        ).split()
+        assert partial_rows == ["2"], (
+            f"{node.name} did not contribute a partial result for both groups: {partial_rows!r}"
+        )
+
+
+def test_distributed_join_dispatch_falls_back(started_cluster):
+    """Tables the dispatch cannot prove safe fall back to ordinary planning instead of failing: a local
+    Memory JOIN partner is not resolvable on a worker, so the candidate must be rejected."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_fallback_{uuid.uuid4()}"
+    fact, _, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    # `test_ref` carries a UUID with hyphens, which is not a valid unquoted identifier.
+    local_table = f"{test_ref.replace('-', '_')}_local"
+    node1.query(f"CREATE TABLE {local_table} (id Int32, city String) ENGINE = Memory()")
+    node1.query(f"INSERT INTO {local_table} VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin')")
+
+    query = f"""
+        SELECT l.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {local_table} AS l ON f.tag = l.id
+        GROUP BY l.city
+        ORDER BY ALL
+    """
+
+    def run(distributed_join):
+        return node1.query(
+            query,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+            },
+        )
+
+    assert run(1) == run(0)
+
+
+def test_distributed_join_dispatch_declines_in_table_name(started_cluster):
+    """`x IN db.table` keeps the right side as a catalog table name, which is not sent as a table function.
+    A worker would resolve it in its own catalog, which node2 lacks here, and would read its latest snapshot
+    instead of the initiator's, so the query must not be dispatched."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_in_table_{uuid.uuid4()}"
+    fact, dim, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    root_namespace = f"{test_ref}_namespace"
+    keys_table = f"{test_ref}_keys"
+    create_clickhouse_iceberg_table(started_cluster, node1, root_namespace, keys_table, "(k Int32)")
+    keys = f"{CATALOG_NAME}.`{root_namespace}.{keys_table}`"
+    node1.query(
+        f"INSERT INTO {keys} VALUES (1), (3)",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag IN {keys}
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def settings(distributed_join):
+        return {
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": distributed_join,
+        }
+
+    plan = node1.query(f"EXPLAIN {query}", settings=settings(1))
+    assert "ReadFromClusterQuery" not in plan, plan
+
+    expected = node1.query(query, settings=settings(0))
+    assert expected == "berlin\t2\n", expected
+    assert node1.query(query, settings=settings(1)) == expected
+
+
+def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
+    """A whole-query dispatch must not let the parallel-replicas settings change what a worker reads.
+
+    A DataLake-catalog table resolved on a worker decides in `StorageObjectStorageCluster`'s constructor,
+    from the cluster name plus the parallel-replicas settings, whether it consumes the initiator's
+    file-task queue -- whichever table it is. A partner answering yes would read the driver's files under
+    its own schema. A dispatched query names no catalog table: every partner arrives as a plain table
+    function, which never consumes the queue. The settings below are the combination that would make a
+    catalog table answer yes.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_pr_{uuid.uuid4()}"
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    expected = node1.query(
+        query,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": 0,
+        },
+    )
+    assert expected == "berlin\t2\nparis\t1\n", f"oracle result changed: {expected!r}"
+
+    query_id = uuid.uuid4().hex
+    got = node1.query(
+        query,
+        query_id=query_id,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": 1,
+            "parallel_replicas_for_cluster_engines": 1,
+            "enable_parallel_replicas": 1,
+            "cluster_for_parallel_replicas": "cluster_simple",
+            "max_parallel_replicas": 2,
+        },
+    )
+    assert got == expected, (
+        "dispatch with the parallel-replicas settings on returned a different result than ordinary "
+        f"planning: {got!r} != {expected!r} -- a partner table most likely consumed the driver's "
+        "file-task queue"
+    )
+
+    # Without this the test would silently stop covering anything if the candidate were rejected
+    # whenever the parallel-replicas settings are set.
+    _assert_dispatched_whole(nodes, query_id)
 
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]

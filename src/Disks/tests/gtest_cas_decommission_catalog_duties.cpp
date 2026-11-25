@@ -1,10 +1,12 @@
 #include "cas_test_helpers.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <optional>
 
 namespace DB::ErrorCodes
@@ -95,6 +97,77 @@ private:
     bool armed = false;
     bool added = false;
 };
+
+/// Runs `on_tombstone` once, right after the first write of the victim's owner object: the decommission's
+/// tombstone, written after its claim raised the victim's epoch and before its drain.
+class AfterTombstoneBackend final : public InMemoryBackend
+{
+public:
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (on_tombstone && key == "p/gc/server-roots/victim/owner")
+        {
+            std::function<void()> hook;
+            std::swap(hook, on_tombstone);
+            hook();
+        }
+        return result;
+    }
+
+    std::function<void()> on_tombstone;
+};
+
+/// After the victim's tombstone, runs `hook` once, right after the `n`-th read of the ref catalog.
+class AtCatalogReadAfterTombstoneBackend final : public InMemoryBackend
+{
+public:
+    void arm(size_t n, std::function<void()> hook_)
+    {
+        reads_to_wait = n;
+        hook = std::move(hook_);
+    }
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (key == "p/gc/server-roots/victim/owner")
+            counting = true;
+        return result;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::read(key, access);
+        if (counting && hook && key == Layout("p").refCatalogKey() && --reads_to_wait == 0)
+        {
+            std::function<void()> fire;
+            std::swap(fire, hook);
+            fire();
+        }
+        return result;
+    }
+
+private:
+    bool counting = false;
+    size_t reads_to_wait = 0;
+    std::function<void()> hook;
+};
+
+CatalogEntry seedVictimCreating(CasOperation & op, const PoolPtr & victim, const RootNamespace & ns)
+{
+    const CatalogEntry entry{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{721},
+        .creator = CreatorFence{.server_root_id = "victim", .writer_epoch = victim->writerEpoch(), .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(op, victim->layout(), victim->poolConfig().gc_shards, entry);
+    return entry;
+}
 
 TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndLeavesAnUnverifiedTombstone)
 {
@@ -305,4 +378,112 @@ TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNo
     EXPECT_TRUE(catalog_op.head(debris_key, Retry::standard()).has_value());
 }
 
+}
+
+/// The claim raises the victim's epoch, which certifies its `Creating` row terminal: the decommission
+/// cancels the row itself and retires the member.
+TEST(CASDecommissionCatalogDuties, AVictimCreatingRowIsCancelledAndTheMemberRetires)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const RootNamespace ns("victim/db/stalled");
+    {
+        auto victim = openVictim(backend);
+        seedVictimCreating(catalog_op, victim, ns);
+    }
+
+    const DecommissionReport report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(report.member_retired) << (report.warnings.empty() ? String{} : report.warnings.front());
+    EXPECT_EQ(report.namespaces_removed, 1u);
+    EXPECT_TRUE(CasRefCatalog::read(catalog_op, Layout("p")).catalog.entries.empty());
+}
+
+/// The GC leader cancels the victim's `Creating` row between the decommission's ownership cut and its
+/// drain. The drain skips the row, which this run did not remove and does not count, and the member retires.
+TEST(CASDecommissionCatalogDuties, AVictimCreatingRowCancelledByGcDuringTheRunIsSkippedAndNotCounted)
+{
+    auto backend = std::make_shared<AfterTombstoneBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const RootNamespace ns("victim/db/stalled");
+    CatalogEntry stalled;
+    {
+        auto victim = openVictim(backend);
+        stalled = seedVictimCreating(catalog_op, victim, ns);
+    }
+    bool cancelled = false;
+    backend->on_tombstone = [&]
+    {
+        CasRequests gc_requests = DB::Cas::tests::openRequestsForTest(*backend);
+        CasOperation gc_op = gc_requests.admit();
+        const Layout layout("p");
+        cancelled = CasRefCatalog::cancelStalledCreating(gc_op, layout, stalled,
+            [&](const CreatorFence & creator)
+            {
+                return isCreatorFenceTerminal(gc_op, layout, creator.server_root_id, creator.writer_epoch);
+            },
+            [](const Retry &) {}) == CasRefCatalog::StalledCreatingCancelOutcome::Cancelled;
+    };
+
+    DecommissionReport report;
+    ASSERT_NO_THROW(report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"));
+
+    EXPECT_TRUE(cancelled) << "positive control: the claim made the row cancellable and GC cancelled it";
+    EXPECT_TRUE(report.member_retired) << (report.warnings.empty() ? String{} : report.warnings.front());
+    EXPECT_EQ(report.namespaces_removed, 0u);
+    EXPECT_EQ(report.namespaces_already_removed, 0u);
+    EXPECT_TRUE(CasRefCatalog::read(catalog_op, Layout("p")).catalog.entries.empty());
+}
+
+/// The GC leader cancels the victim's `Creating` row after the drain checked it, at each catalog read up to the
+/// drop's own cancel. The drop removed nothing, so the run neither counts nor announces the namespace.
+TEST(CASDecommissionCatalogDuties, AVictimCreatingRowCancelledByGcDuringItsDropIsNotCounted)
+{
+    /// Earlier reads come before the drain's check; by the sixth, the drop has cancelled the row itself.
+    for (const size_t reads_before_cancel : {3, 4, 5})
+    {
+        SCOPED_TRACE(fmt::format("cancel after catalog read {} after the tombstone", reads_before_cancel));
+        auto backend = std::make_shared<AtCatalogReadAfterTombstoneBackend>();
+        CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+        CasOperation catalog_op = catalog_requests.admit();
+        const RootNamespace ns("victim/db/stalled");
+        CatalogEntry stalled;
+        {
+            auto victim = openVictim(backend);
+            stalled = seedVictimCreating(catalog_op, victim, ns);
+        }
+        bool cancelled = false;
+        backend->arm(reads_before_cancel, [&]
+        {
+            CasRequests gc_requests = DB::Cas::tests::openRequestsForTest(*backend);
+            CasOperation gc_op = gc_requests.admit();
+            const Layout layout("p");
+            cancelled = CasRefCatalog::cancelStalledCreating(gc_op, layout, stalled,
+                [&](const CreatorFence & creator)
+                {
+                    return isCreatorFenceTerminal(gc_op, layout, creator.server_root_id, creator.writer_epoch);
+                },
+                [](const Retry &) {}) == CasRefCatalog::StalledCreatingCancelOutcome::Cancelled;
+        });
+        std::vector<String> outcomes;
+        const CasEventSink sink = [&](CasEvent e)
+        {
+            if (e.type == CasEventType::MemberDecommission)
+                outcomes.push_back(e.outcome);
+        };
+
+        DecommissionReport report;
+        ASSERT_NO_THROW(report = decommissionPoolMember(
+            backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim", sink));
+
+        EXPECT_TRUE(cancelled) << "positive control: GC cancelled the row during the run";
+        EXPECT_TRUE(report.member_retired) << (report.warnings.empty() ? String{} : report.warnings.front());
+        EXPECT_EQ(report.namespaces_removed, 0u);
+        EXPECT_EQ(std::count(outcomes.begin(), outcomes.end(), "namespace_removed"), 0);
+        EXPECT_TRUE(CasRefCatalog::read(catalog_op, Layout("p")).catalog.entries.empty());
+    }
 }

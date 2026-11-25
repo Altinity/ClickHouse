@@ -146,6 +146,9 @@ struct CatalogCreatorStillLiveMarker : std::exception {};
 /// by one standard window. This cap exists so a call that somehow converges on neither still ends.
 constexpr size_t kMaxCatalogCasAttempts = 100;
 
+/// Proven absence of the catalog, for a caller that takes it as an answer rather than as corruption.
+struct CatalogAbsentMarker : std::exception {};
+
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
 /// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
@@ -155,7 +158,7 @@ RefCatalog casUpdateImpl(
     CasOperation & op, const Layout & layout,
     const std::function<RefCatalog(const RefCatalog &)> & mutate,
     const std::function<String(const RefCatalog &)> & encode,
-    const Retry & policy = Retry::standard())
+    const Retry & policy = Retry::standard(), bool absence_is_an_answer = false)
 {
     const String key = layout.refCatalogKey();
     /// The candidate the LAST `decide` produced, which is the one the engine wrote: every earlier one
@@ -167,7 +170,11 @@ RefCatalog casUpdateImpl(
         /// Absence of the mandatory catalog is corruption, not a fresh bootstrap. Refusing here is
         /// what stops any mutation from replacing every other namespace with a one-update catalog.
         if (!current)
+        {
+            if (absence_is_an_answer)
+                throw CatalogAbsentMarker{};
             throwMandatoryCatalogAbsent(key);
+        }
         const RefCatalog durable = decodeRefCatalog(current->bytes);
         CatalogLifeIndex(durable).throwIfAmbiguous("CAS ref catalog mutation");
         RefCatalog candidate = mutate(durable);
@@ -190,6 +197,10 @@ RefCatalog casUpdateImpl(
     for (;;)
     {
         WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide);
+        /// A write decided on a cached body can be refused by a deletion; its settling read already proved it.
+        if (const auto * conflict = std::get_if<Conflict>(&result);
+            absence_is_an_answer && conflict && std::holds_alternative<ProvenAbsent>(conflict->seen))
+            throw CatalogAbsentMarker{};
         if (const auto * unresolved = std::get_if<GaveUp>(&result);
             unresolved && unresolved->why == GaveUp::Why::Unresolved && unresolved->sent_any
             && !frozen.resend_unresolved && !frozen.single_attempt)
@@ -581,7 +592,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal, const Retry & policy)
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+    const std::function<void(const Retry &)> & refresh_authority, const Retry & policy, bool * catalog_absent)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -589,8 +601,13 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
             "creator fence",
             observed.ns.string());
 
+    /// One deadline for the cancel and its in-lane authority check, so a slow check cannot hold the lane
+    /// after the cancel could no longer write.
+    const Retry frozen = op.freeze(policy);
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
+        /// Inside the lane: a leader deposed while it queued must not write on a reading taken before.
+        refresh_authority(frozen);
         if (!op.admitted())
             throw CatalogFenceMovedMarker{};
 
@@ -605,9 +622,17 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
         return next;
     };
 
+    /// A resend after the lease is lost is harmless: it lands only on the unchanged catalog, so on this same, still
+    /// unfinished life.
     try
     {
-        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, frozen,
+                      /*absence_is_an_answer=*/catalog_absent != nullptr);
+    }
+    catch (const CatalogAbsentMarker &)
+    {
+        *catalog_absent = true;
+        return StalledCreatingCancelOutcome::EntryChanged;
     }
     catch (const CatalogFenceMovedMarker &) { return StalledCreatingCancelOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return StalledCreatingCancelOutcome::EntryChanged; }
