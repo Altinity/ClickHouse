@@ -767,7 +767,10 @@ ObjectIterator StorageObjectStorageCluster::wrapIteratorForClusterTasks(
         std::move(iterator),
         configuration->getFormat(),
         object_storage,
-        local_context);
+        local_context,
+        StorageID::createEmpty(),
+        /*format_filter_info_=*/ nullptr,
+        configuration->getQuerySettings(local_context).ignore_non_existent_file);
 }
 
 bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(

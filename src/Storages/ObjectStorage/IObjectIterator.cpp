@@ -9,6 +9,7 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <Core/Settings.h>
 #include <Core/Defines.h>
+#include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Common/ProfileEvents.h>
@@ -124,7 +125,8 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
     ObjectStoragePtr object_storage_,
     const ContextPtr & context_,
     const StorageID & storage_id_,
-    FormatFilterInfoPtr format_filter_info_)
+    FormatFilterInfoPtr format_filter_info_,
+    bool ignore_non_existent_file_)
     : WithContext(context_)
     , iterator(iterator_)
     , format(format_)
@@ -132,6 +134,7 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
     , format_settings(getFormatSettings(context_))
     , storage_id(storage_id_)
     , format_filter_info(std::move(format_filter_info_))
+    , ignore_non_existent_file(ignore_non_existent_file_)
     , file_progress_callback(context_->getFileProgressCallback())
 {
     if (format_filter_info && format_filter_info->condition_hash)
@@ -175,6 +178,13 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
             /// The listing reported zero bytes for a file that it listed without metadata (`skip_object_metadata`).
             const auto & listed_metadata = last_object_info->relative_path_with_metadata.metadata;
             const bool listed_without_metadata = listed_metadata && !listed_metadata->is_fetched;
+
+            /// `createReadBuffer` below fetches the metadata of a placeholder and fails when the file is gone.
+            /// Fetch it here when missing files are ignored, so that such a file is skipped.
+            if (ignore_non_existent_file
+                && !StorageObjectStorageSource::fetchObjectMetadataIfNeeded(
+                    *last_object_info, object_storage, ignore_non_existent_file, /*with_tags=*/ false))
+                continue;
 
             auto storage_to_use = last_object_info->getResolvedStorage(object_storage);
             auto buffer = createReadBuffer(last_object_info->relative_path_with_metadata, storage_to_use, getContext(), log);

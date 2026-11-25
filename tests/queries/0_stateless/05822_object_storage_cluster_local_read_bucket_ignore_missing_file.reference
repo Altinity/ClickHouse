@@ -1,0 +1,6 @@
+cluster read
+4	6
+local read after the probe
+4	6
+0
+missing file, ignore is off

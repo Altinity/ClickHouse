@@ -151,7 +151,8 @@ public:
         ObjectStoragePtr object_storage_,
         const ContextPtr & context_,
         const StorageID & storage_id_ = StorageID::createEmpty(),
-        FormatFilterInfoPtr format_filter_info_ = nullptr);
+        FormatFilterInfoPtr format_filter_info_ = nullptr,
+        bool ignore_non_existent_file_ = false);
 
     ObjectInfoPtr next(size_t) override;
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
@@ -171,6 +172,8 @@ private:
     StorageID storage_id;
     FormatFilterInfoPtr format_filter_info;
     QueryConditionCachePtr query_condition_cache;
+    /// Skip a file that does not exist any more, as `s3_ignore_file_doesnt_exist` asks, and not fail the query.
+    const bool ignore_non_existent_file;
     /// Reports the size of a file that the listing skipped the metadata of. All buckets of a file share it,
     /// so it is reported here once per file and not for every bucket.
     std::function<void(FileProgress)> file_progress_callback;
