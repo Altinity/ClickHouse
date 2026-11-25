@@ -74,7 +74,12 @@ public:
     bool usesObjectStorageClusterSettingSyntax() const override { return uses_setting_syntax; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
-        const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
+        const ActionsDAG::Node *,
+        const ActionsDAG *,
+        const ContextPtr &,
+        ClusterPtr,
+        StorageMetadataPtr,
+        std::shared_ptr<IObjectIterator>) const override
     {
         return {};
     }

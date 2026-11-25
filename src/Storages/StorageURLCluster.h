@@ -35,7 +35,8 @@ public:
         const ActionsDAG * /* filter */,
         const ContextPtr & context,
         ClusterPtr,
-        StorageMetadataPtr) const override;
+        StorageMetadataPtr,
+        std::shared_ptr<IObjectIterator> /* probed_iterator */ = {}) const override;
 
 private:
     void updateQueryToSendIfNeeded(

@@ -9,10 +9,12 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <Core/Settings.h>
 #include <Core/Defines.h>
+#include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <mutex>
 
 namespace ProfileEvents
 {
@@ -123,7 +125,8 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
     ObjectStoragePtr object_storage_,
     const ContextPtr & context_,
     const StorageID & storage_id_,
-    FormatFilterInfoPtr format_filter_info_)
+    FormatFilterInfoPtr format_filter_info_,
+    bool ignore_non_existent_file_)
     : WithContext(context_)
     , iterator(iterator_)
     , format(format_)
@@ -131,6 +134,8 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
     , format_settings(getFormatSettings(context_))
     , storage_id(storage_id_)
     , format_filter_info(std::move(format_filter_info_))
+    , ignore_non_existent_file(ignore_non_existent_file_)
+    , file_progress_callback(context_->getFileProgressCallback())
 {
     if (format_filter_info && format_filter_info->condition_hash)
         query_condition_cache = context_->getQueryConditionCache();
@@ -170,8 +175,24 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
                 }
             }
 
+            /// The listing reported zero bytes for a file that it listed without metadata (`skip_object_metadata`).
+            const auto & listed_metadata = last_object_info->relative_path_with_metadata.metadata;
+            const bool listed_without_metadata = listed_metadata && !listed_metadata->is_fetched;
+
+            /// `createReadBuffer` below fetches the metadata of a placeholder and fails when the file is gone.
+            /// Fetch it here when missing files are ignored, so that such a file is skipped.
+            if (ignore_non_existent_file
+                && !StorageObjectStorageSource::fetchObjectMetadataIfNeeded(
+                    *last_object_info, object_storage, ignore_non_existent_file, /*with_tags=*/ false))
+                continue;
+
             auto storage_to_use = last_object_info->getResolvedStorage(object_storage);
             auto buffer = createReadBuffer(last_object_info->relative_path_with_metadata, storage_to_use, getContext(), log);
+
+            /// `createReadBuffer` fetched the real size. The buckets below are copies of this object, so they
+            /// cannot tell that the listing missed it: report the file once here.
+            if (listed_without_metadata && file_progress_callback)
+                file_progress_callback(FileProgress(0, last_object_info->getObjectMetadata()->size_bytes));
             size_t bucket_size = getContext()->getSettingsRef()[Setting::cluster_table_function_buckets_batch_size];
             auto file_bucket_infos = splitter->splitToBuckets(bucket_size, *buffer, format_settings);
             for (const auto & file_bucket : file_bucket_infos)
@@ -190,6 +211,11 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
                 }
                 pending_objects_info.push(std::move(copy_object_info));
             }
+        }
+        else
+        {
+            /// The format cannot be split: the whole file is one task. Dropping it would lose its rows.
+            pending_objects_info.push(std::move(last_object_info));
         }
     }
 
@@ -211,6 +237,107 @@ String ObjectInfo::getIdentifierForPath(const String & path, bool include_file_b
     if (include_file_bucket_info && file_bucket_info)
         result += file_bucket_info->getIdentifier();
     return result;
+}
+
+namespace
+{
+
+class ObjectIteratorWithPrefetchedObjects : public IObjectIterator
+{
+public:
+    ObjectIteratorWithPrefetchedObjects(
+        ObjectInfos pulled_,
+        ObjectIterator remaining_,
+        std::optional<UInt64> snapshot_version_,
+        ObjectMetadataResolver resolve_metadata_)
+        : pulled(std::move(pulled_))
+        , remaining(std::move(remaining_))
+        , snapshot_version(snapshot_version_)
+        , resolve_metadata(std::move(resolve_metadata_))
+    {
+    }
+
+    ObjectInfoPtr next(size_t id) override
+    {
+        while (true)
+        {
+            auto object = nextListed(id);
+            /// The resolver may read metadata from the object storage, so it runs without the mutex.
+            if (!object || !resolve_metadata || resolve_metadata(*object))
+                return object;
+        }
+    }
+
+    size_t estimatedKeysCount() override
+    {
+        if (remaining)
+            return remaining->estimatedKeysCount();
+        return pulled.size();
+    }
+
+    std::optional<UInt64> getSnapshotVersion() const override
+    {
+        if (remaining)
+        {
+            if (auto version = remaining->getSnapshotVersion())
+            {
+                return version;
+            }
+        }
+        return snapshot_version;
+    }
+
+private:
+    ObjectInfoPtr nextListed(size_t id)
+    {
+        std::lock_guard lock(mutex);
+        if (index < pulled.size())
+            return pulled[index++];
+
+        if (!remaining)
+            return nullptr;
+
+        return remaining->next(id);
+    }
+
+    ObjectInfos pulled;
+    size_t index = 0;
+    ObjectIterator remaining;
+    std::optional<UInt64> snapshot_version;
+    ObjectMetadataResolver resolve_metadata;
+    std::mutex mutex;
+};
+
+}
+
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage)
+{
+    const auto it = probes.find(storage);
+    if (it == probes.end())
+        return {};
+    return it->second;
+}
+
+ObjectIterator takeObjectStorageClusterReadProbe(
+    const std::shared_ptr<ObjectStorageClusterReadProbe> & probe,
+    ObjectMetadataResolver resolve_metadata)
+{
+    if (!probe || probe->consumed)
+        return nullptr;
+
+    probe->consumed = true;
+
+    ObjectInfos pulled = std::move(probe->pulled);
+    ObjectIterator remaining = std::move(probe->iterator);
+    const auto snapshot_version = probe->snapshot_version;
+    probe->pulled.clear();
+    probe->iterator.reset();
+    probe->snapshot_version.reset();
+
+    return std::make_shared<ObjectIteratorWithPrefetchedObjects>(
+        std::move(pulled), std::move(remaining), snapshot_version, std::move(resolve_metadata));
 }
 
 }

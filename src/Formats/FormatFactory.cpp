@@ -929,6 +929,9 @@ void FormatFactory::registerSplitter(const String & format, BucketSplitterCreato
 BucketSplitter FormatFactory::getSplitter(const String & format)
 {
     auto creator = getCreators(format);
+    /// Only some formats (for example `Parquet`) can split a file into buckets.
+    if (!creator.bucket_splitter_creator)
+        return nullptr;
     return creator.bucket_splitter_creator();
 }
 

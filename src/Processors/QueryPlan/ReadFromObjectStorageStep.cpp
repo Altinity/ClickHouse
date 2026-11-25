@@ -9,6 +9,8 @@
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/Operators.h>
+#include <mutex>
+#include <unordered_set>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
@@ -171,6 +173,47 @@ void ReadFromObjectStorageStep::createIterator()
 {
     if (iterator_wrapper)
         return;
+
+    /// The cluster local-read probe already listed these files. `_tags` is not part of that listing
+    /// (`with_tags` is false there), so a query that reads `_tags` lists again.
+    if (!info.requested_virtual_columns.contains("_tags"))
+    {
+        /// The probe listed the files without their metadata, reporting zero bytes for each. A local read fetches the
+        /// metadata here, skips the files that no longer exist, and reports each real size to the progress callback.
+        const bool ignore_non_existent_file = configuration->getQuerySettings(getContext()).ignore_non_existent_file;
+        /// The buckets of one file are copies of its object. `ObjectIteratorSplitByBuckets` reports the file when it
+        /// sees the real size. When it could not, each copy is still a placeholder here, so report the file once.
+        struct ReportedFiles
+        {
+            std::mutex mutex;
+            std::unordered_set<String> identifiers;
+        };
+        auto reported_files = std::make_shared<ReportedFiles>();
+
+        ObjectMetadataResolver resolve_metadata = [storage = object_storage, ignore_non_existent_file, reported_files,
+                                                   file_progress_callback = getContext()->getFileProgressCallback()](ObjectInfo & object)
+        {
+            const bool is_placeholder = object.relative_path_with_metadata.metadata && !object.relative_path_with_metadata.metadata->is_fetched;
+            if (!StorageObjectStorageSource::fetchObjectMetadataIfNeeded(object, storage, ignore_non_existent_file, /*with_tags=*/ false))
+                return false;
+
+            bool report = is_placeholder && file_progress_callback;
+            if (report && object.file_bucket_info)
+            {
+                std::lock_guard lock(reported_files->mutex);
+                report = reported_files->identifiers.insert(object.getIdentifier(/*include_file_bucket_info=*/ false)).second;
+            }
+            if (report)
+                file_progress_callback(FileProgress(0, object.getObjectMetadata()->size_bytes));
+            return true;
+        };
+
+        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe, std::move(resolve_metadata)))
+        {
+            iterator_wrapper = std::move(reused);
+            return;
+        }
+    }
 
     const ActionsDAG::Node * predicate = nullptr;
     if (filter_actions_dag)

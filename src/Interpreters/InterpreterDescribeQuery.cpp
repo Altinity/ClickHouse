@@ -162,7 +162,10 @@ void InterpreterDescribeQuery::fillColumnsFromSubqueryImpl(const ASTPtr & select
     SharedHeader sample_block;
     if (settings[Setting::allow_experimental_analyzer])
     {
+        /// The query is planned in full, so the access checks of the planner apply to every table it reads.
+        /// It reads no data, so the object storage cluster local-read probe must not list objects.
         SelectQueryOptions select_query_options;
+        select_query_options.planOnly();
         sample_block = InterpreterSelectQueryAnalyzer(select_query, current_context, select_query_options).getSampleBlock();
     }
     else

@@ -1,0 +1,8 @@
+cluster read
+5	24
+local read after the probe, glob
+5	24
+local read after the probe, braces
+5	24
+05821_local_braces	0
+05821_local_glob	0

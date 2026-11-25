@@ -1,0 +1,10 @@
+select secret
+ACCESS_DENIED
+describe secret
+ACCESS_DENIED
+describe nested secret
+ACCESS_DENIED
+describe cte secret
+ACCESS_DENIED
+describe nested granted
+a	UInt8

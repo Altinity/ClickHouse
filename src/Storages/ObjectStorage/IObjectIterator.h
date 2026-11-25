@@ -8,6 +8,8 @@
 #include <Common/Logger.h>
 #include <Common/Macros.h>
 #include <Formats/FormatSettings.h>
+#include <functional>
+#include <unordered_map>
 
 namespace DB
 {
@@ -149,7 +151,8 @@ public:
         ObjectStoragePtr object_storage_,
         const ContextPtr & context_,
         const StorageID & storage_id_ = StorageID::createEmpty(),
-        FormatFilterInfoPtr format_filter_info_ = nullptr);
+        FormatFilterInfoPtr format_filter_info_ = nullptr,
+        bool ignore_non_existent_file_ = false);
 
     ObjectInfoPtr next(size_t) override;
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
@@ -169,9 +172,41 @@ private:
     StorageID storage_id;
     FormatFilterInfoPtr format_filter_info;
     QueryConditionCachePtr query_condition_cache;
+    /// Skip a file that does not exist any more, as `s3_ignore_file_doesnt_exist` asks, and not fail the query.
+    const bool ignore_non_existent_file;
+    /// Reports the size of a file that the listing skipped the metadata of. All buckets of a file share it,
+    /// so it is reported here once per file and not for every bucket.
+    std::function<void(FileProgress)> file_progress_callback;
 
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");
 };
+
+/// Files already returned by an object-storage cluster local-read probe, plus the iterator
+/// that produced them. `iterator` is null once the list has ended. `snapshot_version` is kept
+/// even then: a finished Delta iterator is not reusable, but `_data_lake_snapshot_version`
+/// is read from the iterator during the local scan.
+struct ObjectStorageClusterReadProbe
+{
+    ObjectIterator iterator;
+    ObjectInfos pulled;
+    std::optional<UInt64> snapshot_version;
+    bool read_locally = false;
+    bool consumed = false;
+};
+
+/// Brings the metadata of an object that the probe listed without it up to date. Returns false to skip the object.
+using ObjectMetadataResolver = std::function<bool(ObjectInfo &)>;
+
+/// Hands the probe to one consumer. A second call returns null.
+/// `resolve_metadata`, when set, is applied to every object before it is returned, and objects it rejects are skipped.
+ObjectIterator takeObjectStorageClusterReadProbe(
+    const std::shared_ptr<ObjectStorageClusterReadProbe> & probe,
+    ObjectMetadataResolver resolve_metadata = {});
+
+/// The probe this storage ran, or null when this storage has not probed yet.
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage);
 
 }

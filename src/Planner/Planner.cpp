@@ -145,6 +145,7 @@ namespace Setting
     extern const SettingsUInt64 max_rows_in_distinct;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
+    extern const SettingsUInt64 object_storage_cluster_local_read_max_tasks;
     extern const SettingsBool parallel_replicas_allow_in_with_subquery;
     extern const SettingsString parallel_replicas_custom_key;
     extern const SettingsUInt64 parallel_replicas_min_number_of_rows_per_replica;
@@ -2611,6 +2612,16 @@ void Planner::buildPlanForQueryNode()
 
     collectSets(query_tree, *planner_context);
     auto materialized_ctes = collectMaterializedCTEs(query_tree, select_query_options);
+
+    /// The local-read probe of an object-storage cluster lists objects while planning to choose the plan shape.
+    /// `DESCRIBE` and `EXPLAIN` (without `ANALYZE`) read no data, so they must not depend on the objects being there
+    /// and listable. They show the plan of the cluster read.
+    if (select_query_options.plan_only && settings[Setting::object_storage_cluster_local_read_max_tasks] > 0)
+    {
+        auto & mutable_context = planner_context->getMutableQueryContext();
+        mutable_context->setSetting("object_storage_cluster_local_read_max_tasks", Field(0));
+        LOG_DEBUG(log, "Disabling the object storage cluster local-read probe to explain a query");
+    }
 
     if (query_context->canUseTaskBasedParallelReplicas())
     {
