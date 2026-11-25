@@ -209,7 +209,11 @@ private:
     static void decreaseTaskRefcount(Task * task, size_t amount);
 
     /// A coalesced task with less filler (span minus wanted bytes) than this is never refused,
-    /// regardless of `read_min_fill_ratio`.
+    /// regardless of `read_min_fill_ratio`. Filler is below 2 * `bytes_per_read_task` (the scan
+    /// conditions in `pickRangesAndCreateTaskIfNotExists` bound the span to the requested ranges
+    /// plus `bytes_per_read_task` on each side), and `bytes_per_read_task` is 4 * `min_bytes_for_seek`,
+    /// so this floor is reachable only when `min_bytes_for_seek` is above 8 KiB. With the default
+    /// 8 KiB the guard never refuses a task.
     static constexpr size_t filler_floor_for_fill_ratio = 64 << 10;
 
     /// Whether extending a coalesced task with range `r` should be refused because the task would
