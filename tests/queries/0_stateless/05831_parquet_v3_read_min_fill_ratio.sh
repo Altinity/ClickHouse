@@ -4,7 +4,7 @@
 
 # `input_format_parquet_read_min_fill_ratio` stops the Parquet v3 reader from coalescing reads of a tiny
 # column through the (sub-threshold) gaps filled by a wide neighbouring column. The test writes a file
-# where a constant column `b` is followed in every row group by a wide incompressible column `big`, so
+# where a constant column `b` is followed in every row group by a wide column `big`, so
 # the chunks of `b` are separated by gaps of hundreds of KiB. With a large `min_bytes_for_seek` all of
 # the chunks of `b` are coalesced into one read task that is almost entirely `big`. With the guard on,
 # the task is split: the profile event `ParquetPrefetcherFillRatioLimitedTasks` is incremented, more

@@ -216,9 +216,9 @@ private:
     static constexpr size_t max_filler_floor_for_fill_ratio = 64 << 10;
 
     /// Whether extending a coalesced task with range `r` should be refused because the task would
-    /// end up less than `read_min_fill_ratio` wanted (wanted bytes / span) and with at least the
-    /// filler floor above of filler. `wanted_bytes` is the total length of the ranges already in
-    /// the task, `[start_offset, end_offset)` is its span.
+    /// end up less than `read_min_fill_ratio` wanted (wanted bytes / span) and its filler would be
+    /// at least the floor described above. `wanted_bytes` is the total length of the ranges already
+    /// in the task, `[start_offset, end_offset)` is its span.
     bool fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, size_t end_offset, const RangeState & r) const;
     void scheduleTask(Task * task);
     Task::State runTask(Task * task);
