@@ -303,7 +303,9 @@ void runIntentPrefixProbe(CasOperation & op, const Layout & layout, IntentPrefix
 {
     const String prefix = layout.blobIntentsPrefix();
     const String probe_prefix = layout.blobIntentsProbePrefix();
-    const String key = layout.blobIntentProbeKey(u128ToHex((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng()));
+    const WriteOnceKey write_once_key
+        = layout.writeOnceBlobIntentProbeKey(u128ToHex((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng()));
+    const String & key = write_once_key.str();
 
     /// On S3 an absent key answers 403, not 404, to a credential without list rights; a writer would then fail every
     /// reuse instead of adopting the body.
@@ -370,18 +372,16 @@ void runIntentPrefixProbe(CasOperation & op, const Layout & layout, IntentPrefix
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                 "CasProbe: the conditional create of '{}' did not commit on a fresh key", key);
         expect_listed(true);
-        /// The right GC's intent deletes need; whether the store also takes them in one batch is its own capability.
-        Removal removal = Removal::Gone;
+        /// GC deletes intents without a precondition, and a policy may allow only a conditional delete.
+        /// One key goes out as a single plain delete: the batch-delete call GC prefers is not exercised here.
         try
         {
-            removal = op.remove(key, committed->etag, Retry::standard());
+            op.removeManyWriteOnce({write_once_key}, Retry::standard());
         }
         catch (...) // Ok: `throwMissingRight` throws
         {
             throwMissingRight(fmt::format("the delete of '{}'", key), fmt::format("grant DELETE on '{}'", prefix));
         }
-        if (removal != Removal::Removed)
-            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CasProbe: the delete of '{}' at its own token did not remove it", key);
         expect_absent("after its delete");
     }
     catch (...)

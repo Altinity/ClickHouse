@@ -728,6 +728,7 @@ ManifestSweepResult planManifestCursorPage(
     else
         reader = std::make_unique<InlineKeyReader>(op);
     const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
+    result.orphan_manifest_sweep_page_listed = true;
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
@@ -975,13 +976,16 @@ ManifestSweepResult planManifestCursorPage(
         {
             body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
         }
-        catch (const Exception &)
+        catch (Exception & e)
         {
-            /// A body we cannot decode cannot be shown safe to delete: proving that needs the source
-            /// edges this decode would have produced. So retain it, record it, and walk on. The object
-            /// stays visible to fsck, which counts it as unreachable; the alternative -- letting this
-            /// escape -- aborts the round and every later round on the same object, which stops
-            /// reclamation for the whole pool rather than for this one key.
+            /// Malformed bytes are retained and counted. Any other error fails the round: retaining would label a
+            /// valid object undecodable.
+            if (!isMalformedStoredRecordError(e))
+            {
+                e.addMessage("while the orphan sweep decodes the manifest `{}` of namespace `{}`", candidate.key,
+                             candidate.ns.string());
+                throw;
+            }
             LOG_ERROR(getLogger("CasOrphanManifestSweep"),
                 "CAS orphan sweep: manifest at {} cannot be decoded and was retained; run cas-fsck to "
                 "enumerate such objects", candidate.key);

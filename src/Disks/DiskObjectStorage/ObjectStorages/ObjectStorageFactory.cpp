@@ -31,6 +31,7 @@
 #include <Core/Settings.h>
 
 #include <filesystem>
+#include <mutex>
 #include <set>
 #include <utility>
 
@@ -117,8 +118,13 @@ ObjectStoragePtr ObjectStorageFactory::create(
         disk_name, endpoint, allow_list_entry);
 
     /// system.warnings keeps one message per type, so the message lists all disks seen so far.
-    /// No lock: disk creation runs under storage_policies_mutex in Context::getOrCreateDisk.
-    static std::set<std::string> disks;
+    /// `Context::getOrCreateDisk` runs the creators of different disks in parallel without
+    /// `storage_policies_mutex`, for example when tables are loaded at server start. The lock is held
+    /// until the message is stored, so a message built from fewer disks cannot replace a newer one.
+    static std::mutex disks_mutex;
+    static std::set<std::string> disks TSA_GUARDED_BY(disks_mutex);
+
+    std::lock_guard lock(disks_mutex);
     disks.insert(fmt::format("`{}` -> `{}`", disk_name, endpoint));
     global_context->addOrUpdateWarningMessage(
         Context::WarningType::CUSTOM_DISK_NOT_ALLOWED_BY_REMOTE_URL_ALLOW_HOSTS,

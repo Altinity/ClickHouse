@@ -655,11 +655,12 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
+    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (the disk setting refuses 0 and loads 1 as 2; `PoolConfig` 0 prunes nothing).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t intent_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
+    const uint64_t orphan_manifest_sweep_interval_sec;
     const uint64_t gc_round_intent_create_budget;
     const uint64_t gc_round_redelete_budget;
     const uint64_t gc_round_sweep_namespace_budget;

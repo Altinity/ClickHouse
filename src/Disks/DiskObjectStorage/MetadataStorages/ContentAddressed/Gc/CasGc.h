@@ -32,8 +32,8 @@ namespace DB::Cas
 ///
 /// A round may destroy only while holding a FRONTIER PROOF for EVERY namespace that can hold a live
 /// edge — because reachability is a property of the whole pool, not of one namespace. The proof per
-/// namespace is cheap and exact (a read of the chain's first absent key or of a terminal record,
-/// `CasGc.cpp`'s intake walk). What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
+/// namespace is cheap and exact: each round fixes every namespace life's stop before it walks, and the walk
+/// ends at that stop or at a terminal record. What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
 /// a listing may omit a durable namespace, and a sealed fold cursor names only namespaces some round
 /// already folded, so neither source bounds the set on its own.
 ///
@@ -260,6 +260,11 @@ namespace tests
 {
 RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut);
 class GcRoundPlanSignatureAccess;
+/// Runs `probe` where planning decodes a ref-log body it read, so a test can throw from inside the decode.
+/// Empty clears it.
+void setPlannedRecordDecodeProbeForTest(std::function<void()> probe);
+/// Runs `probe` where the fold's ordered walk decodes a ref-log body, before the decode. Empty clears it.
+void setWalkRecordDecodeProbeForTest(std::function<void()> probe);
 }
 
 /// The one owned observation boundary between the reconciled hot LIST and every ref-plan consumer.
@@ -410,7 +415,7 @@ struct TxnApplyLedger
 /// cannot roll back state or delete a newer object incarnation; the safety argument does not depend on
 /// the lease being perfectly exclusive.
 ///
-/// LEASE / STEAL WINDOW (deterministic — this class NEVER reads a clock). The lease lives inside
+/// LEASE / STEAL WINDOW. The lease lives inside
 /// `gc/state` as {owner, seq} and moves only by CAS on the whole `gc/state` object. The
 /// `acquireOrRenewLease` method implements the observation, renewal, and steal protocol.
 ///
@@ -421,13 +426,10 @@ class Gc
     friend class tests::GcRoundPlanSignatureAccess;
 
 public:
-    /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
-    /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
-    /// OBSERVATION clock: monotonic on this
-    /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
-    /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
-    /// `mono_ms_fn`).
-    /// Everything else in the round stays deterministic/clock-free.
+    /// `now_ms_fn` returns wall-clock milliseconds since the Unix epoch. GC uses it to timestamp
+    /// orphan manifest sweep completion, decide when another traversal may start, and timestamp
+    /// heartbeat diagnostics. `mono_ms_fn` defaults to `Pool::bootMsNow` and measures elapsed time
+    /// on this server for the heartbeat fence-out threshold and per-round work deadlines.
     ///
     /// `log_` is the logger every round-engine log line is emitted through; pass a disk/srid-scoped
     /// logger (e.g. `CasGcScheduler`'s own `log`, built from a `fmt::format("{}::...", storage_path)`
@@ -436,9 +438,13 @@ public:
     Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
        std::function<uint64_t()> mono_ms_fn_ = {}, LoggerPtr log_ = nullptr);
 
-    /// The time slice of one round's ref intake, on `mono_ms_fn`. A writer appends as fast as the walker
-    /// reads, so only time bounds the walk; one default `gc_interval_sec`.
-    static constexpr uint64_t kRefIntakeBudgetMs = 60'000;
+    /// The time slice of one round's ref intake, on `mono_ms_fn`. It cuts only pass 2; planning and pass 1 run to
+    /// their end, and their time counts against it.
+    static constexpr uint64_t kRefIntakeBudgetMs = 30 * 60 * 1000;
+
+    /// The ref-log bodies one round keeps from planning for its walk, summed over all lives. A body that
+    /// does not fit is read again by the walk.
+    static constexpr size_t kRefPlanRetainedBytes = 64ULL << 20;
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
@@ -489,12 +495,24 @@ public:
         uint64_t condemn_round = 0;
     };
 
+    /// What the preview learned about the adopted snapshot, so an empty preview can be told from an unread or damaged one.
+    enum class SnapshotVerdict : uint8_t
+    {
+        NoBaseline,    /// gc/state absent, or generation 0 with no seal
+        Adopted,       /// the seal gc/state names was read (any generation)
+        SealMissing,   /// the seal read absent between two matching gc/state tokens
+        Unread,        /// gc/state moved at every attempt, vanished, or went back a generation; `unread` says which
+    };
+
     struct DeletePreview
     {
+        SnapshotVerdict snapshot = SnapshotVerdict::NoBaseline;
+        /// Set only with `SealMissing`.
+        String missing_seal;
         std::vector<PreviewEntry> deletes;
         /// One message per GC shard whose runs a round would refuse as corrupt; that shard has no row in `deletes`.
         std::vector<String> refused_shards;
-        /// Why the snapshot was not read: `gc/state` moved at every read. `deletes` and `refused_shards` are empty.
+        /// Why the snapshot was not read: `gc/state` moved at every read, or vanished while a read was confirmed. `deletes` and `refused_shards` are empty.
         String unread;
     };
 
@@ -516,6 +534,14 @@ public:
     /// scheduler locals it captures. Not thread-safe, like the rest of `Gc`: one pacing thread drives one
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
+
+    /// Install (or clear) the stop signal of the rounds that follow. Planning asks it before each read, the walk
+    /// before each step, and the intake once more after its last walk. Once it answers true, the intake reads no
+    /// further ref log, every namespace it has not finished stays unproven, and the round deletes nothing; the
+    /// reduce and the commit still run. A stop after the final intake poll does not affect the round. Not asked:
+    /// the pre-fold drain of catalog rows, the checkpoint reads before planning, and a cold cursor's resolution,
+    /// which may follow one backlink per epoch. Installed and cleared like `setPhaseSink`.
+    void setStopSignal(std::function<bool()> signal) { stop_signal = std::move(signal); }
 
     /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
@@ -550,6 +576,8 @@ public:
     {
         /// After the catalog read that fixes the round's universe, before any namespace is walked.
         AfterCatalogRead,
+        /// After the last intake setup read, before the first manifest read. Once per folding round.
+        AfterDiscovery,
         /// After one namespace's walk in pass 1 or pass 2, before the next walk.
         AfterNamespaceWalk,
         /// After the last intake read and the `gc/state` validation, before the intent sweep and the reduce.
@@ -575,6 +603,12 @@ public:
     {
         round_point_hook_for_test = std::move(hook);
     }
+
+    /// Replaces the clock of the fold's intake family accounting, so a test can assert exact durations.
+    void setIntakeClockForTest(UInt64 (*clock)() noexcept) { intake_clock_ns = clock; }
+
+    /// Replaces `kRefPlanRetainedBytes`, so a test can make the walk read again what planning read.
+    void setRefPlanRetainedBytesForTest(size_t bytes) { ref_plan_retained_bytes = bytes; }
 
     /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
@@ -607,13 +641,16 @@ private:
     void throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_etag, const String & failure);
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
-    /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
+    /// parent and delegates deterministic settlement of completed `Removing` rows and stalled `Creating`
+    /// rows to `CatalogLifecycleReconciler`. A round without an adopted parent runs none of it.
     /// It performs no physical LIST or delete.
-    /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
-    /// `leased_etag` tells a deposed leader from a missing parent seal.
+    /// `completed_erases` (`Removing` rows) and `cancelled_creating` are kept current while the drain
+    /// runs, so they are valid after an exception. `leased_etag` tells a deposed leader from a missing
+    /// parent seal.
     CatalogLifecycleReconcileResult drainCompletedRemoving(
-        const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases);
-    /// Same drain for callers that do not need the erase count.
+        const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases,
+        uint64_t & cancelled_creating);
+    /// Same drain for callers that do not need the counts.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
@@ -677,6 +714,7 @@ private:
         ///     suppress_destructive = any anomaly this round
         ///                         OR carriedHolds() is non-empty
         ///                         OR the frontier is incomplete
+        ///                         OR a stop request seen by the final intake poll
         ///                         OR parent_unconfirmed
         ///
         /// The second term is STRUCTURAL, not decorative. Every hold the fold seals also records an
@@ -732,8 +770,10 @@ private:
             Proven,
             CheckpointUnusable,
             Held,
-            /// The ref intake's time slice ended before the walk reached an end.
+            /// The ref intake's time slice ended, or the round was asked to stop, before the walk reached an end.
             IntakeSliceCut,
+            /// The walk reached a key past what the round's planning observed, so no stop bounds it.
+            DiscoveryIncomplete,
             Unattributed,
         };
 
@@ -748,6 +788,7 @@ private:
             uint64_t checkpoint_unusable = 0;
             uint64_t held = 0;
             uint64_t intake_slice_cut = 0;
+            uint64_t discovery_incomplete = 0;
             uint64_t probe_budget = 0;
             uint64_t fold_aborted = 0;
             uint64_t unattributed = 0;
@@ -808,7 +849,7 @@ private:
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
-                    GcRoundWorkBudget & work_budget);
+                    GcRoundWorkBudget & work_budget, bool run_orphan_manifest_sweep);
 
     struct IndexedException
     {
@@ -1032,7 +1073,7 @@ private:
     /// There is deliberately NO per-round current-generation attempt-sweep (it cost a per-round LIST for a
     /// rare concurrent-leader collision, the GC-DISCOVERY-LIST-QUADRATIC concern). Deposed-leader
     /// current-generation debris is bounded space that waits at most `keep` completion-advances for the
-    /// wholesale prune to reclaim it. keep==0 prunes nothing (keep-all forensics mode). `attempt` is the
+    /// wholesale prune to reclaim it. keep==0 prunes nothing (reachable only through `PoolConfig`, not the disk setting); keep==1 acts as 2. `attempt` is the
     /// adopted attempt (`next.snap_attempt`); it is currently unused (retention keys on generation alone).
     ///
     /// `suppress_destructive` is the round's gate: a suppressed round prunes NOTHING and leaves
@@ -1050,13 +1091,16 @@ private:
     void rememberObservation(const GcLease & lease);
 
     /// Re-read `gc/state` and record whether this leader still holds the lease it was admitted under.
-    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed.
-    void refreshAuthority(uint64_t admitted_generation);
+    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed, as does a read that
+    /// `policy` ends first.
+    void refreshAuthority(uint64_t admitted_generation, const Retry & policy = Retry::standard());
 
     PoolPtr store;
     /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one
     /// for the current round, in which case every phase of that round emits a row.
     GcPhaseSink phase_sink;
+    /// See `setStopSignal`. Empty: the intake is never stopped.
+    std::function<bool()> stop_signal;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     /// Every round-engine log line goes through this logger (see the constructor's `log_` doc
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
@@ -1084,6 +1128,10 @@ private:
     std::function<void()> post_hot_scan_catalog_read_hook_for_test;
     /// TEST SEAM ONLY: see setRoundPointHookForTest. Empty in production.
     std::function<void(const RoundPointSiteForTest &)> round_point_hook_for_test;
+    /// TEST SEAM ONLY: see setIntakeClockForTest.
+    UInt64 (*intake_clock_ns)() noexcept = &steadyNowNs;
+    /// TEST SEAM ONLY: see setRefPlanRetainedBytesForTest.
+    size_t ref_plan_retained_bytes = kRefPlanRetainedBytes;
     /// Calls a copy, so a hook that replaces itself does not destroy the function it is running in.
     void runRoundPointHookForTest(const RoundPointSiteForTest & site) const
     {

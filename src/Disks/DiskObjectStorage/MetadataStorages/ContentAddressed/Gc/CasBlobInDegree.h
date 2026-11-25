@@ -162,6 +162,7 @@ public:
 private:
     friend SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
     friend SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy);
+    friend std::optional<SourceEdgeRunView> tryOpenSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy);
     /// Keep the underlying stream alive for the reader, which borrows it rather than owning it.
     explicit SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_);
 
@@ -175,6 +176,8 @@ private:
 /// underneath it buffers on its own terms, unbounded and unmeasured here.
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
 SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy = Retry::standard());
+/// `openSourceEdgeRun` that answers empty for an absent object instead of throwing.
+std::optional<SourceEdgeRunView> tryOpenSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy);
 
 /// What the rows of inherited source-edge runs of one shard are checked against: the pool's GC shard count, the round
 /// of the `gc/state` that adopted the fold seal naming the runs, and that seal's condemned summary of the shard.
@@ -183,6 +186,9 @@ struct AdoptedRunContext
     uint64_t gc_shards = 0;
     uint64_t parent_round = 0;
     CondemnedSummary summary;
+    /// Throw mode only: called with the refusal text before an absent run is raised as `CORRUPTED_DATA`; throws to end
+    /// the reading as something else.
+    std::function<void(const String & failure)> on_absent_run = {};
 };
 
 /// Reads the source-edge runs a GC shard inherits from its parent fold seal. It opens each run typed,
@@ -192,7 +198,8 @@ struct AdoptedRunContext
 /// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round. The message names the run's key,
 /// the shard and the row, and ends with `kCorruptBookkeeping`. Once the last run is drained, the condemned rows read
 /// must match the seal's summary of the shard in all three fields, or the reader refuses the same way. Every refusal
-/// names the run's key. A run that fails to decode, is absent or fails its seal checksum is refused too.
+/// names the run's key. A run that fails to decode, is absent or fails its seal checksum is refused too. In `Throw` mode an
+/// absent run reaches `AdoptedRunContext::on_absent_run` first.
 class AdoptedRunReader
 {
 public:
@@ -235,6 +242,8 @@ private:
     bool reportingRefusal(Read && read);
     void checkRow(const SourceEdgeRecord & rec);
     [[noreturn]] void refuseRow(const SourceEdgeRecord & rec, const String & what) const;
+    /// `Report`: keeps the refusal and returns false. `Throw`: asks the hook, then raises `CORRUPTED_DATA`.
+    bool refuseAbsentRun(const String & key);
     void checkSummary() const;
 
     CasOperation & op;

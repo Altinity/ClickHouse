@@ -400,7 +400,7 @@ private:
         requireCanonicalTokens();
         runIntentPrefixProbe(op, layout, IntentPrefixRights::Read);
         say(fmt::format("dry run: the token form is canonical, and GET and LIST on {} are allowed; not checked: the "
-            "conditional create, replace and delete rights, which the run checks at M1 before it writes",
+            "conditional create and replace rights and the unconditional delete right, which the run checks at M1 before it writes",
             layout.blobIntentsPrefix()));
         const std::vector<NonTerminalMountSlot> held = probeNonTerminalMountSlots(op, layout);
         report.slots_read = listSlotKeys().size();

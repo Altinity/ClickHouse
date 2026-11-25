@@ -26,6 +26,11 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ActionsDAG.h>
+
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Array.h>
 
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/getSchemaFromSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.h>
@@ -37,10 +42,13 @@
 #include <fmt/ranges.h>
 #include <roaring/roaring.hh>
 
+#include <algorithm>
+
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DELTA_KERNEL_ERROR;
+    extern const int INCORRECT_DATA;
 }
 
 namespace DB::Setting
@@ -49,6 +57,7 @@ namespace DB::Setting
     extern const SettingsInt64 delta_lake_snapshot_version;
     extern const SettingsBool delta_lake_throw_on_engine_predicate_error;
     extern const SettingsBool delta_lake_enable_engine_predicate;
+    extern const SettingsBool delta_lake_clustering_predicate_fallback;
 }
 
 namespace ProfileEvents
@@ -56,11 +65,14 @@ namespace ProfileEvents
     extern const Event DeltaLakePartitionPrunedFiles;
     extern const Event DeltaLakeSnapshotInitializations;
     extern const Event DeltaLakeScannedFiles;
+    extern const Event DeltaLakeClusteringPredicateFallbacks;
 }
 
 namespace DB::FailPoints
 {
     extern const char delta_kernel_force_stale_token_error[];
+    extern const char delta_kernel_force_stale_token_error_on_clustering_read[];
+    extern const char delta_kernel_pause_before_clustering_read[];
 }
 
 namespace DeltaLake
@@ -87,6 +99,109 @@ struct DataObjectInfo : public DB::ObjectInfo
 
     const int64_t size;
 };
+
+/// Errors after which retrying with refreshed credentials can succeed.
+bool isStaleCredentialsError(const DB::Exception & e)
+{
+    if (e.code() != DB::ErrorCodes::DELTA_KERNEL_ERROR)
+        return false;
+    const auto & msg = e.message();
+    return msg.contains("ExpiredToken")
+        || msg.contains("InvalidToken")
+        || msg.contains("TokenRefreshRequired");
+}
+
+/// Whether the table protocol has the `clustering` writer feature (liquid clustering).
+/// Only such tables can have `delta.clustering` domain metadata. Reads the in-memory protocol, no I/O.
+bool hasClusteringFeature(ffi::SharedSnapshot * snapshot)
+{
+    using KernelProtocol = KernelPointerWrapper<ffi::SharedProtocol, ffi::free_protocol>;
+    KernelProtocol protocol(ffi::snapshot_get_protocol(snapshot));
+
+    bool has_feature = false;
+    ffi::visit_protocol(
+        protocol.get(),
+        &has_feature,
+        [](ffi::NullableCvoid, int32_t, int32_t) {},
+        [](ffi::NullableCvoid context, bool is_reader, ffi::KernelStringSlice feature)
+        {
+            if (!is_reader && std::string_view(feature.ptr, feature.len) == "clustering")
+                *static_cast<bool *>(context) = true;
+        });
+    return has_feature;
+}
+
+/// Parses the `delta.clustering` domain metadata into the logical names used by the filter DAG.
+/// A clustering column is skipped unless its name resolves unambiguously: pushing a wrong
+/// name would silently lose file skipping, while skipping a column only loses this optimization.
+DB::Names parseClusteringColumns(
+    const std::string & json_str,
+    const DB::NameToNameMap & physical_names_map,
+    const std::string & table_location,
+    const LoggerPtr & log)
+{
+    std::vector<std::vector<std::string>> paths;
+    try
+    {
+        Poco::JSON::Parser parser;
+        auto object = parser.parse(json_str).extract<Poco::JSON::Object::Ptr>();
+        auto columns = object->getArray("clusteringColumns");
+        if (!columns)
+            throw DB::Exception(DB::ErrorCodes::INCORRECT_DATA, "delta.clustering: missing clusteringColumns array");
+
+        for (unsigned int i = 0; i < columns->size(); ++i)
+        {
+            auto path_array = columns->getArray(i);
+            if (!path_array || path_array->size() == 0)
+                continue;
+
+            auto & path = paths.emplace_back();
+            for (unsigned int j = 0; j < path_array->size(); ++j)
+                path.push_back(path_array->getElement<std::string>(j));
+        }
+    }
+    catch (const Poco::Exception & e)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::INCORRECT_DATA,
+            "Failed to parse delta.clustering domain metadata of table {}: {}",
+            table_location, e.displayText());
+    }
+
+    /// `physical_names_map` maps full dotted logical paths to full dotted physical paths,
+    /// nested fields included. It is empty when column mapping is disabled.
+    DB::NameToNameMap physical_to_logical;
+    for (const auto & [logical, physical] : physical_names_map)
+        physical_to_logical.emplace(physical, logical);
+
+    DB::Names result;
+    for (const auto & path : paths)
+    {
+        const auto joined = fmt::format("{}", fmt::join(path, "."));
+
+        /// A dot inside a name makes `a.b` indistinguishable from the nested path `a`, `b`.
+        if (std::ranges::any_of(path, [](const auto & name) { return name.contains('.'); }))
+        {
+            LOG_TRACE(log, "Clustering column `{}` of table {} has a dot in its name, not using it", joined, table_location);
+            continue;
+        }
+
+        if (physical_to_logical.empty())
+        {
+            result.push_back(joined);
+            continue;
+        }
+
+        auto it = physical_to_logical.find(joined);
+        if (it == physical_to_logical.end())
+        {
+            LOG_TRACE(log, "Clustering column `{}` of table {} is not in the schema, not using it", joined, table_location);
+            continue;
+        }
+        result.push_back(it->second);
+    }
+    return result;
+}
 
 }
 
@@ -127,6 +242,7 @@ public:
         bool throw_on_engine_predicate_error_,
         bool enable_engine_predicate_,
         DB::ContextPtr query_context_,
+        bool enable_clustering_predicate_fallback_,
         UpdateStatsFunc update_stats_func_,
         LoggerPtr log_)
         : DB::WithContext(query_context_)
@@ -136,12 +252,14 @@ public:
         , read_schema(read_schema_)
         , expression_schema(table_schema_)
         , partition_columns(partition_columns_)
+        , physical_names_map(physical_names_map_)
         , callback(callback_)
         , list_batch_size(list_batch_size_)
         , log(log_)
         , enable_expression_visitor_logging(enable_expression_visitor_logging_)
         , throw_on_engine_predicate_error(throw_on_engine_predicate_error_)
         , enable_engine_predicate(enable_engine_predicate_)
+        , enable_clustering_predicate_fallback(enable_clustering_predicate_fallback_)
         , update_stats_func(update_stats_func_)
     {
         if (filter_)
@@ -213,6 +331,12 @@ public:
                     predicate.get(),
                     /* schema */nullptr),
                 "scan");
+
+            /// Untranslatable nodes become Unknown inside `AND` and keep the other conjuncts,
+            /// so only a translation exception can lose the clustering-column conjuncts.
+            /// With `throw_on_engine_predicate_error` the query rethrows that exception anyway.
+            if (engine_predicate_exception && enable_clustering_predicate_fallback && !throw_on_engine_predicate_error)
+                tryUseClusteringPredicateFallback();
         }
         else
         {
@@ -230,19 +354,133 @@ public:
             "scan_metadata_iter_init");
     }
 
+    /// Reads the clustering columns of the iterator's snapshot, which is pinned to the query's version.
+    DB::Names readClusteringColumns() const
+    {
+        /// Test hook: lets a test commit a newer table version before the read.
+        DB::FailPointInjection::pauseFailPoint(DB::FailPoints::delta_kernel_pause_before_clustering_read);
+        fiu_do_on(DB::FailPoints::delta_kernel_force_stale_token_error_on_clustering_read,
+        {
+            throw DB::Exception(
+                DB::ErrorCodes::DELTA_KERNEL_ERROR,
+                "ExpiredToken: forced by delta_kernel_force_stale_token_error_on_clustering_read failpoint");
+        });
+
+        void * result = KernelUtils::unwrapResult(
+            ffi::get_domain_metadata_internal(
+                kernel_snapshot_state->snapshot.get(),
+                KernelUtils::toDeltaString("delta.clustering"),
+                kernel_snapshot_state->engine.get(),
+                KernelUtils::allocateString),
+            "get_domain_metadata_internal(delta.clustering)");
+        if (!result)
+        {
+            LOG_TRACE(log, "Table {} has no delta.clustering domain metadata", getTableLocation());
+            return {};
+        }
+
+        std::unique_ptr<std::string> json_str(static_cast<std::string *>(result));
+        return parseClusteringColumns(*json_str, physical_names_map, getTableLocation(), log);
+    }
+
+    /// Replaces the scan with one that pushes only the top-level conjuncts of the filter that
+    /// reference nothing but clustering columns. A subset of the conjuncts of `AND` is implied
+    /// by the full filter, so this scan can only skip files the full filter would skip too.
+    /// Called after the full predicate translation threw.
+    void tryUseClusteringPredicateFallback()
+    {
+        if (!hasClusteringFeature(kernel_snapshot_state->snapshot.get()))
+            return;
+
+        DB::Names clustering_columns;
+        try
+        {
+            clustering_columns = readClusteringColumns();
+        }
+        catch (const DB::Exception & e)
+        {
+            /// Rethrown to the stale-credentials retry in `scanDataFunc`, which keeps the snapshot version.
+            if (isStaleCredentialsError(e))
+                throw;
+            /// Only a failed kernel read or malformed metadata skips the fallback; other errors propagate.
+            if (e.code() != DB::ErrorCodes::DELTA_KERNEL_ERROR && e.code() != DB::ErrorCodes::INCORRECT_DATA)
+                throw;
+            LOG_WARNING(
+                log, "Cannot read the clustering columns of table {}, not using the clustering predicate fallback: {}",
+                getTableLocation(), e.message());
+            return;
+        }
+
+        if (clustering_columns.empty())
+            return;
+
+        const DB::NameSet clustering_inputs(clustering_columns.begin(), clustering_columns.end());
+        auto references_only_clustering_inputs = [&](const DB::ActionsDAG::Node * root)
+        {
+            std::vector<const DB::ActionsDAG::Node *> stack{root};
+            std::unordered_set<const DB::ActionsDAG::Node *> visited;
+            while (!stack.empty())
+            {
+                const auto * node = stack.back();
+                stack.pop_back();
+                if (!visited.insert(node).second)
+                    continue;
+                if (node->type == DB::ActionsDAG::ActionType::INPUT && !clustering_inputs.contains(node->result_name))
+                    return false;
+                for (const auto * child : node->children)
+                    stack.push_back(child);
+            }
+            return true;
+        };
+
+        DB::ActionsDAG::NodeRawConstPtrs clustering_conjuncts;
+        for (const auto * conjunct : DB::ActionsDAG::extractConjunctionAtoms(filter->getOutputs().at(0)))
+            if (references_only_clustering_inputs(conjunct))
+                clustering_conjuncts.push_back(conjunct);
+
+        if (clustering_conjuncts.empty())
+            return;
+
+        auto restricted_dag = DB::ActionsDAG::buildFilterActionsDAG(clustering_conjuncts);
+        if (!restricted_dag)
+            return;
+
+        std::exception_ptr fallback_exception;
+        /// Translate under the query's format settings (notably `date_time_overflow_behavior`),
+        /// exactly like the original predicate, so both predicates agree on literal conversion.
+        auto fallback_predicate = getEnginePredicate(*restricted_dag, fallback_exception, getContext());
+
+        /// The predicate is translated inside `ffi::scan`, so its outcome is known only afterwards.
+        KernelScan fallback_scan(KernelUtils::unwrapResult(
+            ffi::scan(
+                kernel_snapshot_state->snapshot.get(),
+                kernel_snapshot_state->engine.get(),
+                fallback_predicate.get(),
+                /* schema */nullptr),
+            "scan"));
+
+        if (fallback_exception)
+        {
+            LOG_DEBUG(log, "Translation of the clustering-column predicate failed too, keeping the original scan");
+            return;
+        }
+
+        ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
+        LOG_DEBUG(
+            log,
+            "Full predicate translation failed; using the clustering-column predicate for file skipping "
+            "(clustering columns: {})",
+            fmt::join(clustering_columns, ", "));
+        scan = std::move(fallback_scan);
+    }
+
     /// One-shot retry on stale-credentials errors. Safe only when no files have been
     /// enqueued yet — replaying would emit duplicates to the consumer.
     bool tryRefreshAndRetryScanState(const DB::Exception & e)
     {
-        if (e.code() != DB::ErrorCodes::DELTA_KERNEL_ERROR)
+        if (!isStaleCredentialsError(e))
             return false;
         const auto & msg = e.message();
-        const bool stale_credentials_error =
-            msg.contains("ExpiredToken")
-            || msg.contains("InvalidToken")
-            || msg.contains("TokenRefreshRequired");
-        if (!stale_credentials_error)
-            return false;
 
         {
             std::lock_guard lock(next_mutex);
@@ -657,12 +895,15 @@ private:
     DB::NamesAndTypesList read_schema;
     DB::NamesAndTypesList expression_schema;
     DB::Names partition_columns;
+    /// Logical to physical column names, empty when column mapping is disabled.
+    const DB::NameToNameMap physical_names_map;
     const DB::IDataLakeMetadata::FileProgressCallback callback;
     const size_t list_batch_size;
     const LoggerPtr log;
     const bool enable_expression_visitor_logging;
     const bool throw_on_engine_predicate_error;
     const bool enable_engine_predicate;
+    const bool enable_clustering_predicate_fallback;
     const UpdateStatsFunc update_stats_func;
 
     std::exception_ptr scan_exception;
@@ -879,15 +1120,9 @@ bool TableSnapshot::tryRefreshAfterStaleTokenError(
     DB::UInt128 pre_fingerprint,
     const char * context_for_log) const
 {
-    if (e.code() != DB::ErrorCodes::DELTA_KERNEL_ERROR)
+    if (!isStaleCredentialsError(e))
         return false;
     const auto & msg = e.message();
-    const bool stale_credentials_error =
-        msg.contains("ExpiredToken")
-        || msg.contains("InvalidToken")
-        || msg.contains("TokenRefreshRequired");
-    if (!stale_credentials_error)
-        return false;
 
     const bool refreshed_via_callback = helper->refreshCredentials();
     const auto post_fingerprint = helper->getCredentialsFingerprint();
@@ -1018,6 +1253,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         settings[DB::Setting::delta_lake_throw_on_engine_predicate_error],
         settings[DB::Setting::delta_lake_enable_engine_predicate],
         context,
+        settings[DB::Setting::delta_lake_clustering_predicate_fallback],
         std::move(update_stats_func),
         log);
 }

@@ -52,7 +52,7 @@ public:
     using FoldSignature = decltype(&Gc::fold);
     using ExpectedFoldSignature = Gc::FoldResult (Gc::*)(
         GcState &, std::optional<Etag> &, RoundReport &, uint64_t, const RefPlan &, UniversePolicy,
-        GcRoundWorkBudget &);
+        GcRoundWorkBudget &, bool);
     using BuilderSignature = decltype(&buildRefWalkPlan);
     using ExpectedBuilderSignature = RefPlan (*)(RoundInput &&);
 
@@ -1949,19 +1949,19 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return false; }),
+        op, layout, creating, [](const CreatorFence &) { return false; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     CatalogEntry stale = creating;
     stale.creator->writer_epoch = 2;
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, stale, [](const CreatorFence &) { return true; }),
+        op, layout, stale, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return true; }),
+        op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1);
@@ -2352,7 +2352,7 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
     /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
     const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
-    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
               CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";

@@ -713,6 +713,10 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throw;
     }
     committed = true;
+    /// A projection of the new part keeps this transaction for the part's life; the sources were needed only to publish.
+    copy_sources_by_part.clear();
+    for (auto & [key, st] : parts)
+        st.copy_sources.clear();
     /// All pending blobs have been uploaded in publishStaging; remove their staging resources now.
     cleanupPendingTempFiles();
     /// This transaction's unlinkFile ForceFresh-proof memoization is scoped to this transaction only;

@@ -80,12 +80,13 @@ stateDiagram-v2
     Creating --> Live: reconcileStaleCreator finds the creator fence provably dead,<br/>a fresh opener steals and completes it
     Live --> Removing: beginRemoving -- table drop, stamps removal_started_round
     Removing --> [*]: GC drains the row once a fold sealed positive cleanup evidence
+    Creating --> [*]: cancelled as stalled -- the GC leader once the creator fence is provably dead,<br/>or the creating mount itself while no admission of the name is in flight there
     [*] --> Creating: a fresh createNamespace call, only once the old row is fully absent -- brand new life_id
 ```
 
 A row's own state machine is linear per row (`Creating → Live → Removing → gone`); what makes the
-catalog non-linear as a whole is that a stalled `Creating` row can resolve two different ways
-depending on whether its creator fence is still alive, and that a name only becomes creatable again
+catalog non-linear as a whole is that a stalled `Creating` row can be completed or cancelled,
+depending on whose creator fence it carries and whether that fence is still alive, and that a name only becomes creatable again
 once its prior row is completely gone — both shown above.
 
 ## Lifetime end to end {#lifetime}
@@ -114,6 +115,26 @@ if that fence is still provably alive, the opener retries later; only once the f
 dead (the same mount-lease terminality check `GC`'s heartbeat floor uses) does
 `reconcileStaleCreator` let a fresh opener steal the row onto its own fence and finish the two steps
 above itself.
+
+A failed cold admission (any first mutating access that wrote the `Creating` row) often has no opener
+coming back for its row. The `GC` leader therefore also removes a `Creating` row whose creator's mount
+slot certifies that the creator's writer epoch cannot finish it (a later writer epoch, a `GC` fence or a clean farewell). It does so in
+the catalog cleanup each round runs before its fold (from a pool's second round on), with one exact
+compare-and-swap on the catalog. Nothing can be published under
+a `Creating` row, so the row owns no data; its `_ckpt` is left to the namespace janitor. An opener that
+takes the row over at a later epoch, or a `DROP` that cancels it, wins the swap first, and the
+cleanup leaves the row to it.
+
+A cold admission that fails after it wrote the row, on a server that keeps running, leaves the row under
+that server's live writer epoch. No certificate covers that epoch, so the `GC` leader keeps the row. The
+creating mount removes it itself: every tick of its `GC` scheduler, leader or follower, scans the catalog
+and cancels up to 16 rows that carry its exact live creator fence and whose name has no admission in flight
+on that server. The idle check is repeated inside the catalog's write lane, and the cancel is the same exact
+compare-and-swap as the flip to `Live`, so at most one of them lands. A retry that resumes the row before the
+cancel finishes the creation; a retry that loses creates the namespace under a fresh `life_id`. The scan is
+one catalog `GET` per tick on a healthy store. Each cancel can add its own catalog `GET` and a conditional write, and a refused
+write one more `GET`. A read-only mount, a mount with `GC` disabled and a stopped scheduler run no such pass: the row then stays until the server restarts or `GC` fences its mount slot; see
+[`Creating` rows in the catalog](/antalya/cas/operations/debugging#creating-catalog-rows).
 
 ### Removal {#removal}
 

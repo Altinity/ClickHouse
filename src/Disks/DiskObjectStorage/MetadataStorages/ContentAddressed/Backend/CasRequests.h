@@ -24,6 +24,10 @@ namespace ProfileEvents
 namespace DB::ErrorCodes
 {
     extern const int CAS_OWNERSHIP_CONFLICT;
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+    extern const int CORRUPTED_DATA;
+    extern const int TOO_DEEP_RECURSION;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 #include <optional>
 #include <string_view>
@@ -64,6 +68,20 @@ bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
+/// A `MEMORY_LIMIT_EXCEEDED` raised by the memory tracker, whatever it was allocating for.
+bool isMemoryLimitExceeded(const std::exception & e);
+/// A GC decode of a stored ref log or manifest failed because the bytes are malformed. Any other error says nothing
+/// about the bytes and must propagate. The JSON reader does not translate a bad escape or an unknown key nested past
+/// its depth limit to `CORRUPTED_DATA`, so those two parse codes are listed here.
+inline bool isMalformedStoredRecordError(int code)
+{
+    return code == ErrorCodes::CORRUPTED_DATA || code == ErrorCodes::UNKNOWN_FORMAT_VERSION
+        || code == ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE || code == ErrorCodes::TOO_DEEP_RECURSION;
+}
+inline bool isMalformedStoredRecordError(const Exception & e)
+{
+    return isMalformedStoredRecordError(e.code());
+}
 /// An exception the store or the transport raised, as opposed to a local fault.
 bool isStoreAnswer(const std::exception & e);
 /// `VERB key: refused|transport code message`; `code` is the store's error name when it sent one.
@@ -101,6 +119,10 @@ String describeRequestFailure(std::string_view verb, const String & key, const s
 /// remaining uncertain). Startup/decommission and generic live-lock-brake `ABORTED` values keep
 /// their meaning and are not rerouted here.
 [[noreturn]] void throwCasWriteRetryLater(const String & why);
+
+/// Same class as `throwCasWriteRetryLater` (`NETWORK_ERROR`, retry later), worded for a request that is not a
+/// commit: a read, a probe, a delete, or recovery and maintenance work.
+[[noreturn]] void throwCasRequestRetryLater(const String & why);
 
 /// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
 /// `std::exception_ptr` for call sites that fail a pending future/promise rather than throw directly.
@@ -185,6 +207,9 @@ void recordFirstAttemptFuse();
 
 class CasOperation;
 
+/// What a read does when an admitted attempt fails with `MEMORY_LIMIT_EXCEEDED`.
+enum class OnMemoryLimit : uint8_t { Reissue, Propagate };
+
 /// The only caller of `Backend`. It owns the three things a physical request must be measured
 /// against -- the transport, the mount fence, and the clock -- and it is the sole minter of
 /// `Etag`, so a caller can hold one only by way of a request this class admitted.
@@ -218,7 +243,8 @@ public:
     CasOperation admit(Liveness liveness = {});
     /// Admitted earlier: the generation came from a persisted runtime record, and an operation that
     /// resumes under a generation the fence has since moved past gives up rather than writing.
-    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {});
+    /// A non-empty `sleep_ms` replaces the plane's inter-attempt sleep for this operation only.
+    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {}, std::function<void(uint64_t)> sleep_ms = {});
 
     /// The capability predicates and `dialect()`.
     Backend & backendForCapabilityPredicates() { return *backend; }
@@ -312,7 +338,7 @@ public:
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
-    void pause(uint64_t ms) { owner.sleep_ms(ms); }
+    void pause(uint64_t ms) { sleep(ms); }
     /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
     /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
     /// attempt reservations (the re-read and the write) do not fit in `policy`.
@@ -337,7 +363,10 @@ public:
     /// its running out of time is its own error and not the verb's retry-later give-up.
     bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
-    std::optional<Object> read(const String & key, const Retry & policy);
+    /// `OnMemoryLimit::Propagate` makes a `MEMORY_LIMIT_EXCEEDED` from an admitted attempt escape at once: the
+    /// reader that hit its own memory limit gains nothing from the loop replaying the GET until the window ends.
+    /// Only a read that loads data for its caller may ask; settlement and maintenance reads keep reissuing.
+    std::optional<Object> read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
     /// The store returns at most 1000 keys per request, and a page needs one key more than its size to prove
@@ -393,10 +422,14 @@ private:
     /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.
     friend class CasHotKeys;
 
-    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_)
+    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_,
+                 std::function<void(uint64_t)> own_sleep_ms_ = {})
         : owner(owner_), admitted_generation(admitted_generation_), liveness(std::move(liveness_))
+        , own_sleep_ms(std::move(own_sleep_ms_))
     {
     }
+
+    void sleep(uint64_t ms) { own_sleep_ms ? own_sleep_ms(ms) : owner.sleep_ms(ms); }
 
     enum class Gate : uint8_t { Ok, FenceLost, NoBudget };
     /// The admission point: the fence for `needed_ms` from now, then the caller's own facts.
@@ -448,9 +481,10 @@ private:
     /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
     template <typename Fn>
     auto readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                  const Retry::Bound & bound, Fn && once);
+                  const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
 
-    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
+    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound,
+                                    OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   headUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
     ListPage               listUnder(const String & prefix, const String & cursor, size_t limit,
                                     const Retry & policy, const Retry::Bound & bound);
@@ -531,6 +565,7 @@ private:
     CasRequests & owner;
     uint64_t admitted_generation;
     Liveness liveness;
+    std::function<void(uint64_t)> own_sleep_ms;
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
@@ -539,7 +574,7 @@ private:
 
 template <typename Fn>
 auto CasOperation::readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                            const Retry::Bound & bound, Fn && once)
+                            const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit)
 {
     bool refresh_attempted = false;
     uint64_t attempt_started_ms = 0;
@@ -571,6 +606,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         {
             if (observer.on_failure && verb == "read" && isStoreAnswer(e))
                 observer.on_failure("GET", subject, e);
+            if (on_memory_limit == OnMemoryLimit::Propagate && isMemoryLimitExceeded(e))
+                throw;
             bool refreshed = false;
             if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;
@@ -618,7 +655,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(needed, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 

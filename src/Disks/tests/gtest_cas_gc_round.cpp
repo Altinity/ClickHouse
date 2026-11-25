@@ -1765,15 +1765,15 @@ TEST(CASGCSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 /// ---- Task 7 (2026-07-02 snapshot-streaming): ref-aware retention + post-CAS hand-off delete ----
 
 /// Retention must NOT reclaim a generation whose run the live seal still references, EVEN once the
-/// retention cursor (`snap_pruned_through`) has advanced past that generation. With `keep=1` and a live
+/// retention cursor (`snap_pruned_through`) has advanced past that generation. With `keep=2` and a live
 /// ref that idle-carries across generations, `pruneSupersededGenerations` SKIPS gen-1's prefix every
 /// round while advancing the cursor over it. The gen-1 run object (physically holding the seal's ref)
 /// must survive, and folding/in-degree resolution THROUGH the carried ref must keep working.
 TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    /// keep=2: the smallest retention the disk settings accept, so the cursor reaches gen-1's neighbourhood fast.
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 2, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1832,7 +1832,7 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
 TEST(CASGCRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 2, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xAA);
 
@@ -1900,7 +1900,7 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
     /// which would drag the "keep" ref's physical run forward the moment the debris table is touched --
     /// destroying the idle-carry this test depends on. Two independent shards keep debris activity from
     /// disturbing the kept ref's generation at all until its ref is explicitly moved.
-    /// `keep=5` (not the more aggressive `keep=1` other hand-off tests use) is ALSO load-bearing: the
+    /// `keep=5` (not the more aggressive `keep=2` other hand-off tests use) is ALSO load-bearing: the
     /// debris generation must still be numerically AHEAD of the cursor at the moment its own drop folds,
     /// or that fold's post-CAS hand-off phase -- not the ordinary prune -- would claim it (the same
     /// one-round "parent-seal protects, then hand-off claims" shape `HandOffDeletesSupersededRef` relies
@@ -2001,7 +2001,7 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
 TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 {
     auto backend = std::make_shared<GcStateCasFaultBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 2, .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     backend->faulted_key = layout.gcStateKey();
     const RootNamespace ns{"00/aa@cas@"};
@@ -2013,12 +2013,17 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);   // round 1: gen=1 adopted, referencing blob 1's run.
+    /// An idle round carries that run into the next generation. The next round's retention floor is then
+    /// the generation the carried run lives in, which is what the pre-CAS prune must not reclaim.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const GcState st1 = readState(*backend, *store);
     const uint64_t g_parent = st1.snap_generation;
 
     const auto seal1 = decodeFoldSeal(readOf(*backend, layout.foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
     ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
     const String parent_run_key = seal1.blob_target_runs.front().key;
+    ASSERT_LT(seal1.blob_target_runs.front().key_generation, g_parent) << "the parent seal must carry a run of an older generation";
+    ASSERT_TRUE(headExists(*backend, parent_run_key));
     const String parent_gen_prefix = layout.gcGenPrefix(g_parent);
     ASSERT_FALSE(listOf(*backend, parent_gen_prefix, "", 1000).keys.empty());
 
@@ -2033,22 +2038,26 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
     /// `acquireOrRenewLease`'s own lease-renewal CAS (must SUCCEED, so the round actually folds), and the
     /// second is the round's final round-commit CAS (the one that must LOSE, exactly as if a concurrent
     /// leader had already committed a different seal first).
-    const size_t calls_before = backend->calls_to_faulted_key;
-    backend->fail_at_call = calls_before + 2;
-    bool threw_aborted = false;
-    try
+    const auto loseOneRound = [&]
     {
-        gc.runRegularRound();
-    }
-    catch (const DB::Exception & e)
-    {
-        threw_aborted = (e.code() == DB::ErrorCodes::ABORTED);
-        if (!threw_aborted)
-            throw;
-    }
-    ASSERT_TRUE(threw_aborted) << "the losing round's own gc/state CAS must fail and propagate ABORTED";
-    EXPECT_EQ(backend->calls_to_faulted_key, calls_before + 2)
-        << "the round must have made exactly the expected two gc/state casPut attempts (renew + commit)";
+        const size_t calls_before = backend->calls_to_faulted_key;
+        backend->fail_at_call = calls_before + 2;
+        bool threw_aborted = false;
+        try
+        {
+            gc.runRegularRound();
+        }
+        catch (const DB::Exception & e)
+        {
+            threw_aborted = (e.code() == DB::ErrorCodes::ABORTED);
+            if (!threw_aborted)
+                throw;
+        }
+        ASSERT_TRUE(threw_aborted) << "the losing round's own gc/state CAS must fail and propagate ABORTED";
+        EXPECT_EQ(backend->calls_to_faulted_key, calls_before + 2)
+            << "the round must have made exactly the expected two gc/state casPut attempts (renew + commit)";
+    };
+    loseOneRound();
 
     /// GREEN evidence: the losing round's pre-CAS prune must NOT have destroyed `g_parent` — it is still
     /// exactly what the (unreplaced, still-adopted) parent seal references.
@@ -2077,6 +2086,80 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 
     EXPECT_TRUE(blobExists(*backend, layout, DB::UInt128(2)));
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 1);
+}
+
+/// `PoolConfig` keep = 1 reaches the prune without the settings layer; the adopted seal must still survive.
+TEST(CASGCRetention, KeepOneActsAsTwoAndKeepsAdoptedSealThroughLosingRound)
+{
+    auto backend = std::make_shared<GcStateCasFaultBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    backend->faulted_key = layout.gcStateKey();
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xAA);
+
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);   // round 1: gen=1 adopted, referencing blob 1's run.
+    /// An idle round carries that run into the next generation. The next round's retention floor is then
+    /// the generation the carried run lives in, which is what the pre-CAS prune must not reclaim.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const GcState st1 = readState(*backend, *store);
+    const uint64_t g_parent = st1.snap_generation;
+
+    const auto seal1 = decodeFoldSeal(readOf(*backend, layout.foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+    ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
+    const String parent_run_key = seal1.blob_target_runs.front().key;
+    ASSERT_LT(seal1.blob_target_runs.front().key_generation, g_parent) << "the parent seal must carry a run of an older generation";
+    ASSERT_TRUE(headExists(*backend, parent_run_key));
+    const String parent_gen_prefix = layout.gcGenPrefix(g_parent);
+    ASSERT_FALSE(listOf(*backend, parent_gen_prefix, "", 1000).keys.empty());
+
+    /// A real delta: swap the ref to a new manifest naming a different blob. The next fold will move
+    /// shard 0's run OFF `g_parent` onto a fresh generation.
+    const ManifestRef r2 = ref(2, 0xBB);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
+
+    /// Arm the fault for the NEXT round's SECOND casPut on gc/state, not its first: the first is
+    /// `acquireOrRenewLease`'s own lease-renewal CAS (must SUCCEED, so the round actually folds), and the
+    /// second is the round's final round-commit CAS (the one that must LOSE, exactly as if a concurrent
+    /// leader had already committed a different seal first).
+    const auto loseOneRound = [&]
+    {
+        const size_t calls_before = backend->calls_to_faulted_key;
+        backend->fail_at_call = calls_before + 2;
+        bool threw_aborted = false;
+        try
+        {
+            gc.runRegularRound();
+        }
+        catch (const DB::Exception & e)
+        {
+            threw_aborted = (e.code() == DB::ErrorCodes::ABORTED);
+            if (!threw_aborted)
+                throw;
+        }
+        ASSERT_TRUE(threw_aborted) << "the losing round's own gc/state CAS must fail and propagate ABORTED";
+        EXPECT_EQ(backend->calls_to_faulted_key, calls_before + 2)
+            << "the round must have made exactly the expected two gc/state casPut attempts (renew + commit)";
+    };
+    loseOneRound();
+
+    /// GREEN evidence: the losing round's pre-CAS prune must NOT have destroyed `g_parent` — it is still
+    /// exactly what the (unreplaced, still-adopted) parent seal references.
+    EXPECT_FALSE(listOf(*backend, parent_gen_prefix, "", 1000).keys.empty())
+        << "a losing round must never destroy the generation the still-adopted parent seal references";
+    EXPECT_TRUE(headExists(*backend, parent_run_key))
+        << "the parent seal's exact run object must survive a losing round's pre-CAS prune";
+
+    EXPECT_TRUE(headExists(*backend, layout.foldSealKey(st1.snap_generation, st1.snap_attempt)))
+        << "keep 1 acts as 2: the adopted generation's seal must survive a round that loses";
+    EXPECT_EQ(readState(*backend, *store).snap_generation, g_parent);
 }
 
 /// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.
@@ -2121,6 +2204,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     config.server_root_id = "gc-runner";
     config.manifest_sweep_list_budget_keys = 1;
     config.manifest_sweep_delete_budget_keys = 1;
+    config.orphan_manifest_sweep_interval_sec = 0;
     /// This test drives MANY consecutive rounds expecting each to sweep + persist the cursor; force
     /// fold-every-round (Phase-4 Lever A would otherwise defer once the pool quiesces).
     config.gc_fold_max_defer_rounds = 0;

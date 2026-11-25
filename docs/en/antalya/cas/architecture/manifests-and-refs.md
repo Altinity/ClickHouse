@@ -89,14 +89,13 @@ a live precommit would clamp `GC`'s fold barrier forever.
 
 ### The orphan-manifest sweep {#orphan-sweep}
 
-The cursor-paced, budgeted sweep has two stages (`Gc/CasOrphanManifestSweep.cpp`). During fold
-planning, it checks candidates against the mount floor, ownership, fold coverage, and catalog
-lifecycle. It then freezes accepted candidates with exact `GET`s, opens and decodes their bodies,
-and derives the state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
-phase 18 perform physical deletion. Eligibility comes **exclusively** from the durable watermark
-in the mount lease — there is no age threshold and no time-based grace period anywhere in this
-protocol. No mount lease for the `server_root_id` means no deletion authority means nothing is
-swept for that root.
+The [sweep interval](/antalya/cas/configuration#orphan-manifest-sweep-schedule) controls when an
+ordinary fold may plan a page. Each manifest on that page must have a build prefix below the
+watermark in its writer's mount lease to be considered for deletion. A missing lease retains the
+manifest regardless of its age. For a namespace in the catalog, the sweep also checks ownership
+and fold coverage. It rereads the catalog before fetching candidate bodies, as described below.
+The fold derives the blob-source retirements from each validated body. Phase 18 can delete that
+body after the round commits the retirements.
 
 The page reads an initial catalog cut `K0`. The mount floor applies to every candidate, including
 manifests whose namespace is absent from `K0`: a writer can stage a manifest before its first
@@ -324,7 +323,8 @@ call it, and GC intake follows the same successor rule (`refChainSuccessor`).
 | Contains `RemoveNamespace` | none: the stream ends and no later key is read |
 
 History ends at the first absent key on this chain, or at a terminal record. Keys are read by exact
-`GET` in successor order. The record after a tombstone must name it in its backlink, and no other record carries a backlink.
+`GET` in successor order. A GC round's walk reads no key at or past the stop the round fixed before it started walking; see
+[the stop](/antalya/cas/architecture/garbage-collection#phase-8-fold-ref-intake). The record after a tombstone must name it in its backlink, and no other record carries a backlink.
 
 Cleanup deletes only logs strictly below the snapshot id read from `_ckpt`, and that id only grows. So a
 walk from a snapshot base re-reads `_ckpt` after its last read: an unchanged token proves that no

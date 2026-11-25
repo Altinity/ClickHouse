@@ -8193,6 +8193,16 @@ Enables throwing an exception if there was an error when analyzing scan predicat
     DECLARE(Bool, delta_lake_enable_engine_predicate, true, R"(
 Enables delta-kernel internal data pruning.
 )", 0) \
+    DECLARE(Bool, delta_lake_clustering_predicate_fallback, true, R"(
+For a Delta Lake table with liquid clustering: when translating the query filter to a delta-kernel
+predicate throws an exception, push only the top-level `AND` conjuncts of the filter that reference
+nothing but clustering columns, so that file-level data skipping on clustering columns still works.
+Filters that the kernel only partially supports do not need this: their translatable conjuncts are
+pushed anyway. Files without statistics for the clustering columns are not skipped.
+
+Has no effect when `delta_lake_enable_engine_predicate` is disabled or when
+`delta_lake_throw_on_engine_predicate_error` is enabled (the query throws the translation exception).
+)", 0) \
     DECLARE(NonZeroUInt64, delta_lake_insert_max_rows_in_data_file, 1000000, R"(
 Defines a rows limit for a single inserted data file in delta lake.
 )", 0) \

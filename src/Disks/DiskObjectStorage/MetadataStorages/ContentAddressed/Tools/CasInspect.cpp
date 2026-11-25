@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -290,6 +291,7 @@ String renderGcState(const GcState & s)
         .add("snap_pruned_through", jsonUInt(s.snap_pruned_through))
         .add("snap_attempt", jsonUInt(s.snap_attempt))
         .add("manifest_sweep_cursor", jsonEscape(s.manifest_sweep_cursor))
+        .add("orphan_manifest_sweep_completed_at_ms", jsonUInt(s.orphan_manifest_sweep_completed_at_ms))
         .add("lease", renderGcLease(s.lease))
         .str();
 }
@@ -479,6 +481,19 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
         .str();
 }
 
+/// The key carries the whole identity; the body is one constant byte string, so other bytes are damage.
+String renderBlobIntent(const Layout::ParsedBlobIntentKey & parsed, const String & key, std::string_view bytes)
+{
+    if (!isBlobIntentRecord(bytes))
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "cas-inspect: '{}' does not hold the deletion intent record", key);
+    return JsonObj()
+        .add("object", jsonEscape("blob_intent"))
+        .add("blob", jsonEscape(blobIdOf(parsed.ref)))
+        .add("type", jsonEscape(dialectWord(parsed.identity.dialect)))
+        .add("tag_hex", jsonEscape(parsed.identity.tag_hex))
+        .str();
+}
+
 }
 
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
@@ -539,6 +554,9 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     if (const auto parsed = layout.parseBlobTargetRunKey(key))
         return renderBlobTargetRun(*parsed, bytes);
 
+    if (const auto parsed = layout.parseBlobIntentKey(key))
+        return renderBlobIntent(*parsed, key, bytes);
+
     /// `blobMetaKey(id) == blobKey(id) + ".meta"`, so a meta descriptor also matches
     /// `blobsPrefix()` below. Check it first or it would be decoded incorrectly as an envelope. A
     /// non-`.meta` blob body still carries its envelope.
@@ -551,7 +569,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
         "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
         "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
-        "retired, blobs, blobs/*.meta)", key);
+        "blob-intents, blobs, blobs/*.meta)", key);
 }
 
 std::optional<RefTxnId> readInspectBaseSnapshotId(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,

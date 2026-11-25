@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
@@ -171,20 +172,15 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
 
     /// Retained views serve `CachedForLoad` directly only after their manifest ID matches the fresh
     /// resolve. `ForceFresh` and `StrictValidate` always rebuild from the pool's manifest cache.
-    if (freshness == Freshness::CachedForLoad && view_cache)
+    if (freshness == Freshness::CachedForLoad)
     {
-        if (auto cached = view_cache->get(cache_key))
+        if (auto cached = retainedView(cache_key, resolved->manifest_id))
         {
-            if (cached->manifestId() == resolved->manifest_id)
-            {
-                /// The warm hit: the retained view already reflects this exact manifest, so this access
-                /// did no real resolve work beyond a cache lookup — no `RefResolve` audit row for it.
-                ProfileEvents::increment(ProfileEvents::CASPartFolderViewHits);
-                recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
-                return cached;
-            }
-            ProfileEvents::increment(ProfileEvents::CASPartFolderViewValidationMismatches);
-            /// Rebuild below; the stale entry is superseded by the new view when retention is enabled.
+            /// The warm hit: the retained view already reflects this exact manifest, so this access
+            /// did no real resolve work beyond a cache lookup — no `RefResolve` audit row for it.
+            ProfileEvents::increment(ProfileEvents::CASPartFolderViewHits);
+            recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
+            return cached;
         }
     }
 
@@ -221,6 +217,21 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
     return view;
 }
 
+std::shared_ptr<const PartFolderView>
+CachedPartFolderAccess::retainedView(const String & cache_key, const Cas::ManifestId & manifest_id) const
+{
+    if (!view_cache)
+        return nullptr;
+    auto cached = view_cache->get(cache_key);
+    if (!cached)
+        return nullptr;
+    if (cached->manifestId() == manifest_id)
+        return cached;
+    /// The caller rebuilds; the stale entry is superseded by the new view.
+    ProfileEvents::increment(ProfileEvents::CASPartFolderViewValidationMismatches);
+    return nullptr;
+}
+
 void CachedPartFolderAccess::emitResolveEvent(const PartRefKey & key, const Cas::Resolved & resolved) const
 {
     /// Mirrors `CasRefLedger::resolveRef`'s own (deferred-here) emit exactly: same event type and
@@ -245,37 +256,67 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     if (freshness != Freshness::CachedForLoad)
         return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
 
-    std::promise<std::shared_ptr<const PartFolderView>> promise;
-    std::shared_future<std::shared_ptr<const PartFolderView>> future;
-    bool leader = false;
+    const String cache_key = key.cacheKey();
+    /// Readers that resolved different manifests of one ref must not share a build.
+    const String build_key = cache_key + '\0' + resolved.manifest_id.root_namespace.string() + '\0'
+        + Cas::manifestRefDebugString(resolved.manifest_id.ref);
+    for (bool retry = false;; retry = true)
     {
-        std::lock_guard lock(inflight_mutex);
-        if (auto it = inflight.find(key.cacheKey()); it != inflight.end())
-            future = it->second;                          /// Follower: share the leader's build.
-        else
-        {
-            leader = true;
-            future = promise.get_future().share();
-            inflight.emplace(key.cacheKey(), future);
-        }
-    }
-    if (!leader)
-        return future.get();                              /// Rethrows the leader's exception, if any.
+        if (retry)
+            if (auto view = retainedView(cache_key, resolved.manifest_id))
+                return view;
 
-    SCOPE_EXIT({
-        std::lock_guard lock(inflight_mutex);
-        inflight.erase(key.cacheKey());
-    });
-    try
-    {
-        auto view = PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
+        std::promise<std::shared_ptr<const PartFolderView>> promise;
+        std::shared_future<std::shared_ptr<const PartFolderView>> future;
+        bool leader = false;
+        {
+            std::lock_guard lock(inflight_mutex);
+            if (auto it = inflight.find(build_key); it != inflight.end())
+                future = it->second;                          /// Follower: share the leader's build.
+            else
+            {
+                leader = true;
+                future = promise.get_future().share();
+                inflight.emplace(build_key, future);
+            }
+        }
+        if (!leader)
+        {
+            runHookForTest(TestHook::FollowerJoined);
+            try
+            {
+                return future.get();                          /// Rethrows the leader's exception, if any.
+            }
+            catch (const std::exception & e)
+            {
+                /// The leader ran out of its own query's memory, which says nothing about this query's budget.
+                if (!isMemoryLimitExceeded(e))
+                    throw;
+                continue;
+            }
+        }
+
+        /// A failed build leaves the map before its followers wake, so a follower that retries never rejoins it.
+        auto retire = [&]
+        {
+            std::lock_guard lock(inflight_mutex);
+            inflight.erase(build_key);
+        };
+        std::shared_ptr<const PartFolderView> view;
+        try
+        {
+            view = PartFolderView::make(
+                key, resolved, store->readManifestShared(resolved.manifest_id, OnMemoryLimit::Propagate));
+        }
+        catch (...)
+        {
+            retire();
+            promise.set_exception(std::current_exception());
+            throw;
+        }
         promise.set_value(view);
+        retire();
         return view;
-    }
-    catch (...)
-    {
-        promise.set_exception(std::current_exception());  /// Followers see the leader's exception.
-        throw;
     }
 }
 

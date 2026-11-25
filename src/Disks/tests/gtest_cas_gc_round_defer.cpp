@@ -24,12 +24,13 @@ extern const Event CASGCRefWalkPlansBuilt;
 namespace
 {
 const UInt128 kGc = UInt128(0xAB);
+
 }
 
 TEST(CASGCRoundDefer, PredicateTruthTable)
 {
-    /// threshold=1 (default): defer ONLY when zero shards changed AND no graduation due AND within bound.
-    EXPECT_TRUE (shouldDeferRound(/*changed*/0, /*grad_due*/false, /*since*/0, /*threshold*/1, /*max*/8));
+    /// threshold=1 (default): defer ONLY when zero shards changed, no graduation is due, and within bound.
+    EXPECT_TRUE (shouldDeferRound(0, false, 0, 1, 8));
     EXPECT_FALSE(shouldDeferRound(1, false, 0, 1, 8));   // a shard changed => fold
     EXPECT_FALSE(shouldDeferRound(0, true,  0, 1, 8));   // graduation due => force fold
     EXPECT_FALSE(shouldDeferRound(0, false, 8, 1, 8));   // defer bound reached => force fold

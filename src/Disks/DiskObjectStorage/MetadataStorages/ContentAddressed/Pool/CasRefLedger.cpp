@@ -82,6 +82,7 @@ namespace ProfileEvents
     extern const Event CASRefRecoveryStragglerAdopted;
     extern const Event CASRefRecoveryCancelled;
     extern const Event CASRefRecoveryStreamHole;
+    extern const Event CASOwnCreatingCancelled;
 }
 
 namespace DB::Cas
@@ -746,6 +747,74 @@ CasRefLedger::ColdAdmission::~ColdAdmission()
     ledger->releaseColdAdmissionLocked(*this);
 }
 
+void CasRefLedger::cancelIdleOwnCreatingRows(
+    const Liveness & alive, std::function<void(uint64_t)> pause, const std::function<bool()> & stop_requested)
+{
+    static constexpr size_t kMaxCancelsPerPass = 16;
+    const auto stopped = [&] { return stop_requested && stop_requested(); };
+    if (stopped())
+        return;
+    /// The order `Pool::captureMountIncarnation` uses: a generation that holds across the epoch read dates it.
+    const uint64_t generation = fence_generation_fn();
+    const uint64_t epoch = live_epoch_fn();
+    CasOperation op = mount_requests.resume(generation, alive, std::move(pause));
+    if (!op.admitted())
+        return;
+    const String key = layout.refCatalogKey();
+    const auto log_absent = [&]
+    {
+        LOG_ERROR(getLogger("CasRefLedger"), "CAS ref catalog '{}': mandatory catalog absent; skipping owner cleanup", key);
+    };
+    const Retry policy = op.freeze(Retry::standard());
+    const std::optional<Object> got = op.read(key, policy);
+    if (!got)
+    {
+        log_absent();
+        return;
+    }
+    const CreatorFence ours{server_root_id, epoch, generation};
+    std::vector<CatalogEntry> eligible;
+    for (const CatalogEntry & entry : decodeRefCatalog(got->bytes).entries)
+        if (entry.state == NsState::Creating && entry.creator == ours && !hasColdAdmissionInFlight(entry.ns))
+            eligible.push_back(entry);
+    const size_t start = own_creating_rotation.load();
+    for (size_t i = 0; i < std::min(kMaxCancelsPerPass, eligible.size()); ++i)
+    {
+        if (stopped())
+            return;
+        own_creating_rotation.store(start + i + 1);
+        const CatalogEntry & row = eligible[(start + i) % eligible.size()];
+        bool absent = false;
+        /// The idle check is repeated inside the lane, on the catalog the cancel writes over: an admission
+        /// that begins after it resolves through the exact-row compare-and-swap.
+        const auto outcome = CasRefCatalog::cancelStalledCreating(
+            op, layout, row, [&](const CreatorFence &) { return !hasColdAdmissionInFlight(row.ns); },
+            [](const Retry &) {}, policy, &absent);
+        if (absent)
+        {
+            log_absent();
+            return;
+        }
+        if (outcome == CasRefCatalog::StalledCreatingCancelOutcome::FencedOut)
+            return;
+        /// Otherwise the name became busy or the row changed: nothing was written for it.
+        if (outcome != CasRefCatalog::StalledCreatingCancelOutcome::Cancelled)
+            continue;
+        ProfileEvents::increment(ProfileEvents::CASOwnCreatingCancelled);
+        LOG_INFO(getLogger("CasRefLedger"),
+            "CAS namespace '{}': cancelled this mount's own `Creating` row, life {}, writer epoch {}: no admission "
+            "of the name was in flight when the cancel was decided",
+            row.ns.string(), renderIncarnation(row.incarnation), epoch);
+    }
+}
+
+bool CasRefLedger::hasColdAdmissionInFlight(const RootNamespace & ns) const
+{
+    std::lock_guard lock(ref_queue_mutex);
+    const auto it = ref_name_slots.find(ns.string());
+    return it != ref_name_slots.end() && it->second.admissions_in_flight > 0;
+}
+
 CasRefLedger::ColdAdmission CasRefLedger::beginColdAdmission(const RootNamespace & ns)
 {
     String name = ns.string();
@@ -1065,14 +1134,14 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     {
         cancelled = true;
         ProfileEvents::increment(ProfileEvents::CASRefRecoveryCancelled);
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
             "fence was re-armed; the last attempt's fate is unresolved and nothing is installed — the next "
             "touch recovers under the fresh incarnation", ns.string()));
     }
 
     if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
             "while recovery I/O was in flight — nothing further is written and nothing is installed",
             ns.string(), renderIncarnation(rt.life.incarnation)));
@@ -1081,7 +1150,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
     /// cancellation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
     if (rt.superseded_by_remount.load(std::memory_order_acquire))
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
             "mid-recovery — retry against the fresh mount incarnation", ns.string()));
 
@@ -1293,7 +1362,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             if (stamp.outcome == CkptStampOutcome::TokenMismatch)
                 return std::nullopt;
             if (stamp.outcome == CkptStampOutcome::Unresolved)
-                throwCasWriteRetryLater(fmt::format(
+                throwCasRequestRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the generation 3 stamp of its `_ckpt` is "
                     "unresolved; nothing is installed", ns.string()));
             accepted = std::move(*stamp.stamped);
@@ -1329,7 +1398,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         {
             const auto * occupant_object = std::get_if<Object>(&conflict->seen);
             if (!occupant_object)
-                throwCasWriteRetryLater(fmt::format(
+                throwCasRequestRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} lost its slot "
                     "to an occupant the settling read could not observe; the table stays unrecovered",
                     ns.string(), id.writer_epoch, id.ref_sequence));
@@ -1367,13 +1436,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
 
         if (const auto * gave_up = std::get_if<GaveUp>(&created))
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} is UNRESOLVED ({}); the "
                 "table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence,
                 gave_up->sent_any ? "the outcome of the attempt is unknown" : "nothing was sent"));
 
         const auto & refused = std::get<Refused>(created);
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': the store refused the tombstone at {}-{} ({}); "
             "the table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence, refused.message));
     }
@@ -1638,7 +1707,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                                 "CAS ref-table recovery for namespace '{}' found a hole in the durable ref-log "
                                 "stream that persisted across {} re-reads: {}",
                                 ns.string(), attempt - 1, *hole_detail);
-                        throwCasWriteRetryLater(fmt::format(
+                        throwCasRequestRetryLater(fmt::format(
                             "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot "
                             "kept vanishing between the checkpoint that named it and its GET) — giving up; this "
                             "bound is a runaway brake against a pathological cleanup race, not an expected "
@@ -1693,12 +1762,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                     recovery_install_probe_for_test();
                 refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery install");
                 if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
+                    throwCasRequestRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
                         "before recovery install — nothing is installed",
                         ns.string(), renderIncarnation(rt.life.incarnation)));
                 if (rt.superseded_by_remount.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
+                    throwCasRequestRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
                         "self-remount while the walk was in flight — nothing is installed",
                         ns.string()));
@@ -5687,7 +5756,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (initial_it == initial_catalog.catalog.entries.end())
-        return {};
+        return {.already_absent = true};
     if (expected_incarnation && initial_it->incarnation != *expected_incarnation)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': exact removal life {} differs from current catalog life {}",
@@ -5704,6 +5773,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                 return isCreatorFenceTerminal(
                     cancel_op, layout, creator.server_root_id, creator.writer_epoch, policy);
             },
+            /// The mount fence `cancel_op` checks is read live, so there is nothing to refresh.
+            [](const Retry &) {},
             policy))
         {
             case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
@@ -5714,9 +5785,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                     "CAS namespace removal '{}': its catalog entry is still Creating under a creator "
                     "fence that is not yet provably terminal; retry later", ns.string()));
             case CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged:
+            {
+                /// Another actor, such as the GC leader, cancelled the row first: the same answer as no row.
+                const CasRefCatalog::Snapshot after = CasRefCatalog::read(initial_op, layout, policy);
+                if (std::none_of(after.catalog.entries.begin(), after.catalog.entries.end(),
+                        [&](const CatalogEntry & entry) { return entry.ns == ns; }))
+                    return {.already_absent = true};
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace removal '{}': exact Creating row changed before cancellation; retry later",
                     ns.string()));
+            }
             case CasRefCatalog::StalledCreatingCancelOutcome::FencedOut:
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace removal '{}': mount fence moved before stalled creation cancellation",

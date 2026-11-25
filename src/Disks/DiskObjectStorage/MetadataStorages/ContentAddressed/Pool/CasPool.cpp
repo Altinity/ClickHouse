@@ -1285,6 +1285,14 @@ bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
     return true;
 }
 
+void Pool::cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requested)
+{
+    /// The pass keeps the mount fence but backs off on the open plane's sleep, which `beginTeardown` wakes;
+    /// the mount plane's sleep would hold a scheduler join for a whole pause.
+    ref_ledger.cancelIdleOwnCreatingRows(
+        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.pause(ms); }, stop_requested);
+}
+
 void Pool::beginTeardown() noexcept
 {
     {
@@ -1966,9 +1974,9 @@ PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
 
 /// The manifest read path (readManifest / readManifestShared / locate) + its decode cache live in
 /// the `manifest_reader` component (Pool/CasManifestReader.h); these are thin delegates.
-std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id)
+std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id, OnMemoryLimit on_memory_limit)
 {
-    return manifest_reader.readManifestShared(id);
+    return manifest_reader.readManifestShared(id, on_memory_limit);
 }
 
 PartManifest Pool::readManifest(const ManifestId & id)

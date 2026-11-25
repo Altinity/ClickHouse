@@ -2,6 +2,7 @@
 
 #include "config.h"
 
+#include <Disks/tests/cas_scoped_test_directory.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
@@ -478,7 +479,7 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
         throw std::runtime_error("cannot create test object storage root " + root + ": " + ec.message());
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    return ownedByDirectory(std::make_shared<DB::LocalObjectStorage>(std::move(settings)), root);
 }
 
 /// Anchor a key under an object storage's own root, for the `Mode::Native` tests.
@@ -2414,6 +2415,169 @@ private:
     std::function<void()> on_head;
 };
 
+/// Runs a callback once, on the calling thread, before or after the first `GET` of a matching key is served, can
+/// hold one `GET` until the test releases it, and can wait until one `GET` has entered the hold or been served. Callbacks may write through the pool; each is dropped after it fires.
+class GetHookBackend : public HeadHookBackend
+{
+public:
+    void armBeforeGet(std::function<bool(const String &)> key_predicate, std::function<void()> callback)
+    {
+        std::lock_guard lock(get_hook_mutex);
+        get_hook_predicate = std::move(key_predicate);
+        get_hook_callback = std::move(callback);
+    }
+
+    /// Fires after the `GET` is served and before its answer returns, so the answer does not see what `callback`
+    /// writes. The predicate also gets whether the key was found.
+    void armAfterGet(std::function<bool(const String &, bool)> key_predicate, std::function<void()> callback)
+    {
+        std::lock_guard lock(get_hook_mutex);
+        after_get_predicate = std::move(key_predicate);
+        after_get_callback = std::move(callback);
+    }
+
+    /// Holds the first `GET` of a matching key, before it is journaled or served, until `releaseHeldGet`. A `GET`
+    /// issued from inside a callback is never held, and one that arrives after the release passes at once.
+    void holdGet(std::function<bool(const String &)> key_predicate)
+    {
+        std::lock_guard lock(get_hook_mutex);
+        hold_predicate = std::move(key_predicate);
+        hold_released = false;
+        held_thread.reset();
+    }
+
+    void releaseHeldGet()
+    {
+        std::lock_guard lock(get_hook_mutex);
+        hold_released = true;
+        hold_cv.notify_all();
+    }
+
+    /// True until a `GET` matches the predicate of `holdGet`.
+    bool holdArmed() const
+    {
+        std::lock_guard lock(get_hook_mutex);
+        return static_cast<bool>(hold_predicate);
+    }
+
+    /// The thread that issued the `GET` the hold caught, once one did; kept after the release.
+    std::optional<std::thread::id> heldGetThread() const
+    {
+        std::lock_guard lock(get_hook_mutex);
+        return held_thread;
+    }
+
+    /// Returns once a `GET` has entered the hold. The wait is bounded only to turn a hang into an error.
+    void waitForHeldGet()
+    {
+        std::unique_lock lock(get_hook_mutex);
+        if (!hold_cv.wait_for(lock, std::chrono::seconds(20), [this] { return held_thread.has_value(); }))
+            throw std::runtime_error("no GET entered the hold");
+    }
+
+    /// Watches for the first `GET` of a matching key not issued from inside a callback; `waitForWatchedGet` returns
+    /// once that `GET` has been served. The wait is bounded only to turn a hang into an error.
+    void watchGet(std::function<bool(const String &)> key_predicate)
+    {
+        std::lock_guard lock(get_hook_mutex);
+        watch_predicate = std::move(key_predicate);
+        watched_served = false;
+    }
+
+    void waitForWatchedGet()
+    {
+        std::unique_lock lock(get_hook_mutex);
+        if (!hold_cv.wait_for(lock, std::chrono::seconds(20), [this] { return watched_served; }))
+            throw std::runtime_error("the watched GET was never served");
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        std::function<void()> fire;
+        bool held = false;
+        bool watched = false;
+        {
+            std::lock_guard lock(get_hook_mutex);
+            if (get_hook_callback && get_hook_predicate(key))
+            {
+                fire = std::move(get_hook_callback);
+                get_hook_callback = nullptr;
+                get_hook_predicate = nullptr;
+            }
+            if (!insideCallback() && hold_predicate && hold_predicate(key))
+            {
+                hold_predicate = nullptr;
+                held = true;
+                held_thread = std::this_thread::get_id();
+                hold_cv.notify_all();
+            }
+            if (!insideCallback() && watch_predicate && watch_predicate(key))
+            {
+                watch_predicate = nullptr;
+                watched = true;
+            }
+        }
+        if (fire)
+            runCallback(fire);
+        if (held)
+        {
+            std::unique_lock lock(get_hook_mutex);
+            /// The bound only turns a hang into an error.
+            if (!hold_cv.wait_for(lock, std::chrono::seconds(20), [this] { return hold_released; }))
+                throw std::runtime_error("the held GET of " + key + " was never released");
+        }
+        std::optional<DB::Cas::Backend::Raw> got = HeadHookBackend::read(key, access);
+        std::function<void()> after;
+        {
+            std::lock_guard lock(get_hook_mutex);
+            if (watched)
+            {
+                watched_served = true;
+                hold_cv.notify_all();
+            }
+            if (after_get_callback && after_get_predicate(key, got.has_value()))
+            {
+                after = std::move(after_get_callback);
+                after_get_callback = nullptr;
+                after_get_predicate = nullptr;
+            }
+        }
+        if (after)
+            runCallback(after);
+        return got;
+    }
+
+private:
+    static bool & insideCallback()
+    {
+        static thread_local bool inside = false;
+        return inside;
+    }
+
+    static void runCallback(const std::function<void()> & callback)
+    {
+        struct Restore
+        {
+            bool outer;
+            ~Restore() { GetHookBackend::insideCallback() = outer; }
+        } restore{std::exchange(GetHookBackend::insideCallback(), true)};
+        callback();
+    }
+
+    mutable std::mutex get_hook_mutex;
+    std::function<bool(const String &)> get_hook_predicate;
+    std::function<void()> get_hook_callback;
+    std::function<bool(const String &, bool)> after_get_predicate;
+    std::function<void()> after_get_callback;
+    std::function<bool(const String &)> hold_predicate;
+    bool hold_released = false;
+    std::optional<std::thread::id> held_thread;
+    std::function<bool(const String &)> watch_predicate;
+    bool watched_served = false;
+    /// Signals the entry into the hold, the release of the held `GET` and the service of the watched one.
+    std::condition_variable hold_cv;
+};
+
 /// A `CountingBackend` that reports the given token dialect instead of `emulated`.
 class DialectOverrideBackend : public CountingBackend
 {
@@ -2471,6 +2635,7 @@ inline const char * roundInterleavePointName(RoundInterleavePoint point)
     switch (point)
     {
         case RoundInterleavePoint::AfterCatalogRead: return "AfterCatalogRead";
+        case RoundInterleavePoint::AfterDiscovery: return "AfterDiscovery";
         /// The name the generated test parameters and their gtest filters use.
         case RoundInterleavePoint::AfterNamespaceWalk: return "BetweenNamespaces";
         case RoundInterleavePoint::AfterIntake: return "AfterIntake";

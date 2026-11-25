@@ -48,6 +48,7 @@ namespace DB::ErrorCodes
     extern const int CAS_DELETE_MARKER;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int READONLY;
@@ -100,6 +101,13 @@ void logCasWriteRetryLater(const String & why)
 {
     logCasWriteRetryLater(why);
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
+}
+
+[[noreturn]] void throwCasRequestRetryLater(const String & why)
+{
+    LogSeriesLimiter log(getLogger("CasRequestRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
+    LOG_WARNING(log, "CAS request did not complete ({}); retrying later", why);
+    throw Exception(ErrorCodes::NETWORK_ERROR, "CAS request did not complete ({}); retrying later", why);
 }
 
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
@@ -235,6 +243,12 @@ WriteResult withoutBody(WriteResult result)
 
 }
 
+bool isMemoryLimitExceeded(const std::exception & e)
+{
+    const auto * db = dynamic_cast<const Exception *>(&e);
+    return db && db->code() == ErrorCodes::MEMORY_LIMIT_EXCEEDED;
+}
+
 bool isDeterministicLocalFailure(int code)
 {
     return code == ErrorCodes::LOGICAL_ERROR || code == ErrorCodes::NOT_IMPLEMENTED
@@ -350,9 +364,9 @@ CasOperation CasRequests::admit(Liveness liveness)
     return CasOperation(*this, fence.generation(), std::move(liveness));
 }
 
-CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness)
+CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness, std::function<void(uint64_t)> sleep_ms_)
 {
-    return CasOperation(*this, admitted_generation, std::move(liveness));
+    return CasOperation(*this, admitted_generation, std::move(liveness), std::move(sleep_ms_));
 }
 
 Dialect CasOperation::backendDialect() const
@@ -395,7 +409,7 @@ namespace
                                    std::string_view when)
 {
     if (admit == Fence::Admit::NoBudget)
-        throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
+        throwCasRequestRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
     throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
                                  fmt::format("mount fence tripped {}", when));
 }
@@ -589,11 +603,12 @@ void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subj
                                       const Retry::Bound & bound, uint32_t attempts_made)
 {
     last_read_stop = ReadStop::PolicyExhausted;
-    throwCasWriteRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
-                                        verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
+    throwCasRequestRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
+                                          verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
 }
 
-std::optional<Object> CasOperation::readUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
+std::optional<Object> CasOperation::readUnder(
+    const String & key, const Retry & policy, const Retry::Bound & bound, OnMemoryLimit on_memory_limit)
 {
     return readLoop("read", key, policy, bound, [&](auto & access) -> std::optional<Object>
     {
@@ -601,7 +616,7 @@ std::optional<Object> CasOperation::readUnder(const String & key, const Retry & 
         if (!raw)
             return std::nullopt;
         return Object{std::move(raw->bytes), owner.mint(key, std::move(raw->value))};
-    });
+    }, on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
@@ -653,9 +668,9 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
     throw Exception(ErrorCodes::CAS_DELETE_MARKER, "CAS removal created a delete marker for '{}'", key);
 }
 
-std::optional<Object> CasOperation::read(const String & key, const Retry & policy)
+std::optional<Object> CasOperation::read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit)
 {
-    return readUnder(key, policy, owner.bindPolicy(policy));
+    return readUnder(key, policy, owner.bindPolicy(policy), on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)
@@ -824,7 +839,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         /// verb has to honour `once` itself, and its contract is that it never hands a `Mismatch` back.
         /// The message says what actually stopped it, which is the policy and not the deadline.
         if (policy.single_attempt)
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "removeCurrent of '{}': the observed incarnation was replaced and the policy allows no reissue", key));
 
         /// Another incarnation became current between the observation and the delete. Re-observe, paced
@@ -840,7 +855,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         if (!fits(needed, bound))
             giveUpReadDeadline("removeCurrent", key, bound, attempt);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
@@ -909,7 +924,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             return result;
         last_probe = std::move(result);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
@@ -1057,7 +1072,7 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     /// `Retry::backoff`'s full jitter includes zero -- so their call to `sleep_ms(0)` is kept
     /// unconditional here to leave their observable behaviour exactly as it was before this collapse.
     if (should_sleep)
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     return std::nullopt;
 }
 

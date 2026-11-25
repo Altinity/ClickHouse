@@ -30,6 +30,7 @@ TEST(CASFormatBattery, GcState)
         [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
         currentFormatHeader("cas_gc_state") +
         "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"9\",\"snap_pruned_through\":\"7\",\"snap_attempt\":\"3\",\"manifest_sweep_cursor\":\"\","
+        "\"orphan_manifest_sweep_completed_at_ms\":\"0\","
         "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n"});
 }
 
@@ -86,6 +87,74 @@ TEST(CASGCStateFormat, DefaultsRoundTrip)
     EXPECT_EQ(d.snap_attempt, 0u);
     EXPECT_TRUE(d.manifest_sweep_cursor.empty());
     EXPECT_EQ(d.lease.owner, UInt128{});
+}
+
+namespace
+{
+
+String sweepScheduleWire(const String & cursor, const String & fields)
+{
+    return currentFormatHeader("cas_gc_state")
+        + "{\"round\":\"7\",\"gc_shards\":2,\"snap_generation\":\"42\",\"snap_pruned_through\":\"38\","
+          "\"snap_attempt\":\"7\",\"manifest_sweep_cursor\":\"" + cursor + "\"," + fields
+        + "\"lease_owner\":\"00000000000000000000000000000005\",\"lease_seq\":\"12\"}\n";
+}
+
+}
+
+TEST(CASGCStateFormat, SweepScheduleRoundTrip)
+{
+    for (const String & cursor : {String{}, String{"cursor"}})
+    {
+        for (const String & completion : {String{"0"}, String{"500"}, String{"18446744073709551615"}})
+        {
+            const String wire = sweepScheduleWire(cursor, "\"orphan_manifest_sweep_completed_at_ms\":\"" + completion + "\",");
+            EXPECT_EQ(encodeGcState(decodeGcState(wire)), wire);
+        }
+    }
+}
+
+TEST(CASGCStateFormat, LegacyCursorResumesSweep)
+{
+    const String fields = "\"orphan_manifest_sweep_completed_at_ms\":\"0\",";
+    EXPECT_EQ(encodeGcState(decodeGcState(sweepScheduleWire("cursor", ""))), sweepScheduleWire("cursor", fields));
+}
+
+TEST(CASGCStateFormat, LegacyEmptyCursorAllowsFirstRun)
+{
+    const String fields = "\"orphan_manifest_sweep_completed_at_ms\":\"0\",";
+    EXPECT_EQ(encodeGcState(decodeGcState(sweepScheduleWire("", ""))), sweepScheduleWire("", fields));
+}
+
+TEST(CASGCStateFormat, CompletionOnlyStateRoundTrip)
+{
+    const String wire = sweepScheduleWire("cursor", "\"orphan_manifest_sweep_completed_at_ms\":\"500\",");
+    const auto state = decodeGcState(wire);
+    EXPECT_EQ(state.manifest_sweep_cursor, "cursor");
+    EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, 500);
+    EXPECT_EQ(encodeGcState(state), wire);
+}
+
+TEST(CASGCStateFormat, RejectsWrongScheduleTypes)
+{
+    for (const String & value : {String{"500"}, String{"true"}, String{"null"}, String{"\"not-a-number\""},
+             String{"\"18446744073709551616\""}})
+        EXPECT_THROW(decodeGcState(sweepScheduleWire("", "\"orphan_manifest_sweep_completed_at_ms\":" + value + ",")), DB::Exception);
+}
+
+TEST(CASGCStateFormat, PreservesBothCursorsWhenUpgradingGeneration4State)
+{
+    const String old_wire = "{\"type\":\"cas_gc_state\",\"v\":4}\n"
+        "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"3\",\"snap_pruned_through\":\"0\",\"snap_attempt\":\"3\","
+        "\"manifest_sweep_cursor\":\"manifest-key\",\"intent_sweep_cursor\":\"intent-key\","
+        "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n";
+    const GcState state = decodeGcState(old_wire);
+    EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, 0);
+    const GcState rewritten = decodeGcState(encodeGcState(state));
+    EXPECT_EQ(rewritten.header_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(rewritten.manifest_sweep_cursor, "manifest-key");
+    EXPECT_EQ(rewritten.intent_sweep_cursor, "intent-key");
+    EXPECT_EQ(rewritten.orphan_manifest_sweep_completed_at_ms, 0);
 }
 
 TEST(CASGCStateFormat, RejectsZeroGcShards)
@@ -270,13 +339,14 @@ TEST(CASFormatBattery, GcStateHeader4)
     s.round = 4;
     s.header_generation = G_BLOB_INTENTS;
     s.intent_sweep_cursor = "k";
+    s.orphan_manifest_sweep_completed_at_ms = 500;
     s.lease = GcLease{UInt128(1), 12};
     runFormatBattery({FormatId::GcState,
         [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
         [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
         "{\"type\":\"cas_gc_state\",\"v\":4}\n"
         "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"0\",\"snap_pruned_through\":\"0\",\"snap_attempt\":\"0\","
-        "\"manifest_sweep_cursor\":\"\",\"intent_sweep_cursor\":\"k\","
+        "\"manifest_sweep_cursor\":\"\",\"orphan_manifest_sweep_completed_at_ms\":\"500\",\"intent_sweep_cursor\":\"k\","
         "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n",
         [](std::string_view text)
         {

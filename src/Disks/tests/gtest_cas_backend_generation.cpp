@@ -94,7 +94,7 @@ std::shared_ptr<RecordingObjectStorage> makeRecordingObjectStorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<RecordingObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<RecordingObjectStorage>(std::move(settings)), root);
 }
 
 /// A `LocalObjectStorage` whose native-token HEAD answers the file's mtime in nanoseconds, a valid
@@ -124,7 +124,7 @@ std::shared_ptr<GenerationTokenObjectStorage> makeGenerationTokenObjectStorageFo
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<GenerationTokenObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<GenerationTokenObjectStorage>(std::move(settings)), root);
 }
 
 /// A `LocalObjectStorage` that answers the bucket-versioning probe with a value the test chooses, so
@@ -162,7 +162,7 @@ std::shared_ptr<VersioningObjectStorage> makeVersioningObjectStorageForTest(std:
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<VersioningObjectStorage>(std::move(settings), versioned);
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<VersioningObjectStorage>(std::move(settings), versioned), root);
 }
 
 /// Captures what `ObjectStorageBackend` logs at WARNING and above, so a test can assert both that a

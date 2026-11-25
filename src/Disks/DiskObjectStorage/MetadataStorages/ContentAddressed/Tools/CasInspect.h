@@ -19,8 +19,8 @@ class CasOperation;
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
 /// `cas/ns/stream/` and `cas/ns/state/` roots, `/mount` and `/fold_seal` suffixes, the
-/// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`
-/// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
+/// `gc/gen/*/attempt/*/blob_target/*/*` source-edge run segments, then the pool-wide `gc/state`,
+/// the `blob-intents/` keys and the `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
 /// `u128ToHex`), while a recorded incarnation's backend-native value renders as an escaped string
 /// beside its dialect word. Neither is exposed as an array of bytes or a raw struct dump.
 ///

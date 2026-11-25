@@ -308,6 +308,13 @@ bool ReadBufferFromS3::nextImpl()
 
         impl->releaseResult();
     }
+    else if (!read_until_position && !cut_request_end && impl->isFixedLengthBodyComplete())
+    {
+        /// The whole body is in the buffer: return the session now, not on the next call, which a reader
+        /// that knows its size may never make.
+        release_reason = "body complete";
+        impl->releaseResult();
+    }
 
     stop_reason = "";
     return true;

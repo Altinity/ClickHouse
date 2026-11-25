@@ -80,8 +80,9 @@ struct PoolConfig
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
     /// How many superseded snapshot generations to retain. After committing
-    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
-    /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
+    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL (only for direct callers: the disk setting refuses 0).
+    /// 1 acts as 2: the adopted generation's seal must survive a round that loses
+    /// (the disk setting loads 1 as 2). Default 3 = the safety
     /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
     /// has lost its lease; its round-commit CAS fails).
     uint64_t gc_snapshot_generations_to_keep = 3;
@@ -95,6 +96,7 @@ struct PoolConfig
     /// 999 fits one `LIST` response: a page also needs the next key to know the listing continues.
     uint64_t intent_sweep_list_budget_keys = 999;
     uint64_t manifest_sweep_delete_budget_keys = 100;
+    uint64_t orphan_manifest_sweep_interval_sec = 3600;
     /// Keys per batch delete request for the write-once families; tests lower it to exercise chunk boundaries.
     uint64_t gc_bulk_delete_chunk_keys = 1000;
     /// Per-round blob-deletion work envelope. Excess rows are carried unchanged in `still_retired` and retried next
@@ -466,6 +468,9 @@ public:
     /// holding such a lock is refused at its next request instead of being waited out.
     void beginTeardown() noexcept;
     bool teardownBegun() const noexcept;
+    /// The GC scheduler's per-tick cleanup of this mount's own idle `Creating` catalog rows; stops at teardown
+    /// or once `stop_requested` returns true.
+    void cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requested = {});
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;
     uint64_t detachedWorkInFlightForTest() const { return detachedWorkInFlight(); }
@@ -661,7 +666,8 @@ public:
     /// Identical to `readManifest` (same fail-closed validation, same decode cache) but returns the
     /// SHARED immutable decode the manifest cache holds — no per-call copy. The wiring read path
     /// uses this variant.
-    std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
+    std::shared_ptr<const PartManifest> readManifestShared(
+        const ManifestId & id, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Pure existence probe: whether any committed ref name starts with `prefix`, without
