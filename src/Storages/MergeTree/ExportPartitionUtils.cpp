@@ -284,7 +284,7 @@ namespace ExportPartitionUtils
         context_copy->setSetting(
             "export_merge_tree_part_ignore_extra_source_columns",
             manifest.ignore_extra_source_columns.value_or(false));
-        context_copy->setSetting("export_merge_tree_part_check_destination_schema_unchanged", manifest.check_destination_schema_unchanged.value_or(true));
+        context_copy->setSetting("export_merge_tree_part_check_destination_schema_staleness_ms", manifest.check_destination_schema_staleness_ms.value_or(0));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));

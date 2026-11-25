@@ -91,8 +91,8 @@ struct MergeTreePartitionExportTask
     std::optional<UInt64> parquet_row_group_size_bytes;
     std::optional<MergeTreePartExportSchemaMatchMode> schema_match_mode;
     std::optional<bool> ignore_extra_source_columns;
-    /// Optional because of backwards compatibility. An absent value means the check is on.
-    std::optional<bool> check_destination_schema_unchanged;
+    /// Optional because of backwards compatibility. An absent value means 0, a fresh fetch for every part.
+    std::optional<UInt64> check_destination_schema_staleness_ms;
     std::optional<String> iceberg_partition_timezone;
     std::optional<UInt64> min_bytes_to_use_direct_io;
 
@@ -206,8 +206,8 @@ struct MergeTreePartitionExportTask
             json.set("schema_match_mode", String(magic_enum::enum_name(*schema_match_mode)));
         if (ignore_extra_source_columns)
             json.set("ignore_extra_source_columns", *ignore_extra_source_columns);
-        if (check_destination_schema_unchanged)
-            json.set("check_destination_schema_unchanged", *check_destination_schema_unchanged);
+        if (check_destination_schema_staleness_ms)
+            json.set("check_destination_schema_staleness_ms", *check_destination_schema_staleness_ms);
         if (min_bytes_to_use_direct_io)
             json.set("min_bytes_to_use_direct_io", *min_bytes_to_use_direct_io);
 
@@ -310,8 +310,8 @@ struct MergeTreePartitionExportTask
         }
         if (json->has("ignore_extra_source_columns"))
             task.ignore_extra_source_columns = json->getValue<bool>("ignore_extra_source_columns");
-        if (json->has("check_destination_schema_unchanged"))
-            task.check_destination_schema_unchanged = json->getValue<bool>("check_destination_schema_unchanged");
+        if (json->has("check_destination_schema_staleness_ms"))
+            task.check_destination_schema_staleness_ms = json->getValue<UInt64>("check_destination_schema_staleness_ms");
         if (json->has("min_bytes_to_use_direct_io"))
             task.min_bytes_to_use_direct_io = json->getValue<UInt64>("min_bytes_to_use_direct_io");
 

@@ -147,13 +147,13 @@ In case a table function is used as the destination, the schema can be omitted a
   Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion is applied after columns are matched.
 
 
-### `export_merge_tree_part_check_destination_schema_unchanged` (Optional)
+### `export_merge_tree_part_check_destination_schema_staleness_ms` (Optional)
 
-- **Type**: `Bool`
-- **Default**: `true`
-- **Description**: Controls whether each part export task, before it reads or writes anything, checks that the schema and the partition spec of an Apache Iceberg destination are still the ones the export was scheduled against.
-  - `true` (default) - the task reads the latest metadata of the destination and fails with `METADATA_MISMATCH` if the schema or the partition spec changed. This costs one forced metadata listing and read per part.
-  - `false` - the check is skipped. A change of the destination schema or partition spec is then noticed only by the commit, after the data files were written, which are left behind.
+- **Type**: `UInt64` (milliseconds)
+- **Default**: `5000`
+- **Description**: How stale the latest metadata version of an Apache Iceberg destination may be when each part export task checks, before it reads or writes anything, that the destination's schema and partition spec are still the ones the export was scheduled against. If they changed, the task fails with `METADATA_MISMATCH`.
+  - `0` - the latest version is fetched from the object storage for every part.
+  - a larger value - fewer requests, because the latest version is looked up through the Iceberg metadata files cache, shared by all part tasks of the table on a node, so a node lists the table at most once per window however many parts it exports. A change of the destination schema or partition spec can go unnoticed by this check for up to that long. The commit then notices it, after the data files were written, and the files are left behind.
 
   The destination column types of an export always come from the table metadata saved when the export was scheduled, whatever this setting is.
 

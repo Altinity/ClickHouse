@@ -166,6 +166,7 @@ extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+extern const SettingsUInt64 export_merge_tree_part_check_destination_schema_staleness_ms;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
 extern const SettingsBool allow_experimental_iceberg_add_files;
@@ -2908,41 +2909,60 @@ void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceber
 {
     const auto pinned = getExportDestinationInfo(iceberg_metadata_json_string, context);
 
-    /// The latest metadata is always read, like the commit does, not the one a query may have cached.
+    /// The latest metadata version is looked up through the metadata files cache, which every part task of the table on
+    /// this node shares. A version younger than the staleness window is reused, so a node lists the table at most once
+    /// per window however many parts it exports. A window of 0 reads the latest version for every part.
+    auto window_context = Context::createCopy(context);
+    window_context->setSetting("iceberg_metadata_staleness_ms", context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_staleness_ms].value);
     const auto latest_metadata_file = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
         persistent_components.table_path,
         data_lake_settings,
         persistent_components.metadata_cache,
-        context,
+        window_context,
         log.get(),
         persistent_components.table_uuid,
         persistent_components.metadata_compression_method,
-        /* force_fetch_latest_metadata= */ true);
-    const auto latest_metadata = getMetadataJSONObject(
-        latest_metadata_file.path,
-        object_storage,
-        persistent_components.metadata_cache,
-        context,
-        log,
-        latest_metadata_file.compression_method,
-        persistent_components.table_uuid);
+        /* force_fetch_latest_metadata= */ false);
 
-    const auto pinned_schema_id = pinned->schema_id;
-    const auto latest_schema_id = latest_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
-    if (latest_schema_id != pinned_schema_id)
+    /// A metadata file never changes, so its ids are read and parsed once, for as long as it is the latest one.
+    LatestExportDestinationIds latest;
+    {
+        std::lock_guard lock(export_destination_cache_mutex);
+        if (export_latest_ids && export_latest_ids->metadata_path == latest_metadata_file.path)
+            latest = *export_latest_ids;
+    }
+
+    if (latest.metadata_path.empty())
+    {
+        const auto latest_metadata = getMetadataJSONObject(
+            latest_metadata_file.path,
+            object_storage,
+            persistent_components.metadata_cache,
+            context,
+            log,
+            latest_metadata_file.compression_method,
+            persistent_components.table_uuid);
+
+        latest.metadata_path = latest_metadata_file.path;
+        latest.schema_id = latest_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+        latest.spec_id = latest_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        std::lock_guard lock(export_destination_cache_mutex);
+        export_latest_ids = latest;
+    }
+
+    if (latest.schema_id != pinned->schema_id)
         throw Exception(ErrorCodes::METADATA_MISMATCH,
             "Table schema changed after the export was scheduled (expected schema {}, got {}). "
             "Restart the export operation.",
-            pinned_schema_id, latest_schema_id);
+            pinned->schema_id, latest.schema_id);
 
-    const auto pinned_spec_id = pinned->spec_id;
-    const auto latest_spec_id = latest_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
-    if (latest_spec_id != pinned_spec_id)
+    if (latest.spec_id != pinned->spec_id)
         throw Exception(ErrorCodes::METADATA_MISMATCH,
             "Partition spec changed after the export was scheduled (expected spec {}, got {}). "
             "Restart the export operation.",
-            pinned_spec_id, latest_spec_id);
+            pinned->spec_id, latest.spec_id);
 }
 
 NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const

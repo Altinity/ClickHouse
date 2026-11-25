@@ -1363,7 +1363,7 @@ def test_export_part_fails_before_writing_when_destination_schema_changes_in_bac
             mt,
             part,
             iceberg,
-            "export_merge_tree_part_schema_match_mode = 'NAME'",
+            "export_merge_tree_part_schema_match_mode = 'NAME', export_merge_tree_part_check_destination_schema_staleness_ms = 0",
         )
         node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
 
@@ -1376,46 +1376,6 @@ def test_export_part_fails_before_writing_when_destination_schema_changes_in_bac
         exception = wait_for_failed_export_part(node, mt, part)
         assert "METADATA_MISMATCH" in exception and "schema changed after the export was scheduled" in exception, (
             f"Expected the background task to notice the destination schema change before writing, got: {exception}"
-        )
-        assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
-    finally:
-        node.query("SYSTEM DISABLE FAILPOINT export_part_pause_before_schema_validation")
-        node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
-        node.query(f"DROP TABLE IF EXISTS {iceberg}")
-
-
-def test_export_part_schema_change_in_background_task_is_caught_at_commit_when_early_check_is_off(cluster):
-    node = cluster.instances["node1"]
-    sfx = unique_suffix()
-    mt = f"mt_early_check_off_{sfx}"
-    iceberg = f"iceberg_early_check_off_{sfx}"
-
-    make_mt(node, mt, "id Int32, year Int32, payload String", "year")
-    make_iceberg_s3(node, iceberg, "id Int32, year Int32, payload String", "year")
-    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
-    part = get_part(node, mt, "2020")
-
-    try:
-        node.query("SYSTEM ENABLE FAILPOINT export_part_pause_before_schema_validation")
-        export_part(
-            node,
-            mt,
-            part,
-            iceberg,
-            "export_merge_tree_part_schema_match_mode = 'NAME', export_merge_tree_part_check_destination_schema_unchanged = 0",
-        )
-        node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
-
-        node.query(
-            f"ALTER TABLE {iceberg} DROP COLUMN payload",
-            settings={"allow_insert_into_iceberg": 1},
-        )
-        node.query("SYSTEM NOTIFY FAILPOINT export_part_pause_before_schema_validation")
-
-        # Without the early check the task writes its data files and only the commit notices the change.
-        exception = wait_for_failed_export_part(node, mt, part)
-        assert "METADATA_MISMATCH" in exception and "schema changed before export could commit" in exception, (
-            f"Expected the commit to reject the schema change, got: {exception}"
         )
         assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
     finally:

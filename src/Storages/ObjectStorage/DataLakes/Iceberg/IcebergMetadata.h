@@ -352,6 +352,16 @@ private:
     mutable std::mutex export_destination_cache_mutex;
     /// Keyed by the metadata text itself, so an entry can never be stale. Oldest entry is dropped first.
     mutable std::vector<std::pair<String, std::shared_ptr<const ExportDestinationInfo>>> export_destination_cache TSA_GUARDED_BY(export_destination_cache_mutex);
+
+    /// The ids of the latest metadata file `checkExportDestinationUnchanged` has read. A metadata file never changes, so
+    /// they are reused for as long as the latest file is that same one.
+    struct LatestExportDestinationIds
+    {
+        String metadata_path;
+        Int64 schema_id = 0;
+        Int64 spec_id = 0;
+    };
+    mutable std::optional<LatestExportDestinationIds> export_latest_ids TSA_GUARDED_BY(export_destination_cache_mutex);
     DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;

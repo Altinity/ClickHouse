@@ -247,7 +247,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
-    extern const SettingsBool export_merge_tree_part_check_destination_schema_unchanged;
+    extern const SettingsUInt64 export_merge_tree_part_check_destination_schema_staleness_ms;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
@@ -8884,7 +8884,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     manifest.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
-    manifest.check_destination_schema_unchanged = query_context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_unchanged].value;
+    manifest.check_destination_schema_staleness_ms = query_context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_staleness_ms].value;
     manifest.min_bytes_to_use_direct_io = query_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io];
 
     if (dest_storage->isDataLake())
