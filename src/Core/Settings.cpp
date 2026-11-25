@@ -9290,7 +9290,8 @@ or once `object_storage_cluster_local_read_probe_ms` elapses, and then keeps the
 It counts tasks after the filter known at planning time. A filter pushed later can only remove more tasks,
 so a query that is classified as local stays local.
 Does not apply to `object_storage_remote_initiator` or to writes.
-`DESCRIBE` and `EXPLAIN` do not run the check, because they read no data: they do not list objects, and the explained plan is the one of the cluster read.
+`DESCRIBE` and `EXPLAIN` (without `ANALYZE`) do not run the check, because they read no data: they do not list objects, and the explained plan is the one of the cluster read.
+`EXPLAIN ANALYZE` runs the check, like the query it executes.
 )", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_cluster_local_read_probe_ms, 50, R"(
 Time budget, in milliseconds, for deciding `object_storage_cluster_local_read_max_tasks`.

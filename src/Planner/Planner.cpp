@@ -2614,9 +2614,9 @@ void Planner::buildPlanForQueryNode()
     auto materialized_ctes = collectMaterializedCTEs(query_tree, select_query_options);
 
     /// The local-read probe of an object-storage cluster lists objects while planning to choose the plan shape.
-    /// `EXPLAIN` shows a plan and reads nothing, so it must not depend on the objects being there and listable.
-    /// It shows the plan of the cluster read.
-    if (select_query_options.is_explain && settings[Setting::object_storage_cluster_local_read_max_tasks] > 0)
+    /// `DESCRIBE` and `EXPLAIN` (without `ANALYZE`) read no data, so they must not depend on the objects being there
+    /// and listable. They show the plan of the cluster read.
+    if (select_query_options.plan_only && settings[Setting::object_storage_cluster_local_read_max_tasks] > 0)
     {
         auto & mutable_context = planner_context->getMutableQueryContext();
         mutable_context->setSetting("object_storage_cluster_local_read_max_tasks", Field(0));

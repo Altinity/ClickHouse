@@ -42,6 +42,9 @@ struct SelectQueryOptions
     bool with_all_cols = false; /// asterisk include materialized and aliased columns
     bool settings_limit_offset_done = false;
     bool is_explain = false; /// The value is true if it's explain statement.
+    /// The query is only described (`DESCRIBE`, or `EXPLAIN` without `ANALYZE`): its header or plan is built,
+    /// but no data is read. The planner must not list objects for the object storage cluster local-read probe.
+    bool plan_only = false;
     bool is_create_parameterized_view = false;
     /// Bypass setting constraints for some internal queries such as projection ASTs.
     bool ignore_setting_constraints = false;
@@ -196,6 +199,12 @@ struct SelectQueryOptions
     SelectQueryOptions & setExplain(bool value = true)
     {
         is_explain = value;
+        return *this;
+    }
+
+    SelectQueryOptions & planOnly(bool value = true)
+    {
+        plan_only = value;
         return *this;
     }
 

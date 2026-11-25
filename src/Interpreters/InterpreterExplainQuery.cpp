@@ -1131,6 +1131,9 @@ QueryPipeline InterpreterExplainQuery::executeImpl()
     ContextPtr query_context = getContext();
 
     options.setExplain();
+    /// `EXPLAIN ANALYZE` executes the query, so it plans the query as the real run does. The other kinds only show a plan.
+    if (ast.getKind() != ASTExplainQuery::Analyze)
+        options.planOnly();
     options.max_step_description_length = query_context->getSettingsRef()[Setting::query_plan_max_step_description_length];
 
     /// https://github.com/ClickHouse/ClickHouse/issues/88467

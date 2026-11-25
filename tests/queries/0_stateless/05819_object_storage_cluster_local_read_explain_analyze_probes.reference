@@ -1,0 +1,5 @@
+explain plan keeps the cluster read
+1
+explain analyze runs the probe and reads locally
+0
+explain analyze fails on a missing glob like the query
