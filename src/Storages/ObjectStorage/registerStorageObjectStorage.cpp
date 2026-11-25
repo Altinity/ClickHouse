@@ -80,6 +80,9 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         format_settings = getFormatSettings(context);
     }
 
+    const auto table_allow_aggregate_function_states = extractTableAllowAggregateFunctionStates(
+        *format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr);
+
     ASTPtr partition_by;
     if (args.storage_def->partition_by)
         partition_by = args.storage_def->partition_by->clone();
@@ -134,7 +137,8 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         args.query.if_not_exists,
         /* is_datalake_query */ false,
         /* is_table_function */ false,
-        /* lazy_init */ false);
+        /* lazy_init */ false,
+        table_allow_aggregate_function_states);
 }
 
 #endif
@@ -1256,6 +1260,55 @@ Writes use the inverse mapping: `DateTime64(9)` is stored as `timestamp_ns`, and
 | `list` | `Array` |
 | `map` | `Map` |
 | `struct` | `Tuple` |
+
+### Aggregate function states {#aggregate-function-states}
+
+Iceberg has no aggregate-state type. ClickHouse stores these types as plain Iceberg values and records the
+ClickHouse type in the table property `clickhouse.type.<field-id>.<schema-id>`:
+
+| ClickHouse type | Iceberg type | Stored as |
+|---|---|---|
+| `AggregateFunction(f, T...)` | `binary` | The serialized state, the bytes the `-State` combinator produces |
+| `SimpleAggregateFunction(f, T)` | the type `T` maps to | A plain value of type `T` |
+
+A property applies from schema `<schema-id>` until the next property of the same field; an empty value means no type.
+If another engine later changes the field's type, for example promotes `int` to `long` or makes the field optional,
+the type no longer applies to the new schemas, and the field reads as its Iceberg type. Other query engines ignore
+these properties.
+
+```sql
+CREATE TABLE agg (k UInt32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64))
+ENGINE = IcebergLocal('/path/to/table/')
+PARTITION BY k
+SETTINGS allow_aggregate_function_states_in_open_formats = 1;
+
+SELECT k, uniqMerge(u), sum(s) FROM agg GROUP BY k;
+```
+
+States are controlled by
+[`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats),
+disabled by default. The table metadata chooses the deserializer for the stored bytes, so enable the setting only for
+tables from trusted sources. When it is disabled, creating an `AggregateFunction` column and any query on a table
+that has one (`SELECT`, `INSERT`, `ALTER TABLE ... UPDATE`, `OPTIMIZE TABLE`, ...) throw `SUPPORT_IS_DISABLED`.
+`SimpleAggregateFunction` is not affected: its type is always recorded and restored on read, so the column reads as
+`SimpleAggregateFunction(f, T)`, not `T`. Fields without a `clickhouse.type` property read as their Iceberg type.
+
+If the table sets the setting in its `SETTINGS` clause, that value is stored with the table and applies to every
+query on it. Otherwise the query's value applies, as for table functions such as `icebergS3` and for tables of a
+`DataLakeCatalog` database. On a cluster (`object_storage_cluster`), a table sends its own value to the other nodes,
+so all of them must know the setting.
+
+`ALTER TABLE ... EXPORT PART` and `ALTER TABLE ... EXPORT PARTITION` move states from an `AggregatingMergeTree` table
+into such a table without finalizing them. `EXPORT PARTITION` records the query's value with the task, so every
+replica that executes it uses that value.
+
+```sql
+ALTER TABLE mt EXPORT PART 'all_1_1_0' TO TABLE agg;
+ALTER TABLE rmt EXPORT PARTITION ID '1' TO TABLE agg;
+```
+
+Data files also record the types in their Parquet metadata, see
+[aggregate function states in Parquet](/reference/formats/Parquet/Parquet#aggregate-function-states).
 
 ## Schema and write compatibility limitations {#schema-and-write-compatibility-limitations}
 

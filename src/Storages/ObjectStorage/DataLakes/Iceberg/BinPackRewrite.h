@@ -55,6 +55,7 @@ BinPackCommitResult executeBinPackCompaction(
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const String & write_format,
+    const std::optional<FormatSettings> & format_settings,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & storage_id);
 

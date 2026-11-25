@@ -116,24 +116,34 @@ DataTypePtr DataTypeFactory::tryGet(const String & full_name) const
     return getImpl<true>(full_name);
 }
 
+namespace
+{
+
+/// Data type parser can be invoked from coroutines with small stack.
+/// Value 315 is known to cause stack overflow in some test configurations (debug build, sanitizers)
+/// let's make the threshold significantly lower.
+/// It is impractical for user to have complex data types with this depth.
+#if defined(SANITIZER) || !defined(NDEBUG)
+constexpr size_t data_type_max_parse_depth = 150;
+#else
+constexpr size_t data_type_max_parse_depth = 300;
+#endif
+
+}
+
+ASTPtr DataTypeFactory::parse(const String & full_name)
+{
+    ParserDataType parser;
+    return parseQuery(parser, full_name.data(), full_name.data() + full_name.size(), "data type", false, data_type_max_parse_depth, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+}
+
 template <bool nullptr_on_error>
 DataTypePtr DataTypeFactory::getImpl(const String & full_name) const
 {
-    /// Data type parser can be invoked from coroutines with small stack.
-    /// Value 315 is known to cause stack overflow in some test configurations (debug build, sanitizers)
-    /// let's make the threshold significantly lower.
-    /// It is impractical for user to have complex data types with this depth.
-
-#if defined(SANITIZER) || !defined(NDEBUG)
-    static constexpr size_t data_type_max_parse_depth = 150;
-#else
-    static constexpr size_t data_type_max_parse_depth = 300;
-#endif
-
-    ParserDataType parser;
     ASTPtr ast;
     if constexpr (nullptr_on_error)
     {
+        ParserDataType parser;
         String out_err;
         const char * start = full_name.data();
         ast = tryParseQuery(parser, start, start + full_name.size(), out_err, false, "data type", false,
@@ -143,7 +153,7 @@ DataTypePtr DataTypeFactory::getImpl(const String & full_name) const
     }
     else
     {
-        ast = parseQuery(parser, full_name.data(), full_name.data() + full_name.size(), "data type", false, data_type_max_parse_depth, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        ast = parse(full_name);
     }
 
     return getImpl<nullptr_on_error>(ast);

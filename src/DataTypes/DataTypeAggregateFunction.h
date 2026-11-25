@@ -102,4 +102,16 @@ void pinCurrentStateVersionToAggregateFunctions(DataTypePtr & type);
 /// Checks type of any nested type is DataTypeAggregateFunction.
 bool hasAggregateFunctionType(const DataTypePtr & type);
 
+/// Checks type or any nested type is `AggregateFunction` or `SimpleAggregateFunction`.
+bool hasAggregateFunctionOrSimpleAggregateFunctionType(const DataTypePtr & type);
+
+/// The ClickHouse type name recorded for `type` in the metadata of a Parquet file or an Iceberg table,
+/// empty if the file or table schema represents the type itself.
+String getClickHouseTypeAnnotation(const DataTypePtr & type);
+
+/// Resolves a ClickHouse type name recorded in the metadata of a Parquet file or an Iceberg table.
+/// Returns nullptr, without resolving any aggregate function, if the name has an `AggregateFunction`
+/// and `allow_aggregate_function_states` is false. A state without an explicit version has version 0.
+DataTypePtr resolveClickHouseTypeAnnotation(const String & type_name, bool allow_aggregate_function_states);
+
 }

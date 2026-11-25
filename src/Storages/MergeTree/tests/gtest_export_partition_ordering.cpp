@@ -3,6 +3,7 @@
 #include <sstream>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 #include <Poco/JSON/Object.h>
@@ -16,6 +17,7 @@ namespace Setting
 {
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace ErrorCodes
@@ -48,6 +50,29 @@ namespace
         manifest.file_already_exists_policy = MergeTreePartExportManifest::FileAlreadyExistsPolicy::error;
         manifest.filename_pattern = "{part_name}";
         return manifest;
+    }
+
+    MergeTreePartitionExportTask makeValidPlainTask()
+    {
+        MergeTreePartitionExportTask task;
+        task.transaction_id = "tx1";
+        task.query_id = "query1";
+        task.partition_id = "2020";
+        task.source_database = "db1";
+        task.source_table = "source1";
+        task.destination_database = "db1";
+        task.destination_table = "table1";
+        task.create_time = 1000;
+        task.parts.push_back({"part1", false, {}});
+        task.task_timeout_seconds = 60;
+        task.max_threads = 1;
+        task.parallel_formatting = true;
+        task.parquet_parallel_encoding = true;
+        task.max_bytes_per_file = 1000000;
+        task.max_rows_per_file = 1000;
+        task.file_already_exists_policy = MergeTreePartExportManifest::FileAlreadyExistsPolicy::error;
+        task.filename_pattern = "{part_name}";
+        return task;
     }
 }
 
@@ -228,6 +253,45 @@ TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToW
             worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
             value) << "value=" << value;
     }
+}
+
+namespace
+{
+    template <typename Task>
+    void expectAggregateFunctionStatesGateAppliedToWorkerContext(Task task)
+    {
+        const auto & setting = Setting::allow_aggregate_function_states_in_open_formats;
+
+        /// A task written before the key existed leaves the worker its own setting.
+        task.allow_aggregate_function_states_in_open_formats = true;
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(task.toJsonString()).template extract<Poco::JSON::Object::Ptr>();
+        json->remove("allow_aggregate_function_states_in_open_formats");
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        Poco::JSON::Stringifier::stringify(json, oss);
+
+        auto parsed = Task::fromJsonString(oss.str());
+        EXPECT_FALSE(parsed.allow_aggregate_function_states_in_open_formats.has_value());
+        EXPECT_EQ(
+            ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, parsed)->getSettingsRef()[setting].value,
+            getContext().context->getSettingsRef()[setting].value);
+
+        for (const bool value : {false, true})
+        {
+            task.allow_aggregate_function_states_in_open_formats = value;
+            parsed = Task::fromJsonString(task.toJsonString());
+            EXPECT_EQ(
+                ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, parsed)->getSettingsRef()[setting].value,
+                value) << "value=" << value;
+        }
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, AggregateFunctionStatesGateAppliedToWorkerContext)
+{
+    expectAggregateFunctionStatesGateAppliedToWorkerContext(makeValidManifest());
+    expectAggregateFunctionStatesGateAppliedToWorkerContext(makeValidPlainTask());
 }
 
 TEST(ExportPartitionRetryClassification, MissingPartIsFatalOnlyOnPlainPath)

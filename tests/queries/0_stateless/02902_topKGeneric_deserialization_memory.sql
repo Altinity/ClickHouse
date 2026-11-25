@@ -6,4 +6,5 @@
 SELECT
     topKResampleState(1048576, 257, 65536, 10)(toString(number), number)
 FROM numbers(3)
-FORMAT Parquet; -- { clientError UNKNOWN_TYPE }
+SETTINGS allow_aggregate_function_states_in_open_formats = 0
+FORMAT Parquet; -- { clientError SUPPORT_IS_DISABLED }

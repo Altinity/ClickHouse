@@ -309,8 +309,9 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
                 f_schema);
         manifest_schema_id = embedded_schema_id;
 
+        /// The table metadata properties are not available here, so the header schema gets no ClickHouse type annotations.
         schema_processor.addIcebergTableSchema(
-            schema_object, context_, IcebergSchemaProcessor::SchemaSource::ManifestFile, tolerate_conflicting_manifest_schemas);
+            schema_object, context_, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, tolerate_conflicting_manifest_schemas);
     }
 
     /// Every entry of this manifest carries one partition value per spec field, including the

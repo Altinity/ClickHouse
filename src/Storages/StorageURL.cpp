@@ -193,12 +193,14 @@ IStorageURLBase::IStorageURLBase(
     const HTTPHeaderEntries & headers_,
     const String & http_method_,
     ASTPtr partition_by_,
-    bool distributed_processing_)
+    bool distributed_processing_,
+    std::optional<bool> table_allow_aggregate_function_states_)
     : IStorage(table_id_)
     , uri(uri_)
     , compression_method(chooseCompressionMethod(Poco::URI(uri_).getPath(), compression_method_))
     , format_name(format_name_)
     , format_settings(format_settings_)
+    , table_allow_aggregate_function_states(table_allow_aggregate_function_states_)
     , headers(headers_)
     , http_method(http_method_)
     , partition_by(partition_by_)
@@ -212,17 +214,24 @@ IStorageURLBase::IStorageURLBase(
     if (columns_.empty())
     {
         ColumnsDescription columns;
+        const auto inference_format_settings
+            = withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context_);
         if (format_name == "auto")
-            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_);
+            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, inference_format_settings, context_);
         else
-            columns = getTableStructureFromData(format_name, uri, compression_method, headers, format_settings, context_);
+            columns = getTableStructureFromData(format_name, uri, compression_method, headers, inference_format_settings, context_);
 
         storage_metadata.setColumns(columns);
     }
     else
     {
         if (format_name == "auto")
-            format_name = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_).second;
+            format_name = getTableStructureAndFormatFromData(
+                uri,
+                compression_method,
+                headers,
+                withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context_),
+                context_).second;
 
         /// We don't allow special columns in URL storage.
         if (!columns_.hasOnlyOrdinary())
@@ -1500,6 +1509,8 @@ void StorageURLWithFailover::read(
 
 SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, bool /*async_insert*/)
 {
+    const auto query_format_settings = withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context);
+
     if (http_method.empty())
         http_method = Poco::Net::HTTPRequest::HTTP_POST;
 
@@ -1524,7 +1535,7 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
             partition_strategy,
             uri,
             format_name,
-            format_settings,
+            query_format_settings,
             metadata_snapshot->getSampleBlock(),
             context,
             getHTTPTimeouts(context),
@@ -1538,7 +1549,7 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
     return std::make_shared<StorageURLSink>(
         uri,
         format_name,
-        format_settings,
+        query_format_settings,
         metadata_snapshot->getSampleBlock(),
         context,
         getHTTPTimeouts(context),
@@ -1589,7 +1600,8 @@ StorageURL::StorageURL(
     const HTTPHeaderEntries & headers_,
     const String & http_method_,
     ASTPtr partition_by_,
-    bool distributed_processing_)
+    bool distributed_processing_,
+    std::optional<bool> table_allow_aggregate_function_states_)
     : IStorageURLBase(
         uri_,
         context_,
@@ -1603,7 +1615,8 @@ StorageURL::StorageURL(
         headers_,
         http_method_,
         partition_by_,
-        distributed_processing_)
+        distributed_processing_,
+        table_allow_aggregate_function_states_)
 {
     context_->getRemoteHostFilter().checkURL(Poco::URI(uri));
     context_->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
@@ -2584,6 +2597,8 @@ void registerStorageURL(StorageFactory & factory)
 
             ASTs & engine_args = args.engine_args;
             auto format_settings = StorageURL::getFormatSettingsFromArgs(args);
+            const auto table_allow_aggregate_function_states = extractTableAllowAggregateFunctionStates(
+                format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr);
             auto context = args.getLocalContext();
 
             ASTPtr partition_by;
@@ -2610,7 +2625,8 @@ void registerStorageURL(StorageFactory & factory)
                     config.headers,
                     config.http_method,
                     partition_by,
-                    /* distributed_processing */ false);
+                    /* distributed_processing */ false,
+                    table_allow_aggregate_function_states);
             }
 
             if (args.mode <= LoadingStrictnessLevel::CREATE)
@@ -2665,7 +2681,10 @@ void registerStorageURL(StorageFactory & factory)
                 partition_by,
                 /* order_by */ nullptr,
                 /* is_table_function */ false,
-                /* lazy_init */ false);
+                /* lazy_init */ false,
+                /* updated_configuration */ false,
+                /* sample_path */ std::nullopt,
+                table_allow_aggregate_function_states);
         },
         {
             .supports_settings = true,

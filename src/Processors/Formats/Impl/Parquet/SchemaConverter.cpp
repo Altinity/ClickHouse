@@ -20,6 +20,9 @@
 #include <Formats/FormatFilterInfo.h>
 #include <Functions/DateTimeTransforms.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
+#include <Processors/Formats/Impl/Parquet/Write.h>
+#include <Processors/Formats/Impl/ClickHouseColumnTypesMetadata.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 
 #include <array>
 #include <fmt/ranges.h>
@@ -54,6 +57,19 @@ SchemaConverter::SchemaConverter(
             if (kv.key == "geo")
             {
                 geo_columns = parseGeoMetadataEncoding(&kv.value);
+                break;
+            }
+        }
+    }
+
+    /// An explicit structure takes precedence over type annotations in the footer.
+    if (!sample_block)
+    {
+        for (const auto & kv : file_metadata.key_value_metadata)
+        {
+            if (kv.key == clickhouse_column_types_key)
+            {
+                annotated_column_type_names = parseClickHouseColumnTypesMetadata(kv.value);
                 break;
             }
         }
@@ -128,6 +144,36 @@ void SchemaConverter::prepareForReading()
 
 }
 
+DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, const String & type_name, const DataTypePtr & derived_type) const
+{
+    DataTypePtr annotated_type;
+    try
+    {
+        annotated_type = resolveClickHouseTypeAnnotation(type_name, options.format.parquet.allow_aggregate_function_states);
+    }
+    catch (Exception & e)
+    {
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, which this "
+            "server cannot resolve: {}",
+            type_name, column_name, clickhouse_column_types_key, e.message());
+    }
+
+    /// With aggregate function states disabled, a recorded type that has one is ignored.
+    if (!annotated_type)
+        return derived_type;
+
+    if (!annotatedTypeMatchesDerived(annotated_type, derived_type))
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, but the "
+            "parquet schema for that column reads as {}",
+            annotated_type->getName(), column_name, clickhouse_column_types_key, derived_type->getName());
+
+    return annotated_type;
+}
+
 NamesAndTypesList SchemaConverter::inferSchema()
 {
     chassert(!sample_block);
@@ -142,7 +188,27 @@ NamesAndTypesList SchemaConverter::inferSchema()
         if (node.output_idx.has_value())
         {
             const OutputColumnInfo & col = output_columns.at(node.output_idx.value());
-            res.emplace_back(col.name, col.output_type);
+            auto it = annotated_column_type_names.find(col.name);
+            if (it == annotated_column_type_names.end())
+            {
+                res.emplace_back(col.name, col.output_type);
+                continue;
+            }
+
+            DataTypePtr annotated_type;
+            try
+            {
+                annotated_type = resolveAnnotatedType(col.name, it->second, col.output_type);
+            }
+            catch (Exception & e)
+            {
+                if (options.format.parquet.skip_columns_with_unsupported_types_in_schema_inference
+                    && (e.code() == ErrorCodes::INCORRECT_DATA || e.code() == ErrorCodes::NOT_IMPLEMENTED))
+                    continue;
+                throw;
+            }
+
+            res.emplace_back(col.name, annotated_type);
         }
     }
     return res;
@@ -445,11 +511,11 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
         }
     }
 
-    /// GeoParquet types like Point or Polygon can't be inside Nullable.
-    /// Geometry (Variant) is also not Nullable-compatible.
+    /// These types cannot be nested in `Nullable`.
     if (typeid_cast<const DataTypeArray *>(inferred_type.get())
         || typeid_cast<const DataTypeTuple *>(inferred_type.get())
-        || typeid_cast<const DataTypeVariant *>(inferred_type.get()))
+        || typeid_cast<const DataTypeVariant *>(inferred_type.get())
+        || typeid_cast<const DataTypeAggregateFunction *>(inferred_type.get()))
     {
         output_nullable = false;
         output_nullable_if_not_json = false;
@@ -1207,6 +1273,20 @@ void SchemaConverter::processPrimitiveColumn(
             out_decoder.fixed_size_converter = std::move(converter);
             return;
         }
+    }
+
+    if (typeid_cast<const DataTypeAggregateFunction *>(type_hint.get()))
+    {
+        if (type != parq::Type::BYTE_ARRAY)
+            throw Exception(
+                ErrorCodes::TYPE_MISMATCH,
+                "Column is requested as {} but its parquet physical type is {}, not BYTE_ARRAY",
+                type_hint->getName(), thriftToString(type));
+
+        out_inferred_type = type_hint;
+        out_decoder.allow_stats = false;
+        out_decoder.string_converter = std::make_shared<AggregateFunctionStateConverter>(type_hint->getDefaultSerialization());
+        return;
     }
 
     /// GeoParquet.

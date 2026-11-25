@@ -1,0 +1,9 @@
+AggregateFunction(1, quantileDeterministic(0.5), Float64, UInt64)	49.5
+same type without the version
+BAD_ARGUMENTS
+AggregateFunction(1, quantileDeterministic(0.5), Float64, UInt64)	49.5
+explicit version 0
+BAD_ARGUMENTS
+AggregateFunction(1, quantileDeterministic(0.5), Float64, UInt64)	49.5
+same version
+AggregateFunction(1, quantileDeterministic(0.5), Float64, UInt64)	49.5

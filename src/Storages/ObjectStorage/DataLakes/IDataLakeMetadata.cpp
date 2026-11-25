@@ -145,7 +145,9 @@ DataFileMetaInfo::DataFileMetaInfo(
 
         auto i_bounds = value_bounds_.find(column.first);
         auto i_type = type_by_index.find(column.first);
-        if (i_bounds != value_bounds_.end() && i_type != type_by_index.end())
+        /// Bounds use the Iceberg encoding of the field, which an annotated type does not necessarily share.
+        if (i_bounds != value_bounds_.end() && i_type != type_by_index.end()
+            && !schema_processor.hasClickHouseTypeAnnotation(file_schema_id, column.first))
         {
             const auto & type = i_type->second;
             if (const auto type_id = type->getTypeId();

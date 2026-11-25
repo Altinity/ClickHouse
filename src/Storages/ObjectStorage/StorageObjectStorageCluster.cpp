@@ -121,7 +121,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     bool if_not_exists,
     bool is_datalake_query,
     bool is_table_function,
-    bool lazy_init)
+    bool lazy_init,
+    std::optional<bool> table_allow_aggregate_function_states_)
     : IStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
@@ -192,7 +193,13 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     std::string sample_path;
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
+        resolveSchemaAndFormat(
+            columns,
+            object_storage,
+            configuration,
+            withAllowAggregateFunctionStatesForQuery(format_settings_, table_allow_aggregate_function_states_, context_),
+            sample_path,
+            context_);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -294,7 +301,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         /* is_table_function */is_table_function,
         /* lazy_init */lazy_init,
         updated_configuration,
-        sample_path);
+        sample_path,
+        table_allow_aggregate_function_states_);
 
     /// Virtual columns are a part of StorageInMemoryMetadata, so they are propagated together with it.
     pure_storage->setInMemoryMetadata(metadata);

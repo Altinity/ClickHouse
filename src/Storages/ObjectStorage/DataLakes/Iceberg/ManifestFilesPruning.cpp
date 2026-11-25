@@ -219,6 +219,10 @@ ManifestFilesPruner::ManifestFilesPruner(
             if (!name_and_type.has_value())
                 continue;
 
+            /// Bounds use the Iceberg encoding of the field, which an annotated type does not necessarily share.
+            if (schema_processor.hasClickHouseTypeAnnotation(initial_schema_id, used_column_id))
+                continue;
+
             min_max_column_types.emplace(used_column_id, name_and_type->type);
             name_and_type->name = DB::backQuote(DB::toString(used_column_id));
         }
@@ -303,6 +307,9 @@ PartitionKeyFromSpec buildPartitionKeyFromSpec(
         auto numeric_column_name = DB::backQuote(DB::toString(source_id));
         std::optional<DB::NameAndTypePair> column_characteristics = schema_processor.tryGetFieldCharacteristics(schema_id, source_id);
         if (!column_characteristics.has_value())
+            continue;
+        /// Partition values use the Iceberg encoding of the field, which an annotated type does not necessarily share.
+        if (schema_processor.hasClickHouseTypeAnnotation(schema_id, source_id))
             continue;
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression

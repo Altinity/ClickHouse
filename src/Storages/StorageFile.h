@@ -44,6 +44,8 @@ public:
         const ConstraintsDescription & constraints;
         const String & comment;
         const std::string rename_after_processing;
+        /// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
+        std::optional<bool> table_allow_aggregate_function_states;
     };
 
     struct ArchiveInfo
@@ -197,6 +199,8 @@ private:
     // For `file` table function, we use format settings from current user context,
     // in this case, format_settings is not set.
     std::optional<FormatSettings> format_settings;
+    /// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
+    std::optional<bool> table_allow_aggregate_function_states;
 
     int table_fd = -1;
     String compression_method;

@@ -22,7 +22,9 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
+#include <Parsers/ASTDataType.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/ASTLiteral.h>
 
@@ -534,17 +536,82 @@ combinator.
         });
 }
 
-bool hasAggregateFunctionType(const DataTypePtr & type)
+namespace
+{
+
+template <typename Predicate>
+bool hasTypeMatching(const DataTypePtr & type, Predicate && predicate)
 {
     auto result = false;
     auto check = [&](const IDataType & t)
     {
-        result |= WhichDataType(t).isAggregateFunction();
+        result |= predicate(t);
     };
 
     check(*type);
     type->forEachChild(check);
     return result;
+}
+
+}
+
+bool hasAggregateFunctionType(const DataTypePtr & type)
+{
+    return hasTypeMatching(type, [](const IDataType & t) { return WhichDataType(t).isAggregateFunction(); });
+}
+
+bool hasAggregateFunctionOrSimpleAggregateFunctionType(const DataTypePtr & type)
+{
+    return hasTypeMatching(
+        type,
+        [](const IDataType & t)
+        {
+            return WhichDataType(t).isAggregateFunction()
+                || typeid_cast<const DataTypeCustomSimpleAggregateFunction *>(t.getCustomName()) != nullptr;
+        });
+}
+
+String getClickHouseTypeAnnotation(const DataTypePtr & type)
+{
+    return hasAggregateFunctionOrSimpleAggregateFunctionType(type) ? type->getName() : String{};
+}
+
+namespace
+{
+
+/// Checks a parsed type name without resolving aggregate functions through `DataTypeFactory`.
+bool astHasAggregateFunctionType(const ASTPtr & ast)
+{
+    std::string_view name;
+    if (const auto * data_type = ast->as<ASTDataType>())
+        name = data_type->name;
+    else if (const auto * identifier = ast->as<ASTIdentifier>())
+        name = identifier->name();
+
+    if (name == "AggregateFunction")
+        return true;
+
+    for (const auto & child : ast->children)
+        if (astHasAggregateFunctionType(child))
+            return true;
+
+    return false;
+}
+
+}
+
+DataTypePtr resolveClickHouseTypeAnnotation(const String & type_name, bool allow_aggregate_function_states)
+{
+    const auto ast = DataTypeFactory::parse(type_name);
+
+    /// Checked before `DataTypeFactory` resolves the aggregate function named by the annotation.
+    if (!allow_aggregate_function_states && astHasAggregateFunctionType(ast))
+        return nullptr;
+
+    auto type = DataTypeFactory::instance().get(ast);
+    /// As in stored table metadata, a state without an explicit version has version 0.
+    setVersionToAggregateFunctions(type, /*if_empty=*/ true);
+    return type;
 }
 
 }

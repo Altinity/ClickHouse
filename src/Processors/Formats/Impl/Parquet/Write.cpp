@@ -28,6 +28,7 @@
 #include <DataTypes/DataTypeEnum.h>
 #include <Core/Block.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <Processors/Formats/Impl/ClickHouseColumnTypesMetadata.h>
 
 #if USE_SNAPPY
 #include <snappy.h>
@@ -1301,8 +1302,17 @@ void writeColumnImpl(
 }
 
 void writeColumnChunkBody(
-    ColumnChunkWriteState & s, const WriteOptions & options, const FormatSettings & format_settings, WriteBuffer & out)
+    ColumnChunkWriteState & s, const WriteOptions & file_options, const FormatSettings & format_settings, WriteBuffer & out)
 {
+    /// Without page statistics the column index is not written either.
+    WriteOptions options = file_options;
+    if (!s.write_statistics)
+    {
+        options.write_column_chunk_statistics = false;
+        options.write_page_statistics = false;
+        options.write_bloom_filter = false;
+    }
+
     s.column_chunk.meta_data.__set_num_values(s.max_def > 0 ? s.def.size() : s.primitive_column->size());
 
     /// We'll be updating these as we go.
@@ -1691,6 +1701,16 @@ void writeFileFooter(FileWriteState & file,
             meta.key_value_metadata.push_back(std::move(key_value));
             meta.__isset.key_value_metadata = true;
         }
+    }
+
+    if (auto column_types = serializeClickHouseColumnTypesMetadata(header.getNamesAndTypesList()); !column_types.empty())
+    {
+        parquet::format::KeyValue key_value;
+        key_value.__set_key(clickhouse_column_types_key);
+        key_value.__set_value(std::move(column_types));
+
+        meta.key_value_metadata.push_back(std::move(key_value));
+        meta.__isset.key_value_metadata = true;
     }
 
     size_t footer_size = serializeThriftStruct(meta, out);

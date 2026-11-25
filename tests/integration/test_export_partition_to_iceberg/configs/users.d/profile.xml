@@ -2,6 +2,8 @@
     <profiles>
         <default>
             <s3_retry_attempts>3</s3_retry_attempts>
+            <!-- Export workers start from this profile, so only the setting the export query recorded allows states. -->
+            <allow_aggregate_function_states_in_open_formats>0</allow_aggregate_function_states_in_open_formats>
         </default>
     </profiles>
 </clickhouse>

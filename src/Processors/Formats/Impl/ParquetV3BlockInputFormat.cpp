@@ -593,6 +593,37 @@ On write, top-level columns of type `Point`, `MultiPoint`, `LineString`, `Polygo
 
 Geometry columns must appear at the root of the schema or nested inside `Tuple` (`struct`); nesting them inside `Array` or `Map` is not supported. `Nullable` is not supported for geo columns either.
 
+## Aggregate function states {#aggregate-function-states}
+
+Parquet has no aggregate-state type. ClickHouse writes an [`AggregateFunction`](/reference/data-types/aggregatefunction) column as `BYTE_ARRAY` without a logical type, holding the serialized state (the bytes the `-State` combinator produces). A [`SimpleAggregateFunction(f, T)`](/reference/data-types/simpleaggregatefunction) column is written as a plain value of type `T`.
+
+To restore both types on read, ClickHouse records them in the file-level key-value metadata under `clickhouse.column_types`, as JSON `{"version": 1, "columns": {"<column>": "<type>"}}`. A recorded state type without an explicit version reads as version 0. Other query engines ignore the key.
+
+```sql
+SET allow_aggregate_function_states_in_open_formats = 1;
+
+INSERT INTO FUNCTION file('states.parquet')
+SELECT k, uniqState(v) AS u, sumSimpleState(v) AS s FROM source GROUP BY k;
+
+DESCRIBE file('states.parquet');
+-- k  UInt64
+-- u  AggregateFunction(uniq, UInt64)
+-- s  SimpleAggregateFunction(sum, UInt64)
+
+SELECT k, uniqMerge(u), sum(s) FROM file('states.parquet') GROUP BY k;
+```
+
+States are controlled by [`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats), disabled by default. The recorded type chooses the deserializer for the stored bytes, so enable the setting only for files from trusted sources. When it is disabled, writing a state throws `SUPPORT_IS_DISABLED`, and a state column reads as `String`. `SimpleAggregateFunction` is not affected: its type is always recorded on write and restored by schema inference, so a file written with it describes the column as `SimpleAggregateFunction(f, T)`, not `T`. Files without the `clickhouse.column_types` key read as before. A table, such as one with the `File`, `URL` or `S3` engine, can set it in its `SETTINGS` clause, and that value then applies to every query on the table.
+
+An explicit structure overrides the recorded types, whatever the setting:
+
+```sql
+SELECT uniqMerge(CAST(u AS AggregateFunction(uniq, UInt64)))
+FROM file('states.parquet', Parquet, 'u String');
+```
+
+Reading fails if a recorded type does not match the column's Parquet type. State columns are written without statistics, column index or bloom filter.
+
 ## Example usage {#example-usage}
 
 ### Inserting data {#inserting-data}
@@ -698,13 +729,15 @@ void registerParquetSchemaReader(FormatFactory & factory)
             return fmt::format(
                 "schema_inference_make_columns_nullable={};schema_inference_make_json_columns_nullable={};"
                 "enable_json_parsing={};max_parser_depth={};"
-                "local_time_as_utc={};allow_geoparquet_parser={};skip_columns_with_unsupported_types={}",
+                "local_time_as_utc={};allow_geoparquet_parser={};allow_aggregate_function_states={};"
+                "skip_columns_with_unsupported_types={}",
                 settings.schema_inference_make_columns_nullable,
                 settings.schema_inference_make_json_columns_nullable,
                 settings.parquet.enable_json_parsing,
                 settings.max_parser_depth,
                 settings.parquet.local_time_as_utc,
                 settings.parquet.allow_geoparquet_parser,
+                settings.parquet.allow_aggregate_function_states,
                 settings.parquet.skip_columns_with_unsupported_types_in_schema_inference);
         });
 }

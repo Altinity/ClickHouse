@@ -75,8 +75,15 @@ public:
     /// Returns false when neither the type nor the position changed (true no-op).
     /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
-    /// type (the timestamptz timezone and whether geo types are allowed).
-    bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first = false, const String & after_column = {});
+    /// type (the timestamptz timezone, whether geo types are allowed and, unless the table sets it
+    /// in `table_allow_aggregate_function_states`, whether aggregate function states are).
+    bool generateModifyColumnMetadata(
+        const String & column_name,
+        DataTypePtr type,
+        ContextPtr context,
+        bool first = false,
+        const String & after_column = {},
+        std::optional<bool> table_allow_aggregate_function_states = std::nullopt);
     void generateRenameColumnMetadata(const String & column_name, const String & new_column_name);
 
     /// A commit attempt can land in the catalog even when the client observes a failure
