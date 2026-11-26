@@ -66,10 +66,13 @@ void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIde
     std::lock_guard lock(epoch_mutex);
     if (epoch != read.epoch)
         return;
-    /// `Base::get` takes the cache mutex after `epoch_mutex`, the same order as `set` and `remove`.
-    if (auto existing = Base::get(key); existing && existing->fetch_seq > read.seq)
+    /// A later fetch of this key has already stored, even if its entry was evicted since. A slot shared with another key
+    /// can only cause a spurious skip.
+    UInt64 & last_seq = last_stored_seq[std::hash<String>()(key) % FETCH_SEQ_SLOTS];
+    if (last_seq > read.seq)
         return;
-    identity.fetch_seq = read.seq;
+    last_seq = read.seq;
+    /// `Base::set` takes the cache mutex after `epoch_mutex`, the same order as `remove` and `clear`.
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }
 

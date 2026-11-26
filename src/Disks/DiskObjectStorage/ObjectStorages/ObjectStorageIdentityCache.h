@@ -3,6 +3,8 @@
 #include <base/types.h>
 #include <Common/CacheBase.h>
 
+#include <array>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -26,9 +28,6 @@ struct ObjectStorageIdentity
     /// Seconds since epoch. Meaningful only when `is_last_modified_known`.
     Int64 last_modified = 0;
     bool is_last_modified_known = false;
-    /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
-    /// Not part of the object's identity.
-    UInt64 fetch_seq = 0;
     /// SipHash of the access key, secret, session token and extra request headers that authenticated the HEAD. Not a secret.
     /// A hit is only valid for the same principal: the STS mock used in tests returns one access key
     /// with a different secret per role session, so the access key alone does not separate them,
@@ -107,6 +106,8 @@ public:
     Read beginFetch();
 
     /// Store `identity` only when `read.epoch` is still current and no later fetch of `key` has stored.
+    /// "Has stored" is remembered after the entry is evicted, so cache pressure cannot let an older fetch
+    /// overwrite a newer observation.
     void setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read);
 
     /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.
@@ -123,6 +124,11 @@ private:
     UInt64 epoch = 0;
     /// Advanced by every `beginFetch`. Guarded by `epoch_mutex`.
     UInt64 next_fetch_seq = 0;
+    /// The highest sequence that stored an entry, per hash slot of the key. Unlike the entry itself, it survives
+    /// eviction. Two keys can share a slot, which only makes `setIfEpoch` skip a store that was safe to do:
+    /// the next read of that key requests the metadata again. Guarded by `epoch_mutex`.
+    static constexpr size_t FETCH_SEQ_SLOTS = 4096;
+    std::array<UInt64, FETCH_SEQ_SLOTS> last_stored_seq{};
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;
