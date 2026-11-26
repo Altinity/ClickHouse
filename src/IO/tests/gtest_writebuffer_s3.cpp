@@ -1101,6 +1101,79 @@ TEST_P(SyncAsync, ExceptionOnCompleteMPURunsUploadCallback) {
     EXPECT_EQ(callbacks, 1u);
 }
 
+/// With `max_inflight_parts_for_one_file` of 1, `TaskTracker::add` waits for the single-part upload and rethrows
+/// its failure from `preFinalize`, before `finalize` reaches its own handler. `PutObject` can commit the object
+/// and still report an error, so `preFinalize` must run the upload callback too, once, before it propagates.
+TEST_P(SyncAsync, ExceptionOnPutWithOneInflightPartRunsUploadCallback) {
+    setInjectionModel(std::make_shared<MockS3::PutObjectFailIngection>());
+
+    getSettings()[Setting::s3_max_inflight_parts_for_one_file] = 1;
+
+    size_t callbacks_in_finalize = 0;
+    EXPECT_THROW({
+        try {
+            auto buffer = getWriteBuffer("exception_on_put_one_inflight_finalize", {}, [&]() { ++callbacks_in_finalize; });
+            buffer->write('A');
+
+            getAsyncPolicy().setAutoExecute(true);
+            buffer->finalize();
+        }
+        catch(const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("PutObjectFailIngection"));
+            throw;
+        }
+      }, DB::S3Exception);
+    EXPECT_EQ(callbacks_in_finalize, 1u);
+
+    size_t callbacks_in_prefinalize = 0;
+    EXPECT_THROW({
+        try {
+            auto buffer = getWriteBuffer("exception_on_put_one_inflight_prefinalize", {}, [&]() { ++callbacks_in_prefinalize; });
+            buffer->write('A');
+
+            getAsyncPolicy().setAutoExecute(true);
+            buffer->preFinalize();
+        }
+        catch(const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("PutObjectFailIngection"));
+            throw;
+        }
+      }, DB::S3Exception);
+    EXPECT_EQ(callbacks_in_prefinalize, 1u);
+}
+
+/// A part-upload failure surfaced by `preFinalize` never sent the completing request: the visible object is
+/// unchanged and the cached identity must stay.
+TEST_P(SyncAsync, ExceptionOnUploadPartWithOneInflightPartSkipsUploadCallback) {
+    setInjectionModel(std::make_shared<MockS3::UploadPartFailIngection>());
+
+    getSettings()[Setting::s3_max_inflight_parts_for_one_file] = 1;
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0; // no single part
+    getSettings()[Setting::s3_min_upload_part_size] = 1; // small parts are ok
+
+    size_t callbacks = 0;
+    EXPECT_THROW({
+        try {
+            auto buffer = getWriteBuffer("exception_on_upload_part_one_inflight", {}, [&]() { ++callbacks; });
+            buffer->write('A');
+
+            getAsyncPolicy().setAutoExecute(true);
+            buffer->finalize();
+        }
+        catch(const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("UploadPartFailIngection"));
+            throw;
+        }
+      }, DB::S3Exception);
+    EXPECT_EQ(callbacks, 0u);
+}
+
 TEST_P(SyncAsync, ExceptionOnCompleteMPU) {
     setInjectionModel(std::make_shared<MockS3::CompleteMPUFailIngection>());
 

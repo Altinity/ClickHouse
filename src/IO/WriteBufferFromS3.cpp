@@ -189,14 +189,26 @@ void WriteBufferFromS3::preFinalize()
 
     if (do_single_part_upload)
     {
-        if (detached_part_data.empty())
+        try
         {
-            makeSinglepartUpload({});
+            if (detached_part_data.empty())
+            {
+                makeSinglepartUpload({});
+            }
+            else
+            {
+                makeSinglepartUpload(std::move(detached_part_data.front()));
+                detached_part_data.pop_front();
+            }
         }
-        else
+        catch (...)
         {
-            makeSinglepartUpload(std::move(detached_part_data.front()));
-            detached_part_data.pop_front();
+            /// With `max_inflight_parts_for_one_file` of 1, `TaskTracker::add` waits for the upload and
+            /// rethrows its failure here, outside the `try` of `finalizeImpl`. A `PutObject` whose response
+            /// was lost may have replaced the object, so drop the cached identity as `finalizeImpl` does.
+            if (object_creation_request_sent && on_upload_complete)
+                on_upload_complete();
+            throw;
         }
     }
     else
