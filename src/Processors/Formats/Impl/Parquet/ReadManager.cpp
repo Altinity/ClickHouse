@@ -628,10 +628,12 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
         if (row_group_idx != i)
             return false;
         const RowGroup & row_group = reader.row_groups[row_group_idx];
-        /// Must check stage first so that read_ptr is meaningful (we start advancing it in finishRowSubgroupStage).
+        /// Before column data, read_ptr is not advanced yet. This row group still has to run: a coalesced
+        /// prefetch is charged until every handle that pins it has finished, including handles of later
+        /// row groups. Blocking this row group would leave that charge stuck.
         /// Using acquire ordering to synchronize with the release (seq_cst) store in `finishRowGroupStage`.
         if (row_group.stage.load(std::memory_order_acquire) < ReadStage::ColumnData)
-            return false;
+            return true;
         return row_group.read_ptr.load() == row_group.delivery_ptr.load();
     };
 
@@ -649,10 +651,33 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
                 memory_usage, size_t(diff.by_stage[size_t(stage_idx)]),
                 batches_in_progress, tasks.size(), limits);
         bool is_privileged = is_privileged_task(row_group_idx);
-        LOG_TEST(getLogger("ParquetReadManager"), "scheduleTasksIfNeeded: stage={} rg={} can_schedule={} is_privileged={}",
-                  magic_enum::enum_name(stage_idx), row_group_idx, can_schedule, is_privileged);
+        /// A coalesced bloom read is charged once, on this stage, for as long as any row group still
+        /// pins the buffer. That charge can exceed the stage budget (it is 5% of the watermark, split
+        /// across files, while the read can be as large as `input_format_parquet_bloom_filter_coalesce_max_bytes`).
+        /// Row groups whose headers are already in that buffer add no memory. Scheduling only the
+        /// privileged row group would deliver the file one row group at a time until the charge drops.
+        bool charge_already_taken = false;
+        if (!can_schedule && !is_privileged && stage_idx == ReadStage::BloomFilterHeader)
+        {
+            const auto & queued = stage.row_group_tasks_to_schedule[row_group_idx];
+            charge_already_taken = !queued.empty();
+            const RowGroup & queued_group = reader.row_groups[row_group_idx];
+            for (const Task & queued_task : queued)
+            {
+                if (queued_task.column_idx == UINT64_MAX)
+                    continue;
+                const PrefetchHandle & handle = queued_group.columns.at(queued_task.column_idx).bloom_filter_header_prefetch;
+                if (handle && !reader.prefetcher.prefetchChargeIsCovered(handle))
+                {
+                    charge_already_taken = false;
+                    break;
+                }
+            }
+        }
+        LOG_TEST(getLogger("ParquetReadManager"), "scheduleTasksIfNeeded: stage={} rg={} can_schedule={} is_privileged={} charge_already_taken={}",
+                  magic_enum::enum_name(stage_idx), row_group_idx, can_schedule, is_privileged, charge_already_taken);
 
-        if (!can_schedule && !is_privileged)
+        if (!can_schedule && !is_privileged && !charge_already_taken)
             break;
 
         if (!stage.schedulable_row_groups.unset(row_group_idx, std::memory_order_acquire))
