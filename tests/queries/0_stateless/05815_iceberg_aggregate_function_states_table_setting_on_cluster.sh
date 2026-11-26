@@ -45,10 +45,10 @@ ${CLIENT} --query "
     SELECT k, uniqMerge(u) FROM ${PINNED} GROUP BY k ORDER BY k
     SETTINGS ${SETTING} = 0, object_storage_cluster = 'test_cluster_two_shards_localhost'"
 
-# `UInt64` is stored as Iceberg `long`, and the recorded `SimpleAggregateFunction(sum, UInt64)` applies only with the
+# `UInt32` is stored as Iceberg `long`, and the recorded `SimpleAggregateFunction(max, UInt32)` applies only with the
 # setting, so every node must read `s` as `Int64`, as the table does.
 ${CLIENT} --query "
-    CREATE TABLE ${SIMPLE} (k Int32, s SimpleAggregateFunction(sum, UInt64))
+    CREATE TABLE ${SIMPLE} (k Int32, s SimpleAggregateFunction(max, UInt32))
     ENGINE = IcebergLocal('${SIMPLE_PATH}')"
 ${CLIENT} --query "INSERT INTO ${SIMPLE} SELECT toInt32(number % 2), number FROM numbers(10)"
 
