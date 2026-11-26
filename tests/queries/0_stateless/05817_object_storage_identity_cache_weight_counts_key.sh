@@ -7,14 +7,14 @@
 # The identity cache is weighted by its memory use, and the key of an entry (endpoint, bucket and object path) is part
 # of that memory. With a long object path the key is most of an entry, so the weight has to count it. Otherwise the
 # cache holds several times more memory than `object_storage_identity_cache_size` and `ObjectStorageIdentityCacheBytes`
-# report. Here one entry with a 400-byte path must weigh at least its path length. The path stays well below the key length
-# limit of the S3 mock, which rejects longer keys.
+# report. Here one entry with a 100-byte path, under the test name prefix, must weigh at least 400 bytes. Without the key the
+# weight is about 250 bytes. The mock S3 server rejects longer keys, so the path stays short.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-LONG_NAME=$(printf 'p%.0s' $(seq 1 400))
+LONG_NAME=$(printf 'p%.0s' $(seq 1 100))
 URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}_${LONG_NAME}.tsv"
 READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0"
 
@@ -38,6 +38,6 @@ data=$(${CLICKHOUSE_CLIENT} -q "SELECT n FROM s3('${URL}', 'test', 'testtest', '
 
 bytes=$(${CLICKHOUSE_CLIENT} -q "SELECT value FROM system.metrics WHERE metric = 'ObjectStorageIdentityCacheBytes'") \
     || fail "metric query failed"
-[[ $bytes -ge ${#LONG_NAME} ]] || fail "ObjectStorageIdentityCacheBytes=${bytes} is less than the 400-byte object path"
+[[ $bytes -ge 400 ]] || fail "ObjectStorageIdentityCacheBytes=${bytes} is less than 400, the entry does not count its key"
 
 echo OK
