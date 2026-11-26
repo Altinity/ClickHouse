@@ -737,11 +737,11 @@ TEST(IcebergMetadataGenerator, ModifyColumnAppliedDistinguishesNullability)
 
 TEST(IcebergMetadataGenerator, ModifyColumnAppliedRecognisesTypesIcebergCannotDistinguish)
 {
-    /// The case this predicate exists for: a catalog applied Int32 -> UInt64 but reported
-    /// the commit as failed. Iceberg records Int64 and UInt64 alike as `long`, so a retry
+    /// The case this predicate exists for: a catalog applied Int32 -> UInt32 but reported
+    /// the commit as failed. Iceberg records Int64 and UInt32 alike as `long`, so a retry
     /// must recognise the change as already present instead of reporting a failure.
     auto metadata = makeMetadataWithField("x", "long", /* required */ true);
-    EXPECT_TRUE(MetadataGenerator(metadata).isModifyColumnApplied("x", std::make_shared<DataTypeUInt64>()));
+    EXPECT_TRUE(MetadataGenerator(metadata).isModifyColumnApplied("x", std::make_shared<DataTypeUInt32>()));
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnAppliedFalseForColumnNotInSchema)
@@ -752,16 +752,16 @@ TEST(IcebergMetadataGenerator, ModifyColumnAppliedFalseForColumnNotInSchema)
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishablePrimitiveType)
 {
-    /// Int32 and UInt32 are both Iceberg `int`, so the requested change is unrecordable.
+    /// Int32 and UInt16 are both Iceberg `int`, so the requested change is unrecordable.
     auto metadata = makeMetadataWithField("x", "int", /* required */ true);
-    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt32>());
+    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt16>());
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableComplexType)
 {
-    /// Same for a nested type: Tuple(a Int32) and Tuple(a UInt32) are one Iceberg struct.
+    /// Same for a nested type: Tuple(a Int32) and Tuple(a UInt16) are one Iceberg struct.
     auto metadata = makeMetadataWithField("t", makeStructType("a", "int", 2), /* required */ true, /* last_column_id */ 2);
-    auto requested = std::make_shared<DataTypeTuple>(DataTypes{std::make_shared<DataTypeUInt32>()}, Names{"a"});
+    auto requested = std::make_shared<DataTypeTuple>(DataTypes{std::make_shared<DataTypeUInt16>()}, Names{"a"});
     expectModifyRejected(metadata, "t", requested);
 }
 
@@ -1053,15 +1053,15 @@ TEST(IcebergMetadataGenerator, ModifyColumnAppliedSelfAfterIgnoresPosition)
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishablePrimitiveTypeWithFirst)
 {
-    /// Int32 and UInt32 are both Iceberg `int`; positioning must not make the change recordable.
+    /// Int32 and UInt16 are both Iceberg `int`; positioning must not make the change recordable.
     auto metadata = makeMetadataWithGap();
-    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt32>(), /* first */ true);
+    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt16>(), /* first */ true);
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishablePrimitiveTypeWithAfter)
 {
     auto metadata = makeMetadataWithGap();
-    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt32>(), /* first */ false, /* after_column */ "y");
+    expectModifyRejected(metadata, "x", std::make_shared<DataTypeUInt16>(), /* first */ false, /* after_column */ "y");
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnSameTypeWithFirstOnlyRepositions)
@@ -1144,22 +1144,22 @@ DataTypePtr makeTupleOf(const DataTypePtr & element_type)
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableComplexTypeWithFirst)
 {
-    /// Tuple(a Int32) and Tuple(a UInt32) are one Iceberg struct; positioning must not make the change recordable.
+    /// Tuple(a Int32) and Tuple(a UInt16) are one Iceberg struct; positioning must not make the change recordable.
     auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
-    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt32>()), /* first */ true);
+    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt16>()), /* first */ true);
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableComplexTypeWithAfter)
 {
     auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
-    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt32>()), /* first */ false, /* after_column */ "x");
+    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt16>()), /* first */ false, /* after_column */ "x");
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableArrayTypeWithFirst)
 {
     auto metadata = makeMetadataWithIntAndComplexField(makeListType("int", 3), /* last_column_id */ 3);
     expectModifyRejected(
-        metadata, "t", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt32>()), /* first */ true);
+        metadata, "t", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt16>()), /* first */ true);
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithFirstOnlyRepositions)

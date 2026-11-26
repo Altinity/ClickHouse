@@ -8959,11 +8959,6 @@ Has no effect on `EXPORT PARTITION <id>` (single-partition export).
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_part_allow_lossy_cast, false, R"(
-Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
-
-When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
-)", 0) \
     DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::POSITION, R"(
 Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns.
 Possible values:
@@ -8978,6 +8973,15 @@ Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` c
 - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `POSITION` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `NAME` mode, this allows source columns whose name has no destination counterpart.
 
 Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_check_destination_schema_staleness_ms, 5000, R"(
+How stale, in milliseconds, the destination's latest metadata version may be when each part export task of `EXPORT PART`/`EXPORT PARTITION` to an Apache Iceberg table checks, before reading or writing anything, that the destination's schema and partition spec are still the ones the export was scheduled against. If they changed, the task fails with `METADATA_MISMATCH`.
+
+The latest version is looked up through the Iceberg metadata files cache, shared by all part tasks of the table on a node, so a node lists the table at most once per window however many parts it exports.
+- `0` - the latest version is fetched from the object storage for every part.
+- a larger value - fewer requests, but a change of the destination schema or partition spec can go unnoticed by this check for up to that long. It is then noticed by the commit, after the data files were written, which are left behind.
+
+The destination column types of an export always come from the table metadata saved when the export was scheduled, whatever this setting is.
 )", 0) \
     \
     /* ####################################################### */ \
@@ -9535,6 +9539,7 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, distributed_cache_use_clients_cache_for_write, false) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
+    MAKE_OBSOLETE(M, Bool, export_merge_tree_part_allow_lossy_cast, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_query_deduplication, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_ai_functions, false) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \

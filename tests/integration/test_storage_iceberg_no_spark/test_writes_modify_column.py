@@ -91,7 +91,7 @@ def test_modify_column_noop_same_type(started_cluster_iceberg_no_spark, format_v
 @pytest.mark.parametrize("format_version", [1, 2])
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_modify_column_rejects_indistinguishable_type(started_cluster_iceberg_no_spark, format_version, storage_type):
-    """MODIFY COLUMN id UInt32 on an Iceberg 'int' column (Int32) must fail because
+    """MODIFY COLUMN id UInt16 on an Iceberg 'int' column (Int32) must fail because
     Iceberg represents both as 'int' and the change cannot be recorded."""
     instance = started_cluster_iceberg_no_spark.instances["node1"]
     TABLE_NAME = "test_modify_reject_" + storage_type + "_" + get_uuid_str()
@@ -108,7 +108,7 @@ def test_modify_column_rejects_indistinguishable_type(started_cluster_iceberg_no
     instance.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 'x');", settings=INSERT_SETTINGS)
 
     error = instance.query_and_get_error(
-        f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN id UInt32;",
+        f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN id UInt16;",
         settings=INSERT_SETTINGS,
     )
     assert "same iceberg type" in error.lower() or "cannot modify" in error.lower() or "bad_arguments" in error.lower()

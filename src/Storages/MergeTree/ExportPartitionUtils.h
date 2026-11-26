@@ -56,14 +56,22 @@ namespace ExportPartitionUtils
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest);
 
 #if USE_AVRO
-    std::string verifyAndExtractDestinationIcebergMetadataJson(
+    /// The current metadata of the destination Iceberg table, the one an export is validated against and that the
+    /// export manifest stores. Throws unless Iceberg writes are allowed.
+    std::string getDestinationIcebergMetadataJson(const StoragePtr & dest_storage, const ContextPtr & context);
+
+    /// Checks the destination Iceberg partition spec in `iceberg_metadata_json` against the source partition key.
+    void verifyDestinationIcebergPartitionCompatibility(
+        const std::string & iceberg_metadata_json,
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
-        const StoragePtr & dest_storage,
         const MergeTreeData::DataPartsVector & parts,
         const String & partition_id,
         const ContextPtr & context);
 #endif
+
+    /// `getDestinationIcebergMetadataJson` for a data lake destination, `std::nullopt` for any other storage.
+    std::optional<std::string> getDestinationIcebergMetadataJsonIfDataLake(const StoragePtr & dest_storage, const ContextPtr & context);
 
     /// Invokes `commitExportPartitionTransaction` on the destination storage. Does not mark the export
     /// task complete; the caller persists the returned commit info.
@@ -143,8 +151,8 @@ namespace ExportPartitionUtils
 
     /// Validates that source columns can be exported into the destination with the configured
     /// positional or name-based CAST matching (`export_merge_tree_part_schema_match_mode`) and
-    /// unmatched-column policy (`export_merge_tree_part_ignore_extra_source_columns`). Lossy casts are rejected unless
-    /// `export_merge_tree_part_allow_lossy_cast` is set. Throws BAD_ARGUMENTS on any violation.
+    /// unmatched-column policy (`export_merge_tree_part_ignore_extra_source_columns`). Values are cast the way
+    /// `INSERT ... SELECT` casts them. Throws BAD_ARGUMENTS on any violation.
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,

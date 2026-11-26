@@ -879,7 +879,7 @@ def test_export_part_mixed_flat_and_subcolumn_partition_key_flat_part_reordered_
     )
 
 
-def test_export_part_subcolumn_partition_key_owner_reordered_rejected_even_with_allow_lossy_cast(cluster):
+def test_export_part_subcolumn_partition_key_owner_reordered_rejected(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
@@ -909,14 +909,11 @@ def test_export_part_subcolumn_partition_key_owner_reordered_rejected_even_with_
     ).strip()
 
     error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_allow_lossy_cast = 1"
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
     )
     assert "BAD_ARGUMENTS" in error and "partition key column" in error, (
-        f"The partition-key position/name guard is checked before the "
-        f"`allow_lossy_cast` early-continue in verifyExportSchemaCastable, so setting "
-        f"`export_merge_tree_part_allow_lossy_cast = 1` must not suppress the rejection "
-        f"of `t`/`decoy` swapping positions around the partition key column `t.a`; "
+        f"The partition-key position/name guard must reject `t`/`decoy` swapping positions "
+        f"around the partition key column `t.a`; "
         f"got: {error!r}"
     )
 

@@ -156,6 +156,10 @@ public:
 
     bool supportsImport(ContextPtr) const override { return true; }
 
+    NamesAndTypesList getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const override;
+
+    void checkExportDestinationUnchanged(const std::string & iceberg_metadata_json_string, ContextPtr context) const override;
+
     SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> catalog,
         const std::function<void(const std::string &)> & new_file_path_callback,
@@ -331,6 +335,33 @@ private:
     mutable std::shared_ptr<ExternalStorageCache> external_storages;
     /// Set by `checkCanBeDropped` once the dropping user is allowed to delete the external files.
     mutable std::atomic<bool> external_files_drop_authorized = false;
+
+    /// What an export needs from the table metadata it was scheduled against: the schema id and the partition spec id
+    /// it pinned, and the columns that schema derives to. All of a task's parts carry the same metadata, so it is
+    /// parsed and derived once.
+    struct ExportDestinationInfo
+    {
+        Int64 schema_id = 0;
+        Int64 spec_id = 0;
+        NamesAndTypesList columns;
+    };
+
+    std::shared_ptr<const ExportDestinationInfo> getExportDestinationInfo(const std::string & iceberg_metadata_json_string, ContextPtr context) const;
+
+    static constexpr size_t export_destination_cache_capacity = 8;
+    mutable std::mutex export_destination_cache_mutex;
+    /// Keyed by the metadata text itself, so an entry can never be stale. Oldest entry is dropped first.
+    mutable std::vector<std::pair<String, std::shared_ptr<const ExportDestinationInfo>>> export_destination_cache TSA_GUARDED_BY(export_destination_cache_mutex);
+
+    /// The ids of the latest metadata file `checkExportDestinationUnchanged` has read. A metadata file never changes, so
+    /// they are reused for as long as the latest file is that same one.
+    struct LatestExportDestinationIds
+    {
+        String metadata_path;
+        Int64 schema_id = 0;
+        Int64 spec_id = 0;
+    };
+    mutable std::optional<LatestExportDestinationIds> export_latest_ids TSA_GUARDED_BY(export_destination_cache_mutex);
     DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;

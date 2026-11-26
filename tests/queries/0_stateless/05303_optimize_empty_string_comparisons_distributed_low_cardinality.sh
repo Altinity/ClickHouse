@@ -23,7 +23,7 @@ DROP TABLE IF EXISTS t_dist;
 DROP TABLE IF EXISTS t_dist_str;
 DROP TABLE IF EXISTS t;
 
-CREATE TABLE t (id UInt64, s String)
+CREATE TABLE t (id Int64, s String)
 ENGINE = IcebergLocal('${TABLE_PATH}');
 "
 
@@ -32,10 +32,10 @@ INSERT INTO t VALUES (1, 'abc'), (2, ''), (3, 'def'), (4, '');
 "
 
 ${CLICKHOUSE_CLIENT} --query "
-CREATE TABLE t_dist (id UInt64, s LowCardinality(String))
+CREATE TABLE t_dist (id Int64, s LowCardinality(String))
 ENGINE = Distributed('test_shard_localhost', currentDatabase(), t);
 
-CREATE TABLE t_dist_str (id UInt64, s String)
+CREATE TABLE t_dist_str (id Int64, s String)
 ENGINE = Distributed('test_shard_localhost', currentDatabase(), t);
 "
 
