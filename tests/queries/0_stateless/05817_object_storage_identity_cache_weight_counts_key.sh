@@ -5,10 +5,11 @@
 # Tag no-parallel-replicas: the cache is per server, and the read is spread across replicas otherwise
 
 # The identity cache is weighted by its memory use, and the key of an entry (endpoint, bucket and object path) is part
-# of that memory. With a long object path the key is most of an entry, so the weight has to count it. Otherwise the
-# cache holds several times more memory than `object_storage_identity_cache_size` and `ObjectStorageIdentityCacheBytes`
-# report. Here one entry with a 100-byte path, under the test name prefix, must weigh at least 400 bytes. Without the key the
-# weight is about 250 bytes. The mock S3 server rejects longer keys, so the path stays short.
+# of that memory, twice: the cache policy keeps one copy in its hashmap and another in its eviction queue. With a long
+# object path the key is most of an entry, so the weight has to count both copies. Otherwise the cache holds more memory
+# than `object_storage_identity_cache_size` and `ObjectStorageIdentityCacheBytes` report. Here one entry with a 100-byte
+# path, under the test name prefix, must weigh at least 600 bytes. Without the key the weight is about 240 bytes, with
+# one copy of the key about 450 and with both about 660. The mock S3 server rejects longer keys, so the path stays short.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -38,6 +39,6 @@ data=$(${CLICKHOUSE_CLIENT} -q "SELECT n FROM s3('${URL}', 'test', 'testtest', '
 
 bytes=$(${CLICKHOUSE_CLIENT} -q "SELECT value FROM system.metrics WHERE metric = 'ObjectStorageIdentityCacheBytes'") \
     || fail "metric query failed"
-[[ $bytes -ge 400 ]] || fail "ObjectStorageIdentityCacheBytes=${bytes} is less than 400, the entry does not count its key"
+[[ $bytes -ge 600 ]] || fail "ObjectStorageIdentityCacheBytes=${bytes} is less than 600, the entry does not count both copies of its key"
 
 echo OK

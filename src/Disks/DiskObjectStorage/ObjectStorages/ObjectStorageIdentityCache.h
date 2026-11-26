@@ -34,7 +34,8 @@ struct ObjectStorageIdentity
     /// and per-query `headers(...)` carry credentials that are not part of the AWS credentials at all.
     UInt64 credential_hash = 0;
 
-    /// Capacity of the composite key the entry is stored under. Set by `setIfEpoch`, so the weight counts it.
+    /// Memory held by the composite key the entry is stored under, in bytes. Set by `setIfEpoch`, so the weight counts it.
+    /// The cache policies keep every key twice, as the key of the hashmap and in the eviction queue list.
     /// Not part of the object's identity.
     size_t key_capacity = 0;
 
@@ -47,7 +48,7 @@ struct ObjectStorageIdentity
 /// Approximate per-entry weight (bytes) for size-bounded eviction.
 struct ObjectStorageIdentityWeight
 {
-    /// Extra bytes spent on the hashmap node, list links, shared_ptr, etc. The key bytes are counted in the value.
+    /// Extra bytes spent on the hashmap node, list links, shared_ptr, etc. Both copies of the key are counted in the value.
     static constexpr size_t OVERHEAD = 128;
 
     size_t operator()(const ObjectStorageIdentity & identity) const
