@@ -458,7 +458,7 @@ TEST(CASGCHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
     for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
     {
         SCOPED_TRACE(entry.first);
-        EXPECT_DEATH({ (void)encodeFoldSeal(entry.second); }, "");
+        CAS_EXPECT_DEATH({ (void)encodeFoldSeal(entry.second); }, "");
     }
 }
 #endif
@@ -1276,7 +1276,7 @@ TEST(CASGCHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
 }
 
 /// AN ORDINARY CRASH IS NOT A CORRUPT POOL. A round writes its runs during the reduce phase and its
-/// fold seal only at phase 10/18, so a crash in between leaves the newest generation existing WITHOUT
+/// fold seal only near the end of the round, so a crash in between leaves the newest generation existing WITHOUT
 /// a seal — the commonest shape there is. If discovery stopped at the listing's maximum it would find
 /// no seal there, conclude it could enumerate nothing, and refuse — telling the operator to recreate a
 /// pool whose holds are sitting readable one generation down.

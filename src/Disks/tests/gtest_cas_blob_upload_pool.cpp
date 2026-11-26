@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
 #include <Common/ThreadPool.h>
@@ -64,7 +65,7 @@ TEST(CASBlobUploadPoolDeathTest, GetterAbortsBeforeInit)
 {
     shutdownBlobUploadPool();
     ASSERT_FALSE(blobUploadPoolInitializedForTest());
-    EXPECT_DEATH({ (void)blobUploadPool(); }, "");
+    CAS_EXPECT_DEATH({ (void)blobUploadPool(); }, "");
 }
 #endif
 
@@ -109,7 +110,7 @@ TEST(CASBlobUploadPoolDeathTest, DoubleInitAborts)
 {
     shutdownBlobUploadPool();
     initializeBlobUploadPool(2);
-    EXPECT_DEATH({ (void)initializeBlobUploadPool(2); }, "");
+    CAS_EXPECT_DEATH({ (void)initializeBlobUploadPool(2); }, "");
     shutdownBlobUploadPool();
 }
 #endif

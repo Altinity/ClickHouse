@@ -1,0 +1,20 @@
+allow
+1	1	a
+2	2	b
+global
+1	1	a
+2	2	b
+distributed join, join mode allow
+1	1	a
+2	2	b
+distributed join, join mode global
+1	1	a
+2	2	b
+distributed join, join mode global, old analyzer
+1	1	a
+2	2	b
+05484_allow	0
+05484_distributed_allow	0
+05484_distributed_global	1
+05484_distributed_global_old_analyzer	1
+05484_global	1

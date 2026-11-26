@@ -83,6 +83,8 @@ TEST(CASGCManifestBulkDelete, FiveBodiesInChunksOfTwoAreThreeRequests)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .gc_bulk_delete_chunk_keys = 2, .gc_fold_max_defer_rounds = 0});
+    /// The open's intent probe sends one bulk delete of its own.
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
     const auto requests_before = ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests];
 
@@ -90,7 +92,7 @@ TEST(CASGCManifestBulkDelete, FiveBodiesInChunksOfTwoAreThreeRequests)
     const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
 
     EXPECT_EQ(deleted, 5u);
-    EXPECT_EQ(backend->bulkRemoveCalls(), 3u) << "2 + 2 + 1";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 3u) << "2 + 2 + 1";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests] - requests_before, 3u);
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
@@ -106,6 +108,7 @@ TEST(CASGCManifestBulkDelete, NotImplementedFallsBackToOneRequestPerKeyAndStillR
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .gc_fold_max_defer_rounds = 0});
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
 
     /// One armed failure: the chunk's own bulk attempt (all 5 land in one chunk under the default
@@ -118,7 +121,7 @@ TEST(CASGCManifestBulkDelete, NotImplementedFallsBackToOneRequestPerKeyAndStillR
     const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
 
     EXPECT_EQ(deleted, 5u) << "the per-key fallback must still record every manifest as deleted";
-    EXPECT_EQ(backend->bulkRemoveCalls(), 6u) << "1 failed bulk attempt + 5 single-key fallback requests";
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 6u) << "1 failed bulk attempt + 5 single-key fallback requests";
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
         EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
@@ -186,6 +189,7 @@ TEST(CASGCManifestBulkDelete, ASuppressedRoundMakesNoRequest)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .gc_fold_max_defer_rounds = 0});
+    const size_t bulk_calls_at_open = backend->bulkRemoveCalls();
     const auto ids = seedDroppedManifests(*backend, store->layout(), 3);
     Gc gc(store, kGc);
     for (size_t round = 0; round < 4; ++round)
@@ -193,7 +197,7 @@ TEST(CASGCManifestBulkDelete, ASuppressedRoundMakesNoRequest)
         static_cast<void>(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::StageA_Suppressed));
         store->renewWatermarkOnce();
     }
-    EXPECT_EQ(backend->bulkRemoveCalls(), 0u);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_at_open, 0u);
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
         EXPECT_TRUE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
@@ -206,6 +210,7 @@ TEST(CASGCManifestBulkDelete, StorageLimitCutsTheCohortIntoRequestsOfAtMostThatM
     auto backend = std::make_shared<BatchCapabilityBackend>();
     backend->setStorageLimit(3);
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const size_t calls_at_open = backend->callSizes().size();
     const auto ids = seedDroppedManifests(*backend, store->layout(), 8);
 
     uint64_t requests_metric = 0;
@@ -219,7 +224,8 @@ TEST(CASGCManifestBulkDelete, StorageLimitCutsTheCohortIntoRequestsOfAtMostThatM
 
     EXPECT_EQ(deleted, 8u);
     EXPECT_EQ(requests_metric, 3u);
-    const std::vector<size_t> sizes = backend->callSizes();
+    const std::vector<size_t> all_sizes = backend->callSizes();
+    const std::vector<size_t> sizes(all_sizes.begin() + calls_at_open, all_sizes.end());
     ASSERT_FALSE(sizes.empty());
     EXPECT_LE(*std::max_element(sizes.begin(), sizes.end()), 3u);
     EXPECT_EQ(sizes, (std::vector<size_t>{3, 3, 2}));

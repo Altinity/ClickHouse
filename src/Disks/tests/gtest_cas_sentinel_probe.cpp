@@ -24,6 +24,11 @@
 #include <IO/S3Common.h>
 #endif
 
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+}
+
 using namespace DB::Cas;
 
 /// Task 3 (spec §2): the typed sentinel probe below `Backend` must never conflate a transport error
@@ -272,7 +277,7 @@ DB::ObjectStoragePtr makeThrowingS3StorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<ThrowingS3ObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<ThrowingS3ObjectStorage>(std::move(settings)), root);
 }
 
 }
@@ -344,6 +349,32 @@ TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
            "reaches the same Indeterminate give-up on its first try";
 }
 
+/// A body `GET` answers absence only for a missing key. A missing bucket is an error: it would otherwise read as
+/// "the object is gone" to every caller that treats an exact `GET` of `nullopt` as proof.
+TEST(CASSentinelProbe, ANativeReadThrowsOnAMissingBucketAndReturnsAbsentOnAMissingKey)
+{
+    {
+        auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+        storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
+        ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+
+        DB::Cas::tests::FakeClock clock;
+        auto requests = makeRequests(backend, &clock);
+        auto op = requests.admit();
+        DB::Cas::tests::expectThrowsCode(
+            DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read(nativeKeyUnder(storage, "some/key"), Retry::standard()); });
+    }
+    {
+        auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+        storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_KEY);
+        ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+
+        auto requests = makeRequests(backend);
+        auto op = requests.admit();
+        EXPECT_FALSE(op.read(nativeKeyUnder(storage, "some/key"), Retry::standard()).has_value());
+    }
+}
+
 /// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before
 /// anything calls it. `InstrumentedBackend` must forward `probeSentinelRaw` to `inner`, not fall
 /// through to `Backend::probeSentinelRaw`'s generic head/get-based default — the default would derive
@@ -357,7 +388,7 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
     auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
     storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    InstrumentedBackend instrumented(inner);
+    InstrumentedBackend instrumented(inner, "pool");
 
     auto requests = makeRequests(instrumented);
     auto op = requests.admit();

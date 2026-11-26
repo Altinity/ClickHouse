@@ -32,7 +32,7 @@ TEST_P(CASBackendContract, PutIfAbsentAndGet)
     auto g = op.read("k", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
-    EXPECT_EQ(g->etag, t1);
+    EXPECT_EQ(tokenText(g->etag), tokenText(t1));
     EXPECT_FALSE(op.read("absent", Retry::once()).has_value());
 }
 
@@ -57,7 +57,7 @@ TEST_P(CASBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
 
     const auto overwrite = op.replace("k", "v2", t2, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
-    EXPECT_NE(std::get<Committed>(overwrite).etag, t2);  // etags never repeat
+    EXPECT_NE(tokenText(std::get<Committed>(overwrite).etag), tokenText(t2));  // etags never repeat
     expectBytes(b, "k", "v2");
 }
 
@@ -165,10 +165,10 @@ TEST_P(CASBackendContract, ReadAfterWrite)
     auto g = op.read("rw", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "payload");
-    EXPECT_EQ(g->etag, t1);
+    EXPECT_EQ(tokenText(g->etag), tokenText(t1));
     auto h = op.head("rw", Retry::once());
     ASSERT_TRUE(h.has_value());
-    EXPECT_EQ(h->etag, t1);
+    EXPECT_EQ(tokenText(h->etag), tokenText(t1));
 }
 
 /// After an object is created then deleted (key absent again), a conditional update against the

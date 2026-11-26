@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/tests/cas_scoped_test_directory.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteSettings.h>
 
@@ -61,7 +62,8 @@ std::shared_ptr<DB::LocalObjectStorage> makeLocalObjectStorageForRetryProfileTes
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
 
-    return std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 /// Every refusal below is NOT_IMPLEMENTED, and so is the pre-existing refusal of conditional removal,

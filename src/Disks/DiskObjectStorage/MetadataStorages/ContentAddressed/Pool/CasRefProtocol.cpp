@@ -128,7 +128,7 @@ void validateRefChainLink(const std::optional<RefEpochTransition> & open, const 
 bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const Etag & token)
 {
     const std::optional<Object> current = op.read(layout.refCkptKey(life), Retry::standard());
-    return !current || !(current->etag == token);
+    return !current || !sameVersion(current->etag, token);
 }
 
 bool failureJudgedAgainstCkpt(int error_code)
@@ -1041,12 +1041,13 @@ RefCursorResume resolveRefCursorSuccessor(CasOperation & op, const Layout & layo
         result.open_transition = open;
         return result;
     };
-    /// Absent: `nullopt` with `undecodable` empty. A body that does not decode is reported, never thrown:
-    /// the caller holds rather than guessing the record's kind.
+    /// Absent: `nullopt` with `undecodable` empty. A malformed body is reported, never thrown: the caller holds
+    /// rather than guessing the record's kind. Any other decode error propagates.
     String undecodable;
     const auto read_record = [&](const RefTxnId & id) -> std::optional<RefLogTxn>
     {
-        const std::optional<Object> got = op.read(layout.refLogKey(life, id), Retry::standard());
+        const String key = layout.refLogKey(life, id);
+        const std::optional<Object> got = op.read(key, Retry::standard());
         if (!got)
         {
             ++result.absent_probes;
@@ -1057,8 +1058,13 @@ RefCursorResume resolveRefCursorSuccessor(CasOperation & op, const Layout & layo
         {
             return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns, id);
         }
-        catch (const Exception & e)
+        catch (Exception & e)
         {
+            if (!isMalformedStoredRecordError(e))
+            {
+                e.addMessage("while resolving the ref cursor of namespace `{}` from the ref log `{}`", ns, key);
+                throw;
+            }
             undecodable = e.message();
             return std::nullopt;
         }

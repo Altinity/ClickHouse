@@ -3,6 +3,7 @@
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadHelpers.h>
 
 #include <cstring>
 
@@ -69,6 +70,9 @@ public:
 
     void setReadUntilEnd() override { setReadUntilPosition(data.size()); }
 
+    std::optional<size_t> readUntil() const { return read_until; }
+    size_t bytesFetched() const { return bytes_fetched; }
+
 private:
     bool nextImpl() override
     {
@@ -79,6 +83,7 @@ private:
         memcpy(internal_buffer.begin(), data.data() + file_offset, to_read);
         working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + to_read);
         file_offset += to_read;
+        bytes_fetched += to_read;
         return true;
     }
 
@@ -86,6 +91,7 @@ private:
     InnerMode mode;
     size_t file_offset = 0;
     std::optional<size_t> read_until;
+    size_t bytes_fetched = 0;
 };
 
 constexpr size_t kHeader = 256; /// the view's left bound (the CHCA envelope size in production)
@@ -317,6 +323,76 @@ TEST_P(ReadBufferFromFileViewTest, RandomizedOps)
         }
     }
 }
+
+/// One `nextImpl` of the inner buffer fetches up to 1 MiB, like the object-storage read buffer.
+class ReadBufferFromFileViewBoundTest : public ::testing::TestWithParam<InnerMode>
+{
+protected:
+    static constexpr size_t chunk = 1 << 20;
+    const String archive = makePayload(1000);
+    FakeInnerBuffer * inner = nullptr;
+
+    std::unique_ptr<FakeInnerBuffer> makeInner()
+    {
+        auto buffer = std::make_unique<FakeInnerBuffer>(archive, chunk, GetParam());
+        inner = buffer.get();
+        return buffer;
+    }
+};
+
+TEST_P(ReadBufferFromFileViewBoundTest, MiddleMemberRequestEndsAtMemberEnd)
+{
+    ReadBufferFromFileView view(makeInner(), "member", 100, 300);
+
+    EXPECT_EQ(inner->readUntil(), 300);
+    EXPECT_EQ(readExact(view, 200), archive.substr(100, 200));
+    EXPECT_TRUE(view.eof());
+    EXPECT_EQ(inner->bytesFetched(), 200);
+}
+
+TEST_P(ReadBufferFromFileViewBoundTest, MiddleMemberReadReturnsExactlyItsBytes)
+{
+    ReadBufferFromFileView view(makeInner(), "member", 100, 300);
+
+    String content;
+    readStringUntilEOF(content, view);
+    EXPECT_EQ(content, archive.substr(100, 200));
+    EXPECT_EQ(view.getPosition(), 200);
+}
+
+TEST_P(ReadBufferFromFileViewBoundTest, LastMemberRequestEndsAtArchiveEnd)
+{
+    ReadBufferFromFileView view(makeInner(), "member", 800, 1000);
+
+    EXPECT_EQ(inner->readUntil(), 1000);
+    String content;
+    readStringUntilEOF(content, view);
+    EXPECT_EQ(content, archive.substr(800));
+    EXPECT_EQ(inner->bytesFetched(), 200);
+}
+
+/// A member of a packed archive stored as a blob after a 256-byte header: the outer bound wins.
+TEST_P(ReadBufferFromFileViewBoundTest, NestedViewNarrowsTheInnerBound)
+{
+    auto blob = std::make_unique<ReadBufferFromFileView>(makeInner(), "blob", kHeader, archive.size());
+    ReadBufferFromFileView view(std::move(blob), "member", 100, 300);
+
+    EXPECT_EQ(inner->readUntil(), kHeader + 300);
+    String content;
+    readStringUntilEOF(content, view);
+    EXPECT_EQ(content, archive.substr(kHeader + 100, 200));
+    EXPECT_EQ(inner->bytesFetched(), 200);
+}
+
+TEST_P(ReadBufferFromFileViewBoundTest, NestedViewCannotWidenTheInnerBound)
+{
+    auto blob = std::make_unique<ReadBufferFromFileView>(makeInner(), "blob", kHeader, archive.size());
+    const size_t blob_size = archive.size() - kHeader;
+
+    EXPECT_THROW(ReadBufferFromFileView(std::move(blob), "member", 100, blob_size + 1), Exception);
+}
+
+INSTANTIATE_TEST_SUITE_P(Modes, ReadBufferFromFileViewBoundTest, ::testing::Values(InnerMode::FileLike, InnerMode::RemoteLike));
 
 INSTANTIATE_TEST_SUITE_P(
     ChunksAndModes,

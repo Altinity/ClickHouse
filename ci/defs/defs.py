@@ -415,6 +415,7 @@ class JobNames:
     STYLE_CHECK = "Style check"
     CODE_REVIEW = "Code Review"
     FAST_TEST = "Fast test"
+    SMOKE_TEST_PPC64LE = "Smoke test (ppc64le)"
     BUILD = "Build"
     UNITTEST = "Unit tests"
     STATELESS = "Stateless tests"
@@ -545,6 +546,7 @@ class ArtifactNames:
     CH_ARM_TSAN_GH = "CH_ARM_TSAN_GH"
     CH_ARM_ASAN_UBSAN_GH = "CH_ARM_ASAN_UBSAN_GH"
     CH_ARM_MSAN_GH = "CH_ARM_MSAN_GH"
+    CH_PPC64LE_GH = "CH_PPC64LE_BIN_GH"
 
     FAST_TEST = "FAST_TEST"
 
@@ -727,6 +729,7 @@ class ArtifactConfigs:
             ArtifactNames.CH_ARM_MSAN_GH,
             ArtifactNames.CH_ARM_DEBUG_GH,
             ArtifactNames.CH_ARM_TSAN_GH,
+            ArtifactNames.CH_PPC64LE_GH,
         ]
     )
     clickhouse_darwin_plain_binaries = Artifact.Config(

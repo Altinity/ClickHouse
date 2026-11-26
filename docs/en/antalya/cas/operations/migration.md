@@ -181,15 +181,16 @@ steps:
 What happens without the pin, and the other upgrade notes, are in
 [upgrading to the 40 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
-## Upgrading a pool to reader generation 3 {#upgrade-generation-3}
+## Reader generation 3 {#upgrade-generation-3}
 
-The first writable mount of a build with the one-request ref append raises the pool's `min_reader_generation` to 3.
-The raise is one-way, there is no switch, and a pool at 3 cannot be downgraded. Stop every server of the pool
-that runs an older build, upgrade all of them, then start them.
+A pool at reader generation 3 or higher uses the one-request ref append. A mount never raises a pool's
+`min_reader_generation`. `cas-migrate-pool` raises a pool below 3 to 3 at step M6, and every pool to 4 at step M8
+(see [Migrating a pool to generation 4](#migrate-generation-4)). The raises are one-way, and a pool at 3 or higher
+cannot be downgraded. Stop every server of the pool that runs an older build before you run the tool.
 
 | Step | What happens |
 |---|---|
-| Floor raise | The first writable mount logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool already at 2). `clickhouse-disks cas-drop-member` mounts the pool writable too and raises the floor the same way. A mount with `readonly` set never raises it |
+| Floor raise | At M6 on a pool below 3, the tool logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool at 2) |
 | Namespace stamp | The first write into a namespace replaces its `_ckpt` with the generation 3 body, once, before the namespace's first tombstone or append. A namespace nothing writes to stays unstamped. A namespace created by this build is stamped at creation |
 | First append of an epoch | One extra `PUT`: the tombstone that links the previous epoch's chain to this one |
 | Steady state | A positive append costs 1 request instead of 4, and a ref removal 1 instead of 3 |
@@ -211,44 +212,228 @@ Dashboards and scripts that read these names need a look:
 
 ### What an older build sees {#upgrade-generation-3-older-builds}
 
-Generation 3 is the read ceiling of this build. 26.6.x builds have ceiling 1, and 26.8 builds without the
-one-request append have ceiling 2. The behavior of those builds below follows from their format gates.
+Generation 4 is the read ceiling of this build. 26.6.x builds have ceiling 1, and 26.8 builds without deletion
+intents have ceiling 2 or 3. The behavior of those builds below follows from their format gates.
 
-- **A server that mounts after the raise** fails to start the disk with `UNKNOWN_FORMAT_VERSION`:
-  `CAS pool meta: pool requires reader generation 3 but this build supports at most 2` (`at most 1` on 26.6.x).
+- **A server that mounts after step M8** fails to start the disk with `UNKNOWN_FORMAT_VERSION`:
+  `CAS pool meta: pool requires reader generation 4 but this build supports at most 1` (`at most 3` or `2` on a 26.8
+  build without deletion intents). A 26.6.x server is refused the same way from step M6 on, even if a later step fails. Between M6 and M8 the
+  message names reader generation 3; after M8 it names 4.
 - **A server that stays up** cannot remount after a lost mount lease or a fence, and stays unmounted until it is
   upgraded.
 - **An older GC leader that stays up** holds every stamped namespace and suppresses destructive GC steps; see
-  [Upgrading a pool with GC enabled](/antalya/cas/operations/debugging#upgrade-gc). Disable GC on older servers first.
+  [Upgrading a pool with GC enabled](/antalya/cas/operations/debugging#upgrade-gc). Stop older servers before converting.
 - **An older read-only view** keeps serving the table it already recovered.
 
 Mixed versions on one pool are not supported. Fetch-by-relink stays off between versions, as in
 [Upgrading a pool from 26.6.x](/antalya/cas/configuration#upgrading-from-26-6).
 
-### A slow store at the first mount {#upgrade-generation-3-slow-store}
+## Migrating a pool to generation 4 {#migrate-generation-4}
 
-The pool-meta write of the raise runs after the mount claim, and the renewal-window check counts its time. The
-time is measured from the start of the renewer's first lease write, not from the start of the claim. The check
-passes while the elapsed time plus the renewal window stays under `cas_mount_lease_ttl_ms - cas_lease_safety_margin_ms`.
+A pool moves to blob deletion intents, generation 4, once, with `clickhouse-disks cas-migrate-pool`. Bodies stay
+where they are; nothing is copied. Only the conversion is offline; removing the legacy markers is not.
 
-- Attempt envelope = `cas_attempt_timeout_ms + 2 * cap`, where `cap` is the disk's `connect_timeout_ms`, limited to
-  `cas_attempt_timeout_ms`; a `connect_timeout_ms` of `0` means `cap = cas_attempt_timeout_ms`.
-- Renewal window = `cas_mount_renew_period_ms + 2 * envelope` on a server.
+1. Check the pool with the older build, before you stop its servers. Run its `cas-fsck` (`SYSTEM CAS FSCK '<disk>'`
+   on a running server, or `clickhouse-disks cas-fsck`) and resolve every hard finding first, `dangling` above all.
+   The tool reads no references, and `cas-fsck` of this build refuses a pool below generation 4, so this is the
+   last check before the conversion.
+2. Grant the rights the servers of this build need under `<pool>/blob-intents/` (see
+   [Rights on `blob-intents/`](#migrate-generation-4-rights)). The tool checks them before its first write that
+   cannot be undone.
+3. Stop every server and every tool of the pool. Stopped means the process ended, not paused.
+4. Run the tool with the servers' own configuration. It does not mount the pool, start GC or claim a mount slot,
+   whether the disk is writable or read-only. A read-only disk works only where the store does not enforce it (S3);
+   a read-only local object storage refuses the tool's writes.
 
-| `connect_timeout_ms` of the disk | Envelope | Window | Time allowed from the renewer's first lease write to the check |
-|---|---|---|---|
-| `1000` (the S3 disk default) | 5 s + 2 * 1 s = 7 s | 10 s + 14 s = 24 s | 38 s - 24 s = 14 s |
-| `0`, or `4500` and above | at least 5 s + 2 * 4.5 s = 14 s | at least 10 s + 28 s = 38 s | none: the disk does not open writable |
+   ```bash
+   clickhouse-disks --config-file config.xml --disk cas --query 'cas-migrate-pool'
+   ```
 
-Both rows use the defaults: 40 s lease, 2 s safety margin, 10 s renewal period, 5 s attempt timeout.
+5. Start the servers on this build once the tool prints
+   `M8: the pool is migrated: servers of this build may start now`. The tool goes on to remove the legacy markers;
+   no server of generation 4 reads a marker, so servers may run meanwhile.
+6. A server that takes over an old server's data directory on new hardware or in a new container must carry the old
+   server's uuid file, `/var/lib/clickhouse/uuid`, and keep the old `cas_server_root_id`. A server root is owned by
+   a server uuid, and a different uuid is refused with `owned by a different server`.
 
-If the elapsed time is longer, the mount logs a WARNING that gives the time since the claim and the part of it spent
-in the floor raise (`the open took ... ms since the mount claim, ... ms of it in the reader-floor raise, which left too
-little of the lease TTL (40000 ms) to arm the write fence; re-writing the lease first`), writes the lease once more
-and goes on. If that
-write fails, for example because the slot was taken in the meantime, the open fails closed and the next attempt
-follows the ordinary [mount claim rules](/antalya/cas/architecture/mounts-and-leases#claim-outcomes). The raise is
-already durable by then, so the next attempt has no raise to do.
+The command must run through `--query`, alone: every content-addressed disk of the process then skips its own pool
+open, which would refuse the pool, so no other command can run in the same query. It prints one line per step,
+progress lines with an estimate of the time left during the long steps, a summary line of counts
+(`floor_read=... legacy_markers_changed=...`), and `migration complete` at the end. It exits with `0` after
+`migration complete`, also when it printed the notice of [a member seen after the floor](#migrate-generation-4-late-member);
+every refusal exits non-zero.
+
+| Option | Effect |
+|---|---|
+| `--grace-seconds N` | How long no mount slot and no GC lease may move before the tool converts anything. Default 120, or the disk's `cas_request_window_ms` in the tool's configuration when that is longer; at most 604800. Set it to at least twice the `gc/hb` cadence of the older servers, `gc_interval_sec / 4`, and to at least their `cas_request_window_ms` |
+| `--trust-clean-markers` | An intent only for a body a marker or a GC row condemns, not for every body. By default every body gets an intent, so the first reuse of each old body after the migration publishes it once more. With the option, a body with a `Clean` marker gets no intent, and a writer of this build reuses it without an upload: a delete of that body that an older build sent and the store applies later leaves a committed ref with no body. Pass the option only for a pool known never to have run a 26.6.x GC and never to have had `gc/state` rebuilt: a `Clean` marker on another pool proves nothing. After a `cas-gc-rebuild`, run the tool without it. Ignored on a pool below generation 3 |
+| `--keep-markers` | Stop once the pool is migrated (after M8) and leave the legacy markers. A rerun, or `cas-fsck --fix legacy-markers`, removes them later |
+| `--concurrency N` | Requests in flight while markers are read (M4), intents are created (M4, M5) and markers are removed (M9). Default: the disk's `cas_gc_io_concurrency` |
+| `--dry-run` | Writes and deletes nothing, on a pool at any generation. On a pool already at generation 4 it reads `_pool_meta` and lists the markers. Below generation 4 it also checks the store's token form and that `GET` and `LIST` are allowed under `blob-intents/`, also with `skip_access_check`, and reads the mount slots, the reference catalog, `gc/state` with the runs of its fold seal, and the markers. It does not check the rights to create and delete, which need a write: the run checks those at M1, before it writes anything |
+
+Every step can be repeated: after a failure or a crash, run the tool again with the same options. A rerun on a pool
+that is already migrated runs M9 only.
+
+### Rights on `blob-intents/` {#migrate-generation-4-rights}
+
+Writers read and `GC` writes under `<pool>/blob-intents/`. The credential of every server of the pool needs the
+rights listed under [deletion intents](/antalya/cas/bucket-requirements#deletion-intents).
+
+A writable mount and pool creation (unless the disk sets `skip_access_check`) and the tool (at M1) prove these rights before they write anything, with one object
+under `<pool>/blob-intents/_probe/<128-bit hex>/intent`: an exact `GET` of the absent key, a `LIST` of one key of
+`blob-intents/` itself (the request `GC`'s sweep sends; a store may grant `LIST` by the exact prefix; not sent on local
+object storage, which has no such grants), a conditional
+`PUT`, a `LIST` of `_probe/`, a `DELETE` with no precondition (as `GC` deletes intents), and a second exact `GET`. Each missing right stops the run with a message that
+names the right, and the probe object is removed again. Every reader skips the `_probe/` prefix, so debris from a
+stopped probe does no harm. A `--dry-run` sends only the first `GET` and the `LIST`s. A read-only open runs no
+probe. The tool runs this probe, and checks the token form with a `HEAD` of `_pool_meta`, also when the disk sets
+`skip_access_check`: the servers need both once the pool is at generation 4.
+
+| Message | Missing right |
+|---|---|
+| `CasProbe: an exact GET of the absent key '<key>' before the create failed (<error>): the credential cannot tell an absent intent from a denied one: grant GET and LIST on '<pool>/blob-intents/'` | `GET` of an absent key, which on S3 needs the list right |
+| `CasProbe: the store refused the conditional create of '<key>' (<error>): grant PUT with If-None-Match on '<pool>/blob-intents/'` | Conditional `PUT` |
+| `CasProbe: a LIST of '<prefix>' failed (<error>): grant LIST on '<pool>/blob-intents/'` | `LIST` |
+| `CasProbe: the delete of '<key>' failed (<error>): grant DELETE on '<pool>/blob-intents/'` | `DELETE` with no precondition |
+
+### What the tool does {#migrate-generation-4-steps}
+
+| Step | What happens |
+|---|---|
+| M1 | Reads `_pool_meta`, runs the capability probe (not with `skip_access_check`), checks the token form, and proves the rights under `blob-intents/`. A pool already at generation 4 goes to M9 |
+| M2 | Reads every mount slot and both GC leases. A slot that is not terminal is watched for the longer of its declared lease and the disk's `cas_mount_lease_ttl_ms`, plus 5 %, plus one poll step of 1 s, then fenced as GC fences a dead mount. Then the grace interval, then everything is read again |
+| M3, M4 | Reads the condemned rows of `gc/state` and every `.meta` marker. Without `gc/state`, M3 first lists one key of `gc/gen/` and sends a `HEAD` for `gc/hb` and `gc/maintenance_state`: any of them means GC ran and the state was lost, and the run stops. A `gc/state` at generation 0 names no fold seal: then M3 lists one key of `gc/gen/`, and any key stops the run. M3 also stops on a `gc/state` whose `gc_shards` differs from `_pool_meta`, and on a fold seal or a source-edge run that GC of this build refuses. M4 lists `blobs/` a page at a time and reads the markers of a page concurrently. Without `--trust-clean-markers` it then creates the intent of each body that the page lists or a marker of the page names, unless a marker or row condemns it. A body that no listing returns and no marker or row names cannot be found |
+| M5 | Creates an intent for the current token of every body a marker or a row condemns, and for the own token of every pending row. The creates run concurrently, in M4 as in M5. Each create must be confirmed; the first that is not stops the run before M6 |
+| M6 | Raises a pool below generation 3 to 3, then rewrites `gc/state` at generation 4 |
+| M7 | Reads every mount slot, both GC leases and `gc/state` again |
+| M8 | Raises `_pool_meta` to generation 4 and records the token dialect, then reads every slot and both GC leases once more. A member that moved is an error |
+| M9 | Deletes every legacy marker, each after a `HEAD` and only at the token that `HEAD` saw, concurrently; then reads every slot and both GC leases once more. A member that moved is listed, not an error |
+
+A marker that changed between its `HEAD` and its delete stays; a rerun or `cas-fsck --fix legacy-markers` removes it.
+
+### Points of no return {#migrate-generation-4-no-return}
+
+Up to and including M5 an older build can open and use the pool as before: the tool has added only intents, which
+an older build ignores, and fences, which an older GC writes itself for a dead mount. The tool prints a line before
+each of the writes below.
+
+| Write | From then on |
+|---|---|
+| M6, the raise to generation 3, on a pool below 3 | A 26.6.x build is refused at every open |
+| M6, `gc/state` at generation 4 | A GC of an older build is refused: an older server still mounts and writes, and nothing is reclaimed |
+| M8, `_pool_meta` at generation 4 | An older build is refused at every open |
+
+None of these can be undone. A server whose slot or GC lease moves between M6 and the recheck after M8 is named with
+the words `the pool is already migrated and the tool cannot undo it`: stop it at once if it runs an older build.
+
+### A member seen after the floor {#migrate-generation-4-late-member}
+
+After M8 an older build cannot open the pool, so a server that starts after the `servers of this build may start now`
+line runs this build and is expected. The check after M9 lists what it saw and does not fail the run:
+
+```text
+M9: seen since the pool was migrated: server root 'srv-new'; a server of this build may start after the M8 line, so this is expected; if one of them runs an older build, stop it now
+```
+
+It lists a mount slot that appeared, changed or vanished, and a GC lease or `gc/state` that moved. Nothing needs to
+be done unless a listed server runs an older build.
+
+### Downtime {#migrate-generation-4-downtime}
+
+The pool is down from the stop of the last server to the `servers of this build may start now` line. Before it, the
+tool takes the grace interval, plus one mount lease for a slot that did not say farewell, plus its requests:
+
+| Step | Requests |
+|---|---|
+| M4 | one `GET` per marker, and one `LIST` per 1000 keys under `blobs/`; without `--trust-clean-markers` also one `HEAD` and one `PUT` per body no marker or row condemns, and one `HEAD` per marker whose body is absent |
+| M5 | one `HEAD` and one `PUT` per condemned body |
+| M9, after the line | one `HEAD` and one `DELETE` per marker |
+
+With `B` bodies, `K` markers, a request latency `L` and `--concurrency C`, the requests of the downtime take about
+`(K + 2 * B) * L / C`. For example, 1 000 000 bodies with as many markers at 20 ms and 16 in flight: about 63 minutes.
+The requests of one listed page finish before the next page starts, so a slow request holds back its page: read the
+figure as a lower bound.
+M5 prints its own estimate from the rate M4 measured, and every long step prints its progress.
+
+### Counters, columns and phases after the migration {#migrate-generation-4-observability}
+
+Dashboards and scripts that read these names need a look.
+
+| Name | Change |
+|---|---|
+| `CASGCRetiredGraduated` | Kept, with the same value as its new name `CASGCRetiredIntentConfirmed`: rows committed `pending` after an intent was created or found and confirmed for a condemned blob |
+| `CASGCRetiredRedeleted` | Kept, with the same value as its new name `CASGCRetiredBodyDeleted`: exact-token deletes of blob bodies of `pending` rows, answered |
+| `CASGCRetiredRedeleteFailed` | Kept, with the same value as its new name `CASGCRetiredBodyDeleteFailed`: failed `HEAD` or `DELETE` of such a delete; the round fails |
+| `system.cas_gc_log` `entries_graduated`, `entries_redeleted`, `entries_redelete_failed` | Renamed to `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`. The old names stay as `ALIAS` columns of the table, so queries keep working; `SELECT *` does not return them |
+| `SYSTEM CAS GC RUN` output, the same three columns | Renamed as above. The old names stay as extra columns after `pending_retired`, with the same values |
+| `phase_metrics` keys `graduated`, `redeleted`, `redelete_pending`, `graduation_due` | Renamed to `intents_confirmed` (on `fold_reduce` and `pending_deletes`), `bodies_deleted` (on `pending_deletes`), `body_deletes_decided` (on `fold_reduce`), `row_decision_due` (on `defer_decision`) |
+| `CASGCCondemnMarkerUnconfirmedCarry`, `CASGCMetaWriteAnomaly`, `CASGCMetaOps`, `CASMetaPut`, `CASMetaCompareSwap`, `CASMetaDelete`, `CASMetaCreateClean`, `CASMetaAbsentRepublish`, `CASMetaResurrectClean` | Removed: nothing writes or reads a marker |
+| `CASGCRetiredSparedByReref` | Counts a `pending` or `standing` row dropped because a reference returned |
+| `meta_pool_wait` phase of `system.cas_gc_log` | Removed |
+| `intent_sweep_list` phase | New: one `LIST` page of `blob-intents/` per round whose destruction is not suppressed |
+| `CASBlobIntentGet`, `CASBlobIntentPut`, `CASBlobIntentDelete`, `CASBlobIntentList`, `CASGCIntentCreated`, `CASGCIntentConfirmedExisting`, `CASGCIntentUnconfirmedCarry`, `CASGCIntentDeleted`, `CASGCIntentLeftOnSpare`, `CASGCIntentDeletedOnSpare`, `CASGCIntentAdopted`, `CASGCIntentTokenRejected`, `CASBlobReuseIntentPresent`, `CASBlobReuseTokenRejected`, `CASBlobPublishDigestMismatch` | New: see [Antalya profile events](/antalya/metrics-and-events#cas-deletion-intents) |
+| `CASGCIntentStandingAnomaly`, `CASGCUndecodableBlobBody` | New: a `standing` row whose body is back under its own token, and a body shorter than the blob envelope. Both are logged with the blob's key; see [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body) |
+| `system.cas_log` events `blob_intent_adopt`, `blob_intent_delete`, `corrupt_decode` on a blob, and `gc_recheck_verdict` with outcome `standing` | New: see [GC decisions on deletion intents](/operations/system-tables/cas_log#gc-intent-events) |
+| `nominations_waiting` in the `fold_reduce` phase metrics | New: nominated intents left for a later fold |
+| `read_ahead_blobs` in the `fold_reduce` phase metrics | New: blobs the fold holds to read the `HEAD`s of `pending` and `standing` rows ahead |
+
+A server logs a warning at start when `cas_gc_meta_pool_size` or `cas_gc_round_graduation_budget` is set, whatever
+the value. The value of `cas_gc_round_graduation_budget` applies to `cas_gc_round_intent_create_budget`
+when that is not set. The server also logs one line with the pool's reader generation and token dialect at every open
+of a pool (see [protocol version and retired settings](/antalya/cas/configuration#protocol-version)).
+
+### Refusals {#migrate-generation-4-refusals}
+
+| Message | Cause | Action |
+|---|---|---|
+| `mount slot of server root '<id>' changed during the migration; stop that server and run the tool again` | A server renewed or claimed its slot while the tool ran, or a slot appeared | Stop that server, run the tool again |
+| `GC lease of owner <id> moved during the migration; stop that server and run the tool again` | A GC leader renewed its lease or heartbeat, or wrote `gc/state` after M6 | Stop that server, run the tool again |
+| `... changed during the migration; the pool is already migrated and the tool cannot undo it ...` | A slot or a GC lease moved between M8 and the recheck right after it | Stop that server if it runs an older build. Nothing else is needed |
+| `mount slot of server root '<id>' cannot be decoded` | The slot holds bytes this build cannot read | Stop the server that owns it, run the tool again |
+| `CAS pool records token dialect '<a>', this disk uses '<b>': identities are not comparable` | The pool was migrated through a disk whose store client uses another token dialect | Use a disk configured like the one the migration used |
+| `pool prefix of <n> bytes leaves no room for blob intent keys; the limit is <m>` | The pool prefix is too long for intent keys | The pool cannot be migrated in place |
+| `cas-migrate-pool must be the only command of --query` | The query has another command beside the tool | Run the tool in a query of its own |
+| `CasProbe: the store refused the create of '<key>': <message>` | The store refuses writes: a read-only local object storage, or no permission to write | Run the tool on a disk the store lets write |
+| `CasProbe: ...` with `grant GET and LIST`, `grant PUT with If-None-Match`, `grant LIST` or `grant DELETE` on `'<pool>/blob-intents/'` | The credential lacks that right under `blob-intents/` | Grant it, run the tool again; see [rights on `blob-intents/`](#migrate-generation-4-rights) |
+| `the store returns a token that cannot serve as a blob identity: <token>` | The probe found that the store's tokens cannot name a body | The store cannot host a generation 4 pool |
+| `the intent of blob ... could not be confirmed` | An intent create got no usable answer, or the key holds other bytes | Run the tool again; nothing past the intents was written |
+| `an intent create failed; ...` | The store refused an intent create | Fix the store's refusal named in the message, then run the tool again |
+| `reading the legacy marker ... at M4` | A marker needs a newer reader, or its read failed | Only fences (M2) and the intents of earlier pages were written; find out which build wrote the marker before you go on |
+| `gc/state changed under the migration ... times` | `gc/state` kept changing: a GC of an older build still runs | Stop it, run the tool again |
+| `M3: gc/state is absent, but GC has run on this pool: ...` | `gc/state` was lost while GC's runs, fold seals, heartbeat or janitor cursor remain. A state created now would name none of GC's runs and holds | See below |
+| `M3: gc/state names no fold seal and GC owner ... holds its lease, but ... exists: ...` | `gc/state` is at generation 0 and holds a GC lease while runs or fold seals remain under `gc/gen/`: an interrupted `cas-gc-rebuild`, or a GC round stopped before its commit | Restore a consistent backup; see below |
+| `M3: gc/state names <n> GC shard(s), but _pool_meta names <m>; ...` | `gc/state` and `_pool_meta` disagree on the GC shard count; GC of this build refuses such a state | The floor was not raised to 4. Find out which configuration wrote `gc/state` before you go on |
+| `... M3: GC of this build refuses the fold seal ...` | The fold seal `gc/state` adopts fails the checks GC of this build applies, for example a missing shard summary | The floor was not raised to 4: servers of the older build can still open the pool. The tool cannot migrate the pool while `gc/state` adopts that seal |
+| `... M3: GC of this build refuses a source-edge run ...` | A run the adopted fold seal names fails the checks GC of this build applies to inherited rows: a row of a blob that belongs to another GC shard, rows out of `(blob, source)` order, a condemned row stamped after the round of `gc/state`, a broken row rule, a checksum that differs from the seal, or condemned rows that differ from the seal's summary of their shard. The message names the run | The floor was not raised to 4: servers of the older build can still use the pool. This build has no repair for the run: to migrate the pool, restore it from a backup |
+| `M3: gc/state names no fold seal, but ... exists: ...` | `gc/state` is at generation 0 while runs or fold seals remain under `gc/gen/`: an interrupted `cas-gc-rebuild`, or a GC round stopped before its commit. The state names none of them | See below |
+
+To recover from an `M3` refusal whose `gc/state` is absent or holds no lease, run the build that last ran GC on the pool:
+`clickhouse-disks --config-file READ_ONLY_CONFIG_FILE --disk DISK_NAME --query 'cas-gc-rebuild'`. The configuration must
+open the disk read-only (`<readonly>true</readonly>`), because `cas-gc-rebuild` refuses a writable disk. Then run the
+tool again without `--trust-clean-markers`. On local object storage the rebuild cannot complete, because a read-only
+local store refuses its writes: restore the pool from a consistent backup taken while its `gc/state` was intact.
+
+When the `gc/state` at generation 0 holds a lease, restore a consistent backup on any store. The older `cas-gc-rebuild`
+refuses that state with `another GC leader holds the lease`: it takes a fresh identity each run and does not steal.
+
+Until `gc/state` is recovered, keep the pool offline or serve it read-only. A writable older server with GC enabled
+starts folding at generation zero without the lost holds.
+
+### What the migration does not cover {#migrate-generation-4-residuals}
+
+These cases can leave a committed ref with no body. `cas-fsck` reports such a ref.
+
+- **A delete still in flight.** A blob delete that a stopped server sent and the store applies after the tool's grace
+  interval can remove a body that a server of this build has just reused. It needs a marker in a state the older
+  protocol does not expect and a request held back past the whole offline window. A copy that repeats an old
+  incarnation, sent by an older writer and applied after the migration, can do the same without any older delete.
+- **A suspended server.** The tool checks renewals, not processes. A server that was paused instead of stopped can
+  send requests after the migration, or claim its slot again if it was paused inside its mount.
+- **An older reference.** A ref that an older server committed while a delete of its body was outstanding stays
+  exposed, and so does a copy of that ref made later without a read of the body. Intents protect reuse of a body,
+  not refs that already name it.
+- **A server started during the run.** The tool sees a slot that appears before its last check. A server that reads
+  `_pool_meta` before M8 and claims its slot after M7 is not seen.
 
 ## Removing a pool member {#decommission}
 
@@ -274,8 +459,8 @@ SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER c
 Both `server_root_id` and `disk_name` are required string literals. The offline CLI twin,
 `clickhouse-disks cas-drop-member <server_root_id>`, does the same work against a disk opened
 read-only — the pool-admin claim happens internally, so the disk it runs against must not be the
-live server's own mount. The claim mounts the pool writable, so on a pool below reader generation 3 it
-raises the floor, as a server does (see [Upgrading a pool to reader generation 3](#upgrade-generation-3)):
+live server's own mount. The claim mounts the pool writable, so a pool below generation 4 is refused with the
+command line of the migration tool (see [Migrating a pool to generation 4](#migrate-generation-4)):
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-drop-member 'replica-2'

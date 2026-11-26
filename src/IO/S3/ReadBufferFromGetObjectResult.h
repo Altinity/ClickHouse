@@ -32,6 +32,10 @@ public:
 
     bool isResultReleased() const { return !result; }
 
+    /// Whether the transport has delivered the whole fixed-length body. Only the exact
+    /// `HTTPFixedLengthStreamBuf` counts: a derived buffer could hold bytes not yet returned.
+    bool isFixedLengthBodyComplete() const;
+
     ObjectMetadata getObjectMetadata() const { return metadata; }
 };
 }

@@ -53,14 +53,15 @@ DiskFixture openDiskFixture()
 {
     static std::atomic<uint64_t> counter{0};
     const String unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-    auto settings = makeSettingsForTest(
-        "srv1", std::filesystem::temp_directory_path() / ("cas_ns_file_contract_scratch_" + unique));
+    const auto scratch = std::filesystem::temp_directory_path() / ("cas_ns_file_contract_scratch_" + unique);
+    auto settings = makeSettingsForTest("srv1", scratch);
     settings[DB::ContentAddressedSetting::gc_enabled] = false;
 
     DiskFixture fixture;
     fixture.object_storage = makeLocalObjectStorageForTest();
-    fixture.storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        fixture.object_storage, "pool", "srv1", "", nullptr, settings);
+    fixture.storage = ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(fixture.object_storage, "pool", "srv1", "", nullptr, settings),
+        scratch);
     fixture.storage->startup();
     return fixture;
 }
@@ -211,7 +212,7 @@ TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 
     const auto life2_after = op.head(life2_key, Retry::standard());
     ASSERT_TRUE(life2_after.has_value());
-    EXPECT_EQ(life2_after->etag, life2_before->etag);
+    EXPECT_EQ(tokenText(life2_after->etag), tokenText(life2_before->etag));
     const auto life2_body_after = op.read(life2_key, Retry::standard());
     ASSERT_TRUE(life2_body_after.has_value());
     EXPECT_EQ(life2_body_after->bytes, "life-2-stable\n");

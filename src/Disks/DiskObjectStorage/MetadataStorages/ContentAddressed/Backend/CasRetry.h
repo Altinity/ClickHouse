@@ -98,6 +98,15 @@ struct Retry
         return copy;
     }
 
+    /// This policy ending no later than `deadline_ms` on the caller's clock. The deadline replaces `window_ms` as a
+    /// frozen one does; an earlier frozen deadline stays.
+    Retry cappedAt(uint64_t deadline_ms) const
+    {
+        Retry copy = *this;
+        copy.policy_deadline_ms = policy_deadline_ms && *policy_deadline_ms < deadline_ms ? *policy_deadline_ms : deadline_ms;
+        return copy;
+    }
+
     /// A policy bound to an absolute deadline on the caller's own clock, plus which bound produced
     /// it -- the caller's own budget, or the (smaller) lease bound.
     struct Bound

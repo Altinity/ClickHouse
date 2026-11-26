@@ -205,24 +205,11 @@ void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAcces
         /// Drain before taking the store lock: the source may itself read another object from this
         /// backend. The complete body remains private until its size has been validated.
         String body = streaming->fresh_envelope;
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
         {
             WriteBufferFromString out(body, AppendModeTag{});
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, out, streaming->payload_size);
-            if (copy_result.exact(streaming->payload_size))
-                out.finalize();
-            else
-                out.cancel();
+            blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, out, *streaming, request.destination_key,
+                "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
         }
-
-        if (!copy_result.exact(streaming->payload_size))
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
 
         std::lock_guard lock(mutex_);
         Object object;
