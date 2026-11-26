@@ -64,7 +64,10 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
 
     /// The writable mount at open, probe included: `Pool::open` itself issues the identity probe, the
     /// mount claim and the epoch allocation under this same throttled backend.
-    auto store = DB::Cas::tests::openPoolForTest(throttled);
+    /// Each key is refused once, so a retry never has to wait: a no-op pause keeps the gate off the clock.
+    auto store = Pool::open(throttled,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 8,
+                   .retry_sleep_fn = [](uint64_t) {}});
 
     const auto resolve_reads_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead];
 

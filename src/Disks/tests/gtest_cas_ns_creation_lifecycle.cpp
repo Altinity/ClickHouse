@@ -627,7 +627,7 @@ TEST(CASNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAb
     CasOperation op = requests.admit();
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { CasRefCatalog::completeCreation(op, layout, live); },
         "not a Creating entry");
 }
@@ -639,7 +639,7 @@ TEST(CASNsCreationLifecycleDeathTest, ReconcileStaleCreatorRejectsANonCreatingEn
     CasOperation op = requests.admit();
     Layout layout("p");
     const CatalogEntry live{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1)};
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             CasRefCatalog::reconcileStaleCreator(op, layout, live, creatorFence("srv2", 2), fixedTerminality(true));
         },

@@ -5,9 +5,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 
 namespace DB::Cas
 {
+
+/// The `CORRUPTED_DATA` message of `chooseRecoveryGrounding` for a Live or Removing life without a usable `_ckpt`.
+inline constexpr std::string_view kRecoveryGroundingNoCkptMessage
+    = "CAS recovery grounding: a Live or Removing namespace requires a readable _ckpt with life_epoch";
 
 /// The pure, catalog-authoritative input to both recovery entry points. `LIST` cannot supply a base,
 /// life epoch, frontier, or stopping condition.

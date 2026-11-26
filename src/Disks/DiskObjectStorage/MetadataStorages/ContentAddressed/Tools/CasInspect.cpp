@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -291,6 +291,7 @@ String renderGcState(const GcState & s)
         .add("snap_pruned_through", jsonUInt(s.snap_pruned_through))
         .add("snap_attempt", jsonUInt(s.snap_attempt))
         .add("manifest_sweep_cursor", jsonEscape(s.manifest_sweep_cursor))
+        .add("orphan_manifest_sweep_completed_at_ms", jsonUInt(s.orphan_manifest_sweep_completed_at_ms))
         .add("lease", renderGcLease(s.lease))
         .str();
 }
@@ -415,16 +416,15 @@ String renderCondemnedRow(const CondemnedRow & r)
         .add("size", jsonUInt(r.size))
         .add("condemn_round", jsonUInt(r.condemn_round))
         .add("marker_confirmed", jsonBool(r.marker_confirmed))
+        .add("standing", jsonBool(r.standing))
         .str();
 }
 
 /// Renders one blob-target source-edge run segment (`Layout::blobTargetRunKey`): every row (edge,
 /// zero-marker, or condemned sentinel), plus a summary. `parsed` carries the run's own coordinates
-/// recovered from the key; `bytes` is decoded with the same typed `SourceEdgeRunView` reader the fold /
-/// `zeroInDegree` / `fsck` consumers use (the memory overload, since `caInspectToJson` is a pure
-/// function of (key, bytes) with no backend access here). A malformed key or payload propagates the
-/// codec's own `CORRUPTED_DATA` (`SourceEdgeKeyCodec::parse`, `decodeCondemnedRow`) -- rows are never
-/// silently skipped.
+/// recovered from the key; `bytes` is decoded with the typed `SourceEdgeRunView` reader (the memory overload, since
+/// `caInspectToJson` is a pure function of (key, bytes) with no backend access here). A malformed row propagates the reader's
+/// `CORRUPTED_DATA` -- rows are never silently skipped.
 String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_view bytes)
 {
     SourceEdgeRunView reader = openSourceEdgeRun(bytes);
@@ -435,25 +435,17 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
     uint64_t condemned_count = 0;
     uint64_t zero_marker_count = 0;
 
-    String key;
-    String payload;
-    while (reader.next(key, payload))
+    SourceEdgeRecord rec;
+    while (reader.next(rec))
     {
-        BlobRef ref;
-        UInt128 source_id;
-        SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-        if (payload.empty())
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "cas-inspect: source-edge run row for blob {} has an empty payload", blobIdOf(ref));
-        const RunMarker marker = runMarkerFromByte(payload[0], "cas-inspect: source-edge run row");
-
-        distinct_blobs.insert(ref);
+        const RunMarker marker = rec.marker;
+        distinct_blobs.insert(rec.ref);
         JsonObj row;
-        row.add("blob", jsonEscape(blobIdOf(ref)))
+        row.add("blob", jsonEscape(blobIdOf(rec.ref)))
            /// `source_id` is a `CityHash128` of (namespace, writer_epoch, build_sequence,
            /// manifest_ordinal, path) -- not invertible here, so it renders as plain hex, exactly like
            /// every other opaque u128 identifier in this file.
-           .add("source_id", jsonHex(source_id))
+           .add("source_id", jsonHex(rec.source_id))
            .add("kind", jsonEscape(sourceEdgeRowKindName(marker)));
 
         switch (marker)
@@ -466,7 +458,7 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
                 break;
             case RunMarker::Condemned:
                 ++condemned_count;
-                row.add("condemned", renderCondemnedRow(decodeCondemnedRow(payload)));   // CORRUPTED_DATA on malformed (fail-closed)
+                row.add("condemned", renderCondemnedRow(condemnedRowOf(rec)));
                 break;
         }
         rows.push_back(row.str());
@@ -486,6 +478,19 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
             .add("condemned", jsonUInt(condemned_count))
             .add("zero_markers", jsonUInt(zero_marker_count))
             .str())
+        .str();
+}
+
+/// The key carries the whole identity; the body is one constant byte string, so other bytes are damage.
+String renderBlobIntent(const Layout::ParsedBlobIntentKey & parsed, const String & key, std::string_view bytes)
+{
+    if (!isBlobIntentRecord(bytes))
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "cas-inspect: '{}' does not hold the deletion intent record", key);
+    return JsonObj()
+        .add("object", jsonEscape("blob_intent"))
+        .add("blob", jsonEscape(blobIdOf(parsed.ref)))
+        .add("type", jsonEscape(dialectWord(parsed.identity.dialect)))
+        .add("tag_hex", jsonEscape(parsed.identity.tag_hex))
         .str();
 }
 
@@ -549,10 +554,13 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     if (const auto parsed = layout.parseBlobTargetRunKey(key))
         return renderBlobTargetRun(*parsed, bytes);
 
+    if (const auto parsed = layout.parseBlobIntentKey(key))
+        return renderBlobIntent(*parsed, key, bytes);
+
     /// `blobMetaKey(id) == blobKey(id) + ".meta"`, so a meta descriptor also matches
     /// `blobsPrefix()` below. Check it first or it would be decoded incorrectly as an envelope. A
     /// non-`.meta` blob body still carries its envelope.
-    if (key.starts_with(layout.blobsPrefix()) && key.ends_with(".meta"))
+    if (key.starts_with(layout.blobsPrefix()) && Layout::hasLegacyMarkerSuffix(key))
         return renderBlobMeta(decodeBlobMeta(bytes));
 
     if (key.starts_with(layout.blobsPrefix()))
@@ -561,7 +569,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
         "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
         "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
-        "retired, blobs, blobs/*.meta)", key);
+        "blob-intents, blobs, blobs/*.meta)", key);
 }
 
 std::optional<RefTxnId> readInspectBaseSnapshotId(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,

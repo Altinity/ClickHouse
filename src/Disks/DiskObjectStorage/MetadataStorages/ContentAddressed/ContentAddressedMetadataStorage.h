@@ -48,6 +48,16 @@ enum class StagingBackend
 namespace DB
 {
 
+/// A process flag set only by `clickhouse-disks` for `cas-migrate-pool`: a content-addressed disk's `startup` then
+/// opens no pool and sends no request, and the command opens it with `openPoolForMigration`.
+void setDeferPoolOpenForMigration(bool defer);
+bool deferPoolOpenForMigration();
+
+}
+
+namespace DB
+{
+
 /// The SIX operation classes the central `ContentAddressedMetadataStorage::checkOpAdmitted` gate keys on
 /// (rev.7 spec §1). Every public metadata/transaction entry declares its class so a single place decides
 /// what happens per pool-lifecycle condition:
@@ -209,7 +219,7 @@ public:
 
     /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
     /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
-    /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
+    /// (`report.performed == false`) installs no baseline; the `SYSTEM` interpreter surfaces the refusal.
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
 
@@ -388,6 +398,9 @@ public:
     /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when no pool is
     /// published (before the first `startup`, or after `shutdown`). A thin wrapper over `poolAccess()`.
     Cas::PoolPtr store() const;
+    /// Opens this disk's pool with `Cas::Pool::openForMigration`, configured as `startup` configures it. Unpublished:
+    /// the caller owns the pool. Meant for a disk whose `startup` deferred the pool open.
+    Cas::PoolPtr openPoolForMigration() const;
     /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `INVALID_STATE`
     /// under the same not-started condition as `store()`. Committed part-folder reads and mutations
     /// go through this facade so cache validation remains centralized. Returning a `shared_ptr`
@@ -642,11 +655,13 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
+    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (the disk setting refuses 0 and loads 1 as 2; `PoolConfig` 0 prunes nothing).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
+    const uint64_t intent_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
-    const uint64_t gc_round_graduation_budget;
+    const uint64_t orphan_manifest_sweep_interval_sec;
+    const uint64_t gc_round_intent_create_budget;
     const uint64_t gc_round_redelete_budget;
     const uint64_t gc_round_sweep_namespace_budget;
     const uint64_t gc_round_sweep_recovery_op_budget;
@@ -666,8 +681,6 @@ private:
     const bool allow_packed_parts;
     /// Byte bound for the manifest decode cache in `Cas::Pool`. Zero disables decode caching.
     const uint64_t manifest_decode_cache_bytes;
-    /// Bounded pool size for GC's per-hash freshness-metadata writes.
-    const uint64_t gc_meta_pool_size;
     /// Maximum number of threads in the GC I/O pool; 1 disables parallel GC I/O.
     const uint64_t gc_io_concurrency;
     /// Keys per batch delete request for the write-once families.
@@ -796,7 +809,7 @@ private:
     /// (`<readonly>`) disk opens with no write probe, no background watermark, and no GC scheduler. Never
     /// touches `cas_store`/`part_access`/`gc_scheduler`/`physical_key_prefix`/`pool_uuid`; `startup`
     /// applies its own result to those members itself, in its single publish step.
-    PoolView openPoolView(bool context_available) const;
+    PoolView openPoolView(bool context_available, bool for_migration = false) const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch

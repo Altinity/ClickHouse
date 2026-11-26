@@ -103,9 +103,9 @@ IMPLEMENT_SETTING_ENUM(DistributedProductMode, ErrorCodes::UNKNOWN_DISTRIBUTED_P
      {"allow",  DistributedProductMode::ALLOW}})
 
 IMPLEMENT_SETTING_ENUM(ObjectStorageClusterJoinMode, ErrorCodes::BAD_ARGUMENTS,
-    {{"local",  ObjectStorageClusterJoinMode::LOCAL},
-     {"global", ObjectStorageClusterJoinMode::GLOBAL},
-     {"allow",  ObjectStorageClusterJoinMode::ALLOW}})
+    {{"local",       ObjectStorageClusterJoinMode::LOCAL},
+     {"global",      ObjectStorageClusterJoinMode::GLOBAL},
+     {"allow",       ObjectStorageClusterJoinMode::ALLOW}})
 
 
 IMPLEMENT_SETTING_ENUM(QueryResultCacheNondeterministicFunctionHandling, ErrorCodes::BAD_ARGUMENTS,

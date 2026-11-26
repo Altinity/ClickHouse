@@ -1,0 +1,28 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_rebuild>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>node3</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/xcopy_rebuild_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>1</cas_gc_interval_sec>
+            </disk_cas_rebuild>
+        </disks>
+        <policies>
+            <cas_rebuild>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_rebuild</disk>
+                    </main>
+                </volumes>
+            </cas_rebuild>
+        </policies>
+    </storage_configuration>
+</clickhouse>

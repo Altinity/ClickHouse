@@ -484,6 +484,7 @@
     M(DeltaLakePartitionPrunedFiles, "Number of skipped files during DeltaLake partition pruning", ValueType::Number) \
     M(DeltaLakeSnapshotInitializations, "Number of times a DeltaLake table snapshot was initialized (loaded from object storage)", ValueType::Number) \
     M(DeltaLakeScannedFiles, "Number of files scanned during DeltaLake scan callbacks", ValueType::Number) \
+    M(DeltaLakeClusteringPredicateFallbacks, "Number of DeltaLake scans that used the clustering-column predicate after translating the full predicate to delta-kernel threw an exception", ValueType::Number) \
     \
     M(SlowRead, "Number of reads from a file that were slow. This indicate system overload. Thresholds are controlled by read_backoff_* settings.", ValueType::Number) \
     M(ReadBackoff, "Number of times the number of query processing threads was lowered due to slow reads.", ValueType::Number) \
@@ -884,12 +885,28 @@ The server successfully detected this situation and will download merged part fr
     M(CASRefCheckpointPublished, "Number of CAS ref `_ckpt` writes by snapshot publication that committed.", ValueType::Number) \
     M(CASRefCheckpointIdenticalSkip, "Number of CAS ref snapshot publications that needed no `_ckpt` write because the snapshot id was already published.", ValueType::Number) \
     M(CASRefCheckpointNotAdvanced, "Number of CAS ref-table snapshot publications whose `_ckpt` checkpoint could not be advanced (fenced out, refused, contended, or failed). The snapshot body is durable but is not yet cleanup-authoritative; a non-zero value means recovery keeps replaying from an older base.", ValueType::Number) \
-    M(CASGCClampSuppressedPasses, "Number of CAS GC passes that deferred shard graduation and deletion because reachability was uncertain. In the current stage this is EVERY folding round by construction, not an anomaly: the namespace universe is not yet knowable, so the round's destructive gate is shut unconditionally and this counter tracks folding rounds rather than trouble. What does discriminate is the fold seal's hold set and the tables_held column of the fold_ref_intake phase row -- read those, not this, to tell a healthy suppressed round from a namespace that stopped.", ValueType::Number) \
+    M(CASGCClampSuppressedPasses, "Number of CAS GC rounds whose destructive work was suppressed: by an incomplete frontier, a held namespace, an unconfirmed parent, or a stop request that arrived during the round's intake. The fold_reduce row of system.cas_gc_log shows suppression, frontier completeness and parent confirmation; a stop is named by a server log line.", ValueType::Number) \
     M(CASGCDeadPrecommitSkipped, "Number of CAS GC edges skipped for precommits proven dead below the durable watermark. Growing values indicate stale or incomplete ref history.", ValueType::Number) \
     M(CASBlobGet,        "Number of CAS blob GET requests. Grows with blob reads and indicates read traffic.", ValueType::Number) \
     M(CASBlobGetStream,  "Number of streaming CAS blob GET requests. Grows with large or streamed blob reads.", ValueType::Number) \
     M(CASBlobDelete,     "Number of CAS blob DELETE requests. Grows with cleanup and GC deletion activity.", ValueType::Number) \
     M(CASBlobList,       "Number of CAS blob LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
+    M(CASBlobIntentGet,  "Number of CAS blob deletion-intent GET requests.", ValueType::Number) \
+    M(CASBlobIntentPut,  "Number of CAS blob deletion-intent PUT requests. Grows as garbage collection condemns blobs.", ValueType::Number) \
+    M(CASBlobIntentDelete, "Number of CAS blob deletion-intent DELETE requests. Grows as garbage collection removes intents.", ValueType::Number) \
+    M(CASBlobIntentList, "Number of CAS blob deletion-intent LIST requests. Growing values indicate more enumeration of intents.", ValueType::Number) \
+    M(CASGCIntentCreated, "Number of CAS deletion intents whose create the GC confirmed by an answered success, or by reading the record after an unanswered attempt.", ValueType::Number) \
+    M(CASGCIntentConfirmedExisting, "Number of CAS deletion-intent creates the GC confirmed by finding the record already present.", ValueType::Number) \
+    M(CASGCIntentUnconfirmedCarry, "Number of CAS deletion-intent creates the GC could not confirm; the blob stays a candidate and is retried in a later round. Sustained growth indicates object storage errors or foreign bytes at an intent key.", ValueType::Number) \
+    M(CASGCIntentDeleted, "Number of CAS deletion intents the GC deleted after their blob body was gone or replaced.", ValueType::Number) \
+    M(CASGCIntentLeftOnSpare, "Number of CAS GC rows dropped because the blob was referenced again whose deletion intent stays for a later round to adopt. An intent deleted at the spare is counted in CASGCIntentDeletedOnSpare instead.", ValueType::Number) \
+    M(CASGCIntentDeletedOnSpare, "Number of CAS deletion intents the GC deleted when the blob was referenced again and its HEAD showed another incarnation than the row's. Included in CASGCIntentDeleted.", ValueType::Number) \
+    M(CASGCIntentAdopted, "Number of CAS GC rows created for a deletion intent that had no row: candidate when the body shows the intent's token, else standing. Nothing is deleted in the adopting round.", ValueType::Number) \
+    M(CASGCIntentStandingAnomaly, "Number of CAS GC standing rows whose decision HEAD showed their own token again after their body delete was answered. The row is carried and nothing is deleted.", ValueType::Number) \
+    M(CASGCUndecodableBlobBody, "Number of blob bodies a CAS GC round met that are shorter than the pool's blob envelope. GC records no row for such a body, carries an existing row unchanged, and deletes nothing.", ValueType::Number) \
+    M(CASGCIntentTokenRejected, "Number of CAS GC blob observations whose token names no incarnation, so no deletion intent can be keyed by it. Such a body is never deleted by the GC.", ValueType::Number) \
+    M(CASBlobReuseIntentPresent, "Number of CAS blob writes that found the body's incarnation under a deletion intent and published the body again instead of adopting it.", ValueType::Number) \
+    M(CASBlobReuseTokenRejected, "Number of CAS blob writes that found a body whose token names no incarnation and published the body again instead of adopting it.", ValueType::Number) \
     M(CASRefRepoint, "Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals.", ValueType::Number) \
     M(CASRefMove, "Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication.", ValueType::Number) \
     M(CASOwnershipConflict, "Number of CAS operations refused with CAS_OWNERSHIP_CONFLICT: the committed reference the writer had read was moved, dropped or repointed before its change landed.", ValueType::Number) \
@@ -929,7 +946,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCList,         "Number of CAS GC LIST requests. Growing values indicate more collection enumeration.", ValueType::Number) \
     M(CASGCReadAheadHit,    "Number of CAS GC fold reads and HEADs answered by the fold's read-ahead. Growth means the round's small-object round trips overlapped instead of serializing.", ValueType::Number) \
     M(CASGCReadAheadMiss,   "Number of CAS GC fold reads and HEADs performed inline because nothing was hinted for the key. A large value against hits means a hint set is narrower than the walk.", ValueType::Number) \
-    M(CASGCReadAheadWasted, "Number of CAS GC read-ahead results fetched and never taken: a namespace held below its lookahead, or a HEAD candidate that kept an edge. Bounded by the read-ahead window per namespace.", ValueType::Number) \
+    M(CASGCReadAheadWasted, "Number of CAS GC read-ahead results fetched and never taken: reads ahead of a namespace walk (ref logs, and manifests of later ref logs) when the walk stops early at a hold, at the end of its time slice or at a stop request, and HEAD candidates that kept an edge.", ValueType::Number) \
     M(CASServerPut,      "Number of CAS server-object PUT requests. Grows with server metadata writes.", ValueType::Number) \
     M(CASServerPutDeduplicated, "Number of deduplicating CAS server-object PUT requests. Growth indicates reused server objects.", ValueType::Number) \
     M(CASServerOverwrite,"Number of CAS server-object overwrite requests. Growing values indicate repeated replacement writes.", ValueType::Number) \
@@ -954,26 +971,23 @@ The server successfully detected this situation and will download merged part fr
     M(CASOtherList,      "Number of CAS other-object LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
     M(CASGCRetiredCondemned,   "Number of CAS GC entries newly condemned into the retired set. Growth indicates objects becoming eligible for later cleanup.", ValueType::Number) \
     M(CASGCRetiredSpared,      "Number of CAS GC retired entries spared after references returned. Growing values indicate reference churn or resurrection.", ValueType::Number) \
-    M(CASGCRetiredSparedByReref, "Number of CAS GC delete_pending entries spared because a fresh deduplicating adopt re-referenced them after graduation (an ordinary observe/condemn race, not a fail-closed abort). Subset of CASGCRetiredSpared.", ValueType::Number) \
-    M(CASGCRetiredGraduated,   "Number of CAS GC retired entries that passed the safety floor and became pending deletion. Growth indicates cleanup progress.", ValueType::Number) \
-    M(CASGCRetiredRedeleted,   "Number of CAS GC pending deletes executed with an exact object token. Growth indicates physical cleanup activity.", ValueType::Number) \
-    M(CASGCRetiredRedeleteFailed, "Number of CAS GC pending blob deletes whose HEAD or exact-token DELETE failed. A non-zero value indicates object storage errors; the affected blobs are retried in the next round.", ValueType::Number) \
+    M(CASGCRetiredSparedByReref, "Number of CAS GC pending or standing rows dropped because the blob was referenced again (an ordinary race, not a fail-closed abort). Subset of CASGCRetiredSpared.", ValueType::Number) \
+    M(CASGCRetiredIntentConfirmed, "Number of CAS GC rows committed pending after their deletion intent was confirmed. Growth indicates cleanup progress.", ValueType::Number) \
+    M(CASGCRetiredBodyDeleted, "Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity.", ValueType::Number) \
+    M(CASGCRetiredBodyDeleteFailed, "Number of CAS GC pending blob deletes whose HEAD or exact-token DELETE failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round.", ValueType::Number) \
+    M(CASGCRetiredGraduated, "The earlier name of CASGCRetiredIntentConfirmed, incremented together with it.", ValueType::Number) \
+    M(CASGCRetiredRedeleted, "The earlier name of CASGCRetiredBodyDeleted, incremented together with it.", ValueType::Number) \
+    M(CASGCRetiredRedeleteFailed, "The earlier name of CASGCRetiredBodyDeleteFailed, incremented together with it.", ValueType::Number) \
     M(CASGCUnmatchedRemoveDeltas, "Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal.", ValueType::Number) \
-    M(CASGCCondemnMarkerUnconfirmedCarry, "Number of CAS GC retirements delayed because the condemn marker did not confirm: it could not be read or written, it was a readable `Clean`, or it was `Condemned` at an older round than the entry. Deletion is postponed safely.", ValueType::Number) \
     M(CASGCHeartbeatFenceOuts, "Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays.", ValueType::Number) \
-    M(CASGCMetaWriteAnomaly, "Number of CAS GC metadata operations that failed on the bounded metadata pool. A non-zero value indicates backend or pool pressure and may delay metadata convergence.", ValueType::Number) \
-    M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
-    M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
-    M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
-    M(CASMetaAbsentRepublish, "Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail.", ValueType::Number) \
-    M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
-    M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
+    M(CASBlobPublishDigestMismatch, "Number of streamed CAS blob publications refused because the payload did not hash to the blob's key. Any non-zero value means a corrupted or changed source.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \
     M(CASBulkDeleteRequests, "Number of CAS batch delete requests: one DeleteObjects carrying up to 1000 write-once keys (manifest bodies, ref logs, ref snapshots). The per-key class counters (CASManifestDelete, CASRootDelete) say how many keys each request carried.", ValueType::Number) \
     M(CASGCRefWalkPlansBuilt, "Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers.", ValueType::Number) \
     M(CASGCUnmatchedAdoptedParentLives, "Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal.", ValueType::Number) \
     M(CASGCStuckRemovals, "Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion.", ValueType::Number) \
+    M(CASGCStalledCreatingCancelled, "Number of cancels of Creating catalog rows that the CAS GC pre-fold drain observed as successful, each for a row whose creator's mount slot certified that its writer epoch cannot finish creating the namespace. Each also writes one INFO log line. Not an exact audit of which actor removed a row; a cancel whose response was lost and that a later catalog write followed is not counted.", ValueType::Number) \
+    M(CASOwnCreatingCancelled, "Number of cancels of this mount's own Creating catalog rows of its live writer epoch that it observed as successful, each decided while no admission of the name was in flight on this server. Each also writes one INFO log line. A cancel whose lost response settles on different catalog bytes is not counted.", ValueType::Number) \
     M(CASGCNamespaceCleanupLeaks, "Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD, exact-delete or a batch delete failed. Each occurrence is logged with the key, or the first key of the batch, and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress.", ValueType::Number) \
     M(CASDetachedWorkDrainTimeouts, "Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but for that teardown it could not be established that no tracked task still holds the pool. Expected to stay at zero.", ValueType::Number) \
     M(CASEventDroppedContextExpired, "Number of CAS system-log events dropped because the storage's `Context` reference expired before delivery. A non-zero value indicates event production outlived the owning server context.", ValueType::Number) \
@@ -1059,6 +1073,7 @@ The server successfully detected this situation and will download merged part fr
     M(ReadBufferFromS3InitMicroseconds, "Time spent initializing connection to S3.", ValueType::Microseconds) \
     M(ReadBufferFromS3Bytes, "Bytes read from S3.", ValueType::Bytes) \
     M(ReadBufferFromS3RequestsErrors, "Number of exceptions while reading from S3.", ValueType::Number) \
+    M(ReadBufferFromS3RequestsCut, "Number of requests from S3 disks cut to one buffer fill because the connection group of the disks was at or above `disk_connections_soft_limit`.", ValueType::Number) \
     \
     M(WriteBufferFromS3Microseconds, "Time spent on writing to S3.", ValueType::Microseconds) \
     M(WriteBufferFromS3Bytes, "Bytes written to S3.", ValueType::Bytes) \

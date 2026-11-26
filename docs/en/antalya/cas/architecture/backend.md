@@ -30,12 +30,11 @@ every present key has exactly one current incarnation identified by an opaque `T
 
 `deleteExact`, `putIfAbsent`, and `putOverwrite`/`casPut` are safety-critical for exact deletion,
 write-once metadata/control objects, and mutual exclusion. Blob-body publication deliberately has
-different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, freshness metadata, and proof;
+different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, the read of the deletion intent, and proof;
 `publishBlob` only moves the selected bytes.
 
 Writer readiness is represented by `BlobDependencyProof`, not by token presence. `Materialized`
-means the writer observed a present body with a `Clean` marker or completed publication and metadata
-reconciliation. `TrustedManifest` means a durable source manifest proves the blob and requires no
+means the writer observed a present body whose deletion intent is absent, or completed publication. `TrustedManifest` means a durable source manifest proves the blob and requires no
 blob I/O. Pending state and writer tokens are not stored in the dependency record.
 
 **`TOKEN ⟹ CONTENT`** is the one contract item the capability probe cannot check: a token must
@@ -97,17 +96,17 @@ capability probe below, not merely a slower-verified third case.
 
 `deleteExact(key, token)` is realized as a conditional `DELETE` naming the token as a precondition:
 an `If-Match`-style delete on `AWS` (`ETag`), a generation-match delete on `GCS`. A precondition
-failure — `S3::isPreconditionFailedError` — is reported as `DeleteOutcome::TokenMismatch`, never as
-an exception; the object is left untouched. `DeleteOutcome::created_delete_marker` reports whether
+failure is reported as a token mismatch, never as
+an exception; the object is left untouched. The result also says whether
 the backend created a delete marker instead of actually removing the object, which the capability
 probe rejects: a bucket with versioning enabled would let `CAS` "delete" a blob without freeing any
 storage, and GC would silently stop reclaiming.
 
 ## The capability probe {#capability-probe}
 
-`runCapabilityProbe` (`Backend/CasProbe.cpp`) runs a throwaway-key battery against every writable
-mount, described in full on the [bucket requirements](/antalya/cas/bucket-requirements) page. It is
-fail-closed: any check that does not pass throws `NOT_IMPLEMENTED` naming the specific failure, and
+The probe runs a throwaway-key battery when a writable
+disk starts, described in full on the [bucket requirements](/antalya/cas/bucket-requirements) page. It is
+fail-closed: any check that does not pass throws, usually `NOT_IMPLEMENTED`, naming the specific failure (a store's own refusal keeps the store's error code), and
 the mount refuses to become writable. The one tolerated exception is a versioning probe that cannot
 answer at all, described in the first bullet below. Two further gates run as the battery's opening steps, and one
 sits genuinely alongside it. The distinction matters: because the versioning check runs *inside* the
@@ -129,7 +128,7 @@ battery, skipping the battery used to skip it too, which is exactly why the thir
   list-after-write), because the fail-closed tradeoff inverts there: refusing an ordinary mount costs
   availability and protects data, whereas refusing a decommission strands a pool with a dead replica
   in it and leaves the operator no way forward.
-- `checkConditionalWriteSingleAttemptSupport` — inside the battery. Refuses to mount writable unless the underlying
+- The single-attempt conditional-write check — runs on every ordinary writable start, with or without `skip_access_check`. Refuses to mount writable unless the underlying
   object storage supports a single-HTTP-attempt retry profile for conditional writes. A hidden SDK
   retry can outlive the writer's mount lease and obscure whether a conditional operation actually
   committed, so retries on the conditional path must be explicit CAS state-machine transitions, not

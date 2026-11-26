@@ -54,11 +54,11 @@ struct GcRoundLogRecord
     UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted, distinct from blob deletes
     /// Counts for the three-stage deletion pipeline reported by `Cas::RoundReport`.
     UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
-    UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
-    UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
+    UInt64 entries_intent_confirmed = 0;   /// entries newly floor-passed (published delete_pending) this round
+    UInt64 entries_bodies_deleted = 0;   /// pending exact-token blob deletes executed this round
     /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
     /// per affected `delete_pending` entry.
-    UInt64 entries_redelete_failed = 0;
+    UInt64 entries_body_delete_failed = 0;
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
@@ -79,7 +79,7 @@ struct GcRoundLogRecord
     /// The GC phase this row describes; empty on `Start`/`Finish`. The literals are the ones passed to
     /// `Cas::GcPhaseTimer` at each phase's single instrumentation site.
     String phase;
-    /// Wall time of this phase. MICROseconds, not milliseconds: `meta_pool_wait`, `round_commit` and
+    /// Wall time of this phase. MICROseconds, not milliseconds: `round_commit` and
     /// `parent_seal_read` are routinely sub-millisecond and the whole point of the row is seeing when
     /// they are not.
     UInt64 phase_duration_microseconds = 0;
@@ -129,6 +129,10 @@ public:
     /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CAS GC STOP`).
     void stop();
 
+    /// Whether `stop` was called since the last `start`. A background round asks it between ref-intake steps,
+    /// so `stop` does not wait for a long intake to finish.
+    bool stopRequested();
+
     /// Wake the periodic worker so it starts the next ordinary round promptly. This does not create a
     /// second execution path: the same worker, lease protocol, and `gc_round_mutex` remain the sole
     /// scheduled-round authority. Requests coalesce into one boolean while a round is pending.
@@ -173,6 +177,10 @@ public:
     /// delay.
     bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
 
+    /// Runs `hook` on the round worker at every tick, after its stop check and before it takes the round mutex.
+    /// Set it before `start`.
+    void setBeforeTickLockHookForTest(std::function<void()> hook) { before_tick_lock_hook_for_test = std::move(hook); }
+
 private:
     enum class SchedulerState
     {
@@ -190,6 +198,9 @@ private:
     /// observation window, so a long round does not look like a dead leader to another scheduler.
     /// Heartbeat failures are advisory and are retried on the next cadence.
     void heartbeatLoop();
+
+    /// The pool is terminal, or a `FORGET` has published its intent: both loops exit, and no round starts.
+    bool poolTerminalOrForgetting() const;
 
     /// Runs synchronously when `Cas::Gc` acquires or renews the lease, before the round's potentially
     /// long fold begins. It marks this scheduler as the heartbeat owner and sends the first pulse
@@ -246,6 +257,8 @@ private:
     std::atomic<bool> hb_exited_on_terminal_for_test{false};
     std::mutex terminal_exit_mutex;
     std::condition_variable terminal_exit_cv;
+    /// See `setBeforeTickLockHookForTest`. Empty in production.
+    std::function<void()> before_tick_lock_hook_for_test;
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.

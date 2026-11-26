@@ -274,10 +274,10 @@ uint64_t JsonObjectReader::readU64String()
     return guarded([&]
     {
         const std::string_view s = readStringIntoScratch();
-        ReadBufferFromMemory buf(s.data(), s.size());
+        ReadBufferFromMemory buf(s);
         uint64_t v = 0;
-        readIntText(v, buf);
-        if (s.empty() || !buf.eof())
+        /// The wire format uses unsigned decimal digits; `tryReadIntText` also accepts a leading plus.
+        if (s.starts_with('+') || !tryReadIntText<ReadIntTextCheckOverflow::CHECK_OVERFLOW>(v, buf) || !buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected decimal u64 string, got '{}'", what, s);
         return v;
     });

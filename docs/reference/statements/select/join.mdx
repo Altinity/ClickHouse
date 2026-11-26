@@ -478,6 +478,16 @@ The setting applies when the left table is a `*Cluster` table function or a tabl
 | `global` | Nodes, for `INNER`, `LEFT`, and `CROSS` | The right table. For `CROSS JOIN`, every table after the first. |
 | `global` | Initiator, for `RIGHT` and `FULL` | Nothing. A `RIGHT` or `FULL` join on every node would repeat unmatched rows of the preserved side. |
 
+### `allow_object_storage_cluster_distributed_join` {#allow-object-storage-cluster-distributed-join}
+
+Experimental, off by default. With [`allow_object_storage_cluster_distributed_join`](/operations/settings/settings#allow_object_storage_cluster_distributed_join) enabled, a whole `JOIN` query is sent to the cluster of its driving table instead of being planned by [`object_storage_cluster_join_mode`](#object-storage-cluster-join-mode). The `JOIN` and any `GROUP BY` run on the nodes, and the initiator only merges the partial aggregate states.
+
+The driving table is the leftmost table of the query, found through `INNER ALL` and `LEFT` joins and through subqueries or CTEs that do not aggregate, deduplicate, sort, or limit. It must be a `DataLake` catalog table with `object_storage_cluster` set.
+
+The decision is all-or-nothing for the outermost `SELECT` of an initial query. The query is sent whole only if every other table in it also resolves through a `DataLake` catalog, has no row policy, and is readable by the current user. Otherwise the whole query is planned as set by `object_storage_cluster_join_mode`. An explicit `*Cluster` table function, a local or `Distributed` table, `additional_table_filters`, `object_storage_remote_initiator`, or a nested `SETTINGS` clause makes the query ineligible.
+
+Only the driving table is split across the nodes. Every other table is read in full on every node, so the setting helps when those tables are small relative to the driver.
+
 ### `PREWHERE` {#distributed-join-prewhere}
 
 `PREWHERE` is applied on the table it belongs to. When that table is the one sent to the nodes, the filter runs while the initiator builds the temporary table. When that table stays on the nodes, the filter runs there. A `PREWHERE` that names no column is attached to the leftmost table and keeps a `GLOBAL` `RIGHT` join on the initiator.

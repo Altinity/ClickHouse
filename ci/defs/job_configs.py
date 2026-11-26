@@ -559,8 +559,11 @@ class JobConfigs:
         ),
         Job.ParamSet(
             parameter=BuildTypes.PPC64LE,
-            provides=[ArtifactNames.CH_PPC64LE],
-            runs_on=RunnerLabels.ARM_LARGE,
+            provides=[
+                ArtifactNames.CH_PPC64LE,
+                ArtifactNames.CH_PPC64LE_GH,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
         ),
         Job.ParamSet(
             parameter=BuildTypes.AMD_COMPAT,
@@ -634,6 +637,18 @@ class JobConfigs:
             provides=[ArtifactNames.CH_WASM_PARSER],
             runs_on=RunnerLabels.ARM_LARGE,
         ),
+    )
+    smoke_test_ppc64le = Job.Config(
+        name=JobNames.SMOKE_TEST_PPC64LE,
+        runs_on=RunnerLabels.FUNC_TESTER_AMD,
+        command="python3 ./ci/jobs/smoke_test_ppc64le.py",
+        digest_config=Job.CacheDigestConfig(
+            include_paths=[
+                "./ci/jobs/smoke_test_ppc64le.py",
+            ],
+        ),
+        requires=[ArtifactNames.CH_PPC64LE_GH],
+        timeout=900,
     )
     install_check_jobs = Job.Config(
         name=JobNames.INSTALL_TEST,

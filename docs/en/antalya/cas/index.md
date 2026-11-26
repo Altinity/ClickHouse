@@ -64,6 +64,8 @@ Two consequences for planning:
   Each prefix is a fully independent pool (its own refs, leases, and `GC`), so rounds stay short
   regardless of the total fleet size.
 
+Each pool owns its prefix, and its bucket credential is its trust boundary. See [what must not run on the bucket](/antalya/cas/bucket-requirements#must-not) and [the trust boundary](/antalya/cas/bucket-requirements#trust-boundary).
+
 :::tip
 For replicated tables on `CAS`, enable
 [`execute_merges_on_single_replica_time_threshold`](/operations/settings/merge-tree-settings#execute_merges_on_single_replica_time_threshold).
