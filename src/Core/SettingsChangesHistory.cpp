@@ -63,7 +63,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
         {
-            {"input_format_parquet_footer_read_size", 65536, 0, "New setting to override the adaptive Parquet footer initial read size with a fixed number of bytes; 0 keeps the adaptive behavior. Before this setting the reader always read a fixed 64 KiB tail. `compatibility` with 26.8 restores that fixed read."},
+            {"input_format_parquet_footer_read_size", 65536, 0, "New setting for the Parquet footer initial read size; 0 reads 64 KiB of a local file and sizes the read adaptively for other sources. Before this setting the reader always read a fixed 64 KiB tail. `compatibility` with 26.8 restores that fixed read."},
         });
         addSettingsChanges(settings_changes_history, "26.8",
         {

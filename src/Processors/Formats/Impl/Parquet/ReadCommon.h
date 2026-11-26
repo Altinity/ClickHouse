@@ -3,6 +3,8 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <Formats/FormatSettings.h>
 
+#include <algorithm>
+
 namespace DB
 {
 struct FormatParserSharedResources;
@@ -36,7 +38,43 @@ struct ReadOptions
     /// probability becomes very high. E.g. if bloom filter has 1% false positive probability,
     /// searching for 100 elements would have 63% false positive probability.
     size_t bloom_filter_max_set_size = 100;
+
+    /// Hint (in bytes) for how much of the file tail to read when fetching the Parquet footer
+    /// (`FileMetaData`). 0 means unknown. A data lake that already knows per-file statistics
+    /// (Iceberg: number of columns, row groups and the sizes of the column bounds from the manifest)
+    /// sets it with `estimateParquetFooterSize`, so that the footer of a wide file or of a file
+    /// with many row groups is read in one request. It can only make the initial tail read larger
+    /// than the default of `input_format_parquet_footer_read_size`, and an explicit non-zero value
+    /// of that setting takes precedence. It never changes the result of a read: a too small hint
+    /// takes one more read of the rest of the footer, a too large one reads a larger tail.
+    size_t footer_size_hint = 0;
 };
+
+/// Estimates the size of a serialized Parquet `FileMetaData`, to size the initial tail read.
+///  - `num_columns`: the number of leaf columns,
+///  - `num_row_groups`: the number of row groups,
+///  - `bounds_bytes`: the total size of the min and max bounds of all columns of one row group
+///    (for Iceberg, the sum over the `lower_bounds` and `upper_bounds` of a manifest entry), which
+///    are repeated in every row group of the footer.
+/// The result is clamped, so it is always safe to use as `ReadOptions::footer_size_hint`.
+inline size_t estimateParquetFooterSize(size_t num_columns, size_t num_row_groups, size_t bounds_bytes)
+{
+    /// Overestimating only costs a slightly larger tail read, underestimating takes the existing
+    /// second read of the rest of the footer.
+    constexpr size_t fixed_overhead = 4096;      /// the schema and the key-value metadata of the file
+    constexpr size_t per_row_group = 64;         /// `RowGroup` itself
+    /// A Thrift compact `ColumnMetaData` with the `ColumnChunk` around it, plus the column's schema element:
+    /// offsets, sizes, encodings and a short `path_in_schema`, without the min/max bounds that are counted
+    /// separately. Measured at about 50-60 bytes per column and row group in files written by Spark, and at about
+    /// 110 bytes in files written by ClickHouse (3000 columns of `Int32`, one row group, 126 bytes with the bounds).
+    constexpr size_t per_column_chunk = 96;
+    constexpr size_t floor_size = 64ul << 10;    /// never smaller than the former fixed tail read
+    constexpr size_t cap_size = 16ul << 20;      /// do not read an enormous tail speculatively
+
+    size_t estimate = fixed_overhead + num_row_groups * (per_row_group + num_columns * per_column_chunk + bounds_bytes);
+    estimate += estimate / 4; /// 1.25x for the column names and for the bounds that Iceberg truncates differently
+    return std::clamp(estimate, floor_size, cap_size);
+}
 
 struct SharedResourcesExt
 {

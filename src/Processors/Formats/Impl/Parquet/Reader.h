@@ -566,8 +566,12 @@ struct Reader
 
     void init(const ReadOptions & options_, const Block & sample_block_, FormatFilterInfoPtr format_filter_info_);
 
-    /// `footer_read_size` overrides the initial footer read size; 0 sizes it adaptively to the file.
-    static parq::FileMetaData readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size);
+    /// `footer_read_size` overrides the initial footer read size; 0 reads 64 KiB of a local file and sizes the read to the file otherwise.
+    /// `footer_size_hint` (0 if unknown) can only widen the initial read when `footer_read_size` is 0, see `ReadOptions::footer_size_hint`.
+    /// If `retain_tail` and the footer fits into the initial read, the last `Prefetcher::max_retained_tail_size` bytes
+    /// of the part of that read that precedes the footer are retained in `prefetcher`. Pass it only if ranges are going
+    /// to be registered in `prefetcher`, otherwise the retained bytes are never used.
+    static parq::FileMetaData readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size, size_t footer_size_hint, bool retain_tail);
     void prefilterAndInitRowGroups(const std::optional<std::unordered_set<UInt64>> & row_groups_to_read);
     void preparePrewhere();
 

@@ -65,7 +65,25 @@ public:
     /// Pass-through read from the underlying ReadBuffer.
     void readSync(char * to, size_t n, size_t offset);
 
+    /// The most bytes that `retainTail` keeps. The retained chunk is kept for the whole lifetime of the reader, so it
+    /// must not grow with the explicit `input_format_parquet_footer_read_size`. The Column Index and the Offset Index
+    /// are just below the footer, so the bytes closest to the footer are the ones that matter.
+    static constexpr size_t max_retained_tail_size = 2ul << 20;
+
+    /// Retains a chunk of the file that was already read to parse the footer, so that a range that is
+    /// registered later and lies fully inside the chunk (notably the Column Index and the Offset Index, which
+    /// are just below the footer) is served from this copy instead of being read again.
+    /// The first `length` bytes of `data` are the file bytes [file_offset, file_offset + length); the rest of
+    /// `data` (e.g. the footer) is dropped. `data` is moved from, the bytes are not copied, so that the chunk
+    /// does not take memory twice. It is left untouched if nothing is retained.
+    /// `length` must not exceed `max_retained_tail_size`.
+    /// Does nothing if the whole file is in memory already or `length` is 0.
+    /// Must be called before `finalizeRanges`, and from one thread. A repeated call does nothing: the footer of
+    /// the file may be read again, and the first retained chunk is kept.
+    void retainTail(PaddedPODArray<char> && data, size_t length, size_t file_offset);
+
     size_t getFileSize() const { return file_size; }
+    bool isLocalFile() const { return is_local_file; }
 
 private:
     friend class PrefetchHandle;
@@ -180,6 +198,7 @@ private:
     PaddedPODArray<char> entire_file;
 
     size_t file_size{};
+    bool is_local_file = false;
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
 
@@ -194,6 +213,12 @@ private:
     std::deque<RangeSet> range_sets;
 
     std::atomic<bool> ranges_finalized {false};
+
+    /// The chunk retained by `retainTail`: file bytes [retained_tail_start, retained_tail_end), empty if nothing
+    /// is retained. Written once before any range is finalized, read-only afterwards, so needs no locking.
+    PaddedPODArray<char> retained_tail;
+    size_t retained_tail_start = 0;
+    size_t retained_tail_end = 0;
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;

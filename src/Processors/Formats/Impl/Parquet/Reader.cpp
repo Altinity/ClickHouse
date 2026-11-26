@@ -55,6 +55,7 @@ namespace ProfileEvents
     extern const Event ParquetColumnsFilterExpression;
     extern const Event ParquetReadPages;
     extern const Event ParquetPrunedPages;
+    extern const Event ParquetFooterSecondRead;
 }
 
 namespace DB::Parquet
@@ -220,7 +221,7 @@ void Reader::init(const ReadOptions & options_, const Block & sample_block_, For
     format_filter_info = format_filter_info_;
 }
 
-parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size)
+parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size, size_t footer_size_hint, bool retain_tail)
 {
     /// Parquet file ends with:
     ///  * serialized FileMetaData struct,
@@ -231,15 +232,21 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
     if (file_size <= 8)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Parquet file too short: {} bytes", file_size);
 
-    /// Read a tail sized to the file (1%, clamped to [128 KiB, 2 MiB]) so it usually covers the whole
-    /// footer - FileMetaData for wider range of layouts - in one read. A non-zero
-    /// `footer_read_size` overrides this adaptive size with a fixed read size.
+    /// A second read of a local file is cheap. Elsewhere a tail sized to the file (1%, clamped to [128 KiB, 2 MiB])
+    /// usually covers the whole footer in one round trip. A non-zero `footer_read_size` is a fixed read size.
+    /// If the caller knows better how large the footer is (e.g. from Iceberg manifest statistics), it can only
+    /// widen the default tail, so that a wide file or a file with many row groups does not need a second read.
     if (footer_read_size == 0)
-        footer_read_size = std::clamp<size_t>(file_size / 100, 128ul << 10, 2ul << 20);
+    {
+        footer_read_size = prefetcher.isLocalFile() ? 64ul << 10 : std::clamp<size_t>(file_size / 100, 128ul << 10, 2ul << 20);
+        footer_read_size = std::max(footer_read_size, footer_size_hint);
+    }
     /// The read must cover at least the 8-byte trailer (metadata size + magic) so the offsets below
     /// don't underflow; an explicit `footer_read_size` smaller than that is bumped up to 8.
     size_t initial_read_size = std::min(file_size, std::max<size_t>(footer_read_size, 8));
-    PODArray<char> buf(initial_read_size);
+    /// Padded because the part of it that precedes the footer can be retained by `prefetcher` and served as the data
+    /// of ranges, and the readers rely on the padding of the data.
+    PaddedPODArray<char> buf(initial_read_size);
     prefetcher.readSync(buf.data(), initial_read_size, file_size - initial_read_size);
 
     if (memcmp(buf.data() + initial_read_size - 4, "PAR1", 4) != 0)
@@ -254,6 +261,7 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
     size_t buf_offset = 0;
     if (metadata_size + 8 > initial_read_size)
     {
+        ProfileEvents::increment(ProfileEvents::ParquetFooterSecondRead);
         size_t remaining_bytes_to_read = metadata_size + 8 - initial_read_size;
         buf.resize(metadata_size);
         memmove(buf.data() + remaining_bytes_to_read, buf.data(), initial_read_size - 8);
@@ -266,6 +274,22 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
 
     parq::FileMetaData file_metadata = {};
     deserializeThriftStruct(file_metadata, buf.data() + buf_offset, metadata_size);
+
+    /// If the footer fit into the tail we read (`buf_offset` is 0 otherwise), the tail also holds what precedes the
+    /// footer: the Column Index and Offset Index. Retain the last part of that, so the ranges registered for those
+    /// indexes are served from memory rather than read again. Only the bytes closest to the footer are kept, at most
+    /// `max_retained_tail_size`: the retained chunk lives as long as the reader, and an explicit
+    /// `input_format_parquet_footer_read_size` can make the tail arbitrarily large. Nothing to retain if the footer
+    /// begins at the start of the tail. Only a caller that goes on to register ranges in `prefetcher` has a use for it.
+    if (retain_tail && buf_offset > 0)
+    {
+        size_t retained_length = std::min(buf_offset, Prefetcher::max_retained_tail_size);
+        size_t retained_offset = buf_offset - retained_length;
+        /// The footer is already parsed, and the bytes [retained_offset, buf_offset) lie before it, so this does not
+        /// overwrite anything that is still needed. The buffer is moved to the prefetcher, which drops the rest of it.
+        memmove(buf.data(), buf.data() + retained_offset, retained_length);
+        prefetcher.retainTail(std::move(buf), retained_length, file_size - initial_read_size + retained_offset);
+    }
 
     /// Some writers incorrectly set dictionary_page_offset offset to 0 when there's no dictionary
     /// page at offset 0 in the file. Work around it.

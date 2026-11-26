@@ -1,6 +1,7 @@
 -- Tags: no-fasttest, no-random-settings
 -- Closes #90890
 -- This tests verifies that while reading a parquet file, the prefetcher leverages more efficient readBigAt logic (ReadMode::RandomRead)
+-- The file is tiny, so the read of the footer tail covers all of it and the data pages are served from that tail: one read.
 
 DROP TABLE IF EXISTS t_parquet_prefetcher_read_big_at;
 

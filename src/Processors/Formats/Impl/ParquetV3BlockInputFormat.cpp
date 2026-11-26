@@ -58,6 +58,8 @@ ParquetV3BlockInputFormat::ParquetV3BlockInputFormat(
 {
     read_options.min_bytes_for_seek = min_bytes_for_seek;
     read_options.bytes_per_read_task = min_bytes_for_seek * 4;
+    if (object_with_metadata.has_value() && object_with_metadata->footer_size_hint.has_value())
+        read_options.footer_size_hint = *object_with_metadata->footer_size_hint;
 
     if (!format_filter_info)
         format_filter_info = std::make_shared<FormatFilterInfo>();
@@ -103,7 +105,7 @@ void ParquetV3BlockInputFormat::readFileFooterIfNeeded()
 
         auto new_reader = std::make_unique<Parquet::ReadManager>();
         new_reader->reader.prefetcher.init(in, read_options, parser_shared_resources);
-        new_reader->reader.file_metadata = getFileMetadata(new_reader->reader.prefetcher);
+        new_reader->reader.file_metadata = getFileMetadata(new_reader->reader.prefetcher, /*retain_tail=*/ true);
 
         std::lock_guard lock(reader_mutex);
         reader_with_footer = std::move(new_reader);
@@ -125,7 +127,7 @@ void ParquetV3BlockInputFormat::initializeIfNeeded()
     }
 }
 
-parquet::format::FileMetaData ParquetV3BlockInputFormat::getFileMetadata(Parquet::Prefetcher & prefetcher) const
+parquet::format::FileMetaData ParquetV3BlockInputFormat::getFileMetadata(Parquet::Prefetcher & prefetcher, bool retain_tail) const
 {
     if (metadata_cache && object_with_metadata.has_value() && object_with_metadata->metadata.has_value())
     {
@@ -133,11 +135,11 @@ parquet::format::FileMetaData ParquetV3BlockInputFormat::getFileMetadata(Parquet
         String etag = object_with_metadata->metadata->etag;
         ParquetMetadataCacheKey cache_key = ParquetMetadataCache::createKey(file_name, etag);
         return metadata_cache->getOrSetMetadata(
-            cache_key, [&]() { return Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size); });
+            cache_key, [&]() { return Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size, read_options.footer_size_hint, retain_tail); });
     }
     else
     {
-        return Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size);
+        return Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size, read_options.footer_size_hint, retain_tail);
     }
 }
 
@@ -190,7 +192,7 @@ Chunk ParquetV3BlockInputFormat::read()
             /// Don't init Reader and ReadManager if we only need file metadata.
             Parquet::Prefetcher temp_prefetcher;
             temp_prefetcher.init(in, read_options, parser_shared_resources);
-            prepareNeedOnlyCountRowGroups(getFileMetadata(temp_prefetcher));
+            prepareNeedOnlyCountRowGroups(getFileMetadata(temp_prefetcher, /*retain_tail=*/ false));
             need_only_count_prepared = true;
         }
 
@@ -295,7 +297,7 @@ void NativeParquetSchemaReader::initializeIfNeeded()
         return;
     Parquet::Prefetcher prefetcher;
     prefetcher.init(&in, read_options, /*parser_shared_resources_=*/ nullptr);
-    file_metadata = Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size);
+    file_metadata = Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size, read_options.footer_size_hint, /*retain_tail=*/ false);
     initialized = true;
 }
 
@@ -373,7 +375,7 @@ std::vector<FileBucketInfoPtr> ParquetBucketSplitter::splitToBuckets(size_t buck
     Parquet::ReadOptions read_options = convertReadOptions(format_settings_);
     Parquet::Prefetcher prefetcher;
     prefetcher.init(&buf, read_options, /*parser_shared_resources_=*/ nullptr);
-    auto metadata = Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size);
+    auto metadata = Parquet::Reader::readFileMetaData(prefetcher, read_options.format.parquet.footer_read_size, read_options.footer_size_hint, /*retain_tail=*/ false);
     std::vector<size_t> bucket_sizes;
     for (const auto & row_group : metadata.row_groups)
         bucket_sizes.push_back(size_t(row_group.total_byte_size));

@@ -2,6 +2,7 @@
 
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/copyData.h>
+#include <IO/ReadBufferFromFileBase.h>
 #include <IO/SeekableReadBuffer.h>
 #include <IO/WithFileSize.h>
 #include <IO/WriteBufferFromVector.h>
@@ -22,6 +23,7 @@ namespace ProfileEvents
     extern const Event ParquetPrefetcherReadRandomRead;
     extern const Event ParquetPrefetcherReadSeekAndRead;
     extern const Event ParquetPrefetcherReadEntireFile;
+    extern const Event ParquetPrefetcherServedFromRetainedTail;
 }
 
 namespace DB::Parquet
@@ -72,7 +74,14 @@ void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOp
             }
 
             if (reader)
+            {
                 file_size = getFileSizeFromReadBuffer(*seekable);
+                if (auto * file_buf = dynamic_cast<ReadBufferFromFileBase *>(seekable))
+                {
+                    size_t view_offset = 0;
+                    is_local_file = file_buf->isRegularLocalFile(&view_offset);
+                }
+            }
         }
     }
 
@@ -127,6 +136,35 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
     }
     if (nread != n)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected eof: offset {}, length {}, bytes read {}, expected file size {}", offset, n, nread, file_size);
+}
+
+void Prefetcher::retainTail(PaddedPODArray<char> && data, size_t length, size_t file_offset)
+{
+    chassert(!ranges_finalized.load(std::memory_order_relaxed));
+
+    /// With the whole file in memory there is nothing to save.
+    if (read_mode == ReadMode::EntireFileIsInMemory || length == 0)
+        return;
+
+    /// The footer of the same file can be read more than once: `ReadManager::init` reads it again if the
+    /// metadata that it was given has an empty schema (such a file is rejected later, when the schema is
+    /// converted). The bytes at the same offsets of the same file are the same, so keep the first chunk.
+    if (retained_tail_end > retained_tail_start)
+        return;
+    if (file_offset > file_size || length > file_size - file_offset)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail out of bounds: offset {}, length {}, file size {}", file_offset, length, file_size);
+
+    if (length > data.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail is longer than the buffer: length {}, buffer size {}", length, data.size());
+    if (length > max_retained_tail_size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail is longer than the maximum: length {}, maximum {}", length, max_retained_tail_size);
+
+    /// Keep only the requested part, and give the memory of the rest back before keeping the buffer.
+    data.resize(length);
+    data.shrink_to_fit();
+    retained_tail = std::move(data);
+    retained_tail_start = file_offset;
+    retained_tail_end = file_offset + length;
 }
 
 PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used)
@@ -314,6 +352,35 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     {
         start_offset = ranges[range_idx].start;
         end_offset = ranges[range_idx].end;
+    }
+
+    /// A range that lies fully inside the retained tail (e.g. a Column Index or an Offset Index) needs no read:
+    /// attach it to a task that is Done from the start and refers to the retained bytes. It is not coalesced
+    /// with other ranges, that would only make them read the bytes that we already have.
+    if (retained_tail_end > retained_tail_start && start_offset >= retained_tail_start && end_offset <= retained_tail_end)
+    {
+        Task & task = tasks.emplace_back();
+        task.offset = start_offset;
+        task.length = end_offset - start_offset;
+        task.refcount.store(1);
+        task.state.store(Task::State::Done);
+        /// `retained_tail` outlives all handles, so the region needs no keep-alive `handle`.
+        task.cached_region = Task::CachedReadRegion{
+            .handle = {},
+            .data = retained_tail.data() + (start_offset - retained_tail_start),
+            .size = end_offset - start_offset,
+            .file_offset = start_offset};
+
+        initial_req->task = &task;
+        initial_req->task_offset = 0;
+        RequestState::State s = RequestState::State::HasRange;
+        bool changed = initial_req->state.compare_exchange_strong(s, RequestState::State::HasTask);
+        chassert(changed); /// the state was checked above under `mutex`, and the handle is alive
+        if (!changed)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected state of a range with a retained task: {}", static_cast<int>(s));
+
+        ProfileEvents::increment(ProfileEvents::ParquetPrefetcherServedFromRetainedTail);
+        return;
     }
 
     /// Try to extend the task's range in both directions to cover more request ranges, as long

@@ -105,7 +105,8 @@ private:
     void prepareNeedOnlyCountRowGroups(const parquet::format::FileMetaData & file_metadata);
     std::shared_ptr<ParquetFileBucketInfo> buckets_to_read;
 
-    parquet::format::FileMetaData getFileMetadata(Parquet::Prefetcher & prefetcher) const;
+    /// `retain_tail`: ranges are going to be registered in `prefetcher`, see `Parquet::Reader::readFileMetaData`.
+    parquet::format::FileMetaData getFileMetadata(Parquet::Prefetcher & prefetcher, bool retain_tail) const;
 };
 
 class NativeParquetSchemaReader final : public ISchemaReader
