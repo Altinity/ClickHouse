@@ -36,6 +36,7 @@ namespace ProfileEvents
 {
     extern const Event CASBlobUploadFanoutBatches;
     extern const Event CASBlobUploadFanoutTasks;
+    extern const Event CASManifestInlineEntriesSelectedForBlob;
 }
 
 namespace fs = std::filesystem;
@@ -48,6 +49,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
+    extern const int LIMIT_EXCEEDED;
     extern const int NOT_IMPLEMENTED;
 }
 }
@@ -115,13 +117,6 @@ bool hasTopLevelFile(const std::vector<Cas::ManifestEntry> & entries)
 {
     return std::any_of(entries.begin(), entries.end(),
         [](const Cas::ManifestEntry & e) { return e.path.find('/') == std::string::npos; });
-}
-
-/// A committed manifest with no top-level file is not a part: it is the scratch of a sub-storage nested
-/// under the part's directory (`createTemporaryTextIndexStorage`), committed at the part's own name.
-bool isNestedScratchManifest(const std::vector<Cas::ManifestEntry> & entries)
-{
-    return !hasTopLevelFile(entries);
 }
 
 }
@@ -295,7 +290,7 @@ std::shared_ptr<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const
 }
 
 void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
-                                                     const PendingRefs & pending_refs)
+                                                     const PendingRefs & blob_refs_with_upload_requests)
 {
     /// An entry whose bytes this transaction uploads is protected by its own precommit, whatever it was copied from.
     std::vector<std::shared_ptr<Cas::CopySource>> sources;
@@ -305,7 +300,7 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
             { return s->part == source.part && s->manifest_ref == source.manifest_ref; });
     };
     for (const auto & entry : st.entries)
-        if (auto source = copySourceOf(st, entry.path); source && !pending_refs.contains(entry.ref) && !listed(*source))
+        if (auto source = copySourceOf(st, entry.path); source && !blob_refs_with_upload_requests.contains(entry.ref) && !listed(*source))
             sources.push_back(std::move(source));
 
     /// A source this transaction changes before it publishes the copy no longer commits the manifest the copy
@@ -402,20 +397,80 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
-Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
-                                                                const PendingRefs & pending_refs)
+namespace
 {
-    /// Edge before observe: the precommit names every blob before `putBlob` observes one, so a condemnation between
-    /// the upload and the promote cannot delete a body this build relies on.
+
+/// Only entries supplied by this transaction may change placement. The caller has already
+/// excluded shadowed and removed paths from the retained base.
+std::vector<Cas::BlobUploadRequest> applyManifestInlineBudget(
+    std::vector<Cas::ManifestEntry> & entries_to_add_or_replace, uint64_t inline_bytes_from_unchanged_base_entries, Cas::BlobHashAlgo algo)
+{
+    if (inline_bytes_from_unchanged_base_entries > Cas::kMaxManifestInlineBytesTotal)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Retained manifest entries contain {} inline bytes, exceeding the cap of {}",
+            inline_bytes_from_unchanged_base_entries, Cas::kMaxManifestInlineBytesTotal);
+
+    uint64_t total_inline_bytes = inline_bytes_from_unchanged_base_entries;
+    for (const auto & entry : entries_to_add_or_replace)
+        if (entry.placement == Cas::EntryPlacement::Inline)
+            total_inline_bytes += entry.inline_bytes.size();
+
+    if (total_inline_bytes <= Cas::kMaxManifestInlineBytesTotal)
+        return {};
+
+    std::vector<Cas::ManifestEntry *> candidates;
+    for (auto & entry : entries_to_add_or_replace)
+        if (entry.placement == Cas::EntryPlacement::Inline && !entry.inline_bytes.empty())
+            candidates.push_back(&entry);
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto * lhs, const auto * rhs)
+    {
+        if (lhs->inline_bytes.size() != rhs->inline_bytes.size())
+            return lhs->inline_bytes.size() > rhs->inline_bytes.size();
+        return lhs->path < rhs->path;
+    });
+
+    std::vector<Cas::BlobUploadRequest> blob_upload_requests;
+    for (auto * entry : candidates)
+    {
+        /// Decoded Inline entries borrowed from a committed manifest have no serialized BlobRef.
+        const size_t size = entry->inline_bytes.size();
+        entry->ref = Cas::poolContentHash(algo, entry->inline_bytes);
+
+        blob_upload_requests.push_back({entry->ref, Cas::BlobSource::fromString(std::exchange(entry->inline_bytes, {})), size});
+
+        entry->blob_size = size;
+        entry->placement = Cas::EntryPlacement::Blob;
+        total_inline_bytes -= size;
+
+        if (total_inline_bytes <= Cas::kMaxManifestInlineBytesTotal)
+            break;
+    }
+    ProfileEvents::increment(ProfileEvents::CASManifestInlineEntriesSelectedForBlob, blob_upload_requests.size());
+    return blob_upload_requests;
+}
+
+}
+
+Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(
+    const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st, const PendingRefs & blob_refs_with_upload_requests,
+    const std::vector<Cas::BlobUploadRequest> & blob_upload_requests)
+{
+    /// Edge before observe: the precommit names every blob before the pool observes it.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
-    confirmCopySources(ns, ref, st, pending_refs);
-    uploadPendingBlobs(st);
+    confirmCopySources(ns, ref, st, blob_refs_with_upload_requests);
+
+    if (!blob_upload_requests.empty())
+        Cas::fanOutBlobUploads(*st.build, blob_upload_requests, Cas::blobUploadPool());
+
     return id;
 }
 
-void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
+void ContentAddressedTransaction::appendStagedBlobUploads(const PartStaging & st, std::vector<Cas::BlobUploadRequest> & blob_upload_requests) const
 {
+    if (st.pending_blobs.empty())
+        return;
+
     /// Build the set of blob hashes actually referenced by the staged manifest. Only Blob
     /// entries represent pending content uploads — Inline are not pending blobs. A pending_blob whose
     /// hash is NOT in this set had its entry removed by unlinkFile/replaceFile and must not be uploaded
@@ -425,7 +480,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         if (entry.placement == Cas::EntryPlacement::Blob)
             referenced_hashes.insert(entry.ref);
 
-    /// Build one upload request per referenced pending blob. Duplicate refs (staged-hardlink copies push
+    /// Build one blob upload request per referenced pending blob. Duplicate refs (staged-hardlink copies push
     /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
     /// duplicate-membership filter here — the fan-out launches one task per unique ref and merges one
     /// dep. Local staging re-opens the payload file directly. S3 staging owns a complete
@@ -433,8 +488,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
     /// `publication_attempted` flag, so at most one publication across all of them copies that object
     /// verbatim: the first one, and only after an absent destination. Every other publication re-opens
     /// it, validates and skips its fixed envelope, and streams only the payload under a fresh envelope.
-    std::vector<Cas::BlobUploadRequest> requests;
-    requests.reserve(st.pending_blobs.size());
+    blob_upload_requests.reserve(blob_upload_requests.size() + st.pending_blobs.size());
     for (const auto & pb : st.pending_blobs)
     {
         if (!referenced_hashes.contains(pb.ref))
@@ -486,16 +540,8 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         }
         /// `declared_size` mirrors `source.size` (both are `pb.size`); the fan-out fail-closes if they
         /// ever diverge, so build them together from the one authority.
-        requests.push_back(Cas::BlobUploadRequest{pb.ref, std::move(source), pb.size});
+        blob_upload_requests.push_back(Cas::BlobUploadRequest{pb.ref, std::move(source), pb.size});
     }
-
-    if (requests.empty())
-        return;
-
-    /// Fan out the uploads on the server-wide pool (spec §1). The fan-out enforces
-    /// one-task-per-unique-ref grouping, the merge-nothing failure contract, and merges every result
-    /// into `st.build`'s dep set on THIS (the owning writer) thread after the join.
-    Cas::fanOutBlobUploads(*st.build, requests, Cas::blobUploadPool());
 }
 
 void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
@@ -523,87 +569,107 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         return;
     }
 
-    PendingRefs pending_refs;
-    for (const auto & pb : st.pending_blobs)
-        pending_refs.insert(pb.ref);
+    std::shared_ptr<const Cas::PartFolderView> existing_ref_view;
+    if (!st.entries.empty() || !st.content_removed.empty())
+        existing_ref_view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh);
 
-    /// A blob entry's body is either uploaded by this part or confirmed at its committed source; a part may be
-    /// promoted before any other part of this transaction publishes, so nothing else can supply the body.
+    /// A merge can use two disk transactions under `tmp_merge_<part>`. The first publishes the `text_index_tmp/` segments.
+    /// Once the merge has read them and written the final index files, the part transaction can drop the ref to the
+    /// segment manifest and publish the complete part manifest under the same name.
+    /// Check `st.build` before `buildFor` below so a staged move that needs a build only for uploads keeps its base manifest.
+    const bool should_drop_existing_ref = existing_ref_view && st.build
+        && (!st.base_manifest_ref || *st.base_manifest_ref == existing_ref_view->manifestId().ref)
+        && !hasTopLevelFile(existing_ref_view->manifest()->entries)
+        && hasTopLevelFile(st.entries);
+
+    /// A rewrite requires the ref to still point to its base manifest.
+    /// A write with no base expects the name to be free unless it can replace the temporary segment ref described above.
+    if (st.base_manifest_ref && (!existing_ref_view || existing_ref_view->manifestId().ref != *st.base_manifest_ref))
+        Cas::throwCasOwnershipConflict("ContentAddressedTransaction: committed part {}/{} was moved, dropped or repointed while its rewrite was staged; "
+            "the operation must be re-resolved", ns.string(), ref);
+    if (!st.base_manifest_ref && existing_ref_view && !should_drop_existing_ref)
+        Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {}/{} was published by another writer while this transaction was staging it", ns.string(), ref);
+
+    std::vector<Cas::ManifestEntry> merged_manifest_entries;
+    uint64_t inline_bytes_from_unchanged_base_entries = 0;
+
+    /// After `BEGIN TRANSACTION`, an `INSERT` can publish part `all_1_1_0` in CAS while the SQL transaction is still open.
+    /// At `COMMIT`, `MergeTree` rewrites `txn_version.txt` to record the assigned commit sequence number. That disk transaction
+    /// stages only the new `txn_version.txt`. Carry forward the base entries for `data.bin` and the other untouched files,
+    /// including their inline bytes in the budget for the new manifest.
+    if (existing_ref_view && !should_drop_existing_ref)
+    {
+        std::unordered_set<std::string_view> staged_entry_paths;
+        for (const auto & entry : st.entries)
+            staged_entry_paths.insert(entry.path);
+        for (const auto & entry : existing_ref_view->manifest()->entries)
+        {
+            if (st.content_removed.contains(entry.path) || staged_entry_paths.contains(entry.path))
+                continue;
+            if (entry.placement == Cas::EntryPlacement::Inline)
+                inline_bytes_from_unchanged_base_entries += entry.inline_bytes.size();
+            merged_manifest_entries.push_back(entry);
+        }
+    }
+
+    auto blob_upload_requests = applyManifestInlineBudget(st.entries, inline_bytes_from_unchanged_base_entries, metadata_storage.store()->writeAlgo());
+    if (!blob_upload_requests.empty() && !st.build)
+        buildFor({.ns = ns, .ref = ref, .file = {}}, st);
+
+    appendStagedBlobUploads(st, blob_upload_requests);
+
+    PendingRefs blob_refs_with_upload_requests;
+
+    for (const auto & blob_upload_request : blob_upload_requests)
+        blob_refs_with_upload_requests.insert(blob_upload_request.ref);
+
     for (const auto & entry : st.entries)
-        if (entry.placement == Cas::EntryPlacement::Blob && !pending_refs.contains(entry.ref) && !copySourceOf(st, entry.path))
+        if (entry.placement == Cas::EntryPlacement::Blob && !blob_refs_with_upload_requests.contains(entry.ref) && !copySourceOf(st, entry.path))
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "ContentAddressedTransaction: staged blob '{}' of {}/{} has neither a pending upload nor a copy source",
                 entry.path, ns.string(), ref);
 
-    /// For committed-ref standalone writes and removal marks, `st.entries` holds only the
-    /// CHANGED/ADDED entries (see stageBlobPartFile / the inline writeFile path) — never the whole
-    /// part once the ref already exists; `st.content_removed` holds paths a same-transaction
-    /// unlinkFile staged for removal (§6). Carry every OTHER committed entry forward (minus any
-    /// content_removed path) and republish once via the repoint path, rather than letting the
-    /// PartWriteTxn path below replace the manifest with just the delta. That would either reject a
-    /// genuine content change or silently drop untouched files. This handles both sub-cases the
-    /// interface allows: entries staged
-    /// WITH a PartWriteTxn (this transaction uploaded new content) and WITHOUT one (a former mutable
-    /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
-    if (!st.entries.empty() || !st.content_removed.empty())
+    if (should_drop_existing_ref)
     {
-        auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh);
-        /// A build that stages the part's own top-level files replaces a nested scratch manifest at the
-        /// same name instead of merging into it.
-        if (view && st.build && (!st.base_manifest_ref || *st.base_manifest_ref == view->manifestId().ref)
-            && isNestedScratchManifest(view->manifest()->entries) && hasTopLevelFile(st.entries))
+        if (metadata_storage.partAccess()->dropRefExact({ns, ref}, existing_ref_view->manifestId().ref) == Cas::Removal::Mismatch)
+            Cas::throwCasOwnershipConflict("ContentAddressedTransaction: scratch ref {}/{} was repointed while this transaction was staging the part",
+                ns.string(), ref);
+
+        st.base_manifest_ref.reset();
+        existing_ref_view.reset();
+    }
+    else if (existing_ref_view)
+    {
+        /// The scratch precommit protects new blobs until repointRef publishes the merged manifest.
+        if (st.build)
+            (void)precommitAndUpload(ns, ref, st, blob_refs_with_upload_requests, blob_upload_requests);
+
+        for (auto & entry : st.entries)
+            merged_manifest_entries.push_back(std::move(entry));
+
+        /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref`
+        /// right before the durable repoint call. A no-op in production (nothing ever arms it).
+        if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
+            throw Exception(ErrorCodes::ABORTED,
+                "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
+
+        /// Capture the exact `CommitOutcome` IMMEDIATELY -- into the caller-provided slot, before
+        /// the scratch-build `abandon()` below (which can itself throw), and before the test-only
+        /// after-promote hook (which can run arbitrary test code) -- so a later throw in either
+        /// cannot lose it (publish before any throwable post-commit work).
+        const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged_manifest_entries), Cas::ProvenanceOp::Other, *st.base_manifest_ref);
+        out_slot = oc;   /// always created=false here: this block only runs once `existing_ref_view` already resolved
+        /// Test-only: models a concurrent writer racing in right after this transaction's own
+        /// confirm (e.g. repointing `ref` again). A no-op in production.
+        metadata_storage.runAfterPromoteHookForTest({ns, ref});
+
+        if (st.build)
         {
-            if (metadata_storage.partAccess()->dropRefExact({ns, ref}, view->manifestId().ref)
-                == Cas::Removal::Mismatch)
-                Cas::throwCasOwnershipConflict("ContentAddressedTransaction: scratch ref {}/{} was repointed while this transaction was staging the part",
-                    ns.string(), ref);
-            st.base_manifest_ref.reset();
-            view.reset();
+            st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
+            st.build.reset();      /// never re-abandon this build from the destructor
         }
-        if (st.base_manifest_ref && (!view || !(view->manifestId().ref == *st.base_manifest_ref)))
-            Cas::throwCasOwnershipConflict("ContentAddressedTransaction: committed part {}/{} was moved, dropped or repointed while its rewrite was staged; "
-                "the operation must be re-resolved", ns.string(), ref);
-        if (!st.base_manifest_ref && view)
-            Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {}/{} was published by another writer while this transaction was staging it", ns.string(), ref);
-        if (view)
-        {
-            /// `repointRef` promotes through its own build, which adopts existing bodies and uploads none. This build's
-            /// scratch precommit protects the uploads until that promote, then is abandoned, never promoted.
-            if (st.build)
-                (void)precommitAndUpload(ns, ref, st, pending_refs);
-
-            std::vector<Cas::ManifestEntry> merged;
-            for (const auto & e : view->manifest()->entries)
-                if (!st.content_removed.contains(e.path)
-                    && std::none_of(st.entries.begin(), st.entries.end(),
-                                     [&](const Cas::ManifestEntry & s) { return s.path == e.path; }))
-                    merged.push_back(e);
-            for (auto & s : st.entries)
-                merged.push_back(std::move(s));
-
-            /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref`
-            /// right before the durable repoint call. A no-op in production (nothing ever arms it).
-            if (metadata_storage.shouldFailPromoteForTest({ns, ref}))
-                throw Exception(ErrorCodes::ABORTED,
-                    "ContentAddressedTransaction: test-injected promote failure for {}/{}", ns.string(), ref);
-
-            /// Capture the exact `CommitOutcome` IMMEDIATELY -- into the caller-provided slot, before
-            /// the scratch-build `abandon()` below (which can itself throw), and before the test-only
-            /// after-promote hook (which can run arbitrary test code) -- so a later throw in either
-            /// cannot lose it (publish before any throwable post-commit work).
-            const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other, *st.base_manifest_ref);
-            out_slot = oc;   /// always created=false here: this block only runs once `view` already resolved
-            /// Test-only: models a concurrent writer racing in right after this transaction's own
-            /// confirm (e.g. repointing `ref` again). A no-op in production.
-            metadata_storage.runAfterPromoteHookForTest({ns, ref});
-            if (st.build)
-            {
-                st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
-                st.build.reset();      /// never re-abandon this build from the destructor
-            }
-            st.published = true;
-            return;
-        }
+        st.published = true;
+        return;
     }
 
     if (!st.build)
@@ -611,7 +677,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             "ContentAddressedTransaction: staged entries or removal marks for {}/{} without a Build", ns.string(), ref);
 
     /// Promote is an atomic owner move that validates every blob dependency proof.
-    const Cas::ManifestId id = precommitAndUpload(ns, ref, st, pending_refs);
+    const Cas::ManifestId manifest_id = precommitAndUpload(ns, ref, st, blob_refs_with_upload_requests, blob_upload_requests);
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
     /// before the durable promote call. A no-op in production (nothing ever arms it).
@@ -624,7 +690,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// before the promote's own append confirms). Captured into `out_slot` IMMEDIATELY -- before the
     /// test-only after-promote hook below (which can run arbitrary test code) or `st.build.reset()`
     /// -- so a later throw there cannot lose it.
-    const Cas::CommitOutcome oc = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
+    const Cas::CommitOutcome oc = metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), manifest_id);
     out_slot = oc;
     /// Test-only: models a concurrent writer racing in right after this transaction's own confirm. A
     /// no-op in production.
@@ -1657,7 +1723,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 const Cas::ManifestRef committed_ref = committed_at_src->manifestId().ref;
                 const auto & base_entries = committed_at_src->manifest()->entries;
                 const bool ours = staged_source_base && *staged_source_base == committed_ref;
-                if (!ours && !isNestedScratchManifest(base_entries))
+                if (!ours && hasTopLevelFile(base_entries))
                     Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was published as a part by another writer while a staged part is renamed from it",
                         path_from);
                 /// Our staged edits ride on their base: rename the committed ref now (durable at this call, like
@@ -1665,7 +1731,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// `publishStaging` merges the delta into it under the new name the way it does for an edit in
                 /// place; files neither removed nor rewritten survive. The rename is conditional on the manifest
                 /// the ownership check read.
-                if (ours && !isNestedScratchManifest(base_entries))
+                if (ours && hasTopLevelFile(base_entries))
                 {
                     const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey(), committed_ref);
                     if (!renamed)

@@ -33,8 +33,8 @@ namespace DB
 /// `Cas::PartWriteTxn`, created lazily before the first staged dependency, so the durable manifest
 /// edge is established before the pool observes or uploads a new blob.
 ///
-/// Content blobs are first represented by local or S3 staging objects and are uploaded only during
-/// publication. Inline entries remain in the manifest tree when they fit `INLINE_CAP`. The
+/// File writes stage blobs locally or on S3. During publication the transaction also moves
+/// excess inline entries into blobs, uploading them directly from their buffered bytes. The
 /// destructor removes the transaction's local and S3 staging and abandons any open part builds;
 /// it never publishes an uncommitted ref.
 class ContentAddressedTransaction : public IMetadataTransaction
@@ -223,9 +223,9 @@ private:
     /// The refs of `st`'s pending uploads, collected once per publication.
     using PendingRefs = std::unordered_set<Cas::BlobRef, Cas::BlobRefHash>;
     /// Confirms each distinct committed source of `st`'s adopted entries, skipping entries whose ref is in
-    /// `pending_refs`. Runs after the precommit of `st.build` is durable and before its promote; on a refusal it
+    /// `blob_refs_with_upload_requests`. Runs after the precommit of `st.build` is durable and before its promote; on a refusal it
     /// abandons the build and throws `NO_REPLICA_HAS_PART`, and on a failed read it abandons the build and rethrows.
-    void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st, const PendingRefs & pending_refs);
+    void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st, const PendingRefs & blob_refs_with_upload_requests);
     /// After this transaction renamed `from` to `to`, points the borrow of `from` at `to`, when the rename moved the
     /// manifest the borrow read and `to` still commits the manifest the rename produced. Any other borrow keeps its
     /// source, and its confirmation refuses it.
@@ -249,15 +249,12 @@ private:
     /// alike. S3 deletes are best-effort; a lost delete leaves debris for the mount-start sweep.
     void cleanupPendingTempFiles() noexcept;
 
-    /// Uploads through `st.build` only the pending blobs still referenced by `st.entries`. An entry
-    /// removed by `unlinkFile` or `replaceFile` is skipped, but its staging resource is still cleaned
-    /// by `cleanupPendingTempFiles`. Used for both new refs and committed-ref repoints.
-    void uploadPendingBlobs(PartStaging & st);
+    /// Append sources from local or S3 staging only for blob refs still named by the staged entries.
+    void appendStagedBlobUploads(const PartStaging & st, std::vector<Cas::BlobUploadRequest> & blob_upload_requests) const;
 
-    /// Stages `st.entries` as a manifest of `st.build`, precommits it at `ref`, confirms the copy sources and uploads
-    /// the pending blobs, in that order. Returns the staged manifest's id.
+    /// Stage the manifest and precommit its blob refs before confirming copied files and uploading payloads.
     Cas::ManifestId precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
-                                       const PendingRefs & pending_refs);
+                                       const PendingRefs & blob_refs_with_upload_requests, const std::vector<Cas::BlobUploadRequest> & blob_upload_requests);
 
     /// Adopts a manifest entry into another part while preserving its storage state. For a pending
     /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or
@@ -305,7 +302,7 @@ bool partFileMustStayBlob(std::string_view file_name);
 std::unique_ptr<ReadBuffer> openLocalStagedBlobPayload(const std::string & path, uint64_t payload_size);
 
 /// Test-only fault-injection seams for the intra-part blob-upload fan-out. Inert in production
-/// (`ContentAddressedTransaction::uploadPendingBlobs` passes `nullptr`).
+/// (`ContentAddressedTransaction::precommitAndUpload` passes `nullptr`).
 struct BlobUploadFanoutHooksForTest
 {
     /// Invoked ONCE per DISPATCHED task, on the calling (dispatch) thread, immediately before the task

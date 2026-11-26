@@ -56,7 +56,6 @@ namespace
 
 /// Backpressure caps, enforced fail-closed in stageManifest before the body write returns.
 constexpr uint64_t kMaxManifestEntries = 1048576;
-constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
 constexpr uint64_t kMaxLargestInlineEntryBytes = 1ULL << 20;       /// 1 MiB
 
 /// Two thread_local_rng draws composed into a UInt128. Used both to mint build ids and to mint, on
@@ -169,11 +168,23 @@ BlobSource BlobSource::fromString(String bytes)
 {
     BlobSource source;
     source.size = bytes.size();
-    /// Owning reader: `ReadBufferFromString` only borrows, and this factory outlives no single call
-    /// -- an owning copy per attempt removes the question entirely for a source that is small by
-    /// construction (this helper exists for tests and inline payloads).
-    source.open = [b = std::move(bytes)]() -> std::unique_ptr<ReadBuffer>
-    { return std::make_unique<ReadBufferFromOwnString>(b); };
+    /// Requests copied into the upload queue and readers opened on retry share the payload.
+    /// Each reader owns a reference independently of the lifetime of the request.
+    class Reader final : public ReadBufferFromString
+    {
+    public:
+        explicit Reader(std::shared_ptr<const String> bytes_)
+            : ReadBufferFromString(*bytes_), payload_owner(std::move(bytes_))
+        {
+        }
+
+    private:
+        std::shared_ptr<const String> payload_owner;
+    };
+    source.open = [owner = std::make_shared<const String>(std::move(bytes))]
+    {
+        return std::make_unique<Reader>(owner);
+    };
     return source;
 }
 
