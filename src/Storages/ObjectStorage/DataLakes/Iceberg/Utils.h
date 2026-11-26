@@ -255,6 +255,10 @@ void forEachAvroEntry(
 using PartitionColumnValues = std::vector<std::pair<String, DB::Field>>;
 
 PartitionColumnValues getIdentityPartitionColumnValues(
+    const ProcessedManifestFileEntry & manifest_file_entry,
+    const IcebergSchemaProcessor & schema_processor,
+    bool skip_nulls = true);
+
     const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor);
 
 /// Walk a schema's fields array and return field-id -> raw Iceberg type string

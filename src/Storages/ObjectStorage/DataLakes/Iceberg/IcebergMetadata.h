@@ -133,6 +133,13 @@ public:
         ContextPtr local_context) const;
 
     static bool supportsTotalRows(ContextPtr, ObjectStorageType) { return true; }
+    std::optional<size_t> totalRows(ContextPtr Local_context) const override;
+
+    /// Live DATA files with identity partition values (including SQL NULL) and `record_count`.
+    /// Resolved from `datalake_table_state` on `storage_metadata`, the snapshot pinned at analysis.
+    /// nullopt when that state is missing or an exact answer is impossible: equality or position deletes,
+    /// deletion vectors, an unreadable path, or a negative `record_count`. An empty snapshot is an empty vector.
+    std::optional<std::vector<IdentityPartitionFile>> getDataFileIdentityPartitions(StorageMetadataPtr storage_metadata, ContextPtr local_context) const;
     std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const override;
     static bool supportsTotalBytes(ContextPtr, ObjectStorageType) { return true; }
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
