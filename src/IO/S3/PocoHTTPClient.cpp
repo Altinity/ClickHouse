@@ -748,8 +748,13 @@ void PocoHTTPClient::makeRequestInternalImpl(
             const bool is_read_request = request.GetMethod() == Aws::Http::HttpMethod::HTTP_GET
                 || request.GetMethod() == Aws::Http::HttpMethod::HTTP_HEAD;
             const bool is_success_status = status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX;
-            if (is_read_request && is_success_status && HostResolver::latencyAwareSelectionEnabled() && proxy_configuration.isEmpty())
+            if (is_read_request && is_success_status && HostResolver::latencyAwareSelectionEnabled())
             {
+                /// Requests that go through a proxy are not measured, but they need no separate check:
+                /// a connection to the proxy keeps `_resolved_host` empty (the proxy resolves the
+                /// target), which is skipped below. A request that matches `no_proxy` connects to
+                /// the resolved target address directly and is measured like any other.
+                ///
                 /// No `try`/`catch` here: `reportLatency` itself does not allocate, and the only
                 /// remaining failures are a memory limit exception from the address parsing below or
                 /// a query cancellation, which must propagate like in any other allocation of this

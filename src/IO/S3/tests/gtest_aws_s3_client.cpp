@@ -1169,7 +1169,11 @@ public:
 };
 
 std::unique_ptr<RecordingClient> makeRecordingClient(
-    const std::string & endpoint, unsigned int max_retries, unsigned int max_redirects, const std::string & http_client = "gcs_hmac")
+    const std::string & endpoint,
+    unsigned int max_retries,
+    unsigned int max_redirects,
+    const std::string & http_client = "gcs_hmac",
+    std::function<DB::ProxyConfiguration()> per_request_configuration = {})
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::URI uri(endpoint + "/bucket");
@@ -1188,6 +1192,7 @@ std::unique_ptr<RecordingClient> makeRecordingClient(
         uri.uri.getScheme());
 
     client_configuration.endpointOverride = uri.endpoint;
+    client_configuration.per_request_configuration = std::move(per_request_configuration);
     /// The default `gcs_hmac`, not `gcp_oauth`: both make `supportsGcsNativeConditionalRequests()`
     /// true, but `gcp_oauth` fetches a bearer token from the GCE metadata server on every real request
     /// (`PocoHTTPClientGCPOAuth::requestBearerToken`) -- a real network call this test cannot make.
@@ -2224,6 +2229,96 @@ TEST(IOTestAwsS3Client, LatencyAwareSelectionIgnoresNon2xxReadResponses)
 
     EXPECT_TRUE(sendGet().IsSuccess());
     EXPECT_LT(mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip), ewma_seeded);
+}
+
+/// Regression test: with a proxy configured, a request that matches `no_proxy` connects to the
+/// resolved target address directly, so it must feed `HostResolver::reportLatency` like any other
+/// request. A request that really goes through the proxy must not (the proxy, not the target
+/// address, served it).
+TEST(IOTestAwsS3Client, LatencyAwareSelectionMeasuresNoProxyRequestsOnly)
+{
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+        DB::HTTPConnectionPools::instance().dropCache();
+    });
+
+    struct ResolveMock : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ResolveMock(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    const Poco::Net::IPAddress server_ip("127.0.0.1");
+
+    auto makeResolver = [&](const String & host)
+    {
+        auto resolver = std::make_shared<ResolveMock>(
+            host,
+            Poco::Timespan(60 * 1000 * 1000),
+            [server_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {server_ip}; });
+        DB::HostResolversPool::instance().injectResolverForTest(host, resolver);
+        return resolver;
+    };
+
+    auto sendHead = [](DB::S3::Client & client)
+    {
+        DB::S3::HeadObjectRequest req;
+        req.SetBucket("bucket");
+        req.SetKey("key");
+        return client.HeadObject(req);
+    };
+
+    {
+        SCOPED_TRACE("`no_proxy` matches the target: direct connection, sample recorded");
+        ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+        const String host = "latency-feedback-no-proxy-test.invalid";
+        auto resolver = makeResolver(host);
+
+        auto client = makeRecordingClient(
+            "http://" + host + ":" + std::to_string(Poco::URI(server.getUrl()).getPort()),
+            /*max_retries=*/0,
+            /*max_redirects=*/0,
+            /*http_client=*/"",
+            []
+            {
+                DB::ProxyConfiguration proxy;
+                proxy.host = "unreachable-proxy.invalid";
+                proxy.port = 3128;
+                proxy.no_proxy_hosts = "latency-feedback-no-proxy-test.invalid";
+                return proxy;
+            });
+
+        EXPECT_TRUE(sendHead(*client).IsSuccess());
+        EXPECT_GT(resolver->getLatencySnapshot().lookupLatencyMs(server_ip), 0.0);
+    }
+
+    {
+        SCOPED_TRACE("through the proxy: the target address did not serve the request, no sample");
+        ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+        const String host = "latency-feedback-via-proxy-test.invalid";
+        auto resolver = makeResolver(host);
+        const auto proxy_port = Poco::URI(server.getUrl()).getPort();
+
+        auto client = makeRecordingClient(
+            "http://" + host + ":80",
+            /*max_retries=*/0,
+            /*max_redirects=*/0,
+            /*http_client=*/"",
+            [proxy_port]
+            {
+                DB::ProxyConfiguration proxy;
+                proxy.host = "127.0.0.1";
+                proxy.port = proxy_port;
+                return proxy;
+            });
+
+        EXPECT_TRUE(sendHead(*client).IsSuccess());
+        EXPECT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(server_ip));
+    }
 }
 
 #endif
