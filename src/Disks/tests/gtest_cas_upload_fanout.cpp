@@ -1,12 +1,14 @@
 #include <gtest/gtest.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -21,6 +23,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
 #include <latch>
 #include <map>
 #include <mutex>
@@ -34,9 +38,6 @@ using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::blobEntryFor;
-using DB::Cas::tests::writeMetaClean;
-using DB::Cas::tests::condemnMeta;
-using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::runRoundsUntilAbsent;
 using DB::Cas::tests::blobAbsent;
@@ -131,11 +132,11 @@ String logicalPayloadAt(InMemoryBackend & b, const String & key, uint64_t header
     return got->bytes.substr(header_len);
 }
 
-/// The blob's meta state, or nullopt when the meta object is absent.
-std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout, const String & payload)
+/// Whether the body now at the blob's key has a deletion intent.
+bool hasIntentAt(InMemoryBackend & b, const Layout & layout, const String & payload)
 {
-    const auto lm = loadMetaForTest(b, layout, u128Of(payload));
-    return lm ? std::optional<MetaState>(lm->meta.state) : std::nullopt;
+    const auto key = DB::Cas::tests::intentKeyOfCurrentBody(b, layout, idOf(payload));
+    return key && DB::Cas::tests::objectPresent(b, *key);
 }
 
 /// A local streaming source for `payload`, exactly as `ContentAddressedTransaction::uploadPendingBlobs`
@@ -169,16 +170,16 @@ std::map<BlobRef, StableDep> stableDeps(const PartWriteTxn & build)
     return out;
 }
 
-/// The backend end state for a set of blob refs: (logical payload, meta state) per ref. Deterministic
-/// (content is the payload; meta settles to Clean), so it is compared byte-for-byte across worlds.
-using BackendState = std::map<BlobRef, std::pair<String, std::optional<MetaState>>>;
+/// The backend end state for a set of blob refs: (logical payload, whether its body has an intent) per ref.
+/// Deterministic (content is the payload; a published body has no intent), so it is compared across worlds.
+using BackendState = std::map<BlobRef, std::pair<String, bool>>;
 BackendState backendState(InMemoryBackend & b, const PoolPtr & s, const std::vector<String> & payloads)
 {
     BackendState out;
     for (const auto & p : payloads)
         out.emplace(idOf(p),
             std::make_pair(logicalPayloadAt(b, s->layout().blobKey(idOf(p)), s->poolMeta().blob_header_len),
-                           metaStateAt(b, s->layout(), p)));
+                           hasIntentAt(b, s->layout(), p)));
     return out;
 }
 
@@ -353,7 +354,6 @@ WorldA arrangeWorldA()
 
     /// Present body with `Clean` metadata: safe observation avoids publication.
     seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kObserved);
-    writeMetaClean(*w.b, w.s->layout(), u128Of(kObserved), std::string(kObserved).size());
 
     /// Present body, NO meta: republished like an absent body.
     seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kAbsentMarker);
@@ -371,8 +371,7 @@ WorldA arrangeWorldA()
 
     /// condemned-local resurrection: present body + condemned meta, local source.
     seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kResLocal);
-    writeMetaClean(*w.b, w.s->layout(), u128Of(kResLocal), std::string(kResLocal).size());
-    condemnMeta(*w.b, w.s->layout(), u128Of(kResLocal), /*condemn_round=*/7);
+    DB::Cas::tests::plantIntentForCurrentBody(*w.b, w.s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(kResLocal)));
 
     /// condemned-S3 resurrection: present body (= a verbatim promote of the staging object) + condemned
     /// meta, S3 staging source.
@@ -383,8 +382,7 @@ WorldA arrangeWorldA()
         const String staging = encodeEnvelopeHeader(h, static_cast<uint32_t>(w.s->poolMeta().blob_header_len)) + kResS3;
         createRaw(*w.b, "p/staging/mount1/A-republish.tmp", staging);
         createRaw(*w.b, w.s->layout().blobKey(idOf(kResS3)), staging);
-        writeMetaClean(*w.b, w.s->layout(), u128Of(kResS3), std::string(kResS3).size());
-        condemnMeta(*w.b, w.s->layout(), u128Of(kResS3), /*condemn_round=*/9);
+        DB::Cas::tests::plantIntentForCurrentBody(*w.b, w.s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(kResS3)));
     }
 
     w.requests = {
@@ -428,7 +426,7 @@ TEST(CASUploadFanout, DependencyProofEquivalentAcrossFanoutBranches)
         EXPECT_EQ(std::get<2>(dep), BlobDependencyProof::Materialized);
     }
     for (const auto & p : serial.payloads)
-        EXPECT_EQ(metaStateAt(*fanned.b, fanned.s->layout(), p), std::optional<MetaState>(MetaState::Clean));
+        EXPECT_FALSE(hasIntentAt(*fanned.b, fanned.s->layout(), p));
 
 }
 
@@ -447,8 +445,7 @@ TEST(CASUploadFanout, CondemnedBranchesNeverGet)
     const String s3_staging = "p/staging/mount1/noget-republish.tmp";
 
     seedPresentBody(*counting, s->layout(), s->poolMeta(), local_payload);
-    writeMetaClean(*counting, s->layout(), u128Of(local_payload), local_payload.size());
-    condemnMeta(*counting, s->layout(), u128Of(local_payload), /*condemn_round=*/3);
+    DB::Cas::tests::plantIntentForCurrentBody(*counting, s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(local_payload)));
 
     {
         EnvelopeHeader h;
@@ -457,9 +454,14 @@ TEST(CASUploadFanout, CondemnedBranchesNeverGet)
         const String staging = encodeEnvelopeHeader(h, static_cast<uint32_t>(s->poolMeta().blob_header_len)) + s3_payload;
         createRaw(*counting, s3_staging, staging);
         createRaw(*counting, s->layout().blobKey(idOf(s3_payload)), staging);
-        writeMetaClean(*counting, s->layout(), u128Of(s3_payload), s3_payload.size());
-        condemnMeta(*counting, s->layout(), u128Of(s3_payload), /*condemn_round=*/5);
+        DB::Cas::tests::plantIntentForCurrentBody(*counting, s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(s3_payload)));
     }
+
+    const String local_key = s->layout().blobKey(idOf(local_payload));
+    const String s3_key = s->layout().blobKey(idOf(s3_payload));
+    const auto condemned_local = readOf(*counting, local_key);
+    const auto condemned_s3 = readOf(*counting, s3_key);
+    ASSERT_TRUE(condemned_local && condemned_s3);
 
     counting->resetCounts();   /// count only the fan-out's own backend traffic
 
@@ -468,18 +470,24 @@ TEST(CASUploadFanout, CondemnedBranchesNeverGet)
     fanOutBlobUploads(*build, reqs, *pool);
 
     /// INV-1: revival is a fresh re-upload from the writer's own source; the condemned BODY object is
-    /// never read. (The fan-out DOES read the two condemned-META objects -- the meta point-read is how it
-    /// LEARNS an incarnation is condemned -- so the invariant is per-body-key, not a global GET count.)
-    const String local_key = s->layout().blobKey(idOf(local_payload));
-    const String s3_key = s->layout().blobKey(idOf(s3_payload));
+    /// never read. (The fan-out DOES read the two intents -- the intent read is how it LEARNS an incarnation
+    /// is condemned -- so the invariant is per-body-key, not a global GET count.)
     EXPECT_EQ(counting->getCount(local_key), 0u) << "INV-1: the condemned local body is never read";
     EXPECT_EQ(counting->getStreamCount(local_key), 0u) << "INV-1: the condemned local body is never streamed";
     EXPECT_EQ(counting->getCount(s3_key), 0u) << "INV-1: the condemned S3 body is never read";
     EXPECT_EQ(counting->getStreamCount(s3_key), 0u) << "INV-1: the condemned S3 body is never streamed";
 
-    /// Both resurrections still completed to Clean.
-    EXPECT_EQ(metaStateAt(*counting, s->layout(), local_payload), std::optional<MetaState>(MetaState::Clean));
-    EXPECT_EQ(metaStateAt(*counting, s->layout(), s3_payload), std::optional<MetaState>(MetaState::Clean));
+    /// Both resurrections published a fresh incarnation with the writer's bytes.
+    const auto fresh_local = readOf(*counting, local_key);
+    const auto fresh_s3 = readOf(*counting, s3_key);
+    ASSERT_TRUE(fresh_local.has_value()) << "the local resurrection left no body";
+    ASSERT_TRUE(fresh_s3.has_value()) << "the S3 resurrection left no body";
+    EXPECT_FALSE(sameIncarnation(PersistedEtag::capture(condemned_local->etag), fresh_local->etag));
+    EXPECT_FALSE(sameIncarnation(PersistedEtag::capture(condemned_s3->etag), fresh_s3->etag));
+    EXPECT_EQ(logicalPayloadAt(*counting, local_key, s->poolMeta().blob_header_len), local_payload);
+    EXPECT_EQ(logicalPayloadAt(*counting, s3_key, s->poolMeta().blob_header_len), s3_payload);
+    EXPECT_FALSE(hasIntentAt(*counting, s->layout(), local_payload));
+    EXPECT_FALSE(hasIntentAt(*counting, s->layout(), s3_payload));
 }
 
 /// Test 2: duplicate refs (staged-hardlink copies push a duplicate PendingBlob record) collapse to ONE
@@ -558,7 +566,7 @@ TEST(CASUploadFanoutDeathTest, ConflictingDuplicateSizesAbort)
     c.source.size = c.declared_size;
 
     auto pool = makePool(4);
-    EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{a, c}, *pool); }, "");
+    CAS_EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{a, c}, *pool); }, "");
 }
 #endif
 
@@ -596,7 +604,7 @@ TEST(CASUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
     r.declared_size = r.source.size + 7;
 
     auto pool = makePool(2);
-    EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{r}, *pool); }, "");
+    CAS_EXPECT_DEATH({ fanOutBlobUploads(*build, std::vector<BlobUploadRequest>{r}, *pool); }, "");
 }
 #endif
 
@@ -604,7 +612,7 @@ TEST(CASUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
 /// resurrected body is [fresh_header][payload], its token differs from the condemned one, and the
 /// meta flips back to Clean -- which is exactly what a later attempt reads to adopt instead of
 /// re-writing.
-TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
+TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAFreshBody)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -613,8 +621,7 @@ TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
 
     const String payload = "condemned-local-streamed-payload";
     seedPresentBody(*b, s->layout(), s->poolMeta(), payload);
-    writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
-    condemnMeta(*b, s->layout(), u128Of(payload), /*condemn_round=*/13);
+    DB::Cas::tests::plantIntentForCurrentBody(*b, s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(payload)));
 
     const String blob_key = s->layout().blobKey(idOf(payload));
     OperationForTest op(*b);
@@ -629,7 +636,7 @@ TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
     /// delete of the condemned incarnation must miss the resurrection.
     const auto after = (*op).head(blob_key, Retry::standard());
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->etag, condemned_meta->etag);
+    EXPECT_NE(tokenText(after->etag), tokenText(condemned_meta->etag));
     EXPECT_EQ((*op).remove(blob_key, condemned_meta->etag, Retry::standard()), Removal::Mismatch);
     EXPECT_TRUE(headExists(*b, blob_key));
 
@@ -638,10 +645,8 @@ TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes.substr(s->poolMeta().blob_header_len), payload);
 
-    /// The meta flipped back to Clean -- the signal a later attempt adopts on.
-    const auto lm = loadMetaForTest(*b, s->layout(), u128Of(payload));
-    ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(lm->meta.state, MetaState::Clean);
+    /// The fresh incarnation has no intent, so a later attempt adopts it.
+    EXPECT_FALSE(hasIntentAt(*b, s->layout(), payload));
 }
 
 /// `open` is the per-publication unit of re-readability. A present `Condemned` observation selects
@@ -655,8 +660,7 @@ TEST(CASUploadFanout, CondemnedLocalPublicationOpensSourceOnce)
 
     const String payload = "condemned-local-open-count-payload";
     seedPresentBody(*b, s->layout(), s->poolMeta(), payload);
-    writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
-    condemnMeta(*b, s->layout(), u128Of(payload), /*condemn_round=*/17);
+    DB::Cas::tests::plantIntentForCurrentBody(*b, s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(payload)));
 
     int opens = 0;
     BlobSource source;
@@ -693,8 +697,7 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
     const String staging_bytes = encodeEnvelopeHeader(h, static_cast<uint32_t>(s->poolMeta().blob_header_len)) + payload;
     createRaw(*b, staging_key, staging_bytes);
     createRaw(*b, s->layout().blobKey(idOf(payload)), staging_bytes);
-    writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
-    condemnMeta(*b, s->layout(), u128Of(payload), /*condemn_round=*/11);
+    DB::Cas::tests::plantIntentForCurrentBody(*b, s->layout(), DB::Cas::tests::legacyMetaTestRef(u128Of(payload)));
 
     OperationForTest op(*b);
     const auto condemned_meta = (*op).head(s->layout().blobKey(idOf(payload)), Retry::standard());
@@ -712,8 +715,8 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
     EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized);
     const auto after_meta = (*op).head(s->layout().blobKey(idOf(payload)), Retry::standard());
     ASSERT_TRUE(after_meta.has_value());
-    EXPECT_NE(after_meta->etag, condemned_meta->etag) << "a fresh incarnation displaced the condemned one";
-    EXPECT_EQ(metaStateAt(*b, s->layout(), payload), std::optional<MetaState>(MetaState::Clean));
+    EXPECT_NE(tokenText(after_meta->etag), tokenText(condemned_meta->etag)) << "a fresh incarnation displaced the condemned one";
+    EXPECT_FALSE(hasIntentAt(*b, s->layout(), payload));
     EXPECT_EQ(logicalPayloadAt(*b, s->layout().blobKey(idOf(payload)), s->poolMeta().blob_header_len), payload);
 }
 
@@ -1005,4 +1008,38 @@ TEST(CASUploadFanout, TrackingSeamThrowStillDrains)
     EXPECT_TRUE(headExists(*b, s->layout().blobKey(idOf(smaller))))
         << "an already-scheduled task was not drained before the stack unwound";
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a tracking-seam throw";
+}
+
+/// A part's uploads run concurrently and each holds its payload reader until it finishes, so a small
+/// staged payload must not pin a full default-sized read buffer.
+TEST(CASUploadFanout, LocalStagedPayloadReaderIsSizedToThePayload)
+{
+    /// `mkdtemp` creates the directory exclusively, so the cleanup below removes only what this test made.
+    std::string dir_template = (std::filesystem::temp_directory_path() / "cas_staged_payload_reader_XXXXXX").string();
+    ASSERT_NE(::mkdtemp(dir_template.data()), nullptr) << "cannot create a directory from " << dir_template;
+    const std::filesystem::path dir = dir_template;
+    SCOPE_EXIT({ std::filesystem::remove_all(dir); });
+
+    const auto stage = [&](const std::string & name, const std::string & bytes)
+    {
+        const std::string path = (dir / name).string();
+        DB::WriteBufferFromFile out(path);
+        out.write(bytes.data(), bytes.size());
+        out.finalize();
+        return path;
+    };
+
+    const std::string small = "payload";
+    auto small_reader = openLocalStagedBlobPayload(stage("small", small), small.size());
+    EXPECT_EQ(small_reader->internalBuffer().size(), small.size());
+    std::string small_read;
+    DB::readStringUntilEOF(small_read, *small_reader);
+    EXPECT_EQ(small_read, small);
+
+    const std::string large(DB::DBMS_DEFAULT_BUFFER_SIZE + 1, 'x');
+    auto large_reader = openLocalStagedBlobPayload(stage("large", large), large.size());
+    EXPECT_EQ(large_reader->internalBuffer().size(), DB::DBMS_DEFAULT_BUFFER_SIZE);
+    std::string large_read;
+    DB::readStringUntilEOF(large_read, *large_reader);
+    EXPECT_EQ(large_read, large);
 }

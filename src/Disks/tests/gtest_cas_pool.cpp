@@ -1686,7 +1686,7 @@ TEST(CASPool, RestartKeepsTheOwnerLife)
     ASSERT_TRUE(before.has_value());
     EXPECT_EQ(DB::Cas::decodeOwner(before->bytes).owner_life, 1u);
     auto again = DB::Cas::tests::openPoolForTest(backend);
-    EXPECT_EQ((*op).read(owner_key, DB::Cas::Retry::once())->etag, before->etag) << "a plain restart writes no owner";
+    EXPECT_EQ(tokenText((*op).read(owner_key, DB::Cas::Retry::once())->etag), tokenText(before->etag)) << "a plain restart writes no owner";
 }
 
 TEST(CASPoolRemount, OldEpochBuildFailsClosedAfterRemount)
@@ -2907,137 +2907,21 @@ namespace
 /// A pool meta at reader floor 1, as a generation-1 writer leaves it, ready for `Pool::open` with prefix "p".
 void seedFloorOne(DB::Cas::Backend & backend)
 {
-    DB::Cas::tests::seedPoolMetaForRestart(backend);
+    DB::Cas::tests::seedOlderPoolForTest(backend, G_WRITE_FLOOR);
 }
 
-uint64_t storedFloor(DB::Cas::Backend & backend)
-{
-    return decodePoolMeta(readObj(backend, Layout("p").poolMetaKey()).value().bytes).min_reader_generation;
-}
-
-}
-
-TEST(CASMountOpenWaits, FloorRaiseIsCountedByTheRenewalWindowCheck)
-{
-    /// Same envelope as `PublicationHorizonUsesTheEnvelope` (window 600, safe deadline 950) over a held
-    /// boot clock. The pool-meta write is the raise itself, so `extra_ms` is spent inside it.
-    const auto mountWriteCount = [](uint64_t extra_ms) -> uint64_t
-    {
-        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-        Layout l{"p"};
-        seedFloorOne(*b);
-        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
-        b->onBeforeWrite(l.poolMetaKey(), [fake_boot, extra_ms] { *fake_boot += extra_ms; });
-        PoolPtr store = Pool::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
-            .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
-            .wait_sleep_fn = [fake_boot](uint64_t ms) { *fake_boot += ms; },
-        });
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_CHAIN);
-        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
-    };
-
-    EXPECT_EQ(mountWriteCount(0), 2u) << "a raise that costs no time leaves the horizon intact";
-    EXPECT_EQ(mountWriteCount(500), 3u) << "the time the raise took must count against the renewal window";
 }
 
 TEST(CASPool, FloorRaiseLogsTheNewFloor)
 {
     auto b = std::make_shared<InMemoryBackend>();
     seedFloorOne(*b);
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
-    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "warning");
+    PoolPtr store = Pool::openForMigration(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    store->raiseReaderFloorToRefChain();
     EXPECT_NE(
         capture.captured().find("min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool"),
         String::npos) << capture.captured();
-}
-
-TEST(CASPool, WritableMountRaisesTheFloorToThreeBeforeAnyGenerationThreeObject)
-{
-    struct WriteJournalBackend : InMemoryBackend
-    {
-        std::mutex mutex;
-        std::vector<String> written;
-        std::expected<String, Backend::RawConflict> write(const String & key, const String & bytes,
-                                                          const std::optional<String> & expected_value,
-                                                          TransportAccess & access) override
-        {
-            {
-                std::lock_guard lock(mutex);
-                written.push_back(key);
-            }
-            return InMemoryBackend::write(key, bytes, expected_value, access);
-        }
-    };
-    auto b = std::make_shared<WriteJournalBackend>();
-    const Layout l{"p"};
-    seedFloorOne(*b);
-    {
-        DB::Cas::tests::OperationForTest op(*b);
-        PoolMeta::raiseMinReaderGeneration(*op, l, G_REF_MOVE);
-    }
-    ASSERT_EQ(storedFloor(*b), G_REF_MOVE);
-    {
-        std::lock_guard lock(b->mutex);
-        b->written.clear();
-    }
-
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
-    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    const RootNamespace ns{"srv1/floor_three"};
-    store->appendRefOps(ns, MutationScope::ref("a"),
-        [](const RefTableState & state)
-        {
-            std::vector<RefOp> ops;
-            if (state.getLifecycle() != RefLifecycle::Live)
-                ops.push_back(DB::Cas::tests::namespaceBirthOp());
-            return ops;
-        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
-
-    EXPECT_EQ(storedFloor(*b), G_REF_CHAIN);
-    std::vector<String> written;
-    {
-        std::lock_guard lock(b->mutex);
-        written = b->written;
-    }
-    const auto raise = std::find(written.begin(), written.end(), l.poolMetaKey());
-    ASSERT_NE(raise, written.end());
-    size_t ref_writes = 0;
-    for (auto it = written.begin(); it != written.end(); ++it)
-    {
-        if (!it->contains("/_ckpt") && !it->contains("/_log/"))
-            continue;
-        ++ref_writes;
-        EXPECT_GT(it - written.begin(), raise - written.begin()) << *it << " was written before the floor raise";
-    }
-    EXPECT_GE(ref_writes, 2u) << "the creation's _ckpt and the birth log must be among the writes";
-    EXPECT_NE(
-        capture.captured().find("min_reader_generation raised 2 -> 3; readers below generation 3 can no longer mount this pool"),
-        String::npos) << capture.captured();
-}
-
-TEST(CASPool, FloorIsRaisedBeforeTheWorkersStart)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    seedFloorOne(*b);
-    auto workers_started = std::make_shared<std::atomic<uint64_t>>(0);
-    auto started_at_raise = std::make_shared<std::atomic<uint64_t>>(~uint64_t{0});
-    b->onBeforeWrite(Layout("p").poolMetaKey(), [workers_started, started_at_raise]
-    {
-        *started_at_raise = workers_started->load();
-        throw std::runtime_error("injected fault: pool meta write refused");
-    });
-    EXPECT_ANY_THROW(Pool::open(b, PoolConfig{
-        .pool_prefix = "p", .server_root_id = "test", .background_watermark = true,
-        .worker_factory = [workers_started](std::function<void()> body)
-        {
-            ++*workers_started;
-            return ThreadFromGlobalPool(std::move(body));
-        }}));
-    EXPECT_EQ(started_at_raise->load(), 0u) << "the raise must be written before any background worker is created";
-    EXPECT_EQ(storedFloor(*b), 1u);
 }
 
 /// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount
@@ -3621,7 +3505,7 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-#define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_DEATH({ statement; }, "CAS mount runtime")
+#define EXPECT_RUNTIME_STATE_REJECTION(statement) CAS_EXPECT_DEATH({ statement; }, "CAS mount runtime")
 #else
 #define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
 #endif

@@ -78,6 +78,7 @@ def test_gh_binaries_are_github_artifacts_with_s3_fallback():
         ArtifactNames.CH_ARM_MSAN_GH,
         ArtifactNames.CH_ARM_DEBUG_GH,
         ArtifactNames.CH_ARM_TSAN_GH,
+        ArtifactNames.CH_PPC64LE_GH,
     ):
         cfg = gh_by_name[name]
         assert cfg.type == Artifact.Type.GH

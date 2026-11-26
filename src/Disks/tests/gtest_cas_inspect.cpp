@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -7,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
 #include "cas_test_helpers.h"
@@ -217,6 +219,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     condemned_rec.size = 123;
     condemned_rec.condemn_round = 7;
     condemned_rec.marker_confirmed = true;
+    condemned_rec.standing = true;
 
     SourceEdgeRecord edge_rec;
     edge_rec.ref = bh(2);
@@ -239,6 +242,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     EXPECT_NE(json.find(R"("kind":"edge")"), String::npos) << json;
     EXPECT_NE(json.find(R"("kind":"condemned")"), String::npos) << json;
     EXPECT_NE(json.find(R"("delete_pending":true)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("standing":true)"), String::npos) << json;
     EXPECT_NE(json.find(R"("condemn_round":7)"), String::npos) << json;
     EXPECT_NE(json.find(R"("value":"etag-1")"), String::npos) << json;
     EXPECT_NE(json.find(R"("type":"emulated")"), String::npos) << json;
@@ -420,4 +424,60 @@ TEST(CASInspect, UndecodableCheckpointCostsOnlyTheStrayLabel)
     const String critical_printed = critical_diagnostics.str();
     EXPECT_NE(critical_printed.find(layout.refCkptKey(critical_life)), String::npos) << critical_printed;
     EXPECT_EQ(std::count(critical_printed.begin(), critical_printed.end(), '\n'), 1) << critical_printed;
+}
+
+/// A `.meta` key decodes as a legacy blob marker, not as a body: it shares the `blobs/` prefix with the body key.
+TEST(CASInspect, RendersCondemnedMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Condemned, .condemn_round = 9, .size = 123};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"object\":\"blob_meta\""), String::npos);
+    EXPECT_NE(json.find("\"condemned\""), String::npos);
+    EXPECT_NE(json.find("\"condemn_round\":9"), String::npos);
+    EXPECT_NE(json.find("\"size\":123"), String::npos);
+}
+
+TEST(CASInspect, RendersCleanMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-clean"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Clean, .condemn_round = 0, .size = 7};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"clean\""), String::npos);
+}
+
+/// `cas-gc-dryrun` prints an intent key for each `standing` row, and the operator is sent to `cas-inspect` with it.
+TEST(CASInspect, RendersTheDeletionIntentAGcDryRunPrints)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-intent"))};
+    const auto identity = canonicalIdentity(Dialect::ETag, "\"0123456789abcdef0123456789abcdef\"");
+    ASSERT_TRUE(identity.has_value());
+    DB::Cas::InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    ASSERT_TRUE(createBlobIntent(*op, layout, ref, *identity, Retry::standard()).confirmed());
+
+    const String key = layout.blobIntentKey(ref, *identity);
+    const auto stored = (*op).read(key, Retry::standard());
+    ASSERT_TRUE(stored.has_value());
+    const String json = caInspectToJson(layout, key, stored->bytes);
+    EXPECT_NE(json.find("\"object\":\"blob_intent\""), String::npos) << json;
+    EXPECT_NE(json.find("\"blob\":\"" + blobIdOf(ref) + "\""), String::npos) << json;
+    EXPECT_NE(json.find("\"type\":\"etag\""), String::npos) << json;
+    EXPECT_NE(json.find("\"tag_hex\":\"" + identity->tag_hex + "\""), String::npos) << json;
+}
+
+/// An intent holds one constant byte string, so anything else at an intent key is damage, not a version to decode.
+TEST(CASInspect, ADeletionIntentKeyWithOtherBytesIsCorrupted)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-intent-bad"))};
+    const auto identity = canonicalIdentity(Dialect::Generation, "1699999999999999");
+    ASSERT_TRUE(identity.has_value());
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { caInspectToJson(layout, layout.blobIntentKey(ref, *identity), "{}\n"); });
 }

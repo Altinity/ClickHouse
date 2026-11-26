@@ -1,4 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasIntentRules.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
@@ -7,16 +9,21 @@
 #include <base/defines.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SensitiveDataMasker.h>
 #include <Common/logger_useful.h>
 
 namespace ProfileEvents
 {
     extern const Event CASGCRetiredSparedByReref;
     extern const Event CASGCUnmatchedRemoveDeltas;
+    extern const Event CASGCIntentLeftOnSpare;
+    extern const Event CASGCIntentTokenRejected;
+    extern const Event CASGCIntentAdopted;
+    extern const Event CASGCIntentStandingAnomaly;
 }
 #include <city.h>
+#include <fmt/ranges.h>
 #include <algorithm>
-#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -27,7 +34,6 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -39,39 +45,50 @@ namespace
 
 const UInt128 kZeroSourceId{0};
 
-/// Streams a shard's prior source-edge run with one block resident, plus up to `kGraduationLookaheadRows`
-/// decoded rows while a graduation scan is buffering: chains the run SEGMENTS the caller resolved from the
-/// parent seal (`blob_target_runs` filtered to one shard) and exposes the next row to the fold merge. The
-/// prior run carries
-/// BOTH surviving edges (`RunMarker::Edge`) AND the retired `RunMarker::Condemned` sentinel rows at the zero source id,
-/// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
-/// sentinels are dropped on carry (per-generation, never carried forward). Row/key invariants are enforced
-/// while streaming: `RunMarker::Edge` never at `source_id = 0`; sentinel rows (`RunMarker::Zero` /
-/// `RunMarker::Condemned`) ONLY at `source_id = 0`; at most one sentinel per blob; an unknown value byte or an empty
-/// payload is `CORRUPTED_DATA`. Resolution uses the exact object references supplied by the caller, so a run
-/// sealed for generation G that physically lives under an older generation's key is reached
-/// without key construction. An empty `segments` is the fresh-pool / empty baseline. The row stream is
-/// globally sorted by (blob_hash, source_id), so `key()` values are non-decreasing.
+/// The message of the `CORRUPTED_DATA` an absent run raises, masked as `Exception` masks it, built without the exception.
+String absentRunMessage(const String & key)
+{
+    String message = fmt::format("CAS source-edge run: object {} is absent", key);
+    if (auto masker = SensitiveDataMasker::getInstance())
+        masker->wipeSensitiveData(message);
+    return message;
+}
+
+/// A digest wider than its algorithm's own width is a programming bug, not corrupted data: chassert, not throw.
+SourceEdgeKey sourceEdgeKeyOf(const BlobRef & ref, const UInt128 & source_id)
+{
+    const size_t digest_len = blobHashLenFor(ref.algo);
+    for (size_t i = digest_len; i < ref.digest.bytes.size(); ++i)
+        chassert(ref.digest.bytes[i] == 0, fmt::format("source-edge key: non-zero byte at tail position {} (digest_len={})", i, digest_len));
+    return SourceEdgeKey{ref, source_id};
+}
+
+/// Run records held behind a row whose create is unanswered; past this the merge waits for the oldest answer.
+/// Bounds memory, not requests.
+constexpr size_t kHeldRunRecords = 16384;
+
+/// Streams a shard's prior source-edge runs for the fold merge, plus up to `kPendingHeadLookaheadRows` decoded rows
+/// while a pending-row scan is buffering. Rows come from `AdoptedRunReader`, which checks them; this cursor only drops
+/// zero markers, which are per-generation and never carried, and exposes surviving edges and condemned rows in
+/// `(blob, source_id)` order. An empty `segments` is the fresh-pool / empty baseline.
 class PriorEdgeCursor
 {
 public:
-    /// The key codec is stateless and self-describing, so a run may freely mix supported hash algorithms.
-    PriorEdgeCursor(CasOperation & op_, const std::vector<RunRef> & segments_)
-        : op(op_), segments(segments_)
+    PriorEdgeCursor(CasOperation & op, const std::vector<RunRef> & segments, uint64_t shard, AdoptedRunContext parent)
+        : runs(op, segments, shard, parent)
     {
         advance();
     }
 
     bool valid() const { return has_current; }
-    const String & key() const { return current.key; }
+    const SourceEdgeKey & key() const { return current.key; }
     /// The value byte of the current row: `RunMarker::Edge` (a surviving edge) or `RunMarker::Condemned` (a retired
     /// sentinel row). Zero markers are never surfaced (dropped on carry).
     RunMarker rowType() const { return current.type; }
     /// The decoded retired sentinel for the current row (only valid when `rowType() == RunMarker::Condemned`).
     const CondemnedRow & condemnedRow() const { return current.condemned; }
 
-    /// Advance to the next surviving edge OR retired sentinel, dropping zero markers, enforcing the
-    /// row/key invariants, and crossing segment boundaries.
+    /// Advance to the next surviving edge OR retired sentinel, crossing run boundaries.
     void advance()
     {
         if (!lookahead.empty())
@@ -87,40 +104,26 @@ public:
         current_offered = false;
         while (true)
         {
-            if (reader)
+            if (auto row = pullRow())
             {
-                if (auto row = pullRow())
-                {
-                    current = std::move(*row);
-                    has_current = true;
-                    return;
-                }
-                /// Segment fully drained: verify its whole-file checksum against
-                /// the seal's RunRef.checksum BEFORE the fold acts on any of its rows. This is the fold —
-                /// the checksum's most important consumer (it decides deletions). Fail-closed on mismatch.
-                reader->verifyAgainst(segments[seg_idx].checksum);
-                reader.reset();
-                ++seg_idx;
+                current = std::move(*row);
+                has_current = true;
+                return;
             }
-
-            /// Open the next resolved segment; the segment list is exhausted => the chain is done.
-            if (seg_idx >= segments.size())
+            /// The drained run's checksum is verified here, before the fold acts on any row of the next one.
+            if (!runs.openNextRun())
             {
                 has_current = false;
                 return;
             }
-            /// Typed open validates the NDJSON header before any row is consumed. Each row carries its
-            /// own algorithm byte, so no separate width gate is needed.
-            reader = openSourceEdgeRun(op, segments[seg_idx].key);
-            reader_drained = false;
         }
     }
 
     /// Offers the condemned rows from the current row onward, in order, each until `offer` accepts it: rows
-    /// of the OPEN segment are decoded into a buffer of at most `max_rows`. Stops when `offer` returns false
-    /// (that row is offered again next time), the buffer is full, or the open segment ends: opening the next segment,
-    /// and verifying the checksum of the one that ends, stay with `advance`. Rows are validated as `advance`
-    /// validates them, so a corrupt row throws here a few rows early.
+    /// of the OPEN run are decoded into a buffer of at most `max_rows`. Stops when `offer` returns false
+    /// (that row is offered again next time), the buffer is full, or the open run ends: opening the next run,
+    /// and verifying the checksum of the one that ends, stay with `advance`. Rows are checked as `advance`
+    /// checks them, so a corrupt row throws here a few rows early.
     void scanAhead(size_t max_rows, const std::function<bool(const BlobRef &, const CondemnedRow &)> & offer)
     {
         if (has_current && !current_offered)
@@ -135,7 +138,7 @@ public:
                 return;
             ++offered_ahead;
         }
-        while (reader && lookahead.size() < max_rows)
+        while (lookahead.size() < max_rows)
         {
             auto row = pullRow();
             if (!row)
@@ -150,7 +153,8 @@ public:
 private:
     struct Row
     {
-        String key;
+        SourceEdgeKey key;
+        BlobRef ref;
         RunMarker type = RunMarker::Edge;
         CondemnedRow condemned;
     };
@@ -159,79 +163,220 @@ private:
     {
         if (row.type != RunMarker::Condemned)
             return true;
-        BlobRef ref;
-        UInt128 source_id;
-        SourceEdgeKeyCodec::parse(row.key, ref, source_id);
-        return offer(ref, row.condemned);
+        return offer(row.ref, row.condemned);
     }
 
-    /// The next surviving edge or retired sentinel of the open segment, validated; nullopt once it is drained.
+    /// The next surviving edge or retired sentinel of the open run; nullopt once it is drained.
     std::optional<Row> pullRow()
     {
-        if (reader_drained)
-            return std::nullopt;
-        String k;
-        String p;
-        while (reader->next(k, p))
+        SourceEdgeRecord rec;
+        while (runs.nextInRun(rec))
         {
-            BlobRef bh;
-            UInt128 sid;
-            /// `parse` throws CORRUPTED_DATA on a malformed size / NOT_IMPLEMENTED on an
-            /// unknown algo byte (fail-closed).
-            SourceEdgeKeyCodec::parse(k, bh, sid);
-            if (p.empty())
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty row payload");
-            const RunMarker v = runMarkerFromByte(p[0], "CAS source-edge run");
-            const bool sentinel_key = (sid == kZeroSourceId);
-
-            if (sentinel_key)
-            {
-                /// A sentinel key carries exactly one row per blob and never an edge.
-                if (v == RunMarker::Edge)
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS source-edge run: active edge at the reserved sentinel source_id 0");
-                if (have_sentinel_blob && sentinel_blob == bh)
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS source-edge run: duplicate sentinel row for one blob");
-                have_sentinel_blob = true;
-                sentinel_blob = bh;
-                if (v == RunMarker::Zero)
-                    continue;   // A zero marker is per-generation and is dropped on carry.
-                /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
-                return Row{.key = k, .type = RunMarker::Condemned, .condemned = decodeCondemnedRow(p)};
-            }
-
-            /// A non-sentinel key must carry a surviving edge and nothing else.
-            if (v != RunMarker::Edge)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
-                    static_cast<uint8_t>(v));
-            return Row{.key = k, .type = RunMarker::Edge, .condemned = {}};
+            if (rec.marker == RunMarker::Zero)
+                continue;
+            if (rec.marker == RunMarker::Condemned)
+                return Row{.key = sourceEdgeKeyOf(rec.ref, rec.source_id), .ref = rec.ref,
+                           .type = RunMarker::Condemned, .condemned = condemnedRowOf(rec)};
+            return Row{.key = sourceEdgeKeyOf(rec.ref, rec.source_id), .ref = rec.ref,
+                       .type = RunMarker::Edge, .condemned = {}};
         }
-        reader_drained = true;
         return std::nullopt;
     }
 
-    CasOperation & op;
-    const std::vector<RunRef> & segments;
-
-    size_t seg_idx = 0;
-    std::optional<SourceEdgeRunView> reader;
-    /// The open segment returned its last row; `advance` verifies it and opens the next.
-    bool reader_drained = false;
+    AdoptedRunReader runs;
     Row current;
     bool has_current = false;
     bool current_offered = false;
     /// Rows decoded ahead of `current`; the first `offered_ahead` of them were offered.
     std::deque<Row> lookahead;
     size_t offered_ahead = 0;
-
-    /// Duplicate-sentinel guard: the last blob for which a sentinel row was seen (across skipped zero
-    /// markers too). Rows are globally sorted, so two sentinels for one blob are adjacent.
-    bool have_sentinel_blob = false;
-    BlobRef sentinel_blob{};
 };
 
+}
+
+AdoptedRunReader::AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_,
+                                   AdoptedRunContext context_, OnRefusal on_refusal_, RunPolicy run_policy_)
+    : op(op_), runs(runs_), shard(shard_), context(std::move(context_)), on_refusal(on_refusal_), run_policy(std::move(run_policy_))
+{
+}
+
+template <typename Read>
+bool AdoptedRunReader::reportingRefusal(Read && read)
+{
+    if (refused)
+        return false;
+    if (on_refusal == OnRefusal::Throw)
+        return read();
+    try
+    {
+        return read();
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            throw;
+        refused = Refusal{.run_key = next_run > 0 ? currentRun().key : String{}, .message = e.message()};
+        view.reset();
+        return false;
+    }
+}
+
+bool AdoptedRunReader::nextInRun(SourceEdgeRecord & rec)
+{
+    return reportingRefusal([&] { return nextInRunChecked(rec); });
+}
+
+bool AdoptedRunReader::openNextRun()
+{
+    return reportingRefusal([&] { return openNextRunChecked(); });
+}
+
+bool AdoptedRunReader::nextInRunChecked(SourceEdgeRecord & rec)
+{
+    if (!view || drained)
+        return false;
+    bool got = false;
+    try
+    {
+        got = view->next(rec);
+    }
+    catch (Exception & e)
+    {
+        if (e.code() == ErrorCodes::CORRUPTED_DATA)
+            e.addMessage(fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
+        throw;
+    }
+    if (!got)
+    {
+        drained = true;
+        return false;
+    }
+    checkRow(rec);
+    return true;
+}
+
+bool AdoptedRunReader::openNextRunChecked()
+{
+    if (view)
+    {
+        chassert(drained);
+        try
+        {
+            view->verifyAgainst(currentRun().checksum);
+        }
+        catch (Exception & e)
+        {
+            if (e.code() == ErrorCodes::CORRUPTED_DATA)
+                e.addMessage(fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
+            throw;
+        }
+        view.reset();
+    }
+    if (next_run >= runs.size())
+    {
+        if (!finished)
+        {
+            finished = true;
+            checkSummary();
+        }
+        return false;
+    }
+    drained = false;
+    /// Typed open validates the NDJSON header before any row is consumed.
+    const String & key = runs[next_run++].key;
+    view = tryOpenSourceEdgeRun(op, key, run_policy ? run_policy() : Retry::standard());
+    if (!view)
+        return refuseAbsentRun(key);
+    return true;
+}
+
+bool AdoptedRunReader::refuseAbsentRun(const String & key)
+{
+    /// No exception exists before the absence is classified: constructing a `CORRUPTED_DATA` counts it, dropping it logs it.
+    if (on_refusal == OnRefusal::Report)
+    {
+        refused = Refusal{.run_key = key, .message = absentRunMessage(key)};
+        return false;
+    }
+    if (context.on_absent_run)
+        context.on_absent_run(absentRunMessage(key));
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
+}
+
+bool AdoptedRunReader::next(SourceEdgeRecord & rec)
+{
+    while (!nextInRun(rec))
+        if (!openNextRun())
+            return false;
+    return true;
+}
+
+const RunRef & AdoptedRunReader::currentRun() const
+{
+    chassert(next_run > 0);
+    return runs[next_run - 1];
+}
+
+void AdoptedRunReader::refuseRow(const SourceEdgeRecord & rec, const String & what) const
+{
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS source-edge run `{}` of GC shard {}: the row of blob {} source {} {}. {}",
+        currentRun().key, shard, blobIdOf(rec.ref), u128ToHex(rec.source_id), what, kCorruptBookkeeping);
+}
+
+void AdoptedRunReader::checkRow(const SourceEdgeRecord & rec)
+{
+    /// The merge decides a blob from the rows of its own shard alone, and assumes them sorted.
+    if (blobShard(rec.ref, context.gc_shards) != shard)
+        refuseRow(rec, fmt::format("belongs to GC shard {} of {}, not to shard {} whose run holds it",
+            blobShard(rec.ref, context.gc_shards), context.gc_shards, shard));
+    const SourceEdgeKey key{rec.ref, rec.source_id};
+    if (previous_key && key < *previous_key)
+        refuseRow(rec, "sorts before the row above it");
+    previous_key = key;
+    if (rec.source_id == kZeroSourceId)
+    {
+        /// A sentinel key carries exactly one row per blob and never an edge.
+        if (rec.marker == RunMarker::Edge)
+            refuseRow(rec, "is an active edge at the reserved sentinel source_id 0");
+        if (last_sentinel_blob == rec.ref)
+            refuseRow(rec, "is a duplicate sentinel row for one blob");
+        last_sentinel_blob = rec.ref;
+    }
+    else if (rec.marker != RunMarker::Edge)
+    {
+        refuseRow(rec, fmt::format("is a sentinel row type 0x{:02x} at a non-sentinel key", static_cast<uint8_t>(rec.marker)));
+    }
+    /// The parent round stamped every row it condemned; a later stamp would reach the rules on the cut that minted it.
+    if (rec.marker == RunMarker::Condemned && rec.condemn_round > context.parent_round)
+        refuseRow(rec, fmt::format("is stamped with round {}, after the parent round {}", rec.condemn_round, context.parent_round));
+    if (rec.marker == RunMarker::Condemned)
+    {
+        ++counted.condemned_total;
+        if (rec.delete_pending)
+            ++counted.pending_total;
+        else
+            counted.oldest_nonpending_condemn_round = std::min(counted.oldest_nonpending_condemn_round, rec.condemn_round);
+    }
+}
+
+void AdoptedRunReader::checkSummary() const
+{
+    /// A round decides from the summary whether to confirm `gc/state` before it deletes, and a carried shard keeps its
+    /// summary unread, so a summary that differs from its rows must not be acted on.
+    if (counted == context.summary)
+        return;
+    const auto round = [](uint64_t r) { return r == std::numeric_limits<uint64_t>::max() ? String("none") : std::to_string(r); };
+    std::vector<String> keys;
+    for (const RunRef & run : runs)
+        keys.push_back(run.key);
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS GC shard {} ({}): its rows hold {} condemned, {} pending, oldest non-pending round {}, but the parent fold "
+        "seal's summary states {} condemned, {} pending, oldest non-pending round {}. {}",
+        shard, keys.empty() ? String("no source-edge run") : fmt::format("source-edge run `{}`", fmt::join(keys, "`, `")),
+        counted.condemned_total, counted.pending_total, round(counted.oldest_nonpending_condemn_round),
+        context.summary.condemned_total, context.summary.pending_total, round(context.summary.oldest_nonpending_condemn_round),
+        kCorruptBookkeeping);
 }
 
 UInt128 sourceEdgeId(const ManifestId & id, const String & path)
@@ -259,44 +404,11 @@ void assertValidSourceEdgeId(const UInt128 & source_id)
             "CAS source edge: source_id 0 is the reserved sentinel key");
 }
 
-String encodeCondemnedRow(const CondemnedRow & row)
+CondemnedRow condemnedRowOf(const SourceEdgeRecord & rec)
 {
-    String out;
-    out.push_back(runMarkerByte(RunMarker::Condemned));
-    out.push_back(static_cast<char>((row.delete_pending ? 1 : 0) | (row.marker_confirmed ? 2 : 0)));
-    out.push_back(static_cast<char>(dialectByteFromWord(row.token.dialect, "condemned row")));
-    auto beU64 = [&](uint64_t v) { for (int i = 7; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF); };
-    beU64(row.condemn_round);
-    beU64(row.size);
-    if (row.token.value.size() > 0xFFFF)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: token too long ({})", row.token.value.size());
-    out += static_cast<char>((row.token.value.size() >> 8) & 0xFF);
-    out += static_cast<char>(row.token.value.size() & 0xFF);
-    out += row.token.value;
-    return out;
-}
-
-CondemnedRow decodeCondemnedRow(std::string_view p)
-{
-    /// [0]=0x02 [1]=flags [2]=token_type [3..10]=round [11..18]=size [19..20]=len [21..]=value
-    constexpr size_t kFixed = 21;
-    if (p.size() < kFixed || runMarkerFromByte(p[0], "CAS condemned row") != RunMarker::Condemned)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: malformed header");
-    CondemnedRow row;
-    const uint8_t flags = static_cast<uint8_t>(p[1]);
-    if (flags > 3)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown flags 0x{:02x}", flags);
-    row.delete_pending = flags & 1;
-    row.marker_confirmed = flags & 2;
-    row.token.dialect = String(dialectWordFromByte(static_cast<uint8_t>(p[2]), "condemned row"));
-    auto beU64 = [&](size_t off) { uint64_t v = 0; for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(p[off + i]); return v; };
-    row.condemn_round = beU64(3);
-    row.size = beU64(11);
-    const size_t len = (static_cast<uint8_t>(p[19]) << 8) | static_cast<uint8_t>(p[20]);
-    if (p.size() != kFixed + len)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: declared token_len {} vs payload {}", len, p.size() - kFixed);
-    row.token.value = String(p.substr(kFixed, len));
-    return row;
+    return CondemnedRow{.delete_pending = rec.delete_pending, .token = rec.token, .size = rec.size,
+                        .condemn_round = rec.condemn_round, .marker_confirmed = rec.marker_confirmed,
+                        .standing = rec.standing};
 }
 
 SourceEdgeRunView::SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_)
@@ -305,29 +417,9 @@ SourceEdgeRunView::SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_)
 {
 }
 
-bool SourceEdgeRunView::next(String & key, String & payload)
+bool SourceEdgeRunView::next(SourceEdgeRecord & rec)
 {
-    SourceEdgeRecord rec;
-    if (!reader->next(rec))
-        return false;
-    /// Reconstruct the packed SourceEdgeKeyCodec key + the ORIGINAL payload bytes (a single marker byte,
-    /// or the encoded condemned row) so the fold / zeroInDegree / previewDeletes / fsck consumers keep
-    /// their exact parse/compare logic against the NDJSON codec.
-    key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id);
-    switch (rec.marker)
-    {
-        case RunMarker::Edge:
-        case RunMarker::Zero:
-            payload = String(1, runMarkerByte(rec.marker));
-            break;
-        case RunMarker::Condemned:
-            payload = encodeCondemnedRow(CondemnedRow{.delete_pending = rec.delete_pending,
-                                                      .token = rec.token, .size = rec.size,
-                                                      .condemn_round = rec.condemn_round,
-                                                      .marker_confirmed = rec.marker_confirmed});
-            break;
-    }
-    return true;
+    return reader->next(rec);
 }
 
 void SourceEdgeRunView::verifyAgainst(const UInt128 & expected)
@@ -345,62 +437,22 @@ SourceEdgeRunView openSourceEdgeRun(std::string_view bytes)
     return SourceEdgeRunView(std::make_unique<ReadBufferFromMemory>(bytes.data(), bytes.size()));
 }
 
-SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key)
+std::optional<SourceEdgeRunView> tryOpenSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
 {
     /// Streaming: a forward-only read of the write-once run — nothing is materialized whole
-    /// (cas_run is object_cap = 0). Absent object => fail-closed.
-    auto stream = op.stream(key, Retry::standard());
+    /// (cas_run is object_cap = 0).
+    auto stream = op.stream(key, policy);
     if (!stream)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
+        return std::nullopt;
     return SourceEdgeRunView(std::move(stream));
 }
 
-namespace
+SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
 {
-/// len-drift guard (mirrors DigestCodec::checkZeroTail, CasBlobDigest.h): a caller passing a digest
-/// wider than the algo's own width is a programming bug, not corrupted on-disk data — chassert, not
-/// throw.
-void checkZeroTailForAlgo(const BlobDigest & d, uint8_t digest_len, [[maybe_unused]] const char * what)
-{
-    for (size_t i = digest_len; i < d.bytes.size(); ++i)
-        chassert(d.bytes[i] == 0, fmt::format("SourceEdgeKeyCodec::{}: non-zero byte at tail position {} (digest_len={})", what, i, digest_len));
-}
-}
-
-String SourceEdgeKeyCodec::key(const BlobRef & ref, const UInt128 & source_id)
-{
-    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(ref.algo));
-    checkZeroTailForAlgo(ref.digest, digest_len, "key");
-    String out;
-    out.push_back(static_cast<char>(static_cast<uint8_t>(ref.algo)));
-    out += String(reinterpret_cast<const char *>(ref.digest.bytes.data()), digest_len);
-    out += u128ToBytesBE(source_id);
-    return out;
-}
-
-void SourceEdgeKeyCodec::parse(std::string_view key, BlobRef & ref, UInt128 & source_id)
-{
-    if (key.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty key");
-    const uint8_t algo_byte = static_cast<uint8_t>(key[0]);
-    BlobHashAlgo algo{};
-    switch (algo_byte)
-    {
-        case static_cast<uint8_t>(BlobHashAlgo::CityHash128): algo = BlobHashAlgo::CityHash128; break;
-        case static_cast<uint8_t>(BlobHashAlgo::XXH3_128):    algo = BlobHashAlgo::XXH3_128; break;
-        case static_cast<uint8_t>(BlobHashAlgo::Sha256):      algo = BlobHashAlgo::Sha256; break;
-        default:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "CAS source-edge run: unknown algo byte {} in key", algo_byte);
-    }
-    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(algo));
-    if (key.size() != 1 + static_cast<size_t>(digest_len) + 16)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: malformed key ({} bytes, expected {})", key.size(), 1 + digest_len + 16);
-    ref = BlobRef{};
-    ref.algo = algo;
-    memcpy(ref.digest.bytes.data(), key.data() + 1, digest_len);
-    source_id = u128FromBytesBE(String(key.substr(1 + digest_len, 16)), "src-edge run key source_id");
+    auto view = tryOpenSourceEdgeRun(op, key, policy);
+    if (!view)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
+    return std::move(*view);
 }
 
 void putDeterministicArtifact(CasOperation & op, const String & key, const String & bytes)
@@ -428,46 +480,35 @@ void putDeterministicArtifact(CasOperation & op, const String & key, const Strin
     orThrow(std::move(result), what);
 }
 
-void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
-                              const std::vector<RunRef> & prior_runs,
-                              uint64_t new_generation, uint64_t attempt,
-                              uint64_t shard,
-                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
-                              uint64_t current_round, uint64_t condemn_round,
-                              const BlobHeadFn & head_blob,
-                              const BlobHeadFn & peek_head,
-                              const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
-                              RetiredMergeResult * out_retired,
-                              bool suppress_destructive,
-                              std::vector<uint8_t> * out_applied_by_txn_ordinal,
-                              std::vector<BlobSourceRetirement> source_retirements,
-                              GcRoundWorkBudget * work_budget,
-                              const GraduationReadHints * graduation_reads)
+RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
+                                AdoptedRunContext parent, uint64_t new_generation, uint64_t attempt, uint64_t shard,
+                                std::vector<BlobDelta> scattered, ShardFoldOptions options)
 {
+    if (options.suppress_destructive && !options.intent_nominations.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nominations passed to a suppressed round");
+
     RetiredMergeResult sink;
-    RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
+    RetiredMergeResult & rmr = options.out_retired ? *options.out_retired : sink;
 
     // Deterministic input ordering produces a byte-reproducible run for safe retry and adoption.
     // MUST be stable: for the same (ref, source_id) the journal ordering is
     // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
     // An unstable sort can put removal before activation => last=activation => false positive.
-    // The comparator is exactly (ref.algo, ref.digest, source_id) == BlobRef::operator< then
-    // source_id — the same order the raw keys sort in (`SourceEdgeKeyCodec::key`'s algo
-    // byte decides before any digest byte can), so the merge below stays a plain key comparison.
     std::stable_sort(scattered.begin(), scattered.end(),
         [](const BlobDelta & a, const BlobDelta & b)
         {
-            if (a.ref != b.ref) return a.ref < b.ref;
-            return a.source_id < b.source_id;
+            return SourceEdgeKey{a.ref, a.source_id} < SourceEdgeKey{b.ref, b.source_id};
         });
-    std::sort(source_retirements.begin(), source_retirements.end(),
+    std::sort(options.source_retirements.begin(), options.source_retirements.end(),
         [](const BlobSourceRetirement & a, const BlobSourceRetirement & b)
         {
-            if (a.ref != b.ref) return a.ref < b.ref;
-            return a.source_id < b.source_id;
+            return SourceEdgeKey{a.ref, a.source_id} < SourceEdgeKey{b.ref, b.source_id};
         });
+    /// Stable, so the first listed intent of a key is the one adopted.
+    std::stable_sort(options.intent_nominations.begin(), options.intent_nominations.end(),
+        [](const Layout::ParsedBlobIntentKey & a, const Layout::ParsedBlobIntentKey & b) { return a.ref < b.ref; });
 
-    PriorEdgeCursor cursor(op, prior_runs);
+    PriorEdgeCursor cursor(op, prior_runs, shard, parent);
 
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);   // sorted NDJSON; byte-deterministic for write-once adoption
@@ -485,6 +526,9 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     uint64_t cur_edges = 0;              // surviving edges of cur_blob so far
     bool cur_touched = false;            // cur_blob had prior edges or deltas this generation
     std::optional<CondemnedRow> cur_condemned;   // the retired sentinel carried on the prior run for cur_blob
+    std::optional<Layout::ParsedBlobIntentKey> cur_nomination;   // the first listed intent of cur_blob, never a touch
+    std::optional<uint64_t> cur_row_create;   // the create cur_blob's row waits for
+    size_t ni = 0;
 
     auto toRetiredEntry = [](const BlobRef & ref, const CondemnedRow & r) -> RetiredEntry
     {
@@ -495,96 +539,335 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         e.size = r.size;
         e.condemn_round = r.condemn_round;
         e.delete_pending = r.delete_pending;
-        e.marker_confirmed = r.marker_confirmed;
+        e.standing = r.standing;
         return e;
     };
-    /// THE DELETE-SITE IN-DEGREE RE-READ IS NORMATIVE (spec §5, third arm). It is not an optimization
-    /// and not defense-in-depth: it is the last of the three things that keep a delete from racing a
-    /// live edge, and the only one that acts on THIS pass's freshly merged view.
-    ///
-    ///   1. the round-paced floor: a blob condemned in round R cannot graduate before R+1, so a `+1`
-    ///      that lands in the same round as the condemnation is always folded before any delete;
-    ///   2. the exact-token delete: a writer that resurrected the blob replaced its incarnation, so a
-    ///      stale entry's delete matches nothing and removes nothing;
-    ///   3. THIS: the entry is settled against `indeg` recomputed by the merge that just ran, so an edge
-    ///      folded after the condemnation but before the delete pass spares the blob outright --
-    ///      `indeg > 0` wins over `delete_pending`, unconditionally and past the floor.
-    ///
-    /// Arms 1 and 2 bound WHEN and WHAT a delete may remove; only this one asks whether the blob is
-    /// still referenced at the moment the pass decides. Removing it -- or reordering the branches so
-    /// that `delete_pending` is checked first -- silently deletes re-referenced blobs on exactly the
-    /// interleaving the other two arms do not cover. Any change here needs a test that fails without it.
-    auto settleEntry = [&](const RetiredEntry & e, uint64_t indeg)
+    /// The run is written in merge order, but a row whose create is unanswered is not known yet: it and every
+    /// record after it are held until that answer is taken. Answers are taken in the order the creates were sent,
+    /// which is run order, so each row is written from its own create's answer.
+    struct OutstandingCreate
     {
-        chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only
-        if (indeg > 0)
+        IntentCreateAnswer answer;
+        size_t row = 0;                    /// in `rmr.still_retired`
+    };
+    struct HeldRecord
+    {
+        SourceEdgeRecord record;           /// an edge or a zero marker
+        std::optional<size_t> row;         /// a condemned row, built from `rmr.still_retired` when it is written
+        std::optional<uint64_t> create;    /// the create the row waits for
+    };
+    std::deque<OutstandingCreate> outstanding;
+    std::deque<HeldRecord> held;
+    uint64_t creates_sent = 0;
+    uint64_t creates_answered = 0;
+    const size_t create_window = std::max<size_t>(1, options.create_intent.window);
+
+    auto writable = [&](const HeldRecord & r) { return !r.create || *r.create < creates_answered; };
+    auto writeRecord = [&](const HeldRecord & r)
+    {
+        if (!r.row)
         {
-            /// A delete_pending entry recovering in-degree is the expected shape of a dedup-adopt vs
-            /// condemn race, not an ack-floor violation: a graduated blob carries NO surviving prior
-            /// edges (see the comment on the sentinel emission below), so any edge that resurrects its
-            /// in-degree is necessarily a FRESH this-generation edge -- a writer's non-condemned
-            /// observation in `PartWriteTxn::ensureBlobPresent`
-            /// point-read of the per-hash meta raced GC's `Condemned` write and adopted the (about to
-            /// be deleted) token instead of resurrecting from source. Spare it LOUDLY (never a
-            /// fail-closed abort, never a delete of a re-referenced blob), but at Debug: this is a
-            /// routine, safely-handled race, not something to page on.
-            if (e.delete_pending)
-            {
-                /// No LoggerPtr is threaded this deep (foldDeltasIntoGeneration is a free function
-                /// shared by the non-sharded fold and CasGcShardPlan's per-shard reduce); scope the
-                /// message with the pool's own key prefix instead so a multi-disk process's logs can
-                /// still be attributed.
-                LOG_DEBUG(getLogger("CasGcFold"),
-                    "CAS gc fold ({}): delete_pending blob {} (condemned at round {}, observed at round {}) "
-                    "recovered in-degree {} -- a fresh dedup-adopt raced the condemn; sparing (never a "
-                    "fail-closed delete)", layout.poolPrefix(), blobIdOf(e.ref), e.condemn_round, current_round, indeg);
-                ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
-            }
-            rmr.spared.push_back(e);            /// recovery wins, even past the floor
+            writer.append(r.record);
+            return;
         }
-        else if (e.delete_pending)
+        const RetiredEntry & e = rmr.still_retired[*r.row];
+        writer.append(SourceEdgeRecord{.ref = e.ref, .source_id = kZeroSourceId, .marker = RunMarker::Condemned,
+                                       .delete_pending = e.delete_pending, .token = e.token,
+                                       .size = e.size, .condemn_round = e.condemn_round,
+                                       .marker_confirmed = false, .standing = e.standing});
+    };
+    auto writeHeld = [&]
+    {
+        while (!held.empty() && writable(held.front()))
         {
-            /// Excess past the round's redelete budget is carried unchanged (still `delete_pending`) —
-            /// exactly the suppressed-pass shape below — rather than skipped ahead in `scattered`, so a
-            /// budget-exhausted round retries the same entry next round instead of losing it.
-            if (suppress_destructive || (work_budget && !work_budget->redeleteAvailable()))
-                rmr.still_retired.push_back(e); /// clamp-suppressed or budget-exhausted: carry UNCHANGED
-            else
-            {
-                if (work_budget)
-                    ++work_budget->redeletes_used;
-                rmr.redelete.push_back(e);      /// published pending by a PRIOR pass — execute + drop
-            }
+            writeRecord(held.front());
+            held.pop_front();
         }
-        else if (!suppress_destructive && e.condemn_round < current_round)
-        {
-            /// Budget before the gate: a carried entry must not cost a marker read every round. A refusal
-            /// consumes no slot, so refusals cannot crowd out graduations.
-            const bool admitted = graduation_reads ? graduation_reads->admit(e.ref)
-                                                   : (!work_budget || work_budget->graduationAvailable());
-            if (!admitted)
-                rmr.still_retired.push_back(e);
-            else
-            {
-                /// After the admission: a look-ahead hint must never take the settling entry's slot.
-                if (graduation_reads)
-                    cursor.scanAhead(kGraduationLookaheadRows, graduation_reads->offer);
-                if (!confirm_condemned_marker || confirm_condemned_marker(e))
-                {
-                    if (work_budget)
-                        ++work_budget->graduations_used;
-                    RetiredEntry pending = e;       /// newly floor-passed: publish pending; delete NEXT pass
-                    pending.delete_pending = true;
-                    pending.marker_confirmed = true;
-                    rmr.graduated.push_back(pending);
-                    rmr.still_retired.push_back(std::move(pending));
-                }
-                else
-                    rmr.still_retired.push_back(e); /// the gate refused: carried; it has rewritten the marker
-            }
-        }
+    };
+    /// The row is `pending` on a confirmed create, else `candidate`.
+    auto takeOldestAnswer = [&]
+    {
+        OutstandingCreate create = std::move(outstanding.front());
+        outstanding.pop_front();
+        const IntentCreateResult created = create.answer();
+        RetiredEntry & row = rmr.still_retired[create.row];
+        row.delete_pending = created.confirmed();
+        if (created.confirmed())
+            rmr.confirmed.push_back(row);
         else
-            rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
+            rmr.unconfirmed_creates.note([&] { return created.detail; });
+        ++creates_answered;
+        writeHeld();
+    };
+    auto emit = [&](HeldRecord r)
+    {
+        if (held.empty() && writable(r))
+        {
+            writeRecord(r);
+            return;
+        }
+        held.push_back(std::move(r));
+        writeHeld();
+        while (held.size() > kHeldRunRecords && !outstanding.empty())
+            takeOldestAnswer();
+    };
+    /// Records `row` as a candidate and sends the create a decision names. Only a sent create spends a budget slot.
+    auto createAndRecord = [&](RetiredEntry row, const CanonicalIdentity & identity)
+    {
+        if (options.work_budget)
+        {
+            options.work_budget->intent_creates.take(shard, cur_blob);
+        }
+        row.delete_pending = false;
+        row.standing = false;
+        rmr.still_retired.push_back(std::move(row));
+        outstanding.push_back(OutstandingCreate{.answer = options.create_intent.start(cur_blob, identity),
+                                                .row = rmr.still_retired.size() - 1});
+        cur_row_create = creates_sent++;
+        while (outstanding.size() >= create_window)
+            takeOldestAnswer();
+    };
+
+    /// The row a decision writes for the incarnation its `HEAD` observed, stamped with this round.
+    auto observedRow = [&](const IntentDecision & decision, const DecisionHead & head)
+    {
+        RetiredEntry row;
+        row.kind = ObjectKind::Blob;
+        row.ref = cur_blob;
+        row.token = *decision.new_token;
+        row.size = head.observed()->size;
+        row.condemn_round = options.condemn_round;
+        return row;
+    };
+
+    auto noteTokenRejected = [&]
+    {
+        rmr.rejected_tokens.note([&] { return layout.blobKey(cur_blob); });
+        ProfileEvents::increment(ProfileEvents::CASGCIntentTokenRejected);
+    };
+
+    auto noteUndecodable = [&]
+    {
+        rmr.undecodable_bodies.note([&] { return layout.blobKey(cur_blob); });
+    };
+
+    /// A body GC cannot decode is never condemned, adopted or deleted: the row, if any, is carried unchanged.
+    auto carryUndecodable = [&](const std::optional<RetiredEntry> & row)
+    {
+        noteUndecodable();
+        if (row)
+            rmr.still_retired.push_back(*row);
+    };
+
+    /// A spare drops the row and never carries it, so no row sits beside live edges of its blob.
+    auto spareRow = [&](const RetiredEntry & row, const std::optional<CanonicalIdentity> & intent_to_delete)
+    {
+        if (row.delete_pending)
+        {
+            LOG_DEBUG(getLogger("CasGcFold"),
+                "CAS gc fold ({}): {} blob {} (condemned at round {}, observed at round {}) is referenced "
+                "again; the row is dropped and {}", layout.poolPrefix(),
+                row.standing ? "standing" : "pending", blobIdOf(row.ref), row.condemn_round, options.current_round,
+                intent_to_delete ? "the body has another incarnation, so its intent is deleted" : "its intent stays");
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
+            if (intent_to_delete)
+                rmr.spare_intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *intent_to_delete));
+            else
+                ProfileEvents::increment(ProfileEvents::CASGCIntentLeftOnSpare);
+        }
+        rmr.spared.push_back(row);
+    };
+
+    /// Settles the blob being closed: builds the one `IntentRuleInput` from this pass's facts and acts on the
+    /// decision. The decision is authoritative; nothing here re-derives an identity or a rule.
+    ///
+    /// Sparing is decided against the in-degree this merge just computed: an edge folded after the condemnation
+    /// drops the row whatever its state, so no row outlives a cut that shows a reference.
+    auto settleBlob = [&](const std::optional<RetiredEntry> & row)
+    {
+        IntentRuleInput input;
+        input.row = row;
+        input.at_zero = cur_edges == 0;
+        input.key_touched = cur_touched;
+        input.fresh_transition = !row && input.at_zero && cur_touched;
+        input.suppressed = options.suppress_destructive;
+        input.create_budget_admits
+            = options.create_intent && (!options.work_budget || options.work_budget->intent_creates.admits(shard, cur_blob));
+        input.redelete_budget_admits = !options.work_budget || options.work_budget->redeletes.admits(shard, cur_blob);
+
+        /// A row carried after its `HEAD` keeps its slot, so the budget bounds the round's `HEAD`s of pending rows;
+        /// the rotation in `RotatingBudget` keeps such a row from holding the slot in every round.
+        bool redelete_slot_taken = false;
+        const auto takeRedeleteSlot = [&]
+        {
+            if (options.work_budget)
+                options.work_budget->redeletes.take(shard, cur_blob);
+            redelete_slot_taken = true;
+        };
+        switch (decisionHeadNeed(input))
+        {
+            case DecisionHeadNeed::None:
+                break;
+            case DecisionHeadNeed::Spare:
+            {
+                if (!options.spare_head)
+                {
+                    spareRow(*row, std::nullopt);
+                    return;
+                }
+                /// Before the take, so the `HEAD`s of the spared rows behind this one are in flight while it waits.
+                if (options.pending_hints)
+                {
+                    options.pending_hints->take_spare(cur_blob);
+                    cursor.scanAhead(kPendingHeadLookaheadRows, options.pending_hints->offer);
+                }
+                const BlobHead observed = options.spare_head(cur_blob);
+                if (observed.undecodable)
+                {
+                    rmr.undecodable_spares.note([&] { return layout.blobKey(cur_blob); });
+                    spareRow(*row, std::nullopt);
+                    return;
+                }
+                input.head = classifyDecisionHead(row->token, observed.meta);
+                break;
+            }
+            case DecisionHeadNeed::TouchedKey:
+            {
+                const BlobHeadFn & hook = row ? options.peek_head : options.head_blob;
+                if (!hook)
+                {
+                    if (row)
+                        rmr.still_retired.push_back(*row);
+                    return;
+                }
+                const BlobHead observed = hook(cur_blob);
+                if (observed.undecodable)
+                {
+                    carryUndecodable(row);
+                    return;
+                }
+                input.head = row ? classifyDecisionHead(row->token, observed.meta) : classifyDecisionHead(observed.meta);
+                break;
+            }
+            case DecisionHeadNeed::PendingBody:
+            {
+                if (!options.pending_head)
+                {
+                    rmr.still_retired.push_back(*row);
+                    return;
+                }
+                takeRedeleteSlot();
+                /// After the slot is taken, so a look-ahead hint never takes it.
+                if (options.pending_hints)
+                {
+                    options.pending_hints->take_pending(cur_blob);
+                    cursor.scanAhead(kPendingHeadLookaheadRows, options.pending_hints->offer);
+                }
+                const BlobHead observed = options.pending_head(cur_blob);
+                if (observed.undecodable)
+                {
+                    carryUndecodable(row);
+                    return;
+                }
+                input.head = classifyDecisionHead(row->token, observed.meta);
+                break;
+            }
+        }
+
+        if ((input.head && input.head->seen() == HeadSeen::TokenRejected) || (row && !row->token.canonical()))
+            noteTokenRejected();
+
+        const IntentDecision decision = decideIntentStep(input);
+        const bool spends_redelete_slot = decision.step == IntentStep::DeleteBody || decision.step == IntentStep::Standing;
+        if (spends_redelete_slot && !redelete_slot_taken)
+            takeRedeleteSlot();
+
+        switch (decision.step)
+        {
+            case IntentStep::None:
+                return;
+            case IntentStep::Create:
+            case IntentStep::Candidate:
+            {
+                RetiredEntry next = decision.new_token ? observedRow(decision, *input.head) : *row;
+                if (decision.step == IntentStep::Create)
+                    createAndRecord(std::move(next), *decision.intent_to_create);
+                else
+                    rmr.still_retired.push_back(std::move(next));
+                if (row && decision.new_token)
+                    rmr.replaced.push_back(ReplacedEntry{.row = rmr.still_retired.size() - 1, .old_token = row->token});
+                if (decision.intent_to_delete)
+                    rmr.intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *decision.intent_to_delete));
+                return;
+            }
+            case IntentStep::Carry:
+                rmr.still_retired.push_back(*row);
+                return;
+            case IntentStep::Anomaly:
+                rmr.standing_anomalies.note([&] { return layout.blobKey(cur_blob); });
+                ProfileEvents::increment(ProfileEvents::CASGCIntentStandingAnomaly);
+                rmr.still_retired.push_back(*row);
+                return;
+            case IntentStep::Drop:
+                if (!input.at_zero)
+                    spareRow(*row, decision.intent_to_delete);
+                return;
+            case IntentStep::DeleteBody:
+            case IntentStep::Standing:
+            {
+                RetiredEntry standing = *row;
+                standing.standing = true;
+                rmr.still_retired.push_back(standing);
+                rmr.to_standing.push_back(std::move(standing));
+                if (decision.step == IntentStep::DeleteBody)
+                    rmr.body_deletes.push_back(BodyDelete{.entry = *row, .observed = input.head->observed()});
+                return;
+            }
+            case IntentStep::DeleteIntent:
+                rmr.intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *decision.intent_to_delete));
+                return;
+        }
+    };
+
+    /// Adopts an intent that has no row. It sends only the `HEAD`, which follows the listing and the cut.
+    auto adoptOrphan = [&](const Layout::ParsedBlobIntentKey & nomination)
+    {
+        const std::optional<PersistedEtag> token = PersistedEtag::fromIdentity(nomination.identity);
+        if (!token)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nomination of {} carries no tag", layout.blobKey(cur_blob));
+        if (!options.peek_head)
+            return;
+        const BlobHead observed = options.peek_head(cur_blob);
+        if (observed.undecodable)
+        {
+            carryUndecodable(std::nullopt);
+            return;
+        }
+        const DecisionHead head = classifyDecisionHead(*token, observed.meta);
+        RetiredEntry row;
+        row.kind = ObjectKind::Blob;
+        row.ref = cur_blob;
+        row.condemn_round = options.condemn_round;
+        switch (head.seen())
+        {
+            case HeadSeen::TokenRejected:
+                noteTokenRejected();
+                return;
+            case HeadSeen::Same:
+                /// Not pending: no create of this round confirmed the intent.
+                row.token = PersistedEtag::capture(head.observed()->etag);
+                row.size = head.observed()->size;
+                break;
+            case HeadSeen::Absent:
+            case HeadSeen::Other:
+                row.token = *token;
+                row.delete_pending = true;
+                row.standing = true;
+                break;
+        }
+        ProfileEvents::increment(ProfileEvents::CASGCIntentAdopted);
+        rmr.adopted.push_back(row);
+        rmr.still_retired.push_back(std::move(row));
     };
 
     auto closeBlob = [&]()
@@ -593,108 +876,71 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             return;
         const size_t retired_before = rmr.still_retired.size();
 
-        /// Settle the retired row carried on the prior run for the blob being closed, against its
-        /// post-merge in-degree...
         if (cur_condemned)
-        {
-            /// The retired row already identifies the blob with the native `BlobRef` used by the run.
-            const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
-            /// On a re-reference cycle (touched this window, net in-degree 0),
-            /// re-observe the CURRENT token. If it differs from the retired row's token, republication
-            /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
-            /// current token so the replacement enters the pipeline (the stale token's exact-token delete
-            /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
-            /// `peek_head` is deliberately side-effect-free and is not `head_blob` —
-            /// `head_blob` is the fresh-condemn hook (emits `BlobRetire` + increments
-            /// `CASGCRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
-            /// `blob_retire_replaced` this supersede already produces below, and double-count the
-            /// condemned counter for one physical condemnation.
-            bool superseded = false;
-            if (cur_edges == 0 && cur_touched && peek_head)
-            {
-                if (const auto hr = peek_head(cur_blob);
-                    hr && !stale.token.matches(hr->etag))
-                {
-                    RetiredEntry fresh;
-                    fresh.kind = ObjectKind::Blob;
-                    fresh.ref = cur_blob;
-                    fresh.token = PersistedEtag::capture(hr->etag);
-                    fresh.size = hr->size;
-                    fresh.condemn_round = condemn_round;
-                    ReplacedEntry re;
-                    re.old_token = stale.token;                 /// the stale token this supersede replaces
-                    re.fresh = fresh;
-                    rmr.replaced.push_back(std::move(re));       /// caller emits blob_retire_replaced
-                    rmr.still_retired.push_back(std::move(fresh));
-                    superseded = true;
-                }
-            }
-            if (!superseded)
-                settleEntry(stale, cur_edges);
-        }
-        /// ...or condemn a fresh transition-to-zero (no carried row). `head_blob` captures the exact
-        /// incarnation token for the later exact-token delete; an absent object needs no entry.
-        else if (cur_edges == 0 && cur_touched && head_blob)
-        {
-            if (const auto hr = head_blob(cur_blob); hr)
-            {
-                RetiredEntry fresh;
-                fresh.kind = ObjectKind::Blob;
-                fresh.ref = cur_blob;
-                fresh.token = PersistedEtag::capture(hr->etag);
-                fresh.size = hr->size;
-                fresh.condemn_round = condemn_round;
-                rmr.still_retired.push_back(std::move(fresh));
-            }
-        }
+            settleBlob(toRetiredEntry(cur_blob, *cur_condemned));
+        else if (cur_edges == 0 && cur_touched)
+            settleBlob(std::nullopt);
+        /// The key's own rules first: a row from the prior run or from this pass wins over the nomination.
+        if (cur_nomination && !cur_condemned && cur_edges == 0 && rmr.still_retired.size() == retired_before)
+            adoptOrphan(*cur_nomination);
 
-        /// Emit at most one sentinel row per blob: the `RunMarker::Condemned` row when the
-        /// blob is condemned/carried/graduated this pass (still_retired grew for it), else a per-generation
-        /// `RunMarker::Zero` when it transitioned to zero this pass but was not condemned (redelete-dropped or
-        /// absent-at-condemn). A blob with surviving edges (cur_edges > 0) emits neither — its edge rows
+        /// Emit at most one sentinel row per blob: the `RunMarker::Condemned` row when the blob has a row
+        /// after this pass (still_retired grew for it), else a per-generation `RunMarker::Zero` when it
+        /// transitioned to zero this pass with no row (absent at the condemnation, or its intent deleted). A blob with surviving edges (cur_edges > 0) emits neither — its edge rows
         /// were appended inline, and a condemned/zeroed blob has NO surviving edges, so appending the
         /// sentinel now (its key sorts first for the blob, and no edge rows precede it) keeps the run
         /// sorted. `still_retired` therefore mirrors exactly the emitted `RunMarker::Condemned` rows, in order.
         if (rmr.still_retired.size() > retired_before)
-        {
-            const RetiredEntry & e = rmr.still_retired.back();
-            writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = RunMarker::Condemned,
-                                           .delete_pending = e.delete_pending, .token = e.token,
-                                           .size = e.size, .condemn_round = e.condemn_round,
-                                           .marker_confirmed = e.marker_confirmed});
-        }
+            emit(HeldRecord{.record = {}, .row = rmr.still_retired.size() - 1, .create = cur_row_create});
         else if (cur_edges == 0 && cur_touched)
-            writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = RunMarker::Zero});
+            emit(HeldRecord{.record = SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = RunMarker::Zero},
+                            .row = std::nullopt, .create = std::nullopt});
     };
     auto openBlobIfNeeded = [&](const BlobRef & b)
     {
         if (!have_blob || b != cur_blob)
         {
             closeBlob();
-            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false; cur_condemned.reset();
+            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false; cur_condemned.reset(); cur_nomination.reset();
+            cur_row_create.reset();
         }
     };
 
-    while (cursor.valid() || di < scattered.size() || ri < source_retirements.size())
+    while (cursor.valid() || di < scattered.size() || ri < options.source_retirements.size() || ni < options.intent_nominations.size())
     {
-        // Pick the smallest row key across the prior-run cursor and this round's deltas.
-        String key;
+        // Pick the smallest row key across the prior-run cursor and this round's deltas; a tie goes to the earlier input.
+        std::optional<SourceEdgeKey> key;
         bool from_prior = false;
         if (cursor.valid()) { key = cursor.key(); from_prior = true; }
         if (di < scattered.size())
         {
-            const String dk = SourceEdgeKeyCodec::key(scattered[di].ref, scattered[di].source_id);
-            if (!from_prior || dk < key) { key = dk; from_prior = false; }
+            const SourceEdgeKey dk = sourceEdgeKeyOf(scattered[di].ref, scattered[di].source_id);
+            if (!key || dk < *key) { key = dk; from_prior = false; }
         }
-        if (ri < source_retirements.size())
+        if (ri < options.source_retirements.size())
         {
-            const String rk = SourceEdgeKeyCodec::key(source_retirements[ri].ref, source_retirements[ri].source_id);
-            if ((!from_prior && key.empty()) || rk < key) { key = rk; from_prior = false; }
+            const SourceEdgeKey rk = sourceEdgeKeyOf(options.source_retirements[ri].ref, options.source_retirements[ri].source_id);
+            if (!key || rk < *key) { key = rk; from_prior = false; }
+        }
+        /// A nomination sits at its blob's sentinel key, so it opens the blob before any edge of it. On a tie with a
+        /// prior condemned row the row goes first; the nomination is then taken at the same blob.
+        bool from_nomination = false;
+        if (ni < options.intent_nominations.size())
+        {
+            const SourceEdgeKey nk = sourceEdgeKeyOf(options.intent_nominations[ni].ref, kZeroSourceId);
+            if (!key || nk < *key) { key = nk; from_prior = false; from_nomination = true; }
+        }
+        if (from_nomination)
+        {
+            openBlobIfNeeded(options.intent_nominations[ni].ref);
+            if (!cur_nomination)
+                cur_nomination = options.intent_nominations[ni];
+            ++ni;
+            continue;
         }
 
-        BlobRef blob_ref;
-        UInt128 source_id;
-        SourceEdgeKeyCodec::parse(key, blob_ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+        const BlobRef blob_ref = key->ref;
+        const UInt128 source_id = key->source_id;
         openBlobIfNeeded(blob_ref);
 
         /// A retired sentinel row from the prior run: stash it for close-out settlement. It is not an edge
@@ -708,7 +954,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         }
 
         bool present = false;
-        if (from_prior && cursor.key() == key) { present = true; cursor.advance(); cur_touched = true; }
+        if (from_prior && cursor.key() == *key) { present = true; cursor.advance(); cur_touched = true; }
         while (di < scattered.size()
                && scattered[di].ref == blob_ref && scattered[di].source_id == source_id)
         {
@@ -729,8 +975,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             /// at run flush because the in-degree model is a SET — an unmatched `-1` and a duplicate
             /// `+1` legitimately vanish inside the merge, so a flush-side mark would fire on healthy
             /// rounds. See `Cas::TxnApplyLedger`.
-            if (out_applied_by_txn_ordinal)
-                (*out_applied_by_txn_ordinal)[scattered[di].txn_ordinal] = 1;
+            if (options.out_applied_by_txn_ordinal)
+                (*options.out_applied_by_txn_ordinal)[scattered[di].txn_ordinal] = 1;
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
             ++di;
@@ -739,8 +985,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         /// Orphan nomination retires this exact manifest-source identity after ordinary ref deltas at
         /// the same key. It is accounting-neutral: absence is an idempotent no-op, not an unmatched
         /// ref removal, and there is no transaction ordinal to mark in B2's apply ledger.
-        while (ri < source_retirements.size()
-               && source_retirements[ri].ref == blob_ref && source_retirements[ri].source_id == source_id)
+        while (ri < options.source_retirements.size()
+               && options.source_retirements[ri].ref == blob_ref && options.source_retirements[ri].source_id == source_id)
         {
             present = false;
             cur_touched = true;
@@ -749,11 +995,15 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
 
         if (present)
         {
-            writer.append(SourceEdgeRecord{.ref = blob_ref, .source_id = source_id, .marker = RunMarker::Edge});
+            emit(HeldRecord{.record = SourceEdgeRecord{.ref = blob_ref, .source_id = source_id, .marker = RunMarker::Edge},
+                            .row = std::nullopt, .create = std::nullopt});
             ++cur_edges;
         }
     }
     closeBlob();
+    while (!outstanding.empty())
+        takeOldestAnswer();
+    chassert(held.empty());
 
     writer.finish();
     out.finalize();
@@ -764,37 +1014,25 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     const UInt128 run_checksum = sourceEdgeRunChecksum(run_bytes);
     const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
     putDeterministicArtifact(op, run_key, run_bytes);
-    out_runs.push_back(RunRef{.key = run_key, .checksum = run_checksum,
-                              .shard = shard, .key_generation = new_generation});
+    return RunRef{.key = run_key, .checksum = run_checksum, .shard = shard, .key_generation = new_generation};
 }
 
-std::vector<BlobCandidate> zeroInDegree(CasOperation & op, const std::vector<RunRef> & runs)
+AdoptedShardPreview previewAdoptedShard(CasOperation & op, const std::vector<RunRef> & runs, uint64_t shard,
+                                        AdoptedRunContext context)
 {
-    std::vector<BlobCandidate> result;
-    for (const RunRef & run : runs)
+    AdoptedShardPreview preview;
+    AdoptedRunReader reader(op, runs, shard, std::move(context), AdoptedRunReader::OnRefusal::Report);
+    SourceEdgeRecord rec;
+    while (reader.next(rec))
     {
-        /// The caller passes the exact object key, so a run sealed
-        /// for a later generation but physically living under an older key is reached directly. The run is
-        /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
-        /// the run kind + key schema; `RunMarker::Condemned` sentinel rows are skipped (only `RunMarker::Zero` counts).
-        SourceEdgeRunView r = openSourceEdgeRun(op, run.key);
-        String k;
-        String p;
-        while (r.next(k, p))
-            if (!p.empty() && runMarkerFromByte(p[0], "CAS source-edge run") == RunMarker::Zero)
-            {
-                BlobRef bh;
-                UInt128 sid;
-                /// `parse` throws `CORRUPTED_DATA` on a malformed key; malformed rows must not be silently
-                /// treated as absent candidates.
-                SourceEdgeKeyCodec::parse(k, bh, sid);
-                result.push_back(BlobCandidate{.ref = bh});
-            }
-        /// Whole-file checksum: verify the drained run against the seal's
-        /// RunRef.checksum BEFORE its candidates feed a GC delete decision. Fail-closed on mismatch.
-        r.verifyAgainst(run.checksum);
+        if (rec.marker == RunMarker::Zero)
+            preview.zero.push_back(rec.ref);
+        else if (rec.marker == RunMarker::Condemned)
+            preview.condemned.push_back(rec);
     }
-    return result;
+    if (reader.refusal())
+        return AdoptedShardPreview{.zero = {}, .condemned = {}, .refusal = reader.refusal()};
+    return preview;
 }
 
 }

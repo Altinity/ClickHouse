@@ -3,7 +3,6 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 
@@ -282,8 +281,8 @@ TEST(CASFenceGeneration, BlobPublicationHeadTripAndRearmCannotAdoptNewFenceGener
     /// The mount is live again under a FRESH generation, so this read is admitted where the stale
     /// operation's writes were not.
     CasOperation probe = store->mountRequests().admit();
-    EXPECT_FALSE(loadMeta(probe, store->layout(), ref).has_value())
-        << "the stale operation must not reconcile freshness metadata after trip-and-rearm";
+    EXPECT_FALSE(probe.read(store->layout().blobMetaKey(ref), Retry::standard()).has_value())
+        << "the stale operation must not act after trip-and-rearm";
     EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
 }
 

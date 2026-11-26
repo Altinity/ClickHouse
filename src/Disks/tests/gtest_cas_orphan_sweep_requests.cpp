@@ -597,7 +597,6 @@ TEST(CASOrphanSweepRequests, GenerationThreeTailWalksHintAFewKeysPastTheEnd)
 {
     constexpr uint64_t kHintDepth = 4;
     constexpr uint64_t kTail = 3;
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .manifest_sweep_list_budget_keys = 1000,
@@ -646,7 +645,6 @@ TEST(CASOrphanSweepRequests, GcRoundsOverAQuietGenerationThreeNamespaceWasteFewR
 {
     constexpr uint64_t kHintDepth = 4;
     constexpr uint64_t kTail = 3;
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .manifest_sweep_list_budget_keys = 1000,

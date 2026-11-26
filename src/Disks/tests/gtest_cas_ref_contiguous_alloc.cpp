@@ -18,8 +18,10 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -67,6 +69,89 @@ PoolPtr openPool(const BackendPtr & backend)
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
+
+/// Parks every non-test thread's access to one key while the gate is closed, so a background renewer
+/// cannot observe the mount slot between the prefix erase and the recreated pool's claim.
+class MountSlotGateBackend : public InMemoryBackend
+{
+public:
+    void closeGateOn(const String & key)
+    {
+        std::unique_lock lock(mutex);
+        gated_key = key;
+        gate_closed = true;
+        /// An access already past the gate may still read the slot; wait it out.
+        drained.wait(lock, [&] { return in_flight == 0; });
+    }
+
+    void openGate()
+    {
+        {
+            std::lock_guard lock(mutex);
+            gate_closed = false;
+        }
+        reopened.notify_all();
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        Admission admission(*this, key);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        Admission admission(*this, key);
+        return InMemoryBackend::read(key, access);
+    }
+
+    void setTestThread(std::thread::id id)
+    {
+        std::lock_guard lock(mutex);
+        test_thread = id;
+    }
+
+private:
+    class Admission
+    {
+    public:
+        Admission(MountSlotGateBackend & owner_, const String & key)
+            : owner(owner_)
+        {
+            std::unique_lock lock(owner.mutex);
+            if (std::this_thread::get_id() == owner.test_thread || key != owner.gated_key)
+                return;
+            owner.reopened.wait(lock, [&] { return !owner.gate_closed; });
+            ++owner.in_flight;
+            counted = true;
+        }
+
+        ~Admission()
+        {
+            if (!counted)
+                return;
+            {
+                std::lock_guard lock(owner.mutex);
+                --owner.in_flight;
+            }
+            owner.drained.notify_all();
+        }
+
+    private:
+        MountSlotGateBackend & owner;
+        bool counted = false;
+    };
+
+    std::mutex mutex;
+    std::condition_variable reopened;
+    std::condition_variable drained;
+    String gated_key;
+    bool gate_closed = false;
+    size_t in_flight = 0;
+    std::thread::id test_thread;
+};
 
 /// The fence-controlled pool of `gtest_cas_ref_install_safety.cpp`, for the pre-attempt refusal: the
 /// boot clock is frozen so `setMountDeadline` alone decides every fence predicate, renewal is parked an
@@ -485,7 +570,8 @@ TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
 /// cleared is what keeps the ambiguous case from arising at all.
 TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<MountSlotGateBackend>();
+    backend->setTestThread(std::this_thread::get_id());
     /// The survivor uses the runtime-owned renewal worker, as a real mount does: the runtime terminal
     /// consumer is what latches the write fence when a renewal fails, so a renewer-only call would
     /// reproduce the failure but not the lifecycle effect it causes.
@@ -501,12 +587,16 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     const uint64_t violations_before
         = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
 
-    /// The prefix is cleared and the pool recreated underneath the still-running survivor.
+    /// The prefix is cleared and the pool recreated underneath the still-running survivor. The survivor's
+    /// renewer is parked across that gap: reading the slot as absent there is a different outcome
+    /// (vanished) from the one under test (foreign successor).
+    backend->closeGateOn(survivor->layout().mountKey("test"));
     ASSERT_GT(eraseKeysContaining(*backend, ""), 0u);
     PoolConfig recreated_cfg{.pool_prefix = "p", .server_root_id = "test"};
     recreated_cfg.server_id = UInt128{7, 7};
     auto recreated = Pool::open(backend, recreated_cfg);
     ASSERT_TRUE(recreated->mayMutate());
+    backend->openGate();
 
     /// The survivor's next renewal finds a slot held by a foreign server and fails closed, and the loop
     /// latches the local write fence. Bounded wait: a real hang fails the test instead of stalling it.

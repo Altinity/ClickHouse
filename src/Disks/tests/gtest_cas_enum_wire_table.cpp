@@ -69,7 +69,7 @@ TEST(CASEnumWireTable, FromWordFailsClosed)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASEnumWireTableDeathTest, ToWordAbortsOnOutOfRangeValue)
 {
-    EXPECT_DEATH(fruits.toWord(static_cast<Fruit>(99), "fruits"), "outside the wire vocabulary");
+    CAS_EXPECT_DEATH(fruits.toWord(static_cast<Fruit>(99), "fruits"), "outside the wire vocabulary");
 }
 #else
 TEST(CASEnumWireTable, ToWordThrowsLogicalErrorOnOutOfRangeValue)

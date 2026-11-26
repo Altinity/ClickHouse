@@ -326,7 +326,7 @@ TEST(CASRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
     EXPECT_EQ(after->bytes, before->bytes);
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
 }
 
 /// A namespace whose catalog entry is ALREADY `Live` (e.g. admitted by an earlier mount that this
@@ -574,6 +574,37 @@ TEST(CASRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithout
     ASSERT_EQ(after.catalog.entries.size(), 1u);
     ASSERT_TRUE(after.catalog.entries.front().creator);
     EXPECT_EQ(after.catalog.entries.front().creator->server_root_id, "replacement");
+}
+
+/// Another actor, such as the GC leader, cancels the terminal `Creating` row while the `DROP` is cancelling
+/// it. The name is left without a row, so the `DROP` succeeds as it does for a name with no row.
+TEST(CASRefCatalogBirthWiring, DropOfACreatingRowCancelledConcurrentlySucceeds)
+{
+    auto backend = std::make_shared<CatalogCancellationRaceBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"drop_cancel_race"};
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xd004},
+        .creator = CreatorFence{.server_root_id = "dead-creator", .writer_epoch = 9, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    setWatermarkMinActive(*backend, layout, "dead-creator", 9, std::numeric_limits<uint64_t>::max());
+    bool cancelled_elsewhere = false;
+    backend->on_catalog_write = [&]
+    {
+        cancelled_elsewhere = CasRefCatalog::cancelStalledCreating(
+            op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {})
+            == CasRefCatalog::StalledCreatingCancelOutcome::Cancelled;
+    };
+    backend->race_armed = true;
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_TRUE(cancelled_elsewhere) << "positive control: the other cancel landed first";
+    EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
 }
 
 TEST(CASRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)

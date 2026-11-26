@@ -48,6 +48,8 @@ static struct InitFiu
     PAUSEABLE_ONCE(remote_query_executor_receive_packet_pause) \
     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
     ONCE(connection_stale_on_establish) \
+    REGULAR(unresponsive_pooled_connection) \
+    REGULAR(pooled_connection_ping_timeout) \
     PAUSEABLE(swarm_mode_before_task_request) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
@@ -78,6 +80,7 @@ static struct InitFiu
     ONCE(smt_lightweight_snapshot_fail) \
     ONCE(smt_lightweight_snapshot_table_path_session_expired) \
     ONCE(smt_lightweight_update_sleep_after_block_allocation) \
+    PAUSEABLE_ONCE(mt_lightweight_update_pause_after_block_allocation) \
     ONCE(smt_merge_task_sleep_in_prepare) \
     ONCE(rmt_lightweight_update_sleep_after_block_allocation) \
     ONCE(rmt_merge_task_sleep_in_prepare) \
@@ -194,6 +197,7 @@ static struct InitFiu
     ONCE(delta_kernel_fail_literal_visitor) \
     REGULAR(delta_kernel_force_credentials_fingerprint_drift) \
     ONCE(delta_kernel_force_stale_token_error) \
+    ONCE(delta_kernel_force_stale_token_error_on_clustering_read) \
     REGULAR(object_storage_force_refresh_callback_success) \
     REGULAR(refresh_mv_skip_attach_feature_flag_check) \
     REGULAR(refresh_mv_force_scheduling_feature_flags_missing) \
@@ -260,6 +264,10 @@ static struct InitFiu
     PAUSEABLE_ONCE(iceberg_drop_partition_pause_after_discovery) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_fail) \
+    ONCE(iceberg_catalog_update_metadata_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_throw_after_apply) \
+    ONCE(iceberg_glue_update_table_fail) \
     PAUSEABLE_ONCE(iceberg_metadata_prefetch_pause) \
     REGULAR(storage_cluster_read_sleep) \
     ONCE(iceberg_writes_non_retry_cleanup) \
@@ -369,6 +377,7 @@ static struct InitFiu
     REGULAR(mt_mutate_task_can_skip_conversion_to_nullable_force_null_column_desc) \
     PAUSEABLE(iceberg_compaction_merge_pause_in_step) \
     PAUSEABLE_ONCE(iceberg_compaction_pause_before_metadata_commit) \
+    PAUSEABLE_ONCE(delta_kernel_pause_before_clustering_read) \
     REGULAR(tcp_handler_fail_connection_setup) \
     REGULAR(distributed_plan_status_check_reenqueue_fault) \
     PAUSEABLE(keeper_changelog_read_plan_resolved) \
