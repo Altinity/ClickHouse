@@ -1300,6 +1300,25 @@ IStorage::ImportResult StorageObjectStorageCluster::import(
         context);
 }
 
+StorageMetadataHandle StorageObjectStorageCluster::getExportDestinationMetadata(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->getExportDestinationMetadata(iceberg_metadata_json, context);
+    return IStorageCluster::getExportDestinationMetadata(iceberg_metadata_json, context);
+}
+
+void StorageObjectStorageCluster::checkExportDestinationUnchanged(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr context) const
+{
+    if (pure_storage)
+        pure_storage->checkExportDestinationUnchanged(iceberg_metadata_json, context);
+    else
+        IStorageCluster::checkExportDestinationUnchanged(iceberg_metadata_json, context);
+}
+
 IStorage::ExportPartitionCommitInfo StorageObjectStorageCluster::commitExportPartitionTransaction(
     const String & transaction_id,
     const String & partition_id,
