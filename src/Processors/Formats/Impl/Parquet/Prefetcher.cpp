@@ -138,7 +138,7 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected eof: offset {}, length {}, bytes read {}, expected file size {}", offset, n, nread, file_size);
 }
 
-void Prefetcher::retainTail(const char * data, size_t length, size_t file_offset)
+void Prefetcher::retainTail(PaddedPODArray<char> && data, size_t length, size_t file_offset)
 {
     chassert(!ranges_finalized.load(std::memory_order_relaxed));
 
@@ -148,14 +148,19 @@ void Prefetcher::retainTail(const char * data, size_t length, size_t file_offset
 
     /// The footer of the same file can be read more than once: `ReadManager::init` reads it again if the
     /// metadata that it was given has an empty schema (such a file is rejected later, when the schema is
-    /// converted). The bytes at the same offsets of the same file are the same, so keep the first copy.
+    /// converted). The bytes at the same offsets of the same file are the same, so keep the first chunk.
     if (retained_tail_end > retained_tail_start)
         return;
     if (file_offset > file_size || length > file_size - file_offset)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail out of bounds: offset {}, length {}, file size {}", file_offset, length, file_size);
 
-    retained_tail.resize(length);
-    memcpy(retained_tail.data(), data, length);
+    if (length > data.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail is longer than the buffer: length {}, buffer size {}", length, data.size());
+
+    /// Keep only the requested part, and give the memory of the rest back before keeping the buffer.
+    data.resize(length);
+    data.shrink_to_fit();
+    retained_tail = std::move(data);
     retained_tail_start = file_offset;
     retained_tail_end = file_offset + length;
 }

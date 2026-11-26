@@ -68,11 +68,13 @@ public:
     /// Retains a chunk of the file that was already read to parse the footer, so that a range that is
     /// registered later and lies fully inside the chunk (notably the Column Index and the Offset Index, which
     /// are just below the footer) is served from this copy instead of being read again.
-    /// `data` points at `length` bytes that are the file bytes [file_offset, file_offset + length).
+    /// The first `length` bytes of `data` are the file bytes [file_offset, file_offset + length); the rest of
+    /// `data` (e.g. the footer) is dropped. `data` is moved from, the bytes are not copied, so that the chunk
+    /// does not take memory twice. It is left untouched if nothing is retained.
     /// Does nothing if the whole file is in memory already or `length` is 0.
     /// Must be called before `finalizeRanges`, and from one thread. A repeated call does nothing: the footer of
     /// the file may be read again, and the first retained chunk is kept.
-    void retainTail(const char * data, size_t length, size_t file_offset);
+    void retainTail(PaddedPODArray<char> && data, size_t length, size_t file_offset);
 
     size_t getFileSize() const { return file_size; }
     bool isLocalFile() const { return is_local_file; }

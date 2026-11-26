@@ -221,7 +221,7 @@ void Reader::init(const ReadOptions & options_, const Block & sample_block_, For
     format_filter_info = format_filter_info_;
 }
 
-parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size, size_t footer_size_hint)
+parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size, size_t footer_size_hint, bool retain_tail)
 {
     /// Parquet file ends with:
     ///  * serialized FileMetaData struct,
@@ -244,7 +244,9 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
     /// The read must cover at least the 8-byte trailer (metadata size + magic) so the offsets below
     /// don't underflow; an explicit `footer_read_size` smaller than that is bumped up to 8.
     size_t initial_read_size = std::min(file_size, std::max<size_t>(footer_read_size, 8));
-    PODArray<char> buf(initial_read_size);
+    /// Padded because the part of it that precedes the footer can be retained by `prefetcher` and served as the data
+    /// of ranges, and the readers rely on the padding of the data.
+    PaddedPODArray<char> buf(initial_read_size);
     prefetcher.readSync(buf.data(), initial_read_size, file_size - initial_read_size);
 
     if (memcmp(buf.data() + initial_read_size - 4, "PAR1", 4) != 0)
@@ -268,16 +270,18 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
     else
     {
         buf_offset = initial_read_size - 8 - metadata_size;
-
-        /// The footer fit into the tail we read, and the tail also holds what precedes the footer: the Column Index
-        /// and Offset Index. Retain that part so the ranges registered for those indexes are served from memory
-        /// rather than read again. Nothing to retain if the footer begins at the start of the tail.
-        if (buf_offset > 0)
-            prefetcher.retainTail(buf.data(), buf_offset, file_size - initial_read_size);
     }
 
     parq::FileMetaData file_metadata = {};
     deserializeThriftStruct(file_metadata, buf.data() + buf_offset, metadata_size);
+
+    /// If the footer fit into the tail we read (`buf_offset` is 0 otherwise), the tail also holds what precedes the
+    /// footer: the Column Index and Offset Index. Retain that part so the ranges registered for those indexes are
+    /// served from memory rather than read again. Nothing to retain if the footer begins at the start of the tail.
+    /// Only a caller that goes on to register ranges in `prefetcher` has a use for it. The buffer is moved to the
+    /// prefetcher, which drops the footer part of it, so nothing is copied and the raw footer is not kept.
+    if (retain_tail && buf_offset > 0)
+        prefetcher.retainTail(std::move(buf), buf_offset, file_size - initial_read_size);
 
     /// Some writers incorrectly set dictionary_page_offset offset to 0 when there's no dictionary
     /// page at offset 0 in the file. Work around it.
