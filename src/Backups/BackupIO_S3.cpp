@@ -22,6 +22,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 
 #include <Poco/Util/AbstractConfiguration.h>
 
@@ -499,17 +500,37 @@ void BackupReaderS3::copyToDiskImpl(const String & path_in_backup, size_t offset
             auto runner = threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_READER);
             auto create_read_buffer = [&, this] { return readFile(path_in_backup); };
 
+            /// The restored object replaces `blob_path[0]` in `blob_path[1]`, which may hold an identity cached by an
+            /// earlier read. Key the entry by the destination endpoint, as `S3ObjectStorage` does for its own writes.
+            /// Fail before copying if the destination is not an S3 storage: the disk claims the S3 data source kind.
+            auto dest_object_storage = destination_disk->getObjectStorage();
+            auto * dest_s3 = dynamic_cast<S3ObjectStorage *>(dest_object_storage.get());
+            if (!dest_s3)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Destination disk {} does not use S3 object storage", destination_disk->getName());
+            const String dest_endpoint = dest_s3->getURI().endpoint;
+            const String dest_bucket = blob_path[1];
+            const String dest_key = blob_path[0];
+            /// Runs when the copy throws after an object-creating request was sent. The success path below runs it too.
+            auto invalidate_destination = [dest_endpoint, dest_bucket, dest_key]()
+            {
+                invalidateObjectStorageIdentityCache(dest_endpoint, dest_bucket, dest_key);
+            };
+
             if (is_range)
                 copyS3FileRange(
                     client, s3_uri.bucket, src_key, offset, size, /* src_object_size= */ file_size,
-                    dest_client, /* dest_bucket= */ blob_path[1], /* dest_key= */ blob_path[0],
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes);
+                    dest_client, dest_bucket, dest_key,
+                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes,
+                    invalidate_destination);
             else
                 copyS3File(
                     client, s3_uri.bucket, src_key, size,
-                    dest_client, /* dest_bucket= */ blob_path[1], /* dest_key= */ blob_path[0],
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes);
+                    dest_client, dest_bucket, dest_key,
+                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes,
+                    ObjectStorageCopyMode::Default, /* object_creation_client= */ nullptr, invalidate_destination);
 
+            /// The copy has returned, so `dest_key` now holds the restored object.
+            invalidate_destination();
             return size;
         };
 
