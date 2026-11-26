@@ -7,13 +7,16 @@
 # A Parquet count reads the footer from the parquet metadata cache and does not GET. The cache key
 # includes the object ETag. An identity-cache hit must not supply that ETag until a HEAD confirms it,
 # or the count keeps the replaced object's row count.
+# The footer-only count needs `optimize_count_from_files`. Without it the count reads the file with the GET pinned
+# to the cached ETag, and a replaced object fails with `S3_OBJECT_CHANGED_DURING_READ`. The test runner
+# randomizes that setting, so the read settings pin it.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
 URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}.parquet"
-READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0, use_cache_for_count_from_files = 1, schema_inference_use_cache_for_s3 = 1, use_parquet_metadata_cache = 1"
+READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0, use_cache_for_count_from_files = 1, schema_inference_use_cache_for_s3 = 1, use_parquet_metadata_cache = 1, optimize_count_from_files = 1, optimize_trivial_count_query = 1"
 
 fail()
 {
