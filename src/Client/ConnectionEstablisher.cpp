@@ -45,8 +45,14 @@ ConnectionEstablisher::ConnectionEstablisher(
     const ConnectionTimeouts * timeouts_,
     const Settings & settings_,
     LoggerPtr log_,
-    const QualifiedTableName * table_to_check_)
-    : pool(std::move(pool_)), timeouts(timeouts_), settings(settings_), log(log_), table_to_check(table_to_check_)
+    const QualifiedTableName * table_to_check_,
+    bool ping_pooled_connection_)
+    : pool(std::move(pool_))
+    , timeouts(timeouts_)
+    , settings(settings_)
+    , log(log_)
+    , table_to_check(table_to_check_)
+    , ping_pooled_connection(ping_pooled_connection_)
 {
 }
 
@@ -55,24 +61,65 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
     /// A pooled connection is handed out without pinging it first - a ping would add an unnecessary
     /// Ping-Pong round trip when the connection is still alive. A connection that the server has
     /// closed while it was idle in the pool is detected by a zero-timeout poll and recovered by
-    /// reconnecting (see Connection::forceConnected). If a pooled connection nevertheless fails its
+    /// reconnecting (see `Connection::forceConnected`). If a pooled connection nevertheless fails its
     /// very first request (e.g. the server went away without closing it), in the synchronous case we
     /// reconnect once and retry, so that a single available replica is not dropped just because its
     /// pooled connection went stale. In the asynchronous case we do not retry here - stale
-    /// connections are handled by retrying the next replica (see ConnectionPoolWithFailover).
+    /// connections are handled by retrying the next replica (see `ConnectionPoolWithFailover`).
+    ///
+    /// Cluster reads of a remote shard opt into a ping (`ping_pooled_connection`). The poll cannot
+    /// see a server that stopped without closing the socket, and the query would then block until
+    /// `receive_timeout`. The asynchronous path keeps the poll: a ping there would block the fiber.
     const bool can_reconnect = !async_callback;
+    const bool ping_pooled = ping_pooled_connection && can_reconnect;
 
     /// Whether the connection was taken from the pool already established. Only such a connection
     /// can be stale; a failure of a freshly established one is a genuine replica problem, and
     /// retrying it is left to the caller (with its error accounting).
     bool had_pooled_connection = false;
+    /// Set when `Ping` reached `sync_request_timeout` on this attempt.
+    bool pooled_ping_timed_out = false;
+    /// The next attempt is the one reconnect after a ping timeout. Its `Hello` wait is capped
+    /// by `sync_request_timeout`, including when `handshake_timeout_ms` is `0` (no socket timeout).
+    bool cap_handshake_after_ping_timeout = false;
+    /// The entry that failed on the first attempt and is reconnected by the one retry. It stays
+    /// checked out: releasing it and asking the pool again returns the first idle object, which
+    /// can be another still-connected socket that a concurrent query has just released. That
+    /// socket would be pinged or polled instead of reconnected, and the single retry would be
+    /// spent on it even though a new connection to the same server would succeed.
+    decltype(result.entry) entry_to_reconnect;
 
     auto try_establish = [&]()
     {
         ProfileEvents::increment(ProfileEvents::DistributedConnectionTries);
 
+        ConnectionTimeouts attempt_timeouts = *timeouts;
+        if (cap_handshake_after_ping_timeout)
+        {
+            /// `saturate` keeps a zero timeout: it is smaller than any positive limit. A zero
+            /// socket timeout never fires, and `handshake_timeout_ms = 0` means no limit, so
+            /// that value is replaced by `sync_request_timeout`. Any other handshake timeout
+            /// is the minimum of the two.
+            const Poco::Timespan & limit = attempt_timeouts.sync_request_timeout;
+            if (attempt_timeouts.handshake_timeout.totalMicroseconds() == 0)
+            {
+                attempt_timeouts.handshake_timeout = limit;
+            }
+            else
+            {
+                attempt_timeouts.handshake_timeout = ConnectionTimeouts::saturate(attempt_timeouts.handshake_timeout, limit);
+            }
+
+            cap_handshake_after_ping_timeout = false;
+            LOG_TRACE(log, "Reconnecting after a ping timeout with the handshake capped by `sync_request_timeout`.");
+        }
+
         had_pooled_connection = false;
-        result.entry = pool->getUnchecked(*timeouts, settings);
+        pooled_ping_timed_out = false;
+        if (entry_to_reconnect.isNull())
+            result.entry = pool->getUnchecked(attempt_timeouts, settings);
+        else
+            result.entry = std::move(entry_to_reconnect);
         had_pooled_connection = result.entry->isConnected();
 
         AsyncCallbackSetter<Connection> async_setter(&*result.entry, std::move(async_callback));
@@ -85,16 +132,50 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         });
 
         /// Establish the connection, or revalidate a pooled one, under the async callback: with the
-        /// callback installed, Connection::connect uses a non-blocking connect and yields on it, so
+        /// callback installed, `Connection::connect` uses a non-blocking connect and yields on it, so
         /// a caller that multiplexes several connection attempts (e.g. hedged connections) can
         /// preempt a slow connect or handshake and switch to another replica. `result.entry` is
         /// assigned before connecting, so the connection being established is visible to the
-        /// multi-address timeout handling of ConnectionEstablisherAsync.
-        result.entry->forceConnected(*timeouts);
+        /// multi-address timeout handling of `ConnectionEstablisherAsync`.
+        ///
+        /// A pooled connection that the caller asked to ping is checked with `Ping` instead of the
+        /// poll. `Ping` fails when the server stopped without closing the socket; the poll reports
+        /// that socket as idle. A connection that is not established yet is connected, and the
+        /// handshake is the check. A dead socket is a soft error, so the retry below reconnects
+        /// once with the usual handshake timeout. A timeout also reconnects once: the old flow may
+        /// be dead while the server accepts a new connection. That handshake is capped above.
+        if (ping_pooled && result.entry->isConnected())
+        {
+            /// `ping` is private. `checkConnectedThrowOnTimeout` is the wrapper that lets a
+            /// `SOCKET_TIMEOUT` out. This branch already knows the connection is established.
+            bool answered = false;
+            try
+            {
+                answered = result.entry->checkConnectedThrowOnTimeout(attempt_timeouts);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::SOCKET_TIMEOUT)
+                {
+                    pooled_ping_timed_out = true;
+                    LOG_TRACE(log, "Pooled connection timed out on ping, will reconnect.");
+                }
+                throw;
+            }
+            if (!answered)
+            {
+                LOG_TRACE(log, "Pooled connection did not answer a ping, will reconnect.");
+                throw Exception(ErrorCodes::SOCKET_TIMEOUT, "Ping of a pooled connection failed");
+            }
+        }
+        else
+        {
+            result.entry->forceConnected(attempt_timeouts);
+        }
 
         UInt64 server_revision = 0;
         if (table_to_check)
-            server_revision = result.entry->getServerRevision(*timeouts);
+            server_revision = result.entry->getServerRevision(attempt_timeouts);
 
         if (!table_to_check || server_revision < DBMS_MIN_REVISION_WITH_TABLES_STATUS)
         {
@@ -109,7 +190,7 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         TablesStatusRequest status_request;
         status_request.tables.emplace(*table_to_check);
 
-        TablesStatusResponse status_response = result.entry->getTablesStatus(*timeouts, status_request);
+        TablesStatusResponse status_response = result.entry->getTablesStatus(attempt_timeouts, status_request);
         auto table_status_it = status_response.table_states_by_id.find(*table_to_check);
         if (table_status_it == status_response.table_states_by_id.end())
         {
@@ -184,17 +265,27 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
 
             fail_message = getCurrentExceptionMessage(/* with_stacktrace = */ false);
 
+            const bool will_reconnect = can_reconnect && tries == 0 && had_pooled_connection;
+
             if (!result.entry.isNull())
             {
                 result.entry->disconnect();
+                /// The retry reconnects this same entry, see `entry_to_reconnect`.
+                if (will_reconnect)
+                    entry_to_reconnect = std::move(result.entry);
                 result.reset();
             }
 
             /// Reconnect and retry once if a previously established (pooled) connection went stale.
             /// The failed request is safe to repeat: it is either a read-only status request, or the
-            /// connection was closed before the request reached a live server.
-            if (can_reconnect && tries == 0 && had_pooled_connection)
+            /// connection was closed before the request reached a live server. A ping that timed out
+            /// is included: a new connection can succeed when the old flow was dropped and the server
+            /// is up. `cap_handshake_after_ping_timeout` limits that `Hello` wait.
+            if (will_reconnect)
             {
+                if (pooled_ping_timed_out)
+                    cap_handshake_after_ping_timeout = true;
+
                 ProfileEvents::increment(ProfileEvents::DistributedConnectionReconnectCount);
                 continue;
             }
@@ -219,9 +310,10 @@ ConnectionEstablisherAsync::ConnectionEstablisherAsync(
     const ConnectionTimeouts * timeouts_,
     const Settings & settings_,
     LoggerPtr log_,
-    const QualifiedTableName * table_to_check_)
+    const QualifiedTableName * table_to_check_,
+    bool ping_pooled_connection_)
     : AsyncTaskExecutor(std::make_unique<Task>(*this), "ConnectionEstablisherAsync")
-    , connection_establisher(std::move(pool_), timeouts_, settings_, log_, table_to_check_)
+    , connection_establisher(std::move(pool_), timeouts_, settings_, log_, table_to_check_, ping_pooled_connection_)
 {
     epoll.add(timeout_descriptor.getDescriptor());
 }

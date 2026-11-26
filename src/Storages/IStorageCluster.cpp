@@ -1049,12 +1049,22 @@ Pipe buildClusterFunctionRemotePipe(
 
         /// We're taking all replicas as shards,
         /// so each shard will have only one address to connect to.
+        ///
+        /// A remote shard is pinged before the pooled connection is used. `ReplicasAsShards` gives
+        /// this server's own address a real TCP pool too, and `isLocal` is how that shard is told
+        /// apart: pinging it cannot discover a dead peer. A remote peer that stopped without
+        /// closing the socket otherwise stays in the pipeline and the query waits for
+        /// `receive_timeout`. No `Pong` within `sync_request_timeout` drops that socket and opens
+        /// one new connection. The handshake on that connection is capped by `sync_request_timeout`.
+        const bool ping_pooled_connection = !shard_info.isLocal();
         auto try_results = shard_info.pool->getMany(
             timeouts,
             current_settings,
             PoolMode::GET_ONE,
             {},
-            /*skip_unavailable_endpoints=*/true);
+            /*skip_unavailable_endpoints=*/true,
+            /*priority_func=*/{},
+            ping_pooled_connection);
 
         if (try_results.empty())
             continue;
