@@ -126,6 +126,7 @@ struct ManifestSweepResult
 {
     String next_cursor;
     bool wrapped = false;
+    bool orphan_manifest_sweep_page_listed = false;
     uint64_t listed = 0;
     uint64_t deleted = 0;
     uint64_t skipped = 0;

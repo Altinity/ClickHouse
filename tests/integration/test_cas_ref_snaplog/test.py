@@ -125,12 +125,18 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     # (5) THE RECLAMATION: the pool's CONTENT (blobs + part manifests) drains back to baseline. Polled
     #     with an early exit, then cross-checked against GC's own bookkeeping — a pool that shrank for
     #     some other reason must not pass for a round that reclaimed it.
-    final = _content_objects()
+    #     A body is deleted a round after the round that condemned it, which can be after the manifests
+    #     are gone, so the count alone does not show the end: poll until the dry run has nothing to delete.
+    def drained():
+        if _content_objects() > content_baseline:
+            return False
+        return "preview_deletes=0" in _disks(node, "cas-gc-dryrun")
+
     for _ in range(RECLAIM_RETRIES):
-        if final <= content_baseline:
+        if drained():
             break
         time.sleep(RECLAIM_SLEEP)
-        final = _content_objects()
+    final = _content_objects()
 
     assert final <= content_baseline, (
         "the dropped namespaces' content was not reclaimed: baseline={}, "

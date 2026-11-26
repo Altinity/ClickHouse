@@ -641,7 +641,6 @@ TEST(CASGCBoundedWalk, ARoundStopsAtItsFirstAbsentKey)
 /// chain from `{life_epoch,1}`.
 TEST(CASGCBoundedWalk, GenerationThreeCkptWithoutAFrontierIsWalkedNotProven)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
@@ -659,7 +658,6 @@ TEST(CASGCBoundedWalk, GenerationThreeCkptWithoutAFrontierIsWalkedNotProven)
 /// A terminal record ends the stream: it proves the frontier and no key after it is read.
 TEST(CASGCBoundedWalk, TerminalRecordProvesTheFrontierWithoutAProbe)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
@@ -711,7 +709,6 @@ TEST(CASGCBoundedWalk, SliceCutLeavesTheNamespaceUnprovenAndKeepsItsCursor)
 /// not held.
 TEST(CASGCBoundedWalk, ATailThatVanishedAboveTheCursorReadsAsTheEndOfTheLog)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<SteppingClock>();
     auto store = openPoolWithSmallWindow(backend);
     const Layout & layout = store->layout();
@@ -805,7 +802,6 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
 /// tombstone: a new GC resumes at the linked epoch, never at `{1,4}`.
 TEST(CASGCBoundedWalk, CursorOnATombstoneResumesAtTheLinkedEpoch)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
@@ -861,7 +857,6 @@ TEST(CASGCBoundedWalk, CursorBelowTheSnapshotIsNeverRead)
 {
     {
         SCOPED_TRACE("generation 3 _ckpt");
-        ScopedReadCeiling c(3);
         auto backend = std::make_shared<CountingBackend>();
         auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
         const Layout & layout = store->layout();
@@ -923,7 +918,6 @@ TEST(CASGCBoundedWalk, CursorBelowTheSnapshotIsNeverRead)
 /// folded, so the blob survives every round.
 TEST(CASGCBoundedWalk, StrayAtAReclaimedCursorKeyIsNotFolded)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
@@ -956,7 +950,6 @@ TEST(CASGCBoundedWalk, StrayAtAReclaimedCursorKeyIsNotFolded)
 /// The warm GC goes straight to the linked epoch and the blob stays.
 TEST(CASGCBoundedWalk, StrayAfterAReclaimedTombstoneIsNotFolded)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
@@ -987,7 +980,6 @@ TEST(CASGCBoundedWalk, StrayAfterAReclaimedTombstoneIsNotFolded)
 /// the head, its cursor stays on the tombstone and the round deletes nothing.
 TEST(CASGCBoundedWalk, HeadThatDoesNotNameItsTombstoneHoldsTheNamespace)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();

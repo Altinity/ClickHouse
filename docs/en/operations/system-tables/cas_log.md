@@ -35,11 +35,34 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — GC round (`0` if not applicable).
 - `generation` ([UInt64](/sql-reference/data-types/int-uint)) — GC snapshot generation (`0` if not applicable).
 - `at_version` ([UInt64](/sql-reference/data-types/int-uint)) — Manifest `shard_version` of the driving journal record (`0` if not applicable).
-- `outcome` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Decision outcome, e.g. `ok`, `adopt`, `resurrect`, `deleted`, `replaced`, `spared`, `absent`, `zeroed`, `skipped`.
+- `outcome` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Decision outcome, e.g. `ok`, `adopt`, `resurrect`, `deleted`, `replaced`, `spared`, `absent`, `zeroed`, `skipped`, and for writer decisions on a present blob `observed`, `intent_present` and `published`.
 - `reason` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Human-readable rationale for the decision. Templated across rows, so it is `LowCardinality`.
 - `thread_id` ([UInt64](/sql-reference/data-types/int-uint)) — OS thread that emitted the event.
 - `query_id` ([String](/sql-reference/data-types/string)) — Query id for correlation with [`system.query_log`](/operations/system-tables/query_log); empty if not applicable.
-- `detail` ([Map(LowCardinality(String), String)](/sql-reference/data-types/map)) — Structured event-specific facts, e.g. `condemn_round`, `superseded_token`, `code`, `site`, or — on `watermark_renew` — `attempts_sent` and `classification`; see [debugging](/antalya/cas/operations/debugging#trace-renewal-remount) for the mount-renewal detail keys.
+- `detail` ([Map(LowCardinality(String), String)](/sql-reference/data-types/map)) — Structured event-specific facts, e.g. `condemn_round`, `superseded_token`, `code`, `site`, `publication_reason` on a `blob_put` (`absent`, `intent_present` or `token_rejected`: why the writer published instead of adopting), or — on `watermark_renew` — `attempts_sent` and `classification`; see [debugging](/antalya/cas/operations/debugging#trace-renewal-remount) for the mount-renewal detail keys.
+
+## Writer decisions on a present blob {#writer-decisions}
+
+A writer that finds a blob body already in the pool reads the [deletion intent](/antalya/cas/architecture/blob-protocol#deletion-intent)
+of that incarnation and emits one of three events:
+
+| `event_type` | `outcome` | Meaning |
+|---|---|---|
+| `blob_reuse_adopt` | `observed` | No intent exists for the body's incarnation: the writer adopted the body and published nothing |
+| `blob_reuse_resurrect` | `intent_present` | An intent exists: `GC` may be about to delete the body, so the writer published a fresh body |
+| `blob_put` | `published` | The writer published a body. `detail['publication_reason']` is `absent` (no body), `intent_present` (see above) or `token_rejected` (the body's token names no incarnation, so it can never be adopted) |
+
+## GC decisions on deletion intents {#gc-intent-events}
+
+`GC` emits these events for the [deletion intents](/antalya/cas/architecture/blob-protocol#deletion-intent) of
+blobs. `object_kind` is `blob`, `object_hash` is the blob's hash and `round` is the round that decided.
+
+| `event_type` | `outcome` | Meaning |
+|---|---|---|
+| `blob_intent_delete` | `deleted` | An intent was removed after the incarnation it names was gone from the key; when the blob was referenced again and its body had another incarnation, `reason` says so. `detail['key']` is the intent's key; `token` is the incarnation |
+| `blob_intent_adopt` | `candidate` or `standing` | The sweep gave a row to an intent that had none. `candidate`: the body shows the intent's token; `standing`: the body is absent or has another token. `detail['key']` is the intent's key |
+| `gc_recheck_verdict` | `standing` | A `pending` row moved to `standing` after its body delete was answered or the body was absent |
+| `corrupt_decode` | `carried` or `spared` | `GC` met a blob body shorter than the pool's blob envelope, and recorded nothing for it. `spared`: the blob is referenced again, so its row was dropped and its intent kept. `detail` carries `key`, `size` and `envelope` |
 
 ## Example {#example}
 

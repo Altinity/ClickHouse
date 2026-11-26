@@ -39,7 +39,7 @@ TEST(CASFormatBattery, BlobMeta)
     m.size = 12345;
     runFormatBattery(FormatBatteryCase{
         .id = FormatId::BlobMeta,
-        .encode = [&] { return sealObject(FormatId::BlobMeta, encodeBlobMeta(m)); },
+        .encode = [&] { return sealObject(FormatId::BlobMeta, encodeBlobMetaForTest(m)); },
         .decode = [](std::string_view s) { decodeBlobMeta(std::string(openObject(FormatId::BlobMeta, s))); },
         .golden = "{\"type\":\"cas_blob_meta\",\"v\":1}\n"
                   "{\"state\":\"clean\",\"condemn_round\":\"0\",\"size\":\"12345\"}\n"});
@@ -51,11 +51,11 @@ TEST(CASBlobMetaFormat, CondemnedRoundTripAllFields)
     m.state = MetaState::Condemned;
     m.condemn_round = 7;
     m.size = 4096;
-    const BlobMeta back = decodeBlobMeta(encodeBlobMeta(m));
+    const BlobMeta back = decodeBlobMeta(encodeBlobMetaForTest(m));
     EXPECT_EQ(back.state, MetaState::Condemned);
     EXPECT_EQ(back.condemn_round, 7u);
     EXPECT_EQ(back.size, 4096u);
-    EXPECT_EQ(encodeBlobMeta(m),
+    EXPECT_EQ(encodeBlobMetaForTest(m),
         "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"state\":\"condemned\",\"condemn_round\":\"7\",\"size\":\"4096\"}\n");
 }
 
