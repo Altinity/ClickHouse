@@ -44,6 +44,7 @@ UUID loadServerUUID(const fs::path & server_uuid_file, Poco::Logger * log)
             UUID uuid;
             ReadBufferFromFile in(server_uuid_file);
             readUUIDText(uuid, in);
+            skipWhitespaceIfAny(in);
             assertEOF(in);
             return uuid;
         }
