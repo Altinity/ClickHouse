@@ -37,11 +37,11 @@ struct ObjectStorageIdentity
     /// Memory held by the composite key the entry is stored under, in bytes. Set by `setIfEpoch`, so the weight counts it.
     /// The cache policies keep every key twice, as the key of the hashmap and in the eviction queue list.
     /// Not part of the object's identity.
-    size_t key_capacity = 0;
+    size_t key_memory = 0;
 
     size_t memoryUsage() const
     {
-        return sizeof(ObjectStorageIdentity) + etag.capacity() + key_capacity;
+        return sizeof(ObjectStorageIdentity) + etag.capacity() + key_memory;
     }
 };
 
