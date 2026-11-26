@@ -141,10 +141,15 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
 void Prefetcher::retainTail(const char * data, size_t length, size_t file_offset)
 {
     chassert(!ranges_finalized.load(std::memory_order_relaxed));
-    chassert(retained_tail_end == retained_tail_start);
 
     /// With the whole file in memory there is nothing to save.
     if (read_mode == ReadMode::EntireFileIsInMemory || length == 0)
+        return;
+
+    /// The footer of the same file can be read more than once: `ReadManager::init` reads it again if the
+    /// metadata that it was given has an empty schema (such a file is rejected later, when the schema is
+    /// converted). The bytes at the same offsets of the same file are the same, so keep the first copy.
+    if (retained_tail_end > retained_tail_start)
         return;
     if (file_offset > file_size || length > file_size - file_offset)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail out of bounds: offset {}, length {}, file size {}", file_offset, length, file_size);

@@ -70,7 +70,8 @@ public:
     /// are just below the footer) is served from this copy instead of being read again.
     /// `data` points at `length` bytes that are the file bytes [file_offset, file_offset + length).
     /// Does nothing if the whole file is in memory already or `length` is 0.
-    /// Must be called at most once, before `finalizeRanges`, and from one thread.
+    /// Must be called before `finalizeRanges`, and from one thread. A repeated call does nothing: the footer of
+    /// the file may be read again, and the first retained chunk is kept.
     void retainTail(const char * data, size_t length, size_t file_offset);
 
     size_t getFileSize() const { return file_size; }
