@@ -505,6 +505,24 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     return true;
 }
 
+bool StorageObjectStorageCluster::isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const
+{
+    if (!configuration->isIcebergConfiguration())
+        return false;
+
+    const auto * function = table_function ? table_function->as<ASTFunction>() : nullptr;
+    const auto * arguments = function && function->arguments ? function->arguments->as<ASTExpressionList>() : nullptr;
+    if (!arguments)
+        return false;
+
+    for (const auto & argument : arguments->children)
+        if (const auto * settings = argument->as<ASTSetQuery>())
+            if (const auto * path = settings->changes.tryGet("iceberg_metadata_file_path"))
+                return !path->safeGet<String>().empty();
+
+    return false;
+}
+
 void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     ASTPtr & query,
     const DB::StorageSnapshotPtr & storage_snapshot,
@@ -735,6 +753,11 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// Catalog tables may defer initialization until their first read.
+    /// Task creation must also initialize them: whole-query dispatch lists files without a table read.
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),

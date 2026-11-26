@@ -213,6 +213,35 @@ MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
 /// Returns `std::nullopt` if the directory has no metadata files.
 std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr & object_storage, const String & table_path);
 
+/// The current metadata a writer builds its commit on.
+struct LatestMetadata
+{
+    /// The new metadata file gets version `version + 1`.
+    Int32 version;
+    Poco::JSON::Object::Ptr object;
+    /// The catalog's metadata location the commit is based on; empty without a catalog.
+    String catalog_metadata_location;
+    /// The same location exactly as the catalog reports it, which is what `updateMetadataIfCurrent` compares.
+    String raw_catalog_metadata_location;
+    /// The storage path of the metadata file `object` was read from.
+    String path;
+};
+
+/// The storage-relative metadata location the catalog currently names for the table.
+String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context);
+
+/// With a catalog, reads the metadata the catalog names, and picks a version above every metadata file in the
+/// directory, so the new file never reuses the name of a file left by a commit that failed to update the catalog.
+/// Without a catalog, reads the latest metadata in storage.
+LatestMetadata readLatestMetadata(
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    const DataLakeStorageSettings & data_lake_settings,
+    ContextPtr context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id,
+    LoggerPtr log);
+
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::string normalizeUuid(const std::string & uuid);

@@ -59,7 +59,6 @@ namespace DB::Setting
 namespace DB::DataLakeStorageSetting
 {
     extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
-    extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 }
 
 namespace DB::Iceberg
@@ -598,114 +597,6 @@ BinPackPlan buildBinPackPlan(
              plan.bins.size(), plan.num_partitions, plan.removed_data_files, plan.removed_files_size);
 
     return plan;
-}
-
-struct LatestMetadata
-{
-    /// The new metadata file gets version `version + 1`.
-    Int32 version;
-    Poco::JSON::Object::Ptr object;
-    /// The catalog's metadata location the compaction is based on; empty without a catalog.
-    String catalog_metadata_location;
-    /// The same location exactly as the catalog reports it, which is what `updateMetadataIfCurrent` compares.
-    String raw_catalog_metadata_location;
-};
-
-/// The metadata location exactly as the catalog reports it. `table_metadata` receives the table metadata, which
-/// `getMetadataLocation` needs to turn the raw value into a storage-relative one.
-String getRawCatalogMetadataLocation(
-    const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context, DataLake::TableMetadata & table_metadata)
-{
-    table_metadata = DataLake::TableMetadata().withDataLakeSpecificProperties().withLocation();
-    const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-    catalog.getTableMetadata(namespace_name, table_name, context, table_metadata);
-
-    auto specific_properties = table_metadata.getDataLakeSpecificProperties();
-    if (!specific_properties.has_value() || specific_properties->iceberg_metadata_file_location.empty())
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "Catalog did not return a metadata file location for table '{}.{}'",
-            namespace_name, table_name);
-
-    return specific_properties->iceberg_metadata_file_location;
-}
-
-String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context)
-{
-    DataLake::TableMetadata table_metadata;
-    const auto raw_location = getRawCatalogMetadataLocation(catalog, storage_id, context, table_metadata);
-    return table_metadata.getMetadataLocation(raw_location);
-}
-
-LatestMetadata readLatestMetadata(
-    const PersistentTableComponents & persistent_table_components,
-    ObjectStoragePtr object_storage,
-    const DataLakeStorageSettings & data_lake_settings,
-    ContextPtr context,
-    const std::shared_ptr<DataLake::ICatalog> & catalog,
-    const StorageID & storage_id,
-    LoggerPtr log)
-{
-    if (catalog)
-    {
-        /// The catalog, not the newest file in the `metadata` directory, holds the current
-        /// snapshot: a newer file may be left by a commit that failed before updating the catalog.
-        DataLake::TableMetadata table_metadata;
-        String raw_catalog_metadata_location = getRawCatalogMetadataLocation(*catalog, storage_id, context, table_metadata);
-        String catalog_metadata_location = table_metadata.getMetadataLocation(raw_catalog_metadata_location);
-
-        DataLakeStorageSettings effective_settings = data_lake_settings;
-        effective_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = catalog_metadata_location;
-        const auto catalog_metadata = getLatestOrExplicitMetadataFileAndVersion(
-            object_storage,
-            persistent_table_components.table_path,
-            effective_settings,
-            persistent_table_components.metadata_cache,
-            context,
-            log.get(),
-            persistent_table_components.table_uuid,
-            persistent_table_components.metadata_compression_method,
-            /* force_fetch_latest_metadata */ true,
-            /* ignore_explicit_metadata_file_path */ false);
-
-        auto metadata_object = deepCopy(getMetadataJSONObject(
-            catalog_metadata.path,
-            object_storage,
-            persistent_table_components.metadata_cache,
-            context,
-            log,
-            catalog_metadata.compression_method,
-            persistent_table_components.table_uuid));
-
-        /// The new metadata file must not reuse the name of a newer file left in the directory.
-        const auto max_directory_version = getMaxMetadataFileVersionInDirectory(object_storage, persistent_table_components.table_path);
-        const Int32 version = std::max(catalog_metadata.version, max_directory_version.value_or(catalog_metadata.version));
-
-        return {version, metadata_object, std::move(catalog_metadata_location), std::move(raw_catalog_metadata_location)};
-    }
-
-    const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
-        object_storage,
-        persistent_table_components.table_path,
-        data_lake_settings,
-        persistent_table_components.metadata_cache,
-        context,
-        log.get(),
-        persistent_table_components.table_uuid,
-        persistent_table_components.metadata_compression_method,
-        /* force_fetch_latest_metadata */ true,
-        /* ignore_explicit_metadata_file_path */ true);
-
-    auto metadata_object = deepCopy(getMetadataJSONObject(
-        metadata_file_path,
-        object_storage,
-        persistent_table_components.metadata_cache,
-        context,
-        log,
-        persistent_table_components.metadata_compression_method,
-        persistent_table_components.table_uuid));
-
-    return {metadata_version, metadata_object, {}, {}};
 }
 
 enum class MetadataFileOwner : uint8_t
@@ -1432,7 +1323,7 @@ BinPackCommitResult executeBinPackCompaction(
     UInt64 target_size = settings[Setting::iceberg_target_data_file_size_bytes];
     UInt64 min_size = settings[Setting::iceberg_min_data_file_size_bytes];
 
-    const auto [metadata_version, metadata_object, catalog_metadata_location, raw_catalog_metadata_location]
+    const auto [metadata_version, metadata_object, catalog_metadata_location, raw_catalog_metadata_location, _]
         = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, catalog, storage_id, log);
 
     /// Format version 3 requires row lineage (`_row_id`, `_last_updated_sequence_number`) to be carried

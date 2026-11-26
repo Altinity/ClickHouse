@@ -94,6 +94,9 @@ namespace DB::FailPoints
     extern const char check_database_datalake_negative[];
     extern const char iceberg_alter_catalog_update_schema_fail[];
     extern const char iceberg_alter_catalog_commit_reported_as_failed[];
+    extern const char iceberg_catalog_update_metadata_fail[];
+    extern const char iceberg_catalog_update_metadata_reported_as_failed[];
+    extern const char iceberg_catalog_update_metadata_throw_after_apply[];
 }
 
 namespace ProfileEvents
@@ -2870,6 +2873,9 @@ bool RestCatalog::updateMetadataAndProperties(
 
     auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot, properties_to_set);
 
+    /// Simulates a retryable failure where the catalog did not apply the update.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_fail, { return false; });
+
     try
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUpdateTable);
@@ -2895,6 +2901,20 @@ bool RestCatalog::updateMetadataAndProperties(
             table_name,
             ex.displayText());
     }
+
+    /// Simulates the Iceberg "commit state unknown" case: the catalog applied the update but the
+    /// client observes a failure, e.g. because a proxy turned the response into a 5xx.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_reported_as_failed, { return false; });
+
+    /// Simulates a transport error after the catalog applied the update, e.g. a lost response.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_throw_after_apply,
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Injected failure after the catalog applied the update of table {}.{}",
+            namespace_name, table_name);
+    });
+
     return true;
 }
 

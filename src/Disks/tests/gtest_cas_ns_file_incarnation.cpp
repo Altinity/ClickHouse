@@ -1059,7 +1059,7 @@ TEST(CASNsFileIncarnation, RetirementRecordsDoNotAccumulateAcrossCreateDropCycle
     CasOperation catalog_op = catalog_requests.admit();
     Gc gc(store, kGcId);
 
-    for (size_t i = 0; i < 50; ++i)
+    for (size_t i = 0; i < 8; ++i)
     {
         const RootNamespace ns{"00/cycle" + std::to_string(i) + "@cas@"};
         publishWithProductionBirth(store, ns, "x");

@@ -1181,7 +1181,7 @@ TEST(CASTransactionOps, ProjectionRekeyOntoAStagedProjectionThrows)
 /// The storage is built inside the child, so the parent of this death suite constructs none.
 TEST(CASTransactionOpsDeathTest, ProjectionRekeyOntoAStagedProjectionAborts)
 {
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         auto storage = openTxStorage();
         rekeyProjection(*storage, /*destination_staged=*/true);
     }, "");
@@ -2025,7 +2025,7 @@ TEST(CASTransactionStagedCopies, ABlobEntryWithNoUploadAndNoSourceThrows)
 /// The storage is built inside the child, so the parent of this death suite constructs none.
 TEST(CASTransactionStagedCopiesDeathTest, ABlobEntryWithNoUploadAndNoSourceAborts)
 {
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         auto storage = openTxStorage();
         commitUnprovenBlobEntry(*storage);
     }, "has neither a pending upload nor a copy source");

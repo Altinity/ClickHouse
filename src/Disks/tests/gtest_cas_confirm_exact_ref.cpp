@@ -954,7 +954,7 @@ TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
     RefOp add;
     add.kind = RefOpKind::OwnerTransition;
     add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000003, 1, 1}};
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         store->appendRefOps(ns, MutationScope::ref("x"),
                             [add](const RefTableState &) { return std::vector<RefOp>{add}; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
@@ -962,7 +962,7 @@ TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
 
     RefOp remove_namespace;
     remove_namespace.kind = RefOpKind::RemoveNamespace;
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         store->appendRefOps(ns, MutationScope::ref("x"),
                             [remove_namespace](const RefTableState &) { return std::vector<RefOp>{remove_namespace}; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
@@ -1321,7 +1321,7 @@ TEST(CASConfirmExactRefDeathTest, MoveOpsOutsideTheirScopeFailTheFlushCheckAbort
     move.kind = RefOpKind::OwnerTransition;
     move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", id_a.ref};
     move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "c", id_a.ref};
-    EXPECT_DEATH(store->appendRefOps(ns, MutationScope::refs("a", "b"),
+    CAS_EXPECT_DEATH(store->appendRefOps(ns, MutationScope::refs("a", "b"),
                                      [move](const RefTableState &) { return std::vector<RefOp>{move}; },
                                      RootMutationOrigin::Writer, RootMutationKind::Move),
                  "names ref 'c'");

@@ -82,6 +82,7 @@ namespace DB::ErrorCodes
 namespace DB::FailPoints
 {
     extern const char check_database_datalake_negative[];
+    extern const char iceberg_glue_update_table_fail[];
 }
 
 namespace DB::Setting
@@ -1270,6 +1271,9 @@ bool GlueCatalog::updateTableInGlue(
     table_input.SetParameters(parameters);
 
     request.SetTableInput(table_input);
+
+    /// Simulates Glue rejecting the update with `CONCURRENT_MODIFICATION` or `VERSION_MISMATCH`, without applying it.
+    fiu_do_on(DB::FailPoints::iceberg_glue_update_table_fail, { return false; });
 
     /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
     /// update if the table has been modified since that version was read. It is only sound together

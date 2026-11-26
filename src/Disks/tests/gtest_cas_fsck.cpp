@@ -1970,13 +1970,6 @@ ToolDeadline fsckDeadlineIn(Pool & store, std::chrono::milliseconds timeout)
     return ToolDeadline(store.openRequests(), timeout, "fsck", "raise --timeout");
 }
 
-void spinPast(const ToolDeadline & deadline)
-{
-    while (!deadline.passed())
-    {
-    }
-}
-
 /// Moves the virtual clock just past `deadline`.
 void advancePast(VirtualRetryClock & clock, const ToolDeadline & deadline)
 {
@@ -2462,9 +2455,10 @@ TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
         f.marker(1);
         f.marker(2);
         const std::vector<String> keys{f.markerKey(1), f.markerKey(2)};
+        const auto clock = VirtualRetryClock::installOn(f.store);
         const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-        /// The pool's clock is the real one, so the slow `HEAD` waits for it to pass the deadline.
-        f.backend->beforeHead(keys[slow], [&deadline] { spinPast(deadline); });
+        /// The slow `HEAD` moves the pool's virtual clock past the deadline.
+        f.backend->beforeHead(keys[slow], [clock, &deadline] { advancePast(*clock, deadline); });
         f.backend->clearJournal();
         uint64_t reported = 99;
 
@@ -5280,14 +5274,11 @@ TEST(CASFsckPartial, DeadlineReportsHeldFindingsAsUnchecked)
     const String hole = layout.refLogKey(broken_life, RefTxnId{1, 2});
     removeForFsck(*backend, hole);
 
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
-    /// Runs out the clock while the first life's walk meets its hole, so the deadline fires before the
-    /// second life, after the first life's finding is held.
-    backend->armOnFirstGet(hole, [&]
-    {
-        while (!deadline.passed())
-            std::this_thread::yield();
-    });
+    /// Runs out the virtual clock while the first life's walk meets its hole, so the deadline fires
+    /// before the second life, after the first life's finding is held.
+    backend->armOnFirstGet(hole, [&] { advancePast(*clock, deadline); });
 
     const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
     ASSERT_TRUE(report.partial);
@@ -5338,15 +5329,12 @@ TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
     const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
     writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
 
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
-    /// Both blobs are missing. The first is re-resolved and held; the clock runs out before the second
-    /// one's recheck, so the deadline fires inside the blob loop with one dangling held.
+    /// Both blobs are missing. The first is re-resolved and held; the virtual clock runs out before the
+    /// second one's recheck, so the deadline fires inside the blob loop with one dangling held.
     backend->blobs_prefix = layout.blobsPrefix();
-    backend->on_second_blob_head = [&]
-    {
-        while (!deadline.passed())
-            std::this_thread::yield();
-    };
+    backend->on_second_blob_head = [&] { advancePast(*clock, deadline); };
 
     const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
     ASSERT_TRUE(report.partial);

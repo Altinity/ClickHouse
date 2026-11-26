@@ -1503,7 +1503,7 @@ TEST(CASWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_x/txn_version.txt", "A");
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9/txn_version.txt", "B");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    EXPECT_DEATH({ ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"); }, "");
+    CAS_EXPECT_DEATH({ ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"); }, "");
 }
 #endif
 
@@ -2179,14 +2179,14 @@ TEST(CASWiringExchangeDeathTest, PrepareAdoptRefusesATargetThatIsNotAPartDirecto
     ASSERT_NE(exchange, nullptr);
 
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "a22/a22a22a2-2222-4222-8222-222222222222", std::string{}, prepared),
                  "does not address a content-addressed part directory");
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "a22/a22a22a2-2222-4222-8222-222222222222/tmp-fetch_all_1_1_0/data.bin",
                      std::string{}, prepared),
                  "does not address a content-addressed part directory");
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "shadow/bk1/store/a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0",
                      std::string{}, prepared),
                  "does not address a content-addressed part directory");

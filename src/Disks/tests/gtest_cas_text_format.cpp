@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -103,7 +104,7 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
 /// (same pattern as CASBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
 TEST(CASFormatTraitsDeathTest, TraitsForRosterAborts)
 {
-    EXPECT_DEATH({ (void)traitsFor(FormatId::Roster); }, "");
+    CAS_EXPECT_DEATH({ (void)traitsFor(FormatId::Roster); }, "");
 }
 #endif
 

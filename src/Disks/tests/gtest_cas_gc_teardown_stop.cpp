@@ -385,6 +385,7 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
     GateOpenedOnExit opener(*release);
     backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
     sched.start();
+    sched.requestRoundSoon();
     entered->wait("entered");
 
     store->beginTeardown();
