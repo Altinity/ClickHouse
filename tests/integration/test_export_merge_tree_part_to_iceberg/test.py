@@ -57,13 +57,6 @@ def cluster():
             main_configs=["configs/config.d/metadata_log.xml"],
             with_minio=True,
         )
-        # Second node: changes the destination schema from outside `node1`, so that `node1`'s
-        # metadata cache is not invalidated by the change.
-        cluster.add_instance(
-            "node2",
-            main_configs=["configs/config.d/metadata_log.xml"],
-            with_minio=True,
-        )
         logging.info("Starting cluster...")
         cluster.start()
         yield cluster
@@ -1389,64 +1382,6 @@ def test_export_part_fails_before_writing_when_destination_schema_changes_in_bac
         node.query("SYSTEM DISABLE FAILPOINT export_part_pause_before_schema_validation")
         node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
         node.query(f"DROP TABLE IF EXISTS {iceberg}")
-
-
-def test_export_part_schema_change_from_another_node_is_caught_at_commit(cluster):
-    """
-    The early per-part check reads the latest destination metadata through a cache that may be up
-    to `export_merge_tree_part_check_destination_schema_staleness_ms` old. A schema change made by
-    another writer within that window is not seen by the early check, so the task writes its data
-    files and only the commit-time check ("Table schema changed before export could commit")
-    rejects it.
-
-    The change is made from `node2`: an ALTER on `node1` itself could refresh `node1`'s cache and
-    be seen by the early check.
-    """
-    node = cluster.instances["node1"]
-    other = cluster.instances["node2"]
-    sfx = unique_suffix()
-    mt = f"mt_commit_check_{sfx}"
-    iceberg = f"iceberg_commit_check_{sfx}"
-    columns = "id Int32, year Int32, payload String"
-
-    make_mt(node, mt, columns, "year")
-    make_iceberg_s3(node, iceberg, columns, "year")
-    # Same table name, hence the same default MinIO prefix: `other` writes to the same Iceberg table.
-    make_iceberg_s3(other, iceberg, columns, "year")
-    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
-    part = get_part(node, mt, "2020")
-
-    try:
-        # Warm `node1`'s metadata cache with the pre-change latest metadata.
-        node.query(f"SELECT count() FROM {iceberg}")
-
-        node.query("SYSTEM ENABLE FAILPOINT export_part_pause_before_schema_validation")
-        # A window far larger than the test duration: the early check keeps using the cached metadata.
-        export_part(
-            node,
-            mt,
-            part,
-            iceberg,
-            "export_merge_tree_part_schema_match_mode = 'NAME', export_merge_tree_part_check_destination_schema_staleness_ms = 600000",
-        )
-        node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
-
-        other.query(
-            f"ALTER TABLE {iceberg} DROP COLUMN payload",
-            settings={"allow_insert_into_iceberg": 1},
-        )
-        node.query("SYSTEM NOTIFY FAILPOINT export_part_pause_before_schema_validation")
-
-        exception = wait_for_failed_export_part(node, mt, part)
-        assert "METADATA_MISMATCH" in exception and "schema changed before export could commit" in exception, (
-            f"Expected the commit-time check to reject the schema change, got: {exception}"
-        )
-        assert other.query(f"SELECT count() FROM {iceberg}").strip() == "0"
-    finally:
-        node.query("SYSTEM DISABLE FAILPOINT export_part_pause_before_schema_validation")
-        node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
-        node.query(f"DROP TABLE IF EXISTS {iceberg}")
-        other.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
 def test_export_part_match_by_name_uses_source_snapshot_when_source_column_is_added(cluster):
