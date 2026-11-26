@@ -39,6 +39,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.6.8.20002.altinityantalya",
+        {
+            {"delta_lake_clustering_predicate_fallback", false, true, "New setting to enable clustering-aware predicate fallback for Delta Lake tables with Liquid Clustering."},
+        });
+
         addSettingsChanges(settings_changes_history, "26.6.8.20003.altinityantalya",
         {
             {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
