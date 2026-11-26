@@ -86,10 +86,6 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
-<<<<<<< HEAD
-=======
-#include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestListPruning.h>
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Mutations.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
@@ -164,10 +160,6 @@ extern const SettingsInt64 iceberg_timestamp_ms;
 extern const SettingsInt64 iceberg_snapshot_id;
 extern const SettingsBool use_iceberg_metadata_files_cache;
 extern const SettingsBool use_iceberg_partition_pruning;
-<<<<<<< HEAD
-=======
-extern const SettingsBool use_iceberg_manifest_list_partition_pruning;
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 extern const SettingsBool write_full_path_in_iceberg_metadata;
 extern const SettingsBool use_roaring_bitmap_iceberg_positional_deletes;
 extern const SettingsString iceberg_metadata_compression_method;
@@ -1666,117 +1658,6 @@ bool IcebergMetadata::supportsLazyMaterialization(StorageMetadataPtr storage_met
     return true;
 }
 
-<<<<<<< HEAD
-=======
-std::optional<DataLakeReadEstimate>
-IcebergMetadata::estimateRead(StorageMetadataPtr storage_metadata_snapshot, const ActionsDAG * filter, ContextPtr context) const
-{
-    auto table_state_snapshot = extractIcebergSnapshotIdFromMetadataObject(storage_metadata_snapshot);
-    if (table_state_snapshot == nullptr)
-    {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Can't extract iceberg table state from storage snapshot for table location {}",
-            persistent_components.table_location);
-    }
-
-    DataLakeReadEstimate estimate;
-    estimate.rows = 0;
-
-    /// A table that was never written has no snapshot and no rows.
-    auto data_snapshot = getRelevantDataSnapshotFromTableStateSnapshot(*table_state_snapshot, context);
-    if (!data_snapshot)
-        return estimate;
-
-    /// Prune as the read does (`IcebergIterator`), but never build an `IN` set: planning must not run a subquery.
-    const auto & settings = context->getSettingsRef();
-    const ActionsDAG * pruning_filter = settings[Setting::use_iceberg_partition_pruning] ? filter : nullptr;
-
-    std::unique_ptr<ManifestListPruner> manifest_list_pruner;
-    if (pruning_filter && data_snapshot->partition_specs && settings[Setting::use_iceberg_manifest_list_partition_pruning])
-        manifest_list_pruner = std::make_unique<ManifestListPruner>(
-            *persistent_components.schema_processor,
-            table_state_snapshot->schema_id,
-            data_snapshot->schema_id_on_snapshot_commit,
-            data_snapshot->partition_specs,
-            pruning_filter,
-            context,
-            /* require_ready_sets */ true);
-
-    std::vector<ManifestFileCacheKey> manifests_to_decode;
-    for (const auto & manifest_list_entry : data_snapshot->manifest_list_entries)
-    {
-        if (manifest_list_entry.content_type == ManifestFileContentType::DATA && manifest_list_pruner
-            && manifest_list_pruner->canBePruned(manifest_list_entry.partition_spec_id, manifest_list_entry.partition_summaries))
-            estimate.pruned_data_files = true;
-        else
-            manifests_to_decode.push_back(manifest_list_entry);
-    }
-
-    /// Read ahead on the IO thread pool as in `totalRows`, parsed in order on this thread.
-    const auto query_status = context->getProcessListElement();
-    Iceberg::ManifestFilesPrefetcher manifests(object_storage, persistent_components, context, log, std::move(manifests_to_decode));
-    while (auto fetch = manifests.take())
-    {
-        /// The walk runs during planning, before any pipeline, so it checks `KILL QUERY` and the time limit itself.
-        if (query_status)
-            query_status->checkTimeLimit();
-
-        const auto & manifest_list_entry = fetch->key();
-        const auto files_handle = getManifestFileEntriesHandle(
-            fetch->get(), persistent_components, context, manifest_list_entry, table_state_snapshot->schema_id);
-
-        if (!files_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty()
-            || !files_handle.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE).empty())
-            estimate.has_delete_files = true;
-
-        /// The pruners refer to the partition key of this manifest, so they live as long as its handle.
-        std::unordered_map<Int32, std::unique_ptr<ManifestFilesPruner>> file_pruners_by_schema_id;
-        for (const auto & data_file : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
-        {
-            if (pruning_filter)
-            {
-                /// Keyed by the file's schema: a pruner is bound to one schema, and a merged manifest can hold files of several.
-                auto & pruner = file_pruners_by_schema_id[data_file->resolved_schema_id];
-                if (!pruner)
-                    pruner = std::make_unique<ManifestFilesPruner>(
-                        *persistent_components.schema_processor,
-                        table_state_snapshot->schema_id,
-                        data_file->resolved_schema_id,
-                        pruning_filter,
-                        files_handle.getPartitionKeyDescription(),
-                        context,
-                        /* require_ready_sets */ true);
-
-                const auto hyperrectangles
-                    = getDataFileHyperrectangles(*data_file, pruner->getMinMaxColumnTypes(), manifest_list_entry.manifest_file_path);
-                if (pruner->canBePruned(data_file, hyperrectangles) != PruningReturnStatus::NOT_PRUNED)
-                {
-                    estimate.pruned_data_files = true;
-                    continue;
-                }
-            }
-
-            /// A negative count comes from a corrupted manifest, as in `totalRows`.
-            if (data_file->parsed_entry->record_count < 0)
-            {
-                LOG_WARNING(
-                    log,
-                    "Data file '{}' of manifest '{}' has a negative record count {}, so the read gets no row estimate",
-                    data_file->parsed_entry->file_path_key.serialize(),
-                    manifest_list_entry.manifest_file_path,
-                    data_file->parsed_entry->record_count);
-                estimate.rows.reset();
-                return estimate;
-            }
-            /// Trusted as written, although ClickHouse before 26.5 wrote the row count of the whole commit into each file.
-            *estimate.rows += static_cast<UInt64>(data_file->parsed_entry->record_count);
-        }
-    }
-    return estimate;
-}
-
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const
 {
     IcebergDataSnapshotPtr actual_data_snapshot;
@@ -1795,40 +1676,12 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context, const
         return 0;
     }
 
-<<<<<<< HEAD
     /// Equality deletes remove data rows by value match; summary `total-equality-deletes` counts
     /// rows in delete files, not deleted data rows. Fail closed when the field is present and > 0.
     /// If the field is absent, skip to manifests for EQUALITY_DELETE files.
     if (actual_data_snapshot->total_equality_delete_rows.has_value()
         && *actual_data_snapshot->total_equality_delete_rows > 0)
         return {};
-=======
-
-    if (auto total_rows = actual_data_snapshot->getTotalRows(); total_rows.has_value())
-    {
-        ProfileEvents::increment(ProfileEvents::IcebergTrivialCountOptimizationApplied);
-        return total_rows;
-    }
-
-    const Int32 schema_id = actual_table_state_snapshot.schema_id;
-
-    UInt64 result = 0;
-    Iceberg::ManifestFilesPrefetcher manifests(
-        object_storage, persistent_components, local_context, log, actual_data_snapshot->manifest_list_entries);
-    while (auto fetch = manifests.take())
-    {
-        auto manifest_file_ptr = getManifestFileEntriesHandle(fetch->get(), persistent_components, local_context, fetch->key(), schema_id);
-
-        if (!manifest_file_ptr.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE).empty()
-            || !manifest_file_ptr.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty())
-            return {};
-
-        auto manifest_rows = manifest_file_ptr.getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
-        if (!manifest_rows.has_value())
-            return {};
-        result += *manifest_rows;
-    }
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 
     /// Row counts stored in the metadata layers above the manifest files are not used as
     /// data sources, because writers derive them instead of measuring them against the data:

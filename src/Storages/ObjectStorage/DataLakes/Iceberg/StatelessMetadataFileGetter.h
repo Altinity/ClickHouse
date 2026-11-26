@@ -101,7 +101,8 @@ public:
         const PersistentTableComponents & persistent_table_components_,
         ContextPtr local_context_,
         LoggerPtr log_,
-        ManifestFileCacheKeys manifests_);
+        ManifestFileCacheKeys manifests_,
+        std::shared_ptr<ExternalStorageCache> external_storages_);
 
     ~ManifestFilesPrefetcher();
 
@@ -121,6 +122,8 @@ private:
     const ContextPtr local_context;
     const LoggerPtr log;
     const ManifestFileCacheKeys manifests;
+    /// Shared with the reads in flight, which may outlive the prefetcher.
+    const std::shared_ptr<ExternalStorageCache> external_storages;
     const bool use_metadata_cache;
 
     size_t next_to_fetch = 0;

@@ -47,11 +47,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 
 
-<<<<<<< HEAD
-=======
 #include <IO/SharedThreadPools.h>
-#include <Common/ElapsedTimeProfileEventIncrement.h>
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 #include <Common/ProfileEvents.h>
 #include <Common/SharedLockGuard.h>
 #include <Common/logger_useful.h>
@@ -167,21 +163,11 @@ Iceberg::ManifestFileCacheableInfo getManifestFile(
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
         });
 
-<<<<<<< HEAD
         auto buffer = createReadBuffer(manifest_object_info, storage_to_use, local_context, log, read_settings);
-        auto manifest_file_deserializer = std::make_shared<Iceberg::AvroForIcebergDeserializer>(
-            std::move(buffer), filename, getFormatSettings(local_context));
-
-        const size_t manifest_file_bytes = manifest_file_deserializer->bytesRead();
-        return Iceberg::ManifestFileCacheableInfo{std::move(manifest_file_deserializer), manifest_file_bytes};
-=======
-        auto buffer = createReadBuffer(manifest_object_info, object_storage, local_context, log, read_settings);
         String manifest_file_bytes;
         readStringUntilEOF(manifest_file_bytes, *buffer);
 
-        ProfileEvents::increment(ProfileEvents::IcebergManifestFilesReadBytes, manifest_file_bytes.size());
         return Iceberg::ManifestFileCacheableInfo::fromBytes(std::move(manifest_file_bytes), filename, getFormatSettings(local_context));
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     };
 
     if (use_iceberg_metadata_cache && persistent_table_components.table_uuid.has_value())
@@ -414,12 +400,14 @@ ManifestFilesPrefetcher::ManifestFilesPrefetcher(
     const PersistentTableComponents & persistent_table_components_,
     ContextPtr local_context_,
     LoggerPtr log_,
-    ManifestFileCacheKeys manifests_)
+    ManifestFileCacheKeys manifests_,
+    std::shared_ptr<ExternalStorageCache> external_storages_)
     : object_storage(std::move(object_storage_))
     , persistent_table_components(persistent_table_components_)
     , local_context(std::move(local_context_))
     , log(std::move(log_))
     , manifests(std::move(manifests_))
+    , external_storages(std::move(external_storages_))
     , use_metadata_cache(
           useMetadataCacheForManifestFiles(persistent_table_components, local_context) && persistent_table_components.table_uuid.has_value())
 {
@@ -464,11 +452,11 @@ void ManifestFilesPrefetcher::fill()
             fetch->cached = std::move(cached);
         else
             fetch->pending = runner(
-                [stopped_ = stopped, object_storage_ = object_storage, components = persistent_table_components, context = local_context, log_ = log, path = manifest.manifest_file_path]
+                [stopped_ = stopped, object_storage_ = object_storage, components = persistent_table_components, context = local_context, log_ = log, path = manifest.manifest_file_path, external_storages_ = external_storages]
                 {
                     if (*stopped_)
                         return ManifestFileCacheableInfo{};
-                    return getManifestFile(object_storage_, components, context, log_, path);
+                    return getManifestFile(object_storage_, components, context, log_, path, *external_storages_);
                 },
                 Priority{});
 

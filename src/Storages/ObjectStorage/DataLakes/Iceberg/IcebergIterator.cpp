@@ -173,160 +173,6 @@ std::span<const ProcessedManifestFileEntryPtr> defineDeletesSpan(
 
 }
 
-<<<<<<< HEAD
-namespace Iceberg
-{
-
-DataFileEntriesStream::DataFileEntriesStream(
-    size_t queue_size_,
-    size_t decode_concurrency_,
-    IcebergDataSnapshotPtr data_snapshot_,
-    std::function<void()> prepare_,
-    CreateManifestIterator create_manifest_iterator_,
-    SkipManifest skip_manifest_)
-    : chunk_size(queue_size_)
-    , decode_concurrency(decode_concurrency_)
-    , data_snapshot(std::move(data_snapshot_))
-    , prepare(std::move(prepare_))
-    , create_manifest_iterator(std::move(create_manifest_iterator_))
-    , skip_manifest(std::move(skip_manifest_))
-    , queue(queue_size_)
-{
-    producer = std::make_unique<ThreadFromGlobalPool>(
-        [this, thread_group = CurrentThread::getGroup()]()
-        {
-            DB::ThreadGroupSwitcher switcher(thread_group, DB::ThreadName::ICEBERG_ITERATOR);
-            try
-            {
-                run();
-            }
-            catch (...)
-            {
-                std::lock_guard lock(exception_mutex);
-                if (!exception)
-                {
-                    exception = std::current_exception();
-                }
-            }
-            stop();
-        });
-}
-
-DataFileEntriesStream::~DataFileEntriesStream()
-{
-    stop();
-    if (producer)
-    {
-        producer->join();
-    }
-}
-
-bool DataFileEntriesStream::pop(ProcessedManifestFileEntryPtr & entry)
-{
-    return queue.pop(entry);
-}
-
-void DataFileEntriesStream::clearAndFinish()
-{
-    stopped.store(true, std::memory_order_relaxed);
-    queue.clearAndFinish();
-}
-
-void DataFileEntriesStream::stop()
-{
-    stopped.store(true, std::memory_order_relaxed);
-    queue.finish();
-}
-
-std::exception_ptr DataFileEntriesStream::getException() const
-{
-    std::lock_guard lock(exception_mutex);
-    return exception;
-}
-
-void DataFileEntriesStream::run()
-{
-    if (!data_snapshot)
-        return;
-
-    if (prepare)
-        prepare();
-
-    auto stream_runner = threadPoolCallbackRunnerUnsafe<void>(getIcebergManifestDecodeThreadPool().get(), DB::ThreadName::ICEBERG_ITERATOR);
-
-    std::deque<std::unique_ptr<InFlightManifest>> in_flight;
-    SCOPE_EXIT({
-        for (auto & manifest : in_flight)
-        {
-            if (manifest->future.valid())
-                manifest->future.wait();
-        }
-    });
-
-    const auto & manifest_list_entries = data_snapshot->manifest_list_entries;
-    size_t next_index = 0;
-    while (!stopped.load(std::memory_order_relaxed))
-    {
-        while (in_flight.size() < decode_concurrency && next_index < manifest_list_entries.size())
-        {
-            const size_t index = next_index++;
-            if (manifest_list_entries[index].content_type != ManifestFileContentType::DATA)
-                continue;
-            if (skip_manifest && skip_manifest(manifest_list_entries[index]))
-                continue;
-            auto manifest = std::make_unique<InFlightManifest>(manifest_list_entries[index]);
-            auto * scheduled = manifest.get();
-            manifest->future = stream_runner([this, scheduled] { decodeChunk(*scheduled); }, Priority{});
-            in_flight.push_back(std::move(manifest));
-        }
-
-        if (in_flight.empty())
-            return;
-
-        auto & manifest = *in_flight.front();
-        manifest.future.get();
-
-        for (auto & entry : manifest.chunk)
-        {
-            if (!queue.push(std::move(entry)))
-                return;
-        }
-        manifest.chunk.clear();
-
-        if (manifest.exhausted)
-            in_flight.pop_front();
-        else
-            manifest.future = stream_runner([this, scheduled = &manifest] { decodeChunk(*scheduled); }, Priority{});
-    }
-}
-
-void DataFileEntriesStream::decodeChunk(InFlightManifest & manifest)
-{
-    if (stopped.load(std::memory_order_relaxed))
-    {
-        manifest.exhausted = true;
-        return;
-    }
-
-    if (!manifest.iterator)
-        manifest.iterator = create_manifest_iterator(manifest.key, &stopped);
-
-    while (manifest.chunk.size() < chunk_size)
-    {
-        auto entry = manifest.iterator->next();
-        if (!entry)
-        {
-            manifest.exhausted = true;
-            return;
-        }
-        manifest.chunk.push_back(std::move(entry));
-    }
-}
-
-}
-
-=======
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 IcebergIterator::IcebergIterator(
     ObjectStoragePtr object_storage_,
     ContextPtr local_context_,
@@ -357,30 +203,6 @@ IcebergIterator::IcebergIterator(
         && local_context->getSettingsRef()[Setting::use_iceberg_partition_pruning]
         && local_context->getSettingsRef()[Setting::use_iceberg_manifest_list_partition_pruning];
 
-<<<<<<< HEAD
-    data_files_stream = std::make_unique<Iceberg::DataFileEntriesStream>(
-        local_context->getSettingsRef()[Setting::iceberg_file_entries_queue_size],
-        local_context->getSettingsRef()[Setting::iceberg_manifest_decode_concurrency],
-        data_snapshot,
-        [this, manifest_list_pruning_enabled]
-        {
-            if (manifest_filter_dag)
-                VirtualColumnUtils::buildOrderedSetsForDAG(*manifest_filter_dag, local_context);
-            /// The key conditions of the pruner are built over the filter DAG, so they need its
-            /// ordered sets to be ready.
-            if (manifest_list_pruning_enabled)
-                manifest_list_pruner = std::make_unique<Iceberg::ManifestListPruner>(
-                    *persistent_components.schema_processor,
-                    table_state_snapshot->schema_id,
-                    data_snapshot->schema_id_on_snapshot_commit,
-                    data_snapshot->partition_specs,
-                    manifest_filter_dag.get(),
-                    local_context);
-        },
-        [this](const ManifestFileCacheKey & manifest_list_entry, const std::atomic<bool> * stop_flag)
-        { return createManifestIterator(manifest_list_entry, stop_flag); },
-        [this](const ManifestFileCacheKey & manifest_list_entry)
-=======
     /// The filter sets are shared with the reader of this table, which prepares them on its own
     /// thread, so they must be ready before any manifest is pruned.
     if (data_snapshot && manifest_filter_dag)
@@ -403,7 +225,6 @@ IcebergIterator::IcebergIterator(
     if (data_snapshot)
     {
         for (const auto & manifest_list_entry : data_snapshot->manifest_list_entries)
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
         {
             if (manifest_list_entry.content_type == Iceberg::ManifestFileContentType::DELETE)
             {
@@ -429,7 +250,7 @@ IcebergIterator::IcebergIterator(
     manifest_keys.insert(
         manifest_keys.end(), std::make_move_iterator(data_manifest_keys.begin()), std::make_move_iterator(data_manifest_keys.end()));
     manifests = std::make_unique<Iceberg::ManifestFilesPrefetcher>(
-        object_storage, persistent_components, local_context, logger, std::move(manifest_keys));
+        object_storage, persistent_components, local_context, logger, std::move(manifest_keys), external_storages);
 }
 
 void IcebergIterator::ensureDeletesReady()
@@ -453,9 +274,15 @@ void IcebergIterator::ensureDeletesReady()
             ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergIteratorInitializationMicroseconds);
             /// Sort objects by common_partition_specification, partition_key_value and added_sequence_number.
             /// This is needed to efficiently match delete and data manifests in defineDeletesSpan().
-            LOG_DEBUG(logger, "Taken {} position deletes file and {} equality deletes files in iceberg iterator", position_deletes_files.size(), equality_deletes_files.size());
+            LOG_DEBUG(
+                logger,
+                "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
+                deletion_vector_files.size(),
+                parquet_position_deletes_files.size(),
+                equality_deletes_files.size());
             std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
-            std::sort(position_deletes_files.begin(), position_deletes_files.end());
+            std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
+            std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
             deletes_ready = true;
             delete_manifest_parsed.notify_all();
             break;
@@ -519,8 +346,10 @@ void IcebergIterator::ensureDeletesReady()
                 {
                     if (delete_file->parsed_entry->equality_ids.has_value())
                         equality_deletes_files.emplace_back(std::move(delete_file));
+                    else if (delete_file->parsed_entry->isDeletionVector())
+                        deletion_vector_files.emplace_back(std::move(delete_file));
                     else
-                        position_deletes_files.emplace_back(std::move(delete_file));
+                        parquet_position_deletes_files.emplace_back(std::move(delete_file));
                 }
             }
             catch (...)
@@ -537,17 +366,6 @@ void IcebergIterator::ensureDeletesReady()
 Iceberg::ManifestIteratorPtr IcebergIterator::createManifestIterator(
     const ManifestFileCacheKey & manifest_list_entry, const Iceberg::ManifestFileCacheableInfo & manifest_file) const
 {
-<<<<<<< HEAD
-    auto manifest_file_cacheable_part = Iceberg::getManifestFile(
-        object_storage,
-        persistent_components,
-        local_context,
-        logger,
-        manifest_list_entry.manifest_file_path,
-        *external_storages);
-
-=======
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     return Iceberg::ManifestFileIterator::create(
         manifest_file.getDeserializer(),
         manifest_list_entry.manifest_file_path,
@@ -578,63 +396,6 @@ Iceberg::ProcessedManifestFileEntryPtr IcebergIterator::nextDataFileEntry()
             manifest = std::move(idle_data_manifests.back());
             idle_data_manifests.pop_back();
         }
-<<<<<<< HEAD
-    }
-
-    /// Cap concurrency: each in-flight manifest holds its decoded contents.
-    const size_t max_in_flight = local_context->getSettingsRef()[Setting::iceberg_manifest_decode_concurrency];
-
-    auto decode_runner
-        = threadPoolCallbackRunnerUnsafe<ManifestEntryBatch>(getIOThreadPool().get(), DB::ThreadName::ICEBERG_DELETE_DECODE);
-
-    std::deque<std::future<ManifestEntryBatch>> in_flight;
-    /// The tasks capture `this`, so none of them may still be running when this function is left.
-    SCOPE_EXIT({
-        for (auto & future : in_flight)
-        {
-            if (future.valid())
-                future.wait();
-        }
-    });
-
-    size_t next_to_decode = 0;
-    while (next_to_decode < delete_manifests.size() || !in_flight.empty())
-    {
-        while (in_flight.size() < max_in_flight && next_to_decode < delete_manifests.size())
-        {
-            auto decode = [this, manifest_list_entry = delete_manifests[next_to_decode++]]()
-            { return decodeManifest(manifest_list_entry, /* stop_flag */ nullptr); };
-            in_flight.push_back(decode_runner(std::move(decode), Priority{}));
-        }
-
-        auto pending = std::move(in_flight.front());
-        in_flight.pop_front();
-        /// Collected in manifest list order, so the failure reported is the first one in that order.
-        for (auto & delete_file : pending.get())
-        {
-            if (delete_file->parsed_entry->equality_ids.has_value())
-                equality_deletes_files.emplace_back(std::move(delete_file));
-            else if (delete_file->parsed_entry->isDeletionVector())
-                deletion_vector_files.emplace_back(std::move(delete_file));
-            else
-                parquet_position_deletes_files.emplace_back(std::move(delete_file));
-        }
-    }
-    chassert(in_flight.empty());
-    chassert(next_to_decode == delete_manifests.size());
-
-    /// Sort objects by common_partition_specification, partition_key_value and added_sequence_number.
-    /// This is needed to efficiently match delete and data manifests in defineDeletesSpan().
-    LOG_DEBUG(
-        logger,
-        "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
-        deletion_vector_files.size(),
-        parquet_position_deletes_files.size(),
-        equality_deletes_files.size());
-    std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
-    std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
-    std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
-=======
         else
         {
             try
@@ -699,7 +460,6 @@ Iceberg::ProcessedManifestFileEntryPtr IcebergIterator::nextDataFileEntry()
         if (!error && entry)
             return entry;
     }
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 }
 
 ObjectInfoPtr IcebergIterator::next(size_t)

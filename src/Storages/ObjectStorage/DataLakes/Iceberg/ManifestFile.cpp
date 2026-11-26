@@ -3,12 +3,7 @@
 #if USE_AVRO
 
 #include <compare>
-<<<<<<< HEAD
 #include <limits>
-
-#include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
-
-=======
 #include <mutex>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
@@ -17,20 +12,10 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
 
-#include <Poco/String.h>
-
-#include <Common/ElapsedTimeProfileEventIncrement.h>
-#include <Common/ProfileEvents.h>
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 #include <Common/logger_useful.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
-
-namespace ProfileEvents
-{
-    extern const Event IcebergManifestFilesReadMicroseconds;
-}
 
 namespace DB::ErrorCodes
 {
@@ -73,7 +58,6 @@ std::shared_ptr<AvroForIcebergDeserializer> ManifestFileCacheableInfo::getDeseri
         state->parsed,
         [&parsed_state = *state]
         {
-            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergManifestFilesReadMicroseconds);
             parsed_state.deserializer = std::make_shared<AvroForIcebergDeserializer>(
                 std::make_unique<ReadBufferFromOutsideMemoryFile>(parsed_state.path.serialize(), parsed_state.bytes),
                 parsed_state.path,

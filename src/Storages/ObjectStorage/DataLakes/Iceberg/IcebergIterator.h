@@ -35,65 +35,7 @@ namespace DB
 
 namespace Iceberg
 {
-<<<<<<< HEAD
-
-class DataFileEntriesStream
-{
-public:
-    using CreateManifestIterator = std::function<ManifestIteratorPtr(const ManifestFileCacheKey &, const std::atomic<bool> *)>;
-    /// Called on the producer thread, after `prepare`, for every data manifest of the snapshot.
-    using SkipManifest = std::function<bool(const ManifestFileCacheKey &)>;
-
-    DataFileEntriesStream(
-        size_t queue_size_,
-        size_t decode_concurrency_,
-        IcebergDataSnapshotPtr data_snapshot_,
-        std::function<void()> prepare_,
-        CreateManifestIterator create_manifest_iterator_,
-        SkipManifest skip_manifest_);
-
-    ~DataFileEntriesStream();
-
-    bool pop(ProcessedManifestFileEntryPtr & entry);
-    void clearAndFinish();
-    std::exception_ptr getException() const;
-
-private:
-    struct InFlightManifest
-    {
-        explicit InFlightManifest(ManifestFileCacheKey key_)
-            : key(std::move(key_))
-        {
-        }
-
-        ManifestFileCacheKey key;
-        ManifestIteratorPtr iterator;
-        std::vector<ProcessedManifestFileEntryPtr> chunk;
-        bool exhausted = false;
-        std::future<void> future;
-    };
-
-    void run();
-    void decodeChunk(InFlightManifest & manifest);
-    void stop();
-
-    const size_t chunk_size;
-    const size_t decode_concurrency;
-    const IcebergDataSnapshotPtr data_snapshot;
-
-    const std::function<void()> prepare;
-    const CreateManifestIterator create_manifest_iterator;
-    const SkipManifest skip_manifest;
-    ConcurrentBoundedQueue<ProcessedManifestFileEntryPtr> queue;
-    std::atomic<bool> stopped{false};
-    mutable std::mutex exception_mutex;
-    std::exception_ptr exception TSA_GUARDED_BY(exception_mutex);
-    std::unique_ptr<ThreadFromGlobalPool> producer;
-};
-
-=======
 class ManifestFilesPrefetcher;
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 }
 
 class IcebergIterator : public IObjectIterator
@@ -142,15 +84,8 @@ private:
     size_t delete_manifests_in_progress TSA_GUARDED_BY(deletes_mutex) = 0;
     bool deletes_ready TSA_GUARDED_BY(deletes_mutex) = false;
     std::exception_ptr deletes_exception TSA_GUARDED_BY(deletes_mutex);
-<<<<<<< HEAD
     Int32 table_schema_id;
     std::shared_ptr<ExternalStorageCache> external_storages;
-    /// Built on the producer thread of `data_files_stream` and read only there.
-    std::unique_ptr<Iceberg::ManifestListPruner> manifest_list_pruner;
-    /// Declared last: its tasks call back into `createManifestIterator`, so it must be destroyed
-    /// (producer joined, tasks drained) before any other member.
-    std::unique_ptr<Iceberg::DataFileEntriesStream> data_files_stream;
-=======
 
     std::mutex data_files_mutex;
     std::condition_variable data_manifest_released;
@@ -160,7 +95,6 @@ private:
     std::vector<Iceberg::ManifestIteratorPtr> idle_data_manifests TSA_GUARDED_BY(data_files_mutex);
     size_t data_manifests_in_use TSA_GUARDED_BY(data_files_mutex) = 0;
     std::exception_ptr data_files_exception TSA_GUARDED_BY(data_files_mutex);
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 };
 }
 

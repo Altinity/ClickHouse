@@ -6109,34 +6109,7 @@ Possible values:
 )", 0) \
     DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
 If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
-<<<<<<< HEAD
 )", 0) \
-    DECLARE_WITH_ALIAS(NonZeroUInt64, iceberg_manifest_decode_concurrency, 4, R"(
-Maximum number of Iceberg manifest files decoded concurrently while reading a table.
-
-Delete manifests are all decoded before any data file is read; data manifests are decoded while the list of data files for the query is produced, and new ones are decoded only as the query consumes already decoded entries. Decoding several manifests at a time overlaps the object storage round-trips and the per-entry pruning work.
-
-Higher values raise peak memory when the Iceberg metadata files cache is disabled or full, since each in-flight manifest then holds its own decoded contents.
-
-Must be greater than zero; `1` decodes the manifests one at a time.
-)", 0, iceberg_delete_manifest_decode_concurrency) \
-    DECLARE(NonZeroUInt64, iceberg_file_entries_queue_size, 100, R"(
-Capacity of the queue between the Iceberg data manifest decode tasks and the query, in data file entries.
-
-The decode tasks pause once the queue is full and the query is not consuming, so this also bounds the read-ahead.
-
-Must be greater than zero.
-)", 0) \
-=======
-)", 0, \
-        {"26.3", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"}) \
-    DECLARE(Bool, iceberg_list_only_v_prefixed_metadata_files, false, R"(
-Find the latest metadata file of an Iceberg table read by path on S3 or Azure by listing only the key prefix `metadata/v`, so that the manifests stored in the same `metadata` directory are not listed. If it holds `.metadata.json` files, only they are candidates; otherwise the whole directory is listed. Does not apply with `iceberg_use_version_hint`, `iceberg_metadata_file_path`, `iceberg_metadata_table_uuid` or `iceberg_recent_metadata_file_by_last_updated_ms_field`, nor to the tables of a data lake catalog database.
-
-Enable it only for tables whose metadata files are all named `v<N>...` (as ClickHouse and Hadoop catalogs name them): in a directory that also holds `<N>-<uuid>.metadata.json` files, those files are never candidates, so the commits of their writer are not seen.
-)", 0, \
-        {"26.11", false, false, "New setting to list only the `metadata/v` key prefix when looking for the latest metadata file of an Iceberg table read by path."}) \
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     DECLARE(Bool, use_parquet_metadata_cache, true, R"(
 If turned on, parquet format may utilize the parquet metadata cache.
 
@@ -9662,60 +9635,16 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, use_json_alias_for_old_object_type, false) \
     MAKE_OBSOLETE(M, Bool, describe_extend_object_types, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_object_type, false) \
-<<<<<<< HEAD
     MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"}) \
     MAKE_OBSOLETE(M, Bool, use_text_index_dictionary_cache, false) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_logical_join_step, true) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true) \
     MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1) \
     MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
-    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true)
-=======
-    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"}, \
-        {"25.12", Field{"auto"}, Field{"auto"}, "New setting"}) \
-    MAKE_OBSOLETE(M, Bool, use_text_index_dictionary_cache, false, \
-        {"25.11", false, false, "New setting"}) \
-    MAKE_OBSOLETE(M, Bool, query_plan_use_logical_join_step, true, \
-        {"26.5", true, true, "Obsolete setting, the logical join step is now always used."}, \
-        {"25.10", true, true, "Added alias"}) \
-    MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true, \
-        {"26.5", true, true, "Obsolete setting, the logical join step is now always used."}, \
-        {"25.2", false, true, "Enable new step"}, \
-        {"25.1", false, false, "New join step, internal change"}) \
-    MAKE_OBSOLETE(M, Bool, query_plan_read_in_order, true, \
-        {"26.10", true, true, "Obsolete setting: the read-in-order optimization is now always applied at the query plan level, and the legacy interpreter-level implementation (`ReadInOrderOptimizer`) was removed. Use `optimize_read_in_order` to toggle the optimization."}) \
-    MAKE_OBSOLETE(M, Bool, query_plan_optimize_prewhere, true, \
-        {"26.10", true, true, "Obsolete setting: moving conditions from `WHERE` to `PREWHERE` is now always done at the query plan level, and the legacy AST-based implementation in `InterpreterSelectQuery` was removed. Use `optimize_move_to_prewhere` to toggle the optimization."}, \
-        {"24.2", true, true, "Allow to push down filter to PREWHERE expression for supported storages"}) \
-    MAKE_OBSOLETE(M, Bool, query_plan_aggregation_in_order, true, \
-        {"26.10", true, true, "Obsolete setting: the aggregation-in-order optimization is now always applied at the query plan level, and the legacy interpreter-level implementation was removed. Use `optimize_aggregation_in_order` to toggle the optimization."}, \
-        {"22.12", 0, 1, "Enable some refactoring around query plan"}) \
-    MAKE_OBSOLETE(M, Bool, parallel_replicas_insert_select_local_pipeline, true, \
-        {"26.10", true, true, "Obsolete setting: whether the initiator runs the local pipeline of a distributed `INSERT SELECT` is decided by `parallel_replicas_local_plan` and `parallel_replicas_prefer_local_replica` alone, and it is still skipped when `max_execution_time_leaf` imposes a different timeout contract. Set `parallel_replicas_local_plan = 0` to leave all the reading to the remote replicas."}, \
-        {"25.5", false, true, "Use local pipeline during distributed INSERT SELECT with parallel replicas. Currently disabled due to performance issues"}, \
-        {"25.4", false, false, "Use local pipeline during distributed INSERT SELECT with parallel replicas. Currently disabled due to performance issues"}) \
-    MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1, \
-        {"26.6", 1, 1, "Obsolete setting, the database engine in Cloud no longer depends on it."}, \
-        {"24.10", 1, 1, "A setting for ClickHouse Cloud"}) \
-    MAKE_OBSOLETE(M, Float, text_index_lazy_intersection_density_threshold, 0.2f, \
-        {"26.7", 0.2, 0.2, "Renamed from `text_index_density_threshold` (kept as an alias); selects the posting list intersection algorithm in lazy posting list apply mode."}) \
-    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true, \
-        {"26.10", true, true, "Obsolete. Overriding named collection keys requires `SHOW NAMED COLLECTIONS SECRETS`."}) \
-    MAKE_OBSOLETE(M, Float, text_index_density_threshold, 0.2f, \
-        {"26.6", 0.2, 0.2, "New setting for lazy posting list density threshold"}) \
-    MAKE_OBSOLETE(M, Bool, use_compact_format_in_distributed_parts_names, true, \
-        {"26.10", true, true, "Obsolete setting. The non-compact directory format for the async `INSERT` queue of a `Distributed` table has been removed. The setting was 1 by default since version 21.1. Switch to `1` and let the queue drain before upgrading."}, \
-        {"21.1", false, true, "Use compact format for async INSERT into Distributed tables by default"}) \
-    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_manifest_decode_concurrency, 16, \
-        {"26.11", 4, 16, "Obsolete setting: Iceberg manifest files are read on the IO thread pool and parsed by the threads reading the table."}, \
-        {"26.9", 2, 4, "New setting bounding how many Iceberg manifest files are decoded concurrently, for delete and data manifests alike. It replaces `iceberg_delete_manifest_decode_concurrency` (kept as an alias). `2` approximates the pre-26.9 data path, which decoded one manifest at a time with the next one's fetch already in flight; under `compatibility` at or below 26.8 the delete decode therefore also runs at 2 rather than its released default of 4, preserving the older data-path memory envelope at the cost of some delete-decode overlap."}, \
-        {"26.8", 2, 4, "New setting bounding how many Iceberg delete manifest files are decoded concurrently before the first row is read. Before 26.8 one manifest was decoded at a time with the next one's fetch already in flight, so `2` is the closest equivalent of the previous behavior, which put the sum of their object storage round-trips on the critical path before the first row. At the time the setting was named `iceberg_delete_manifest_decode_concurrency`, which is now an alias of it."}) \
-    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_delete_manifest_decode_concurrency, 16, \
-        {"26.11", 4, 16, "Obsolete setting, formerly an alias of `iceberg_manifest_decode_concurrency`."}) \
-    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_file_entries_queue_size, 100, \
-        {"26.11", 100, 100, "Obsolete setting: there is no queue between Iceberg manifest parsing and the query any more."}, \
-        {"26.9", 100, 100, "New setting for the previously hardcoded capacity of the queue between the Iceberg data manifest decode tasks and the query."})
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
+    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_manifest_decode_concurrency, 4) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_delete_manifest_decode_concurrency, 4) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_file_entries_queue_size, 100)
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 

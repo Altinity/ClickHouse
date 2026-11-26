@@ -166,41 +166,6 @@ def test_data_and_delete_manifest_decode_concurrency(
     instance.query(f"DROP TABLE {TABLE_NAME}")
 
 
-<<<<<<< HEAD
-=======
-def test_data_manifest_decode_concurrency_row_lineage(started_cluster_iceberg_with_spark):
-    """Format-version 3 manifests carry an inherited `first_row_id`, which the manifest
-    iterator materializes per entry before yielding anything; the row ids and the result
-    must not depend on how many threads read the table."""
-    instance = started_cluster_iceberg_with_spark.instances["node1"]
-    TABLE_NAME = "test_data_manifest_decode_concurrency_row_lineage_" + get_uuid_str()
-
-    write_table(started_cluster_iceberg_with_spark, TABLE_NAME, format_version=3)
-    create_iceberg_table(
-        STORAGE_TYPE, instance, TABLE_NAME, started_cluster_iceberg_with_spark
-    )
-
-    serial = instance.query(
-        f"SELECT id, _row_id FROM {TABLE_NAME} ORDER BY id",
-        settings={
-            "max_threads": 1,
-            "use_iceberg_metadata_files_cache": 0,
-        },
-    )
-    assert serial.strip(), "the serial read returned no rows; fixture broken"
-    result = instance.query(
-        f"SELECT id, _row_id FROM {TABLE_NAME} ORDER BY id",
-        settings={
-            "max_threads": 16,
-            "use_iceberg_metadata_files_cache": 0,
-        },
-    )
-    assert result == serial, "row lineage changed with max_threads=16"
-
-    instance.query(f"DROP TABLE {TABLE_NAME}")
-
-
->>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
 def test_data_manifest_decode_large_manifest(started_cluster_iceberg_with_spark):
     """A single manifest with 300 entries, read by one thread or by several threads
     taking turns on it; the result must not depend on how many threads read the table."""
