@@ -2,6 +2,7 @@
 
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Interpreters/Context.h>
 
 namespace ProfileEvents
@@ -21,6 +22,11 @@ namespace DB
 
 void invalidateObjectStorageIdentityCache(std::string_view endpoint, std::string_view bucket, std::string_view path)
 {
+    /// Callers run this after an object-changing request has already succeeded, and some of them do not sit in a
+    /// `SCOPE_EXIT_MEMORY`. Building the key allocates, so without this lock a query at its memory limit would throw
+    /// here and leave the previous identity cached.
+    LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+
     auto global_context = Context::getGlobalContextInstance();
     if (!global_context)
         return;
