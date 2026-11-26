@@ -486,6 +486,10 @@ public:
     /// Checks that part is already in virtual parts
     bool isVirtualPart(const MergeTreeData::DataPartPtr & data_part) const;
 
+    /// True if the part is going to be replaced by a part with a different block range, that is, merged
+    /// with other parts rather than mutated.
+    bool isGoingToBeMergedWithOtherParts(const MergeTreePartInfo & part_info) const;
+
     /// Returns true if part_info is covered by some DROP_RANGE or DROP_PART
     bool isGoingToBeDropped(const MergeTreePartInfo & part_info, MergeTreePartInfo * out_drop_range_info = nullptr) const;
     bool isGoingToBeDroppedImpl(const MergeTreePartInfo & part_info, MergeTreePartInfo * out_drop_range_info) const;

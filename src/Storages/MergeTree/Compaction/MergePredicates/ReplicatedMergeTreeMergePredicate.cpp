@@ -25,6 +25,8 @@ using MergeCore = DistributedMergePredicate<ActiveDataPartSet, ReplicatedMergeTr
 ReplicatedMergeTreeBaseMergePredicate::ReplicatedMergeTreeBaseMergePredicate(const ReplicatedMergeTreeQueue & queue_, std::optional<PartitionIdsHint> partition_ids_hint_)
     : MergeCore(std::move(partition_ids_hint_))
     , queue(queue_)
+    , exported_blocks(queue_.storage.getLatestExportedBlocks())
+    , delete_gate(queue_.storage.getExportTTLDeleteGate())
 {
 }
 
@@ -42,6 +44,9 @@ std::expected<void, PreformattedMessage> ReplicatedMergeTreeBaseMergePredicate::
 
     if (inprogress_quorum_part_ptr && *inprogress_quorum_part_ptr == part->name)
         return std::unexpected(PreformattedMessage::create("Quorum insert for part {} is currently in progress", part->name));
+
+    if (auto reason = delete_gate.check(part->name, part->info, part->ttl_infos, exported_blocks.get()))
+        return std::unexpected(PreformattedMessage::create("{}", *reason));
 
     /// FIXME: remove lock here
     std::lock_guard lock(queue.state_mutex);

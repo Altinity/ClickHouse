@@ -204,6 +204,10 @@ struct StorageInMemoryMetadata
     TTLDescriptions getGroupByTTLs() const;
     bool hasAnyGroupByTTL() const;
 
+    /// Just wrapper for table TTLs, return the `EXPORT TO TABLE` TTL (at most one).
+    TTLDescriptions getExportTTLs() const;
+    bool hasAnyExportTTL() const;
+
     using HasDependencyCallback = std::function<bool(const String &, ColumnDependency::Kind)>;
 
     /// Returns columns, which will be needed to calculate dependencies (skip indices, projections,

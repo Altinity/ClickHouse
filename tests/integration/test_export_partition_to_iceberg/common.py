@@ -58,7 +58,7 @@ def _destination_paths_has_sync_failed_marker(node, source_table, dest_table, pa
     """True when destination_file_paths contains the Keeper sync-failed marker value."""
     result = node.query(
         f"SELECT has(arrayFlatten(mapValues(destination_file_paths)), '<failed to read from zk>')"
-        f" FROM system.partition_exports"
+        f" FROM system.distributed_exports"
         f" WHERE source_table = '{source_table}'"
         f"   AND destination_table = '{dest_table}'"
         f"   AND partition_id = '{partition_id}'"

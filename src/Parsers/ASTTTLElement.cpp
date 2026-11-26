@@ -79,6 +79,13 @@ void ASTTTLElement::formatImpl(WriteBuffer & ostr, const FormatSettings & settin
         ostr << " RECOMPRESS ";
         recompression_codec->format(ostr, settings, state, frame);
     }
+    else if (mode == TTLMode::EXPORT)
+    {
+        ostr << " EXPORT TO TABLE ";
+        if (!destination_database.empty())
+            ostr << backQuoteIfNeed(destination_database) << ".";
+        ostr << backQuoteIfNeed(destination_name);
+    }
     else if (mode == TTLMode::DELETE)
     {
         /// It would be better to output "DELETE" here but that will break compatibility with earlier versions.

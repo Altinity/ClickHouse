@@ -1,0 +1,17 @@
+structural
+dst_year
+dst_month
+dst_region
+dst_ba
+dst_year_mod
+dst_hash
+dst_year
+dynamic
+dst_to_year
+dst_d
+dst_hundreds
+refused
+dst_nullable
+alter
+TTL t + toIntervalDay(30) SETTINGS
+TTL t + toIntervalDay(1) EXPORT TO TABLE dst_year_mod SETTINGS

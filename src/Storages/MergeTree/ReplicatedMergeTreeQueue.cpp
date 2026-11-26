@@ -119,6 +119,16 @@ bool ReplicatedMergeTreeQueue::isVirtualPart(const MergeTreeData::DataPartPtr & 
     return !virtual_part_name.empty() && virtual_part_name != data_part->name;
 }
 
+bool ReplicatedMergeTreeQueue::isGoingToBeMergedWithOtherParts(const MergeTreePartInfo & part_info) const
+{
+    std::lock_guard lock(state_mutex);
+    const auto virtual_part_name = virtual_parts.getContainingPart(part_info);
+    if (virtual_part_name.empty())
+        return false;
+    const auto virtual_part_info = MergeTreePartInfo::fromPartName(virtual_part_name, format_version);
+    return virtual_part_info.min_block != part_info.min_block || virtual_part_info.max_block != part_info.max_block;
+}
+
 bool ReplicatedMergeTreeQueue::isGoingToBeDropped(const MergeTreePartInfo & part_info, MergeTreePartInfo * out_drop_range_info) const
 {
     std::lock_guard lock(state_mutex);

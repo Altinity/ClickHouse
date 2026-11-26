@@ -16,6 +16,9 @@ public:
     TTLMode mode;
     DataDestinationType destination_type;
     String destination_name;
+    /// `EXPORT TO TABLE` only: database of the destination table `destination_name`. Empty means the
+    /// database of the table the TTL belongs to.
+    String destination_database;
     bool if_exists = false;
 
     ASTs group_by_key;

@@ -69,6 +69,11 @@ TTLCalcTransform::TTLCalcTransform(
             getExpressions(move_ttl, subqueries_for_sets, context), move_ttl,
             TTLUpdateField::MOVES_TTL, move_ttl.result_column, old_ttl_infos.moves_ttl[move_ttl.result_column], current_time_, force_));
 
+    for (const auto & export_ttl : metadata_snapshot_->getExportTTLs())
+        algorithms.emplace_back(std::make_unique<TTLUpdateInfoAlgorithm>(
+            getExpressions(export_ttl, subqueries_for_sets, context), export_ttl,
+            TTLUpdateField::EXPORT_TTL, export_ttl.result_column, old_ttl_infos.export_ttl[export_ttl.result_column], current_time_, force_));
+
     for (const auto & recompression_ttl : metadata_snapshot_->getRecompressionTTLs())
         algorithms.emplace_back(std::make_unique<TTLUpdateInfoAlgorithm>(
             getExpressions(recompression_ttl, subqueries_for_sets, context), recompression_ttl,

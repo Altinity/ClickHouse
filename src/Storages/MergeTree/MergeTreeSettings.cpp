@@ -820,6 +820,15 @@ Possible values:
     - [load_existing_rows_count_for_old_parts](#load_existing_rows_count_for_old_parts)
       setting
     )", 0) \
+    DECLARE(UInt64, ttl_export_check_period_seconds, 60, R"(
+    How often the `TTL ... EXPORT TO TABLE` scheduler of the table exports the eligible parts, in
+    seconds. Each check exports the eligible parts of a partition together, unless an export task of the
+    partition is still running, so this is the interval of the batches.
+    )", EXPERIMENTAL) \
+    DECLARE(String, ttl_export_settings_profile, "", R"(
+    Settings profile whose settings the tasks of the `EXPORT` TTL run with, e.g. the output format
+    settings and `export_merge_tree_task_timeout_seconds`. If empty, the default profile is used.
+    )", EXPERIMENTAL) \
     DECLARE(String, merge_workload, "", R"(
     Used to regulate how resources are utilized and shared between merges and
     other workloads. Specified value is used as `workload` setting value for
