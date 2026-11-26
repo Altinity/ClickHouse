@@ -1,7 +1,7 @@
 #include <Backups/BackupIO_S3.h>
 
 #if USE_AWS_S3
-#include <base/scope_guard.h>
+#include <Common/scope_guard_safe.h>
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
 #include <Common/HTTPHeaderFilter.h>
@@ -840,7 +840,8 @@ void BackupWriterS3::removeFile(const String & file_name)
 {
     const String object_key = fs::path(s3_uri.key) / file_name;
     /// Runs when the delete throws too: a lost response can follow an applied delete.
-    SCOPE_EXIT(
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
     {
         invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, object_key);
     });
@@ -860,7 +861,8 @@ void BackupWriterS3::removeFiles(const Strings & file_names)
 
     /// A key that was deleted, or was already gone, must not keep its previous size and ETag. This also runs
     /// when a later batch throws: earlier batches have already deleted their keys.
-    SCOPE_EXIT(
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
     {
         for (const auto & key : keys)
             invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, key);

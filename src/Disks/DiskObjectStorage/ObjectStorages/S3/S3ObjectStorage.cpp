@@ -33,7 +33,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/diskSettings.h>
 
-#include <base/scope_guard.h>
+#include <Common/scope_guard_safe.h>
 
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
@@ -630,7 +630,8 @@ void S3ObjectStorage::removeObjectImpl(const StoredObject & object, bool if_exis
 
     /// Runs when the delete throws too. A `DeleteObject` whose response was lost can still have removed the
     /// object, and the cache must not keep the previous size and ETag.
-    SCOPE_EXIT(
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
     {
         invalidateCachedIdentity(object.remote_path);
     });
@@ -665,7 +666,8 @@ void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_e
 
     /// Runs when the batch throws too. Chunks sent before the failing one have already deleted their keys,
     /// and a chunk whose response was lost may have as well.
-    SCOPE_EXIT(
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
     {
         for (const auto & object : objects)
             invalidateCachedIdentity(object.remote_path);
@@ -786,7 +788,8 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     {
         const StoredObject & object = objects.front();
         /// Runs when the delete throws too: a lost response can follow an applied delete.
-        SCOPE_EXIT(
+        /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+        SCOPE_EXIT_MEMORY(
         {
             invalidateCachedIdentity(object.remote_path);
         });
