@@ -1774,6 +1774,8 @@ The server successfully detected this situation and will download merged part fr
     M(AddressesDiscovered, "Total count of new addresses in DNS resolve results for HTTP connections", ValueType::Number) \
     M(AddressesExpired, "Total count of expired addresses which is no longer presented in DNS resolve results for HTTP connections", ValueType::Number) \
     M(AddressesMarkedAsFailed, "Total count of addresses which have been marked as faulty due to connection errors for HTTP connections", ValueType::Number) \
+    M(AddressesLatencyReported, "Total count of request latency samples (time to first byte of successful `GET` and `HEAD` requests) recorded per address when `http_latency_aware_host_selection` is used", ValueType::Number) \
+    M(HTTPConnectionsSkippedAsSlow, "Number of times a pooled client HTTP connection was not reused because its address is much slower than the fastest known one, and a new connection was opened instead (`http_latency_aware_host_selection`)", ValueType::Number) \
     \
     M(ReadWriteBufferFromHTTPRequestsSent, "Number of HTTP requests sent by ReadWriteBufferFromHTTP", ValueType::Number) \
     M(ReadWriteBufferFromHTTPBytes, "Total size of payload bytes received and sent by ReadWriteBufferFromHTTP. Doesn't include HTTP headers.", ValueType::Bytes) \

@@ -1,6 +1,11 @@
 #include <Common/HTTPConnectionPool.h>
 #include <Common/HostResolvePool.h>
 
+#include <algorithm>
+#include <limits>
+#include <optional>
+#include <vector>
+
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
 #include <Common/CurrentMetrics.h>
@@ -9,6 +14,7 @@
 #include <Common/ErrorCodes.h>
 #include <Common/ProxyConfiguration.h>
 #include <Common/CurrentThread.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Common/MemoryTrackerSwitcher.h>
 #include <Common/SipHash.h>
 #include <Common/Scheduler/ResourceGuard.h>
@@ -44,6 +50,7 @@
 
 namespace ProfileEvents
 {
+    extern const Event HTTPConnectionsSkippedAsSlow;
     extern const Event StorageConnectionsCreated;
     extern const Event StorageConnectionsReused;
     extern const Event StorageConnectionsReset;
@@ -669,10 +676,26 @@ private:
             return request_stream_completed && response_stream_completed;
         }
 
+        /// Not `noexcept`: copying the resolved host and building `IPAddress` objects allocate. The
+        /// only caller, `atConnectionDestroy`, calls this inside its `try` block, so a failure
+        /// resets the connection instead of terminating the process.
+        void updateCachedResolvedIp()
+        {
+            Poco::Net::IPAddress ip;
+            const std::string resolved = Session::getResolvedHost();
+            if (!resolved.empty() && Poco::Net::IPAddress::tryParse(resolved, ip))
+                cached_resolved_ip = ip;
+            else
+                cached_resolved_ip.reset();
+        }
+
         EndpointConnectionPool::WeakPtr pool;
         ConnectionGroup::Ptr group;
         IHTTPConnectionPoolForEndpoint::Metrics metrics;
         bool isExpired = false;
+        /// Pre-parsed `_resolved_host` so `selectBestStoredConnectionImpl` never allocates a
+        /// `std::string` or runs `IPAddress::tryParse` per candidate while holding `mutex`.
+        std::optional<Poco::Net::IPAddress> cached_resolved_ip;
 
         LoggerPtr log = getLogger("PooledConnection");
 
@@ -694,7 +717,94 @@ private:
         }
     };
 
-    using ConnectionsMinHeap = std::priority_queue<ConnectionPtr, std::vector<ConnectionPtr>, GreaterByLastRequest>;
+    /// Thin min-heap wrapper over `std::vector<ConnectionPtr>` (`GreaterByLastRequest` keeps the
+    /// earliest-expiring connection at `front()`, matching `std::priority_queue::top()`). Unlike
+    /// `std::priority_queue`, it exposes read-only indexed access for an O(N) scan and O(log N)
+    /// removal of an arbitrary element (`extractAt`), so latency-aware dispatch does not drain
+    /// and re-push the entire pool in O(N log N) on every borrow.
+    class ConnectionsMinHeap
+    {
+    public:
+        bool empty() const noexcept { return items.empty(); }
+        size_t size() const noexcept { return items.size(); }
+
+        const ConnectionPtr & top() const noexcept { return items.front(); }
+        const ConnectionPtr & operator[](size_t index) const noexcept { return items[index]; }
+
+        void push(ConnectionPtr conn)
+        {
+            items.push_back(std::move(conn));
+            std::push_heap(items.begin(), items.end(), GreaterByLastRequest{});
+        }
+
+        void pop()
+        {
+            std::pop_heap(items.begin(), items.end(), GreaterByLastRequest{});
+            items.pop_back();
+        }
+
+        /// Not `noexcept`: it relies on the comparator and the heap algorithms, which are not
+        /// declared not to throw. The only caller runs under `getConnection`, which propagates.
+        ConnectionPtr extractAt(size_t index)
+        {
+            chassert(index < items.size());
+            if (index == 0)
+            {
+                ConnectionPtr chosen = items.front();
+                pop();
+                return chosen;
+            }
+
+            ConnectionPtr chosen = std::move(items[index]);
+            const size_t last = items.size() - 1;
+            if (index == last)
+            {
+                items.pop_back();
+                return chosen;
+            }
+
+            items[index] = std::move(items[last]);
+            items.pop_back();
+
+            /// Restore min-heap order (`GreaterByLastRequest(parent, child) == false` means
+            /// `parent <= child` in expiry order, i.e. heap property holds). Either the moved
+            /// replacement expires earlier than its parent (sift up) or later than a child
+            /// (sift down), in at most O(log N) swaps with zero allocations.
+            GreaterByLastRequest cmp;
+            if (cmp(items[(index - 1) / 2], items[index]))
+            {
+                while (index > 0)
+                {
+                    const size_t parent = (index - 1) / 2;
+                    if (!cmp(items[parent], items[index]))
+                        break;
+                    std::swap(items[parent], items[index]);
+                    index = parent;
+                }
+            }
+            else
+            {
+                const size_t n = items.size();
+                while (true)
+                {
+                    const size_t left = 2 * index + 1;
+                    if (left >= n)
+                        break;
+                    const size_t right = left + 1;
+                    size_t smallest = (right < n && cmp(items[left], items[right])) ? right : left;
+                    if (!cmp(items[index], items[smallest]))
+                        break;
+                    std::swap(items[index], items[smallest]);
+                    index = smallest;
+                }
+            }
+
+            return chosen;
+        }
+
+    private:
+        std::vector<ConnectionPtr> items;
+    };
 
 public:
     template <class... Args>
@@ -722,25 +832,56 @@ public:
 
     IHTTPConnectionPoolForEndpoint::ConnectionPtr getConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time) override
     {
+        /// Declared before the `SCOPE_EXIT` below: the snapshot's buffer is allocated under
+        /// `total_memory_tracker` (see below), so it must also be released under it. Letting it be
+        /// destroyed at scope exit would free it while the query's tracker is active, crediting the
+        /// query with bytes it was never charged for.
+        HostResolver::LatencySnapshot latency_snapshot;
+
         std::vector<ConnectionPtr> expired_connections;
 
         SCOPE_EXIT({
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
-            expired_connections.clear();
+            /// Release the buffers, not just the elements: both were allocated under
+            /// `total_memory_tracker` (the `reserve` below, `getLatencySnapshot`), so `clear` would
+            /// leave the capacity to be freed later against the query's tracker.
+            std::vector<ConnectionPtr>().swap(expired_connections);
+            latency_snapshot = HostResolver::LatencySnapshot{};
         });
 
         ConnectionPtr reused_connection;
 
+        /// Capture a single-lock latency snapshot from the cached resolver before taking `mutex`:
+        /// - `tryGetResolver` never creates a resolver or runs DNS, so proxy-only targets and
+        ///   dropped DNS caches cannot throw or self-deadlock under `mutex`;
+        /// - `getLatencySnapshot` returns immediately in O(1) without locking the resolver mutex
+        ///   when no address has a measurement (e.g. non-S3 HTTP pools), and otherwise takes the
+        ///   resolver mutex at most once per `getConnection` outside `mutex` rather than N + 1
+        ///   times inside `mutex`.
+        if (HostResolver::latencyAwareSelectionEnabled() && uses_target_resolution)
         {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            if (auto latency_resolver = HostResolversPool::instance().tryGetResolver(host))
+                latency_snapshot = latency_resolver->getLatencySnapshot();
+        }
+
+        {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
             std::lock_guard lock(mutex);
             expired_connections.reserve(stored_connections.size());
 
-            wipeExpiredImpl(expired_connections);
+            auto is_soft_limit_reached = group->isSoftLimitReached();
+            wipeExpiredImpl(expired_connections, is_soft_limit_reached);
 
             if (!stored_connections.empty())
             {
-                reused_connection = stored_connections.top();
-                stored_connections.pop();
+                if (!latency_snapshot.empty())
+                    reused_connection = selectBestStoredConnectionImpl(latency_snapshot, is_soft_limit_reached, expired_connections);
+                else
+                {
+                    reused_connection = stored_connections.top();
+                    stored_connections.pop();
+                }
             }
         }
 
@@ -782,17 +923,16 @@ public:
         });
 
         std::lock_guard lock(mutex);
-        return wipeExpiredImpl(expired_connections);
+        return wipeExpiredImpl(expired_connections, group->isSoftLimitReached());
     }
 
-    size_t wipeExpiredImpl(std::vector<ConnectionPtr> & expired_connections) TSA_REQUIRES(mutex)
+    size_t wipeExpiredImpl(std::vector<ConnectionPtr> & expired_connections, bool is_soft_limit_reached) TSA_REQUIRES(mutex)
     {
         SCOPE_EXIT({
             CurrentMetrics::sub(getMetrics().stored_count, expired_connections.size());
             ProfileEvents::increment(getMetrics().expired, expired_connections.size());
         });
 
-        auto is_soft_limit_reached = group->isSoftLimitReached();
         while (!stored_connections.empty())
         {
             auto connection = stored_connections.top();
@@ -815,10 +955,111 @@ private:
         , https(https_)
         , proxy_configuration(std::move(proxy_configuration_))
         , group(group_)
+        , poco_proxy_config(
+              proxy_configuration.isEmpty() ? Poco::Net::HTTPClientSession::ProxyConfig{}
+                                            : proxyConfigurationToPocoProxyConfig(proxy_configuration))
+        , uses_target_resolution(computeUsesTargetResolution())
     {
     }
 
+    /// Whether connections in this pool resolve `host` locally and connect directly to a
+    /// resolved IP, rather than connecting to a proxy and letting the proxy resolve the target.
+    /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
+    /// `!_proxyConfig.host.empty() && !bypassProxy()`; when `no_proxy` matches `host`
+    /// (`bypassProxy()` true) Poco connects directly to `_resolved_host`.
+    /// `host` and the proxy configuration never change, so this is evaluated once, in the
+    /// constructor, instead of building a regular expression on every borrow.
+    bool computeUsesTargetResolution() const
+    {
+        /// Mirrors `Poco::Net::HTTPClientSession::bypassProxy`; keep in sync on Poco upgrades.
+        const bool proxy_bypassed_for_host = !poco_proxy_config.nonProxyHosts.empty()
+            && Poco::RegularExpression::match(
+                host,
+                poco_proxy_config.nonProxyHosts,
+                Poco::RegularExpression::RE_CASELESS | Poco::RegularExpression::RE_ANCHORED);
+        return proxy_configuration.isEmpty() || proxy_bypassed_for_host;
+    }
+
     WeakPtr getWeakFromThis() { return EndpointConnectionPool::weak_from_this(); }
+
+    /// Latency-aware dispatch: among the pooled connections, hand out the one whose resolved
+    /// front-end has the lowest observed latency EWMA, instead of the default least-recently-used
+    /// pick. Scans the underlying heap storage in-place in O(N) using pre-parsed `cached_resolved_ip`
+    /// and the pre-fetched `snapshot` (zero nested mutex acquisitions under `mutex`), then extracts
+    /// the chosen slot in O(log N) via `extractAt`.
+    /// Returns `nullptr` when even the fastest pooled connection is materially slower than the
+    /// fastest known front-end and the group is below its soft limit, or when no usable pooled
+    /// connection is left, so the caller opens a fresh connection instead.
+    ///
+    /// `wipeExpiredImpl` validates (`isExpired`, `isStale`) only `top()`, which is the connection the
+    /// default dispatch hands out. A connection picked by latency can be anywhere in the heap, so it
+    /// is validated here before it is handed out. An invalid one is moved to `expired_connections`
+    /// (destroyed by the caller outside `mutex`) and the selection is repeated.
+    ConnectionPtr selectBestStoredConnectionImpl(
+        const HostResolver::LatencySnapshot & snapshot, bool is_soft_limit_reached, std::vector<ConnectionPtr> & expired_connections)
+        TSA_REQUIRES(mutex)
+    {
+        /// `wipeExpiredImpl` has just validated the current `top()`.
+        bool top_is_validated = true;
+
+        while (!stored_connections.empty())
+        {
+            size_t best = 0;
+            double best_latency = std::numeric_limits<double>::max();
+            const size_t n = stored_connections.size();
+            for (size_t i = 0; i < n; ++i)
+            {
+                double latency = std::numeric_limits<double>::max();
+                if (const auto & ip = stored_connections[i]->cached_resolved_ip)
+                {
+                    const double ewma = snapshot.lookupLatencyMs(*ip);
+                    /// Unmeasured (0) is treated as worst so measured-fast connections win;
+                    /// unmeasured ones are still used once the fast ones are handed out (and
+                    /// reporting keeps every served address's EWMA fresh).
+                    if (ewma > 0)
+                        latency = ewma;
+                }
+                if (latency < best_latency)
+                {
+                    best_latency = latency;
+                    best = i;
+                }
+            }
+
+            /// Pool-composition bias: if even the fastest pooled connection's front-end is materially
+            /// slower than the fastest front-end we know of, prefer opening a fresh connection
+            /// (`selectBest` routes it to a fast front-end) over reusing a slow-backend one.
+            /// Same-region the TCP connect cost is ~1 ms, negligible next to the tens-of-ms backend
+            /// TTFB gap, so this trades a cheap connect for a big per-request win and shifts the
+            /// pool's composition toward fast front-ends over time. Gated on the soft limit so it
+            /// cannot grow the pool without bound.
+            if (!is_soft_limit_reached && best_latency != std::numeric_limits<double>::max())
+            {
+                const double fleet_min = snapshot.min_non_failed_ms;
+                if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
+                {
+                    ProfileEvents::increment(ProfileEvents::HTTPConnectionsSkippedAsSlow);
+                    return nullptr;
+                }
+            }
+
+            const bool is_validated = best == 0 && top_is_validated;
+            if (is_validated || (!isExpired(stored_connections[best], is_soft_limit_reached) && !isStale(*stored_connections[best])))
+                return stored_connections.extractAt(best);
+
+            /// `expired_connections` was reserved for the whole pool in `getConnection`, so this
+            /// `push_back` does not allocate. `wipeExpiredImpl` already accounted for its own entries,
+            /// so account for this one here.
+            auto invalid_connection = stored_connections.extractAt(best);
+            invalid_connection->markAsExpired();
+            expired_connections.push_back(std::move(invalid_connection));
+            CurrentMetrics::sub(getMetrics().stored_count, 1);
+            ProfileEvents::increment(getMetrics().expired, 1);
+            top_is_validated = false;
+        }
+
+        return nullptr;
+    }
 
     bool isExpired(ConnectionPtr connection, bool isSoftLimitReached) TSA_REQUIRES(mutex)
     {
@@ -875,8 +1116,7 @@ private:
     /// `_resolved_host` is left empty (Poco then uses `_host` for the proxy request / `CONNECT`
     /// target). A connect failure here belongs to the proxy, so it propagates without resolver
     /// bookkeeping or per-address retry.
-    ConnectionPtr prepareConnectionViaProxy(
-        const ConnectionTimeouts & timeouts, UInt64 * connect_time, const Poco::Net::HTTPClientSession::ProxyConfig & poco_proxy_config)
+    ConnectionPtr prepareConnectionViaProxy(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
     {
         auto connection = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
         connection->setKeepAlive(true);
@@ -903,24 +1143,12 @@ private:
 
     ConnectionPtr prepareNewConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
     {
-        /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
-        /// `!_proxyConfig.host.empty() && !bypassProxy()`; route that case to
-        /// `prepareConnectionViaProxy`, which does not touch the target `HostResolver`. When
-        /// `no_proxy` matches the target host (`bypassProxy()` true) Poco connects directly to
-        /// `_resolved_host`, so per-address retries and `setFail` apply as in the no-proxy case.
-        auto poco_proxy_config = proxy_configuration.isEmpty()
-            ? Poco::Net::HTTPClientSession::ProxyConfig{}
-            : proxyConfigurationToPocoProxyConfig(proxy_configuration);
-        /// Mirrors `Poco::Net::HTTPClientSession::bypassProxy`; keep in sync on Poco upgrades.
-        const bool proxy_bypassed_for_host = !poco_proxy_config.nonProxyHosts.empty()
-            && Poco::RegularExpression::match(
-                host,
-                poco_proxy_config.nonProxyHosts,
-                Poco::RegularExpression::RE_CASELESS | Poco::RegularExpression::RE_ANCHORED);
-        const bool retry_resolved_addresses = proxy_configuration.isEmpty() || proxy_bypassed_for_host;
-
-        if (!retry_resolved_addresses)
-            return prepareConnectionViaProxy(timeouts, connect_time, poco_proxy_config);
+        /// Route non-bypassed proxy connections to `prepareConnectionViaProxy`, which does not
+        /// touch the target `HostResolver`. When `no_proxy` matches the target host, Poco connects
+        /// directly to `_resolved_host`, so per-address retries and `setFail` apply as in the
+        /// no-proxy case.
+        if (!uses_target_resolution)
+            return prepareConnectionViaProxy(timeouts, connect_time);
 
         /// When DNS returns several addresses (e.g. an IPv4 and an IPv6 record), try the next one
         /// if the first fails with a network error. `max_connect_attempts` bounds real connect
@@ -1106,14 +1334,25 @@ private:
             return;
         }
 
+        /// The pool is global: everything allocated to keep the connection (the new session, the
+        /// sockets taken over by `assign`, the cached resolved IP, the heap slot) belongs to
+        /// `total_memory_tracker`, not to the query whose thread returns the connection. It is freed
+        /// later under the total tracker, and a query at its memory limit must not lose the connection.
+        /// Declared before `connection_to_store` so it outlives the local reference as well.
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
+        /// Declared outside the `try` so the `catch` can mark it expired: otherwise its destructor
+        /// (a connected, completed connection that is not marked expired) would call
+        /// `atConnectionDestroy` again, count a second reset and retry preserving it.
+        ConnectionPtr connection_to_store;
         try
         {
-            auto connection_to_store = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
+            connection_to_store = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
             connection_to_store->assign(connection);
+            connection_to_store->updateCachedResolvedIp();
             connection_to_store->notifySocketInode();
 
             {
-                MemoryTrackerSwitcher switcher{&total_memory_tracker};
                 std::lock_guard lock(mutex);
                 stored_connections.push(connection_to_store);
             }
@@ -1123,6 +1362,11 @@ private:
         }
         catch (...)
         {
+            /// This handler runs in a `noexcept` function and must not throw: building the log message
+            /// allocates, and the failure being handled may itself be a memory limit exception.
+            LockMemoryExceptionInThread lock_memory_exception{VariableContext::Global};
+            if (connection_to_store)
+                connection_to_store->markAsExpired();
             ProfileEvents::increment(getMetrics().reset, 1);
             tryLogCurrentException("HTTPConnectionPool", "Failed to preserve connection for reuse");
         }
@@ -1134,6 +1378,8 @@ private:
     const bool https;
     const ProxyConfiguration proxy_configuration;
     const ConnectionGroup::Ptr group;
+    const Poco::Net::HTTPClientSession::ProxyConfig poco_proxy_config;
+    const bool uses_target_resolution;
 
     std::mutex mutex;
     ConnectionsMinHeap stored_connections TSA_GUARDED_BY(mutex);

@@ -2,11 +2,16 @@
 
 #include <Common/DNSResolver.h>
 #include <Common/NetException.h>
+#include <Common/SharedLockGuard.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/thread_local_rng.h>
 #include <Common/MemoryTrackerSwitcher.h>
 
 #include <mutex>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
 #include <Poco/Timespan.h>
 
 
@@ -15,6 +20,7 @@ namespace ProfileEvents
     extern const Event AddressesDiscovered;
     extern const Event AddressesExpired;
     extern const Event AddressesMarkedAsFailed;
+    extern const Event AddressesLatencyReported;
 }
 
 namespace CurrentMetrics
@@ -29,6 +35,18 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int DNS_ERROR;
+}
+
+std::atomic<bool> HostResolver::latency_aware_selection{false};
+
+void HostResolver::setLatencyAwareSelection(bool enabled)
+{
+    latency_aware_selection.store(enabled, std::memory_order_relaxed);
+}
+
+bool HostResolver::latencyAwareSelectionEnabled()
+{
+    return latency_aware_selection.load(std::memory_order_relaxed);
 }
 
 HostResolverMetrics HostResolver::getMetrics()
@@ -66,6 +84,13 @@ HostResolver::HostResolver(
 
 HostResolver::~HostResolver()
 {
+    /// The records (and the `IPAddress` implementations in them) and the scratch buffer were
+    /// allocated under `total_memory_tracker` (see `update`), while this destructor runs in whatever
+    /// thread drops the last reference, under that thread's query tracker. Release them under the
+    /// tracker they were charged to, and explicitly: members are destroyed only after the body,
+    /// when the switcher is already gone.
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
     std::lock_guard lock(mutex);
 
     auto banned_count = 0;
@@ -74,7 +99,8 @@ HostResolver::~HostResolver()
     CurrentMetrics::sub(metrics.banned_count, banned_count);
 
     CurrentMetrics::sub(metrics.active_count, records.size());
-    records.clear();
+    Records().swap(records);
+    std::vector<double>().swap(measured_latencies_scratch);
 }
 
 void HostResolver::Entry::setFail()
@@ -117,10 +143,15 @@ void HostResolver::update()
 
 void HostResolver::reset()
 {
+    /// `clear` destroys the `IPAddress` implementations allocated under `total_memory_tracker`.
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
     std::lock_guard lock(mutex);
 
     CurrentMetrics::sub(metrics.active_count, records.size());
     records.clear();
+    weights_dirty = false;
+    has_measured_latency.store(false, std::memory_order_relaxed);
 }
 
 void HostResolver::updateWeights()
@@ -163,6 +194,88 @@ void HostResolver::setSuccess(const Poco::Net::IPAddress & address)
 
     if (old_weight != new_weight)
         updateWeights();
+}
+
+void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds)
+{
+    if (microseconds == 0)
+        return;
+
+    std::lock_guard lock(mutex);
+
+    auto it = find(address);
+    if (it == records.end())
+        return;
+
+    it->setLatency(microseconds);
+    has_measured_latency.store(true, std::memory_order_relaxed);
+    ProfileEvents::increment(ProfileEvents::AddressesLatencyReported);
+
+    /// Defer the O(R) median + prefix-sum recomputation to `selectBest`: pooled requests report
+    /// latency at the full S3 read rate while `resolve` runs only when opening a new connection,
+    /// and deferring also keeps `reportLatency` allocation-free and keeps it from running `updateWeights`
+    /// (whose all-banned fallback would un-ban addresses during `setFail`'s DNS refresh window).
+    if (latency_aware_selection.load(std::memory_order_relaxed))
+        weights_dirty = true;
+}
+
+HostResolver::LatencySnapshot::AddressKey HostResolver::LatencySnapshot::AddressKey::from(const Poco::Net::IPAddress & address)
+{
+    AddressKey key;
+    const size_t address_length = address.length();
+    chassert(address_length <= MAX_ADDRESS_LENGTH);
+    key.length = static_cast<UInt8>(address_length);
+    key.scope = address.scope();
+    std::memcpy(key.bytes.data(), address.addr(), address_length);
+    return key;
+}
+
+bool HostResolver::LatencySnapshot::AddressKey::operator<(const AddressKey & other) const
+{
+    /// The same order as `Poco::Net::IPAddress::operator<`.
+    if (length != other.length)
+        return length < other.length;
+    if (scope != other.scope)
+        return scope < other.scope;
+    return std::memcmp(bytes.data(), other.bytes.data(), length) < 0;
+}
+
+bool HostResolver::LatencySnapshot::AddressKey::operator==(const AddressKey & other) const
+{
+    return length == other.length && scope == other.scope && std::memcmp(bytes.data(), other.bytes.data(), length) == 0;
+}
+
+double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const
+{
+    const auto key = AddressKey::from(address);
+    auto it = std::lower_bound(
+        entries.begin(),
+        entries.end(),
+        key,
+        [](const auto & entry, const AddressKey & value) { return entry.first < value; });
+    if (it != entries.end() && it->first == key)
+        return it->second;
+    return 0;
+}
+
+HostResolver::LatencySnapshot HostResolver::getLatencySnapshot()
+{
+    LatencySnapshot snapshot;
+    if (!has_measured_latency.load(std::memory_order_relaxed))
+        return snapshot;
+
+    std::lock_guard lock(mutex);
+
+    snapshot.entries.reserve(records.size());
+    for (const auto & rec : records)
+    {
+        if (rec.latency_ms_ewma <= 0)
+            continue;
+        snapshot.entries.emplace_back(LatencySnapshot::AddressKey::from(rec.address), rec.latency_ms_ewma);
+        if (!rec.failed && (snapshot.min_non_failed_ms == 0 || rec.latency_ms_ewma < snapshot.min_non_failed_ms))
+            snapshot.min_non_failed_ms = rec.latency_ms_ewma;
+    }
+    return snapshot;
 }
 
 void HostResolver::setFail(const Poco::Net::IPAddress & address)
@@ -217,9 +330,16 @@ void HostResolver::setFail(const Poco::Net::IPAddress & address)
     }
 }
 
-Poco::Net::IPAddress HostResolver::selectBest()
+const Poco::Net::IPAddress & HostResolver::selectBest()
 {
     chassert(!records.empty());
+
+    /// Apply any latency samples accumulated since the last weight recomputation. Uses
+    /// `updateWeightsImpl` (not `updateWeights`) so a concurrent `resolve` during `setFail`'s
+    /// DNS refresh window leaves `total_weight == 0` intact for the uniform fallback below
+    /// rather than prematurely clearing bans.
+    if (weights_dirty || weights_latency_aware != latency_aware_selection.load(std::memory_order_relaxed))
+        updateWeightsImpl();
 
     /// Every address can be banned at once, giving a zero total weight. This happens
     /// transiently and without holding the lock continuously: `setFail` zeroes the
@@ -266,8 +386,20 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 {
     const auto last_effective_resolve = now - history;
 
+    /// Everything that can throw runs before the first change of shared state: the allocations of
+    /// the scratch buffer and of the merged records (including the `IPAddress` copies), then the
+    /// swap, which does not throw. The metrics are applied at the very end from local counters, so
+    /// a failure leaves `records`, `last_resolve_time` and the metrics as they were.
+    /// The scratch buffer is reserved first so `capacity() >= records.size()` holds on every exit
+    /// path (`merged` never has more records than the old and the new generation together).
+    measured_latencies_scratch.reserve(records.size() + next_gen.size());
+
     Records merged;
     merged.reserve(records.size() + next_gen.size());
+
+    size_t expired_count = 0;
+    size_t discovered_count = 0;
+    size_t banned_dropped_count = 0;
 
     auto it_before = records.begin();
     auto it_next = next_gen.begin();
@@ -280,10 +412,9 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
                 merged.push_back(*it_before);
             else
             {
-                CurrentMetrics::sub(metrics.active_count, 1);
-                ProfileEvents::increment(metrics.expired, 1);
+                ++expired_count;
                 if (it_before->failed)
-                    CurrentMetrics::sub(metrics.banned_count);
+                    ++banned_dropped_count;
             }
             ++it_before;
         }
@@ -292,8 +423,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
             /// there are could be duplicates in next_gen vector
             if (merged.empty() || merged.back().address != *it_next)
             {
-                CurrentMetrics::add(metrics.active_count, 1);
-                ProfileEvents::increment(metrics.discovered, 1);
+                ++discovered_count;
                 merged.push_back(Record(*it_next, now));
             }
             ++it_next;
@@ -318,7 +448,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
         if (record.fail_time < banned_until)
         {
             record.failed = false;
-            CurrentMetrics::sub(metrics.banned_count);
+            ++banned_dropped_count;
         }
     }
 
@@ -326,8 +456,24 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
     // check that merged contains unuque elements
     chassert(std::adjacent_find(merged.begin(), merged.end()) == merged.end());
 
-    last_resolve_time = now;
     records.swap(merged);
+    last_resolve_time = now;
+
+    CurrentMetrics::add(metrics.active_count, static_cast<Int64>(discovered_count) - static_cast<Int64>(expired_count));
+    CurrentMetrics::sub(metrics.banned_count, static_cast<Int64>(banned_dropped_count));
+    ProfileEvents::increment(metrics.expired, expired_count);
+    ProfileEvents::increment(metrics.discovered, discovered_count);
+
+    bool any_measured = false;
+    for (const auto & rec : records)
+    {
+        if (rec.latency_ms_ewma > 0)
+        {
+            any_measured = true;
+            break;
+        }
+    }
+    has_measured_latency.store(any_measured, std::memory_order_relaxed);
 
     if (records.empty())
         throw NetException(ErrorCodes::DNS_ERROR, "no endpoints resolved for host {}", host);
@@ -336,7 +482,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 }
 
 
-size_t HostResolver::getTotalWeight() const
+size_t HostResolver::getTotalWeight() const noexcept
 {
     if (records.empty())
         return 0;
@@ -346,11 +492,51 @@ size_t HostResolver::getTotalWeight() const
 
 void HostResolver::updateWeightsImpl()
 {
+    weights_dirty = false;
+
+    /// When latency-aware selection is on, compute the median latency (TTFB EWMA) across the
+    /// addresses that have a measurement, and bias each address's base weight by how its own
+    /// latency compares to that median. The bias is clamped and floored so that no address is
+    /// starved: even a slow one keeps a weight of at least 1 and is still probed, which keeps
+    /// its EWMA fresh and lets it recover if it speeds up again.
+    double median_latency_ms = 0;
+    const bool latency_aware = latency_aware_selection.load(std::memory_order_relaxed);
+    weights_latency_aware = latency_aware;
+    if (latency_aware)
+    {
+        /// `measured_latencies_scratch` is pre-reserved to `records.size()` in `updateImpl`,
+        /// so clearing and filling it here does not allocate under `mutex`.
+        measured_latencies_scratch.clear();
+        for (const auto & rec : records)
+            if (rec.latency_ms_ewma > 0)
+                measured_latencies_scratch.push_back(rec.latency_ms_ewma);
+
+        if (!measured_latencies_scratch.empty())
+        {
+            auto mid = measured_latencies_scratch.begin() + measured_latencies_scratch.size() / 2;
+            std::nth_element(measured_latencies_scratch.begin(), mid, measured_latencies_scratch.end());
+            median_latency_ms = *mid;
+        }
+    }
+
     size_t total_weight_next = 0;
 
     for (auto & rec: records)
     {
-        total_weight_next += rec.getWeight();
+        size_t weight = rec.getWeight();
+
+        if (latency_aware && weight > 0 && median_latency_ms > 0 && rec.latency_ms_ewma > 0)
+        {
+            /// ratio > 1 for faster-than-median addresses, < 1 for slower ones. Squared to
+            /// concentrate new-connection opens on the fast front-ends (so the pool composition
+            /// shifts toward them), with a wide clamp and a floor of 1 so slow addresses are
+            /// still probed occasionally and can recover.
+            const double ratio = median_latency_ms / rec.latency_ms_ewma;
+            const double factor = std::clamp(ratio * ratio, 0.1, 16.0);
+            weight = std::max<size_t>(1, static_cast<size_t>(std::lround(static_cast<double>(weight) * factor)));
+        }
+
+        total_weight_next += weight;
         rec.weight_prefix_sum = total_weight_next;
     }
 }
@@ -363,27 +549,143 @@ HostResolversPool & HostResolversPool::instance()
 
 void HostResolversPool::dropCache()
 {
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
     std::lock_guard lock(mutex);
     host_pools.clear();
+    /// Detach the in-flight lookups: their leaders and waiters keep their own references, but a
+    /// caller arriving after the drop starts a fresh lookup instead of joining one that began
+    /// before it, and a leader that finds its slot gone does not publish its result (see `getResolver`).
+    pending_resolvers.clear();
 }
 
 HostResolver::Ptr HostResolversPool::getResolver(const String & host)
 {
-    std::lock_guard lock(mutex);
+    {
+        SharedLockGuard lock(mutex);
+        if (auto it = host_pools.find(host); it != host_pools.end())
+            return it->second;
+    }
 
-    auto it = host_pools.find(host);
-    if (it != host_pools.end())
+    ResolverFactory factory;
+    std::shared_ptr<PendingResolver> pending;
+    std::shared_future<HostResolver::Ptr> in_flight;
+    {
+        /// The pool is global: the `PendingResolver` slot, its future state, and its map node
+        /// belong to `total_memory_tracker`, not to whichever query reached this cold host first,
+        /// and may be freed later by another thread.
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+        std::lock_guard lock(mutex);
+        if (auto it = host_pools.find(host); it != host_pools.end())
+            return it->second;
+
+        if (auto it = pending_resolvers.find(host); it != pending_resolvers.end())
+        {
+            in_flight = it->second->result;
+        }
+        else
+        {
+            factory = resolver_factory_for_test;
+            pending = std::make_shared<PendingResolver>();
+            pending_resolvers.emplace(host, pending);
+        }
+    }
+
+    /// Another thread is already resolving this host: wait for its outcome (a resolver, or the
+    /// exception of its failed lookup) instead of running the same DNS lookup again.
+    if (!pending)
+    {
+        SCOPE_EXIT_SAFE({
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            in_flight = {};
+        });
+        try
+        {
+            return in_flight.get();
+        }
+        catch (...)
+        {
+            /// All waiters of one lookup get the same stored exception. Give each waiter its own
+            /// copy so a caller that mutates its exception (e.g. `addMessage`) does not race with
+            /// the others.
+            std::rethrow_exception(copyMutableException(std::current_exception()));
+        }
+    }
+
+    /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
+    /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
+    /// every other host in the process. Concurrent callers for the same cold host wait on `pending`.
+    /// Switch to `total_memory_tracker` for the whole leader path so the `HostResolver` object and
+    /// `host_pools` node are charged to the global pool (matching `dropCache`), and a query at its
+    /// own memory limit neither fails to resolve nor publishes its query-specific exception to
+    /// unrelated waiting queries. Declared outside `pending`'s release scope so `~PendingResolver`
+    /// also runs under `total_memory_tracker`.
+    SCOPE_EXIT_SAFE({
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+        pending.reset();
+    });
+
+    HostResolver::Ptr resolver;
+    try
+    {
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+        auto created = factory ? factory(host) : HostResolver::create(host);
+
+        std::lock_guard lock(mutex);
+        /// `dropCache` removes the slot of a lookup in flight. Then this result may come from DNS
+        /// data older than the drop, so answer the callers of this lookup with it but do not cache it.
+        auto slot = pending_resolvers.find(host);
+        if (slot != pending_resolvers.end() && slot->second == pending)
+        {
+            resolver = host_pools.try_emplace(host, std::move(created)).first->second;
+            pending_resolvers.erase(slot);
+        }
+        else
+        {
+            resolver = std::move(created);
+        }
+    }
+    catch (...)
+    {
+        {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            std::lock_guard lock(mutex);
+            /// Only this lookup's own slot: after `dropCache` the key may belong to a newer lookup.
+            if (auto slot = pending_resolvers.find(host); slot != pending_resolvers.end() && slot->second == pending)
+                pending_resolvers.erase(slot);
+        }
+        /// Store an immutable copy as the template for the waiters so this caller can mutate its
+        /// own exception up the stack without racing with `copyMutableException` in a waiter.
+        {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            pending->promise.set_exception(copyMutableException(std::current_exception()));
+        }
+        throw;
+    }
+
+    pending->promise.set_value(resolver);
+    return resolver;
+}
+
+HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host)
+{
+    SharedLockGuard lock(mutex);
+
+    if (auto it = host_pools.find(host); it != host_pools.end())
         return it->second;
 
-    it = host_pools.emplace(host, HostResolver::create(host)).first;
-
-    return it->second;
+    return nullptr;
 }
 
 void HostResolversPool::injectResolverForTest(const String & host, HostResolver::Ptr resolver)
 {
     std::lock_guard lock(mutex);
     host_pools[host] = std::move(resolver);
+}
+
+void HostResolversPool::setResolverFactoryForTest(ResolverFactory factory)
+{
+    std::lock_guard lock(mutex);
+    resolver_factory_for_test = std::move(factory);
 }
 
 }

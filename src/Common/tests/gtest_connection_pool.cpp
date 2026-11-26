@@ -1,5 +1,8 @@
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <Common/CurrentThread.h>
+#include <Common/MemoryTracker.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/HTTPConnectionPool.h>
 #include <Common/HostResolvePool.h>
 #include <base/scope_guard.h>
@@ -15,10 +18,18 @@
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Net/SocketAddress.h>
+#include <Poco/Net/StreamSocket.h>
 
 #include <atomic>
+#include <map>
+#include <set>
 
 #include <gtest/gtest.h>
+
+namespace ProfileEvents
+{
+    extern const Event HTTPConnectionsSkippedAsSlow;
+}
 
 namespace
 {
@@ -1144,4 +1155,568 @@ TEST_F(ConnectionPoolTest, ServerOverwriteMaxRequests)
 
     ASSERT_EQ(0, CurrentMetrics::get(metrics.active_count));
     ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareReuseAfterDropDnsCacheForUnresolvableHost)
+{
+    /// Regression test: if `stored_connections` already holds a live connection and the cached
+    /// `HostResolver` is dropped (e.g. `SYSTEM DROP DNS CACHE`) while DNS for `host` fails,
+    /// `getConnection` under `http_latency_aware_host_selection` must reuse the pooled connection
+    /// without running DNS (and without destroying drained `PooledConnection`s while holding the
+    /// endpoint mutex, which self-deadlocks in `atConnectionDestroy`).
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "dropped-resolver-reuse.invalid";
+    const Poco::Net::IPAddress server_ip("127.0.0.1");
+
+    struct ResolveMock : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ResolveMock(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<ResolveMock>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [server_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {server_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Establish a connection and return it to `stored_connections`.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("Hello", *connection);
+    }
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+
+    /// Drop the cached resolver so `test_host` (`.invalid` TLD) is now unresolvable via real DNS.
+    DB::HostResolversPool::instance().dropCache();
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver(test_host));
+
+    /// Borrowing again must reuse the pooled connection without attempting DNS.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("World", *connection);
+    }
+
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(2, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver(test_host));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareProxyReuseSkipsTargetResolution)
+{
+    /// Regression test: a non-bypassed proxy pool never resolves the target host locally on
+    /// connect (`ProxyConnectSkipsTargetResolution`); reusing a pooled proxy connection under
+    /// `http_latency_aware_host_selection` must not resolve the proxy-only target host either
+    /// (which previously threw `DNS_ERROR` while `stored_connections` was drained under the
+    /// endpoint mutex, self-deadlocking in `~PooledConnection` -> `atConnectionDestroy`).
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    /// Point the HTTP proxy config at the local echo server: for plain HTTP proxy requests Poco
+    /// connects to `proxy_config.host:port` and sends the full target URI in the request line,
+    /// which `MockRequestHandler` echoes regardless of URI, while `proxy-only-reuse.invalid`
+    /// remains guaranteed unresolvable locally.
+    auto uri = Poco::URI("http://proxy-only-reuse.invalid:9999");
+
+    DB::ProxyConfiguration proxy_config;
+    proxy_config.host = "127.0.0.1";
+    proxy_config.port = server_data.port;
+    proxy_config.protocol = DB::ProxyConfiguration::Protocol::HTTP;
+
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, proxy_config);
+    auto metrics = pool->getMetrics();
+
+    /// First borrow opens a connection to the proxy and returns it to `stored_connections`.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("Hello", *connection);
+    }
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("proxy-only-reuse.invalid"));
+
+    /// Second borrow hits the non-empty `stored_connections` path under latency-aware selection.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("World", *connection);
+    }
+
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(2, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("proxy-only-reuse.invalid"));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareDispatchExtractsFastestConnectionInPlace)
+{
+    /// Exercises in-place heap scan + `ConnectionsMinHeap::extractAt` across multiple pooled
+    /// connections bound to distinct loopback addresses (`127.0.0.1`, `127.0.0.2`, `127.0.0.3`):
+    /// regardless of where the fastest connection sits in the min-heap (root, interior, or leaf),
+    /// `getConnection` must hand out pooled connections in ascending EWMA order and preserve heap
+    /// integrity across repeated borrows and returns.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "multi-frontend-dispatch.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress mid_ip("127.0.0.2");
+    const Poco::Net::IPAddress fast_ip("127.0.0.3");
+
+    /// Deterministic round-robin mock resolver so three simultaneous borrows open one connection
+    /// to each of the three loopback addresses (`server_data` listens on wildcard `0.0.0.0`).
+    /// Note: on macOS only `127.0.0.1` is configured on `lo0` by default, whereas the Linux test
+    /// container routes the entire `127.0.0.0/8` block on `lo`. Probe `127.0.0.2` first and fall
+    /// back to `127.0.0.1` only if the host OS lacks `127.0.0.2`.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(mid_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, mid_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+        {
+            return {slow_ip, mid_ip, fast_ip};
+        });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Open concurrent connections until we hold at least one bound to each of the 3 addresses,
+    /// plus extras so `stored_connections` has depth >= 3 (root, interior, leaf positions).
+    std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+    std::set<std::string> seen_ips;
+    for (size_t attempt = 0; attempt < 64 && (seen_ips.size() < 3 || held.size() < 6); ++attempt)
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("warmup", *conn);
+        seen_ips.insert(conn->getResolvedHost());
+        held.push_back(std::move(conn));
+    }
+    ASSERT_EQ(3u, seen_ips.size());
+    const size_t pooled_total = held.size();
+    held.clear(); /// Return all connections into `stored_connections`.
+    ASSERT_EQ(static_cast<Int64>(pooled_total), CurrentMetrics::get(metrics.stored_count));
+
+    /// Keep the spread within 15 ms (`best - fleet_min <= 15`) so pool-composition bias does not
+    /// open fresh connections and we strictly test in-place extraction from `stored_connections`.
+    mock_resolver->reportLatency(fast_ip, 2'000);  /// 2 ms
+    mock_resolver->reportLatency(mid_ip, 8'000);   /// 8 ms
+    mock_resolver->reportLatency(slow_ip, 14'000); /// 14 ms
+
+    /// Borrow all `pooled_total` connections simultaneously: every `fast_ip` connection must come
+    /// out before any `mid_ip`, and every `mid_ip` before any `slow_ip`.
+    double prev_latency = 0.0;
+    for (size_t i = 0; i < pooled_total; ++i)
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        Poco::Net::IPAddress ip(conn->getResolvedHost());
+        const double lat = mock_resolver->getLatencySnapshot().lookupLatencyMs(ip);
+        ASSERT_GE(lat, prev_latency);
+        prev_latency = lat;
+        echoRequest("check", *conn);
+        held.push_back(std::move(conn));
+    }
+    held.clear();
+    ASSERT_EQ(static_cast<Int64>(pooled_total), CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareDispatchSkipsStaleNonTopConnection)
+{
+    /// Regression test: the default dispatch hands out `top()` of the heap, which `wipeExpiredImpl`
+    /// has just validated (`isExpired`, `isStale`). Latency-aware dispatch picks the fastest pooled
+    /// connection wherever it sits in the heap, so it must validate that connection itself: a
+    /// connection that is no longer usable (here: the peer side is closed, as when a server drops
+    /// an idle keep-alive connection) must not be handed out, and the next best one must be used.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "stale-non-top-dispatch.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress fast_ip("127.0.0.2");
+
+    /// `server_data` listens on the wildcard address. macOS configures only `127.0.0.1` on `lo0`,
+    /// whereas Linux routes the whole `127.0.0.0/8` block, so skip where `127.0.0.2` is unreachable.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(fast_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+        {
+            return {slow_ip, fast_ip};
+        });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Hold connections simultaneously so that each borrow opens a new one, until there is one
+    /// bound to each address. Keep exactly one per address and close the rest.
+    std::map<std::string, DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> kept;
+    {
+        std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+        for (size_t attempt = 0; attempt < 64 && kept.size() < 2; ++attempt)
+        {
+            auto conn = pool->getConnection(timeouts, nullptr);
+            echoRequest("warmup", *conn);
+            const std::string resolved_host = conn->getResolvedHost();
+            if (kept.contains(resolved_host))
+                held.push_back(std::move(conn));
+            else
+                kept.emplace(resolved_host, std::move(conn));
+        }
+        for (auto & conn : held)
+            (*conn).reset();
+    }
+    ASSERT_EQ(2u, kept.size());
+
+    /// The fast connection must not be `top()`: it is used after the slow one, so the slow one
+    /// expires first and is at the heap root.
+    echoRequest("slow", *kept.at(slow_ip.toString()));
+    echoRequest("fast", *kept.at(fast_ip.toString()));
+
+    /// Make the fast connection unusable while it stays "connected" from the pool's point of view:
+    /// after `SHUT_RD`, `recv` returns EOF, which `getSocketState` reports as `Closed`, exactly as
+    /// for a connection the peer has closed. It is neither expired nor flagged by `atConnectionDestroy`.
+    kept.at(fast_ip.toString())->socket().shutdownReceive();
+
+    kept.clear(); /// Return both connections into `stored_connections`.
+    ASSERT_EQ(2, CurrentMetrics::get(metrics.stored_count));
+
+    /// Keep the spread within 15 ms so the pool-composition bias does not open a fresh connection.
+    mock_resolver->reportLatency(fast_ip, 2'000);   /// 2 ms
+    mock_resolver->reportLatency(slow_ip, 10'000);  /// 10 ms
+
+    const UInt64 expired_before = DB::CurrentThread::getProfileEvents()[metrics.expired];
+    const UInt64 reused_before = DB::CurrentThread::getProfileEvents()[metrics.reused];
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        ASSERT_EQ(slow_ip.toString(), conn->getResolvedHost());
+        echoRequest("after-stale", *conn);
+    }
+
+    ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
+    ASSERT_EQ(reused_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareSnapshotIsReleasedUnderTheTrackerItWasAllocatedUnder)
+{
+    /// Regression test: `getConnection` captures the resolver latency snapshot under
+    /// `total_memory_tracker` (the pool is global, not charged to a query). Previously the snapshot
+    /// was destroyed at scope exit, after the `MemoryTrackerSwitcher` was gone, so its buffer was
+    /// freed against the query tracker: the query was credited with bytes it was never charged for
+    /// (and `total_memory_tracker` kept them accounted forever).
+    DB::MainThreadStatus::getInstance();
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "snapshot-tracker-symmetry.invalid";
+    const Poco::Net::IPAddress ip("127.0.0.1");
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("warmup", *conn);
+    }
+    mock_resolver->reportLatency(ip, 2'000); /// Non-empty snapshot => `entries` is heap-allocated.
+
+    /// Interpose a "query" tracker between the thread tracker and `total_memory_tracker`.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(&query_tracker);
+
+    /// A tracker's amount is clamped at zero, so charge the "query" first to make an over-release
+    /// visible. This buffer is allocated and released while the query tracker is the parent.
+    auto pre_charge = std::make_unique<char[]>(1 << 20);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory"); /// Keep the compiler from eliding the allocation.
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = query_tracker.get();
+    auto conn = pool->getConnection(timeouts, nullptr);
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 delta = query_tracker.get() - before;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(prev_parent);
+
+    /// The snapshot was charged to `total_memory_tracker`, so it must be released there too:
+    /// nothing may be credited back to the query tracker.
+    ASSERT_GE(delta, 0) << "latency snapshot freed against the query tracker";
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareSlowPooledConnectionIsSkippedAndCounted)
+{
+    /// A pooled connection whose address is much slower than the fastest known one (`> 1.3x` and
+    /// `> 15 ms` above it) is not reused: a new connection is opened instead and the decision is
+    /// counted in `HTTPConnectionsSkippedAsSlow`.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "slow-pooled-connection-skipped.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress fast_ip("127.0.0.2");
+
+    /// macOS configures only `127.0.0.1` on `lo0`, whereas Linux routes the whole `127.0.0.0/8`.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(fast_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {slow_ip, fast_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Hold connections simultaneously until there is one bound to each address, then keep only
+    /// the slow one in the pool.
+    DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr slow_connection;
+    {
+        std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+        for (size_t attempt = 0; attempt < 64 && !slow_connection; ++attempt)
+        {
+            auto conn = pool->getConnection(timeouts, nullptr);
+            echoRequest("warmup", *conn);
+            if (conn->getResolvedHost() == slow_ip.toString())
+                slow_connection = std::move(conn);
+            else
+                held.push_back(std::move(conn));
+        }
+        for (auto & conn : held)
+            (*conn).reset();
+    }
+    ASSERT_TRUE(slow_connection);
+    slow_connection.reset(); /// Return the slow connection into `stored_connections`.
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+
+    mock_resolver->reportLatency(fast_ip, 2'000);   /// 2 ms
+    mock_resolver->reportLatency(slow_ip, 50'000);  /// 50 ms
+
+    const UInt64 skipped_before = DB::CurrentThread::getProfileEvents()[ProfileEvents::HTTPConnectionsSkippedAsSlow];
+    const UInt64 reused_before = DB::CurrentThread::getProfileEvents()[metrics.reused];
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("after-skip", *conn);
+    }
+
+    ASSERT_EQ(skipped_before + 1, DB::CurrentThread::getProfileEvents()[ProfileEvents::HTTPConnectionsSkippedAsSlow]);
+    ASSERT_EQ(reused_before, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+}
+
+TEST_F(ConnectionPoolTest, PreservingConnectionSurvivesAllocationFailureWhileCachingResolvedIp)
+{
+    /// Regression test: `atConnectionDestroy` is `noexcept` and wraps the preparation of the
+    /// connection to store in `try`/`catch`, which resets the connection and logs. An allocation
+    /// failure there (`assign`, caching the resolved IP) must be handled by that `catch`, and the
+    /// handler itself must not throw while building the log message. Both `updateCachedResolvedIp`
+    /// being `noexcept` and an unprotected handler turned the exception into `std::terminate`.
+    DB::MainThreadStatus::getInstance();
+
+    auto pool = getPool();
+    auto metrics = pool->getMetrics();
+
+    auto conn = pool->getConnection(timeouts, nullptr);
+    echoRequest("Hello", *conn);
+
+    const UInt64 reset_before = DB::CurrentThread::getProfileEvents()[metrics.reset];
+    const UInt64 preserved_before = DB::CurrentThread::getProfileEvents()[metrics.preserved];
+
+    /// The preserve path allocates under `total_memory_tracker` (the pool is global), so a 1-byte
+    /// hard limit on it makes every allocation of that path throw `MEMORY_LIMIT_EXCEEDED`.
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_total_hard_limit = total_memory_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        total_memory_tracker.setHardLimit(saved_total_hard_limit);
+        DB::CurrentThread::flushUntrackedMemory();
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    total_memory_tracker.setHardLimit(1);
+
+    conn.reset(); /// Returns the connection to the pool: `atConnectionDestroy`.
+
+    total_memory_tracker.setHardLimit(saved_total_hard_limit);
+
+    /// Exactly one reset: the destructor of the half-built connection must not count another one.
+    ASSERT_EQ(reset_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reset]);
+    ASSERT_EQ(preserved_before, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
+}
+
+TEST_F(ConnectionPoolTest, PreservingConnectionDoesNotChargeTheQueryMemoryLimit)
+{
+    /// Regression test: the pool is global, so everything `atConnectionDestroy` allocates to keep
+    /// a connection (`assign`, the cached resolved IP) belongs to `total_memory_tracker`, like the
+    /// `create` and `push` it already switched for. Part of it used to be allocated under the
+    /// query tracker, so a query at its memory limit lost the connection, and the bytes were
+    /// freed later under the total tracker.
+    DB::MainThreadStatus::getInstance();
+
+    auto pool = getPool();
+    auto metrics = pool->getMetrics();
+
+    auto conn = pool->getConnection(timeouts, nullptr);
+    echoRequest("Hello", *conn);
+
+    const UInt64 reset_before = DB::CurrentThread::getProfileEvents()[metrics.reset];
+    const UInt64 preserved_before = DB::CurrentThread::getProfileEvents()[metrics.preserved];
+
+    /// Interpose a "query" tracker with a 1-byte hard limit between the thread and the total tracker.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    query_tracker.setHardLimit(1);
+    thread_tracker->setParent(&query_tracker);
+
+    conn.reset(); /// Returns the connection to the pool: `atConnectionDestroy`.
+
+    DB::CurrentThread::flushUntrackedMemory();
+    query_tracker.setHardLimit(0);
+    thread_tracker->setParent(prev_parent);
+
+    ASSERT_EQ(reset_before, DB::CurrentThread::getProfileEvents()[metrics.reset]);
+    ASSERT_EQ(preserved_before + 1, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
 }

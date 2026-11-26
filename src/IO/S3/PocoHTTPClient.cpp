@@ -17,6 +17,7 @@
 
 #include <Common/logger_useful.h>
 #include <Common/Stopwatch.h>
+#include <Common/HostResolvePool.h>
 #include <Common/Throttler.h>
 #include <Common/re2.h>
 #include <IO/Expect404ResponseScope.h>
@@ -725,12 +726,50 @@ void PocoHTTPClient::makeRequestInternalImpl(
 
             if (enable_s3_requests_logging)
                 LOG_TEST(log, "Receiving response...");
+            /// Measure time-to-first-byte: the wait for and read of the response status line and
+            /// headers. This isolates request latency (network RTT + server/backend first-byte
+            /// time) from the connect and body-transfer phases, and is fed back per resolved
+            /// address to drive latency-aware host selection when it is enabled. Only successful
+            /// (`2xx`) `GET` and `HEAD` responses are fed back: for a request with a body the wait
+            /// also covers the server-side processing of the upload (for example
+            /// `CompleteMultipartUpload`), and error or fast-fail responses (`4xx`/`5xx`, such as
+            /// edge throttling, `404` existence probes, or unhealthy front-ends returning `500`/
+            /// `503` without consulting storage) complete much faster than real storage reads and
+            /// would otherwise create positive feedback towards failing or misbehaving addresses.
+            Stopwatch first_byte_watch;
             auto & response_body_stream = session->receiveResponse(poco_response);
+            const UInt64 first_byte_us = first_byte_watch.elapsedMicroseconds();
 
             watch.stop();
             addMetric(request, S3MetricType::Microseconds, watch.elapsedMicroseconds());
 
             int status_code = static_cast<int>(poco_response.getStatus());
+
+            const bool is_read_request = request.GetMethod() == Aws::Http::HttpMethod::HTTP_GET
+                || request.GetMethod() == Aws::Http::HttpMethod::HTTP_HEAD;
+            const bool is_success_status = status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX;
+            if (is_read_request && is_success_status && HostResolver::latencyAwareSelectionEnabled())
+            {
+                /// Requests that go through a proxy are not measured, but they need no separate check:
+                /// a connection to the proxy keeps `_resolved_host` empty (the proxy resolves the
+                /// target), which is skipped below. A request that matches `no_proxy` connects to
+                /// the resolved target address directly and is measured like any other.
+                ///
+                /// No `try`/`catch` here: `reportLatency` itself does not allocate, and the only
+                /// remaining failures are a memory limit exception from the address parsing below or
+                /// a query cancellation, which must propagate like in any other allocation of this
+                /// request instead of being swallowed and logged.
+                Poco::Net::IPAddress resolved_ip;
+                const std::string resolved_host = session->getResolvedHost();
+                if (!resolved_host.empty() && Poco::Net::IPAddress::tryParse(resolved_host, resolved_ip))
+                {
+                    /// Use `tryGetResolver` rather than `getResolver`: if the DNS cache was just
+                    /// dropped (`SYSTEM DROP DNS CACHE`) and DNS is transiently failing, creating
+                    /// a resolver here would run DNS and throw.
+                    if (auto resolver = HostResolversPool::instance().tryGetResolver(target_uri.getHost()))
+                        resolver->reportLatency(resolved_ip, first_byte_us);
+                }
+            }
 
             if (status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX)
             {

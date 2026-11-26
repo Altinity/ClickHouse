@@ -66,6 +66,7 @@
 #include <Common/FailPoint.h>
 #include <Common/CPUID.h>
 #include <Common/HTTPConnectionPool.h>
+#include <Common/HostResolvePool.h>
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
 #include <Common/SQLDefinedHandlers/SQLDefinedHandlersFactory.h>
 #include <Server/createServer.h>
@@ -272,6 +273,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 http_connections_warn_limit;
     extern const ServerSettingsUInt64 http_connections_rcvbuf;
     extern const ServerSettingsUInt64 http_connections_sndbuf;
+    extern const ServerSettingsBool http_latency_aware_host_selection;
     extern const ServerSettingsString index_mark_cache_policy;
     extern const ServerSettingsUInt64 index_mark_cache_size;
     extern const ServerSettingsDouble index_mark_cache_size_ratio;
@@ -3201,6 +3203,8 @@ try
                     new_server_settings[ServerSetting::http_connections_rcvbuf],
                     new_server_settings[ServerSetting::http_connections_sndbuf],
                 });
+
+            HostResolver::setLatencyAwareSelection(new_server_settings[ServerSetting::http_latency_aware_host_selection]);
 
             DNSResolver::instance().setFilterSettings(new_server_settings[ServerSetting::dns_allow_resolve_names_to_ipv4], new_server_settings[ServerSetting::dns_allow_resolve_names_to_ipv6]);
 

@@ -1,0 +1,3 @@
+<clickhouse>
+    <http_latency_aware_host_selection>1</http_latency_aware_host_selection>
+</clickhouse>

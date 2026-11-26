@@ -1,14 +1,31 @@
 #include <IO/WriteBufferFromFile.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/CurrentThread.h>
 #include <Common/HostResolvePool.h>
+#include <Common/MemoryTracker.h>
+#include <Common/NetException.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 
 #include <gtest/gtest.h>
 
 #include <optional>
 #include <chrono>
+#include <future>
 #include <thread>
 
+
+namespace DB::ErrorCodes
+{
+    extern const int DNS_ERROR;
+}
+
+namespace ProfileEvents
+{
+    extern const Event AddressesLatencyReported;
+}
 
 using namespace std::literals::chrono_literals;
 
@@ -819,4 +836,925 @@ TEST_F(ResolvePoolTest, UnbannedAfterConcurrentSuccess)
 
     ASSERT_EQ(3, CurrentMetrics::get(metrics.active_count));
     ASSERT_EQ(0, CurrentMetrics::get(metrics.banned_count));
+}
+
+namespace
+{
+
+/// The switch is process-wide, so a test that turns it on must not leak it into the next one.
+class LatencyAwareSelectionScope
+{
+public:
+    explicit LatencyAwareSelectionScope(bool enabled) { DB::HostResolver::setLatencyAwareSelection(enabled); }
+    ~LatencyAwareSelectionScope() { DB::HostResolver::setLatencyAwareSelection(false); }
+};
+
+}
+
+TEST_F(ResolvePoolTest, LatencyEwma)
+{
+    LatencyAwareSelectionScope scope(false);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress slow("127.0.0.2");
+    const Poco::Net::IPAddress unknown("127.0.0.9");
+
+    const UInt64 reported_before = DB::CurrentThread::getProfileEvents()[ProfileEvents::AddressesLatencyReported];
+
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().min_non_failed_ms);
+
+    resolver->reportLatency(fast, 1000);
+    ASSERT_DOUBLE_EQ(1.0, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+
+    /// EWMA with alpha = 0.2: 0.2 * 2 + 0.8 * 1.
+    resolver->reportLatency(fast, 2000);
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+
+    resolver->reportLatency(slow, 10000);
+    ASSERT_DOUBLE_EQ(10.0, resolver->getLatencySnapshot().lookupLatencyMs(slow));
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().min_non_failed_ms);
+
+    /// A zero sample and an unknown address are ignored.
+    resolver->reportLatency(fast, 0);
+    resolver->reportLatency(unknown, 5000);
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(unknown));
+
+    /// Only the three accepted samples are counted; the zero sample and the unknown address are not.
+    ASSERT_EQ(reported_before + 3, DB::CurrentThread::getProfileEvents()[ProfileEvents::AddressesLatencyReported]);
+}
+
+TEST_F(ResolvePoolTest, LatencyAwareSelectionPrefersFastAddress)
+{
+    LatencyAwareSelectionScope scope(true);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 10000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 10000);
+
+    std::map<String, size_t> results;
+    for (size_t i = 0; i < 3000; ++i)
+    {
+        auto entry = resolver->resolve();
+        ++results[*entry];
+    }
+
+    ASSERT_EQ(size_t(3), results.size());
+    ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.2"]);
+    ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.3"]);
+
+    /// A slow address keeps a floor of weight, so it is still probed and can recover.
+    ASSERT_GT(results["127.0.0.2"], 0);
+    ASSERT_GT(results["127.0.0.3"], 0);
+}
+
+TEST_F(ResolvePoolTest, LatencyIsIgnoredWhenLatencyAwareSelectionIsOff)
+{
+    LatencyAwareSelectionScope scope(false);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 100000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 100000);
+
+    std::map<String, size_t> results;
+    for (size_t i = 0; i < 50000; ++i)
+    {
+        auto entry = resolver->resolve();
+        ++results[*entry];
+    }
+
+    auto mean = getMean(results);
+    auto diff = getMaxDiff(results, mean);
+
+    ASSERT_GT(0.3 * mean, diff);
+}
+
+TEST_F(ResolvePoolTest, TogglingLatencyAwareSelectionRecomputesWeights)
+{
+    LatencyAwareSelectionScope scope(false);
+    /// Large history so `resolve_interval` (history / 3) keeps the DNS refresh, which recomputes
+    /// the weights, out of the way: only the toggle may trigger a recomputation here.
+    auto resolver = make_resolver(100000);
+    resolver->resolve(); /// populate the records
+
+    const auto count_picks = [&](size_t n)
+    {
+        std::map<String, size_t> results;
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto entry = resolver->resolve();
+            ++results[*entry];
+        }
+        return results;
+    };
+
+    /// Move every address past the last `usage` threshold of `Record::getWeight`; crossing one
+    /// recomputes the weights (`setSuccess`) and would hide a missing recomputation on a toggle flip.
+    count_picks(40000);
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 100000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 100000);
+
+    /// Turning the setting on after the latencies were reported biases the next picks, although
+    /// no new sample marked the weights dirty.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    {
+        auto results = count_picks(3000);
+        ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.2"]);
+    }
+
+    /// Turning it off drops the bias on the next pick, without waiting for a DNS refresh.
+    DB::HostResolver::setLatencyAwareSelection(false);
+    {
+        auto results = count_picks(50000);
+        auto mean = getMean(results);
+        auto diff = getMaxDiff(results, mean);
+        ASSERT_GT(0.3 * mean, diff);
+    }
+}
+
+TEST_F(ResolvePoolTest, LatencySnapshotFastExitAndLookup)
+{
+    LatencyAwareSelectionScope scope(true);
+    auto resolver = make_resolver();
+    resolver->resolve();
+
+    /// Before any measurement, `getLatencySnapshot` takes the atomic fast path and returns empty.
+    ASSERT_TRUE(resolver->getLatencySnapshot().empty());
+
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress mid("127.0.0.2");
+    const Poco::Net::IPAddress unmeasured("127.0.0.3");
+    const Poco::Net::IPAddress unknown("127.0.0.9");
+
+    resolver->reportLatency(mid, 10000);
+    resolver->reportLatency(fast, 2000);
+
+    {
+        auto snap = resolver->getLatencySnapshot();
+        ASSERT_FALSE(snap.empty());
+        ASSERT_EQ(2u, snap.entries.size());
+        ASSERT_DOUBLE_EQ(2.0, snap.lookupLatencyMs(fast));
+        ASSERT_DOUBLE_EQ(10.0, snap.lookupLatencyMs(mid));
+        ASSERT_DOUBLE_EQ(0.0, snap.lookupLatencyMs(unmeasured));
+        ASSERT_DOUBLE_EQ(0.0, snap.lookupLatencyMs(unknown));
+        ASSERT_DOUBLE_EQ(2.0, snap.min_non_failed_ms);
+    }
+
+    /// `reset` clears the measured flag so the snapshot is empty again.
+    resolver->reset();
+    ASSERT_TRUE(resolver->getLatencySnapshot().empty());
+}
+
+TEST_F(ResolvePoolTest, ColdHostResolveDoesNotBlockHotResolverLookups)
+{
+    /// Regression test: latency-aware selection calls `tryGetResolver` on the request hot paths
+    /// (`getConnection` and after every successful S3 `GET`/`HEAD`). Creating a resolver for a
+    /// cold host runs its initial DNS lookup, so `HostResolversPool::getResolver` must not hold
+    /// the global pool lock across that lookup, or one slow DNS query stalls every other host.
+    SCOPE_EXIT({
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String hot_host = "hot-endpoint.invalid";
+    const String cold_host = "slow-dns-endpoint.invalid";
+    const Poco::Net::IPAddress hot_ip("127.0.0.1");
+    const Poco::Net::IPAddress cold_ip("127.0.0.2");
+
+    auto hot_resolver = std::make_shared<ResolvePoolMock>(
+        hot_host,
+        Poco::Timespan(60, 0),
+        [hot_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {hot_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(hot_host, hot_resolver);
+
+    std::promise<void> dns_entered;
+    auto dns_entered_future = dns_entered.get_future();
+    std::promise<void> allow_dns_finish;
+    auto allow_dns_finish_future = allow_dns_finish.get_future().share();
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host) -> DB::HostResolver::Ptr
+        {
+            return std::make_shared<ResolvePoolMock>(
+                host,
+                Poco::Timespan(60, 0),
+                [&, cold_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+                {
+                    dns_entered.set_value();
+                    allow_dns_finish_future.wait();
+                    return {cold_ip};
+                });
+        });
+
+    std::thread cold_resolve_thread([&]
+    {
+        auto resolver = DB::HostResolversPool::instance().getResolver(cold_host);
+        ASSERT_NE(nullptr, resolver);
+    });
+    SCOPE_EXIT({
+        if (cold_resolve_thread.joinable())
+            cold_resolve_thread.join();
+    });
+
+    ASSERT_EQ(std::future_status::ready, dns_entered_future.wait_for(5s));
+
+    /// While `cold_host` is blocked inside its initial DNS lookup, both `tryGetResolver` and
+    /// `getResolver` for `hot_host` (and `tryGetResolver` for an unknown host) must finish
+    /// immediately rather than waiting on `allow_dns_finish`.
+    auto lookup_done = std::async(std::launch::async, [&]
+    {
+        EXPECT_EQ(hot_resolver, DB::HostResolversPool::instance().tryGetResolver(hot_host));
+        EXPECT_EQ(hot_resolver, DB::HostResolversPool::instance().getResolver(hot_host));
+        EXPECT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("unregistered.invalid"));
+    });
+
+    const auto status = lookup_done.wait_for(500ms);
+    allow_dns_finish.set_value();
+    lookup_done.get();
+    cold_resolve_thread.join();
+
+    ASSERT_EQ(std::future_status::ready, status);
+    ASSERT_NE(nullptr, DB::HostResolversPool::instance().tryGetResolver(cold_host));
+}
+
+TEST_F(ResolvePoolTest, LatencyReportDoesNotUnbanAddressDuringFailRefresh)
+{
+    /// Regression: `setFail` zeroes the failed address's weight with `updateWeightsImpl` and then
+    /// releases the lock to refresh DNS. It deliberately does not run the "all addresses banned"
+    /// fallback (`updateWeights`) before the refresh, because that would un-ban the address it
+    /// just failed even if the refresh discovers a healthy one. A latency report that lands in that
+    /// window must not apply the fallback either.
+    ///
+    /// `update` calls `resolve_function` without the lock, exactly in that window, so reporting
+    /// latency from inside `resolve_function` reproduces the interleaving deterministically.
+    LatencyAwareSelectionScope scope(true);
+
+    const Poco::Net::IPAddress ip("127.0.0.1");
+    const std::vector<Poco::Net::IPAddress> current{ip};
+    DB::HostResolver * resolver_raw = nullptr;
+    bool report_in_refresh = false;
+    std::optional<Int64> banned_during_refresh;
+
+    auto resolve_func = [&](const String &)
+    {
+        if (report_in_refresh)
+        {
+            report_in_refresh = false;
+            resolver_raw->reportLatency(ip, 5000);
+            banned_during_refresh = CurrentMetrics::get(metrics.banned_count);
+        }
+        return current;
+    };
+
+    /// Large history so the ban does not expire and no background refresh fires.
+    auto resolver = std::make_shared<ResolvePoolMock>("some_host", Poco::Timespan(10 * 1000 * 1000), resolve_func);
+    resolver_raw = resolver.get();
+
+    auto addr = resolver->resolve();
+    ASSERT_EQ(*addr, "127.0.0.1");
+
+    report_in_refresh = true;
+    addr.setFail();
+
+    ASSERT_TRUE(banned_during_refresh.has_value());
+    ASSERT_EQ(1, *banned_during_refresh);
+}
+
+TEST_F(ResolvePoolTest, ReportLatencyDoesNotAllocateOrThrowUnderMemoryLimit)
+{
+    /// Regression test: `PocoHTTPClient` calls `reportLatency` after `receiveResponse` has already
+    /// read the HTTP response headers, and `reportLatency` runs under `HostResolver::mutex`.
+    /// Previously `reportLatency` called `updateWeightsImpl` on every sample, which allocated a
+    /// temporary `std::vector<double>` under `mutex` and threw `MEMORY_LIMIT_EXCEEDED` when the
+    /// query/server memory tracker was at its limit - aborting a completed S3 read and doing an
+    /// O(R) median + prefix-sum recomputation per request.
+    DB::MainThreadStatus::getInstance();
+    LatencyAwareSelectionScope scope(true);
+
+    struct ZeroAllocInspector : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ZeroAllocInspector(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+
+        const Poco::Net::IPAddress & pickBestZeroAlloc()
+        {
+            std::lock_guard lock(mutex);
+            return selectBest();
+        }
+    };
+
+    /// Large history so no background `update` runs.
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress mid("127.0.0.2");
+    const Poco::Net::IPAddress slow("127.0.0.3");
+    auto resolver = std::make_shared<ZeroAllocInspector>(
+        "zero_alloc_host",
+        Poco::Timespan(60, 0),
+        [fast, mid, slow](const String &) -> std::vector<Poco::Net::IPAddress> { return {fast, mid, slow}; });
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_thread_hard_limit = thread_tracker.getHardLimit();
+    const Int64 saved_total_hard_limit = total_memory_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+
+    SCOPE_EXIT_SAFE({
+        total_memory_tracker.setHardLimit(saved_total_hard_limit);
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    /// Touch `thread_local_rng` via a warmup `resolve` before arming the memory limit, because
+    /// C++ `thread_local` initialization (`randomSeed`) runs on first ODR-use in the thread.
+    resolver->resolve().setUnused();
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    total_memory_tracker.resetCounters();
+    thread_tracker.resetCounters();
+    total_memory_tracker.setHardLimit(1);
+    thread_tracker.setHardLimit(1);
+
+    /// Under a 1-byte hard limit, any heap allocation throws `MEMORY_LIMIT_EXCEEDED`. Both
+    /// `reportLatency` and the lazy weight recomputation inside `selectBest` -> `updateWeightsImpl`
+    /// must succeed with zero allocations (`Entry` construction is excluded because `Poco::Net::IPAddress`
+    /// allocates its `IPv4AddressImpl` on copy).
+    bool threw = false;
+    try
+    {
+        resolver->reportLatency(fast, 1'000);
+        resolver->reportLatency(mid, 20'000);
+        resolver->reportLatency(slow, 20'000);
+        const auto & picked = resolver->pickBestZeroAlloc();
+        (void)picked;
+    }
+    catch (...)
+    {
+        threw = true;
+    }
+
+    total_memory_tracker.setHardLimit(saved_total_hard_limit);
+    thread_tracker.setHardLimit(saved_thread_hard_limit);
+    DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+
+    ASSERT_FALSE(threw) << "reportLatency / selectBest allocated memory under hard limit";
+
+    /// Verify that the deferred weight recomputation actually took effect and biased `selectBest`
+    /// toward `fast` (`1 ms` vs median `20 ms`).
+    size_t fast_picks = 0;
+    constexpr size_t trials = 2000;
+    for (size_t i = 0; i < trials; ++i)
+    {
+        auto entry = resolver->resolve();
+        if (*entry == "127.0.0.1")
+            ++fast_picks;
+        entry.setUnused();
+    }
+    ASSERT_GT(fast_picks, trials * 8 / 10);
+}
+
+TEST_F(ResolvePoolTest, LatencySnapshotHoldsOnlyItsEntryBuffer)
+{
+    /// Regression test: `getLatencySnapshot` runs on every borrow, under the resolver mutex shared
+    /// with `reportLatency`. Storing `Poco::Net::IPAddress` copies in the snapshot cost one extra
+    /// heap allocation per address (the implementation object), so a snapshot of `R` addresses made
+    /// `1 + R` allocations under the mutex. The snapshot must hold nothing but its entry buffer.
+    DB::MainThreadStatus::getInstance();
+    LatencyAwareSelectionScope scope(true);
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({ DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit; });
+
+    /// Large history so no background `update` runs.
+    auto resolver = make_resolver(100000);
+    resolver->resolve().setUnused();
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 2000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 3000);
+
+    /// Account every allocation precisely instead of batching it in the per-thread untracked counter.
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = thread_tracker.get();
+    auto snapshot = resolver->getLatencySnapshot();
+    const Int64 held = thread_tracker.get() - before;
+
+    ASSERT_EQ(size_t(3), snapshot.entries.size());
+    using Entry = decltype(snapshot.entries)::value_type;
+    ASSERT_EQ(static_cast<Int64>(snapshot.entries.capacity() * sizeof(Entry)), held);
+}
+
+TEST_F(ResolvePoolTest, DestroyingResolverReleasesItsStateUnderTheTotalTracker)
+{
+    /// Regression test: the `records` and `measured_latencies_scratch` buffers and the
+    /// `IPAddress` implementations of every record are allocated by `update` under
+    /// `total_memory_tracker` (the resolver is global, not charged to a query), but the thread that
+    /// drops the last reference runs the destructor under its own query tracker. Freeing them there
+    /// credited the query with bytes it was never charged for.
+    DB::MainThreadStatus::getInstance();
+
+    constexpr size_t address_count = 200;
+    std::vector<Poco::Net::IPAddress> resolved;
+    resolved.reserve(address_count);
+    for (size_t i = 0; i < address_count; ++i)
+        resolved.emplace_back("10.0." + std::to_string(i / 250) + "." + std::to_string(i % 250 + 1));
+
+    /// Large history so no background `update` runs.
+    auto resolver = std::make_shared<ResolvePoolMock>(
+        "tracker-symmetry-host",
+        Poco::Timespan(60 * 1000 * 1000),
+        [&resolved](const String &) -> std::vector<Poco::Net::IPAddress> { return resolved; });
+
+    /// Interpose a "query" tracker between the thread tracker and `total_memory_tracker`.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(&query_tracker);
+
+    /// A tracker's amount is clamped at zero, so charge the "query" first to make an over-release
+    /// visible. This buffer is allocated and released while the query tracker is the parent.
+    auto pre_charge = std::make_unique<char[]>(1 << 20);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory"); /// Keep the compiler from eliding the allocation.
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = query_tracker.get();
+    resolver.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 delta = query_tracker.get() - before;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(prev_parent);
+
+    /// The resolver object and its control block were allocated before the "query" existed, so a
+    /// few hundred bytes of slack are expected; the 200 records and their addresses are tens of KiB.
+    ASSERT_GE(delta, -1024) << "resolver state freed against the query tracker";
+}
+
+TEST_F(ResolvePoolTest, FailedUpdateLeavesMetricsAndStateUnchanged)
+{
+    /// Regression test: `updateImpl` used to change the address metrics (and `last_resolve_time`)
+    /// while merging, and only then do the allocation that can still throw (the scratch buffer
+    /// reserve). A failure there left `records` unchanged but the metrics already moved, so the next
+    /// update counted the same expired addresses again.
+    ///
+    /// Fault injection sweep: allow `extra` more bytes than currently used, widening the budget one
+    /// byte at a time, so that every allocation of `updateImpl` fails once. Each failed attempt must
+    /// leave everything unchanged, and the attempt without a failure must apply the whole update.
+    DB::MainThreadStatus::getInstance();
+
+    struct UpdateInspector : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        UpdateInspector(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+
+        /// Runs `updateImpl` under the lock, like `update` does after the DNS lookup.
+        void applyUpdate(Poco::Timestamp now, std::vector<Poco::Net::IPAddress> next_gen)
+        {
+            std::lock_guard lock(mutex);
+            updateImpl(now, next_gen);
+        }
+
+        size_t recordCount()
+        {
+            std::lock_guard lock(mutex);
+            return records.size();
+        }
+
+        Poco::Timestamp lastResolveTime()
+        {
+            std::lock_guard lock(mutex);
+            return last_resolve_time;
+        }
+    };
+
+    auto resolver = std::make_shared<UpdateInspector>(
+        "failed-update-host",
+        Poco::Timespan(1, 0),
+        [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("10.0.0.1")}; });
+    ASSERT_EQ(size_t(1), resolver->recordCount());
+
+    /// The only known address expires (it is older than `history` at `future`), three others are discovered.
+    Poco::Timestamp now;
+    const Poco::Timestamp future = now + 10 * Poco::Timestamp::resolution();
+    const std::vector<Poco::Net::IPAddress> next_gen{
+        Poco::Net::IPAddress("10.1.0.1"), Poco::Net::IPAddress("10.1.0.2"), Poco::Net::IPAddress("10.1.0.3")};
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_thread_hard_limit = thread_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 active_before = CurrentMetrics::get(metrics.active_count);
+    const Int64 banned_before = CurrentMetrics::get(metrics.banned_count);
+    const UInt64 expired_before = DB::CurrentThread::getProfileEvents()[metrics.expired];
+    const UInt64 discovered_before = DB::CurrentThread::getProfileEvents()[metrics.discovered];
+    const Poco::Timestamp last_resolve_before = resolver->lastResolveTime();
+
+    size_t failed_attempts = 0;
+    bool applied = false;
+    for (Int64 extra = 1; extra < (1 << 16) && !applied; ++extra)
+    {
+        thread_tracker.setHardLimit(thread_tracker.get() + extra);
+        bool failed = false;
+        try
+        {
+            resolver->applyUpdate(future, next_gen);
+        }
+        catch (const DB::Exception &)
+        {
+            failed = true;
+        }
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+
+        if (!failed)
+        {
+            applied = true;
+            break;
+        }
+
+        ++failed_attempts;
+        ASSERT_EQ(size_t(1), resolver->recordCount()) << "extra=" << extra;
+        ASSERT_EQ(active_before, CurrentMetrics::get(metrics.active_count)) << "extra=" << extra;
+        ASSERT_EQ(banned_before, CurrentMetrics::get(metrics.banned_count)) << "extra=" << extra;
+        ASSERT_EQ(expired_before, DB::CurrentThread::getProfileEvents()[metrics.expired]) << "extra=" << extra;
+        ASSERT_EQ(discovered_before, DB::CurrentThread::getProfileEvents()[metrics.discovered]) << "extra=" << extra;
+        ASSERT_EQ(last_resolve_before, resolver->lastResolveTime()) << "extra=" << extra;
+    }
+
+    ASSERT_TRUE(applied);
+    ASSERT_GT(failed_attempts, size_t(0)) << "the sweep never injected a failure";
+
+    ASSERT_EQ(size_t(3), resolver->recordCount());
+    ASSERT_EQ(active_before + 2, CurrentMetrics::get(metrics.active_count));
+    ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
+    ASSERT_EQ(discovered_before + 3, DB::CurrentThread::getProfileEvents()[metrics.discovered]);
+}
+
+TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostRunsDnsOnce)
+{
+    /// Regression test: `getResolver` creates the resolver (and runs its initial DNS lookup)
+    /// outside the pool lock. Two threads racing on the same cold host each used to run their own
+    /// lookup and build their own resolver, and the loser was discarded after counting its
+    /// addresses in `AddressesDiscovered`. The second thread must wait for the first one instead,
+    /// while other hosts stay unaffected (see `ColdHostResolveDoesNotBlockHotResolverLookups`).
+    const String host = "single-flight-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    /// Declared before the guard below: on a failed assertion the guard must release the blocked
+    /// lookups before the futures are destroyed (their destructors wait for the threads).
+    std::future<DB::HostResolver::Ptr> first;
+    std::future<DB::HostResolver::Ptr> second;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            if (factory_calls.fetch_add(1) == 0)
+                first_entered.set_value();
+            allow_finish_future.wait();
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+
+    /// The second thread has every chance to start its own lookup while the first one is blocked
+    /// inside the factory. It must not: it has to wait for the first one to finish.
+    ASSERT_EQ(std::future_status::timeout, second.wait_for(300ms));
+    ASSERT_EQ(size_t(1), factory_calls.load());
+
+    allow_finish.set_value();
+    released = true;
+
+    auto first_resolver = first.get();
+    auto second_resolver = second.get();
+    ASSERT_NE(nullptr, first_resolver);
+    ASSERT_EQ(first_resolver, second_resolver);
+    ASSERT_EQ(size_t(1), factory_calls.load());
+}
+
+TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostSharesFailedLookup)
+{
+    /// Regression test: when the initial lookup of a cold host fails, the threads waiting for it
+    /// must get that failure instead of each running their own (slow) lookup one after another,
+    /// and the failed attempt must not block or leak into the next one.
+    const String host = "single-flight-failing-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    /// Declared before the guard below: on a failed assertion the guard must release the blocked
+    /// lookup before the futures are destroyed (their destructors wait for the threads).
+    std::future<String> first;
+    std::future<String> second;
+    std::future<String> third;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            if (factory_calls.fetch_add(1) == 0)
+            {
+                first_entered.set_value();
+                allow_finish_future.wait();
+                throw DB::NetException(DB::ErrorCodes::DNS_ERROR, "no endpoints resolved for host {}", host_to_create);
+            }
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    /// Each caller catches `DB::NetException &` and appends its own context via `addMessage`, just
+    /// like `ReadBufferFromS3` and `copyS3File` do. Every caller (the leader and each waiter) must
+    /// receive its own exception object so one caller's `addMessage` cannot leak into or race with
+    /// another's.
+    auto call_and_annotate = [&](const String & caller_tag) -> String
+    {
+        try
+        {
+            [[maybe_unused]] auto resolver = DB::HostResolversPool::instance().getResolver(host);
+            return "DID_NOT_THROW";
+        }
+        catch (DB::NetException & e)
+        {
+            String before = e.message();
+            e.addMessage(caller_tag);
+            return before;
+        }
+    };
+
+    first = std::async(std::launch::async, [&] { return call_and_annotate("context=leader"); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    second = std::async(std::launch::async, [&] { return call_and_annotate("context=waiter1"); });
+    third = std::async(std::launch::async, [&] { return call_and_annotate("context=waiter2"); });
+    ASSERT_EQ(std::future_status::timeout, second.wait_for(300ms));
+    ASSERT_EQ(std::future_status::timeout, third.wait_for(50ms));
+
+    allow_finish.set_value();
+    released = true;
+
+    const String expected_message = "no endpoints resolved for host " + host;
+    EXPECT_EQ(expected_message, first.get());
+    EXPECT_EQ(expected_message, second.get());
+    EXPECT_EQ(expected_message, third.get());
+    ASSERT_EQ(size_t(1), factory_calls.load());
+
+    /// The failed attempt left nothing behind: the next call runs its own lookup and succeeds.
+    auto resolver = DB::HostResolversPool::instance().getResolver(host);
+    ASSERT_NE(nullptr, resolver);
+    ASSERT_EQ(size_t(2), factory_calls.load());
+    ASSERT_EQ(resolver, DB::HostResolversPool::instance().tryGetResolver(host));
+}
+
+TEST_F(ResolvePoolTest, LeaderQueryMemoryLimitDoesNotFailGetResolverOrWaiter)
+{
+    /// Regression test: `HostResolversPool` is global, so the `PendingResolver` slot, the
+    /// `HostResolver` object, and the map nodes allocated during a cold-host `getResolver` belong
+    /// to `total_memory_tracker`, not to the query whose thread happened to arrive first (and must
+    /// be released under `total_memory_tracker` in `dropCache` as well). Charging them to the
+    /// leader's query tracker both made a query at its memory limit fail `getResolver` and
+    /// published that query-specific `MEMORY_LIMIT_EXCEEDED` to unrelated waiting queries.
+    DB::MainThreadStatus::getInstance();
+
+    /// Long host name so `String` heap-allocates (exceeds SSO) when emplaced into the pool maps.
+    const String host = "cold-host-with-long-name-exceeding-sso-for-tracker-test.invalid";
+
+    std::promise<void> leader_entered;
+    auto leader_entered_future = leader_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    std::future<DB::HostResolver::Ptr> waiter;
+
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        if (!released)
+            allow_finish.set_value();
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            /// Allocate a dummy buffer first so the leader enters the factory even if `PendingResolver`
+            /// was already switched to `total_memory_tracker`, allowing the waiter to attach before any
+            /// failure inside the factory could throw (and publish `MEMORY_LIMIT_EXCEEDED` to the waiter).
+            leader_entered.set_value();
+            allow_finish_future.wait();
+            /// Matches `HostResolver::create`: the resolver object itself is allocated here, while
+            /// `HostResolver::update` inside the constructor switches to `total_memory_tracker`.
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+
+    /// Run the leader on a worker thread with its own `ThreadStatus` whose query tracker has a
+    /// 1-byte hard limit, and start an unconstrained waiter on another thread while the leader is
+    /// in flight. Neither caller may fail with the leader's query memory limit.
+    std::future<DB::HostResolver::Ptr> leader = std::async(
+        std::launch::async,
+        [&]() -> DB::HostResolver::Ptr
+        {
+            DB::ThreadStatus thread_status;
+            MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+            query_tracker.setHardLimit(1);
+
+            auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+            auto * prev_parent = thread_tracker->getParent();
+            DB::CurrentThread::get().untracked_memory_limit = 0;
+            DB::CurrentThread::flushUntrackedMemory();
+            thread_tracker->setParent(&query_tracker);
+            SCOPE_EXIT_SAFE({
+                DB::CurrentThread::flushUntrackedMemory();
+                thread_tracker->setParent(prev_parent);
+            });
+
+            return DB::HostResolversPool::instance().getResolver(host);
+        });
+
+    /// Either the leader already threw before reaching the factory (unfixed code fails on
+    /// `PendingResolver` allocation), or it entered the factory and is waiting for `allow_finish`.
+    if (leader_entered_future.wait_for(500ms) == std::future_status::ready)
+    {
+        waiter = std::async(
+            std::launch::async,
+            [&]() -> DB::HostResolver::Ptr
+            {
+                DB::ThreadStatus waiter_status;
+                return DB::HostResolversPool::instance().getResolver(host);
+            });
+        ASSERT_EQ(std::future_status::timeout, waiter.wait_for(200ms));
+    }
+
+    allow_finish.set_value();
+    released = true;
+
+    DB::HostResolver::Ptr leader_resolver = leader.get();
+    ASSERT_NE(nullptr, leader_resolver);
+    if (waiter.valid())
+        ASSERT_EQ(leader_resolver, waiter.get());
+
+    /// Dropping the cache while another query's tracker is active must also release the cached
+    /// resolver and map node under `total_memory_tracker`, not credit the caller's query tracker.
+    leader_resolver.reset();
+    auto * main_thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker drop_query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = main_thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        main_thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    main_thread_tracker->setParent(&drop_query_tracker);
+
+    auto pre_charge = std::make_unique<char[]>(1 << 16);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory");
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before_drop = drop_query_tracker.get();
+    DB::HostResolversPool::instance().dropCache();
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 drop_delta = drop_query_tracker.get() - before_drop;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    main_thread_tracker->setParent(prev_parent);
+
+    ASSERT_EQ(Int64(0), drop_delta) << "dropCache credited the caller's query tracker";
+}
+
+TEST_F(ResolvePoolTest, DropCacheDuringColdHostLookupDoesNotCacheTheStaleResult)
+{
+    /// Regression test: `getResolver` runs the lookup outside the pool lock, so `dropCache` can run
+    /// while it is in flight. The result of a lookup that started before the drop must not be
+    /// published into the cache afterwards, and callers arriving after the drop must not join the
+    /// pre-drop lookup: they start their own.
+    const String host = "drop-cache-in-flight-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    std::future<DB::HostResolver::Ptr> first;
+    std::future<DB::HostResolver::Ptr> second;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            /// Only the first (pre-drop) lookup blocks.
+            if (factory_calls.fetch_add(1) == 0)
+            {
+                first_entered.set_value();
+                allow_finish_future.wait();
+            }
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    DB::HostResolversPool::instance().dropCache();
+
+    /// A caller after the drop starts its own lookup instead of joining the pre-drop one.
+    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, second.wait_for(5s));
+    auto post_drop_resolver = second.get();
+    ASSERT_NE(nullptr, post_drop_resolver);
+    ASSERT_EQ(size_t(2), factory_calls.load());
+    ASSERT_EQ(post_drop_resolver, DB::HostResolversPool::instance().tryGetResolver(host));
+
+    allow_finish.set_value();
+    released = true;
+
+    /// The pre-drop lookup still answers its own caller, but it must not replace the cached entry.
+    auto pre_drop_resolver = first.get();
+    ASSERT_NE(nullptr, pre_drop_resolver);
+    ASSERT_NE(pre_drop_resolver, post_drop_resolver);
+    ASSERT_EQ(post_drop_resolver, DB::HostResolversPool::instance().tryGetResolver(host));
 }
