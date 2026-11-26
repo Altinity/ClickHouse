@@ -156,6 +156,8 @@ void Prefetcher::retainTail(PaddedPODArray<char> && data, size_t length, size_t 
 
     if (length > data.size())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail is longer than the buffer: length {}, buffer size {}", length, data.size());
+    if (length > max_retained_tail_size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Retained tail is longer than the maximum: length {}, maximum {}", length, max_retained_tail_size);
 
     /// Keep only the requested part, and give the memory of the rest back before keeping the buffer.
     data.resize(length);

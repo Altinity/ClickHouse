@@ -276,12 +276,20 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t foot
     deserializeThriftStruct(file_metadata, buf.data() + buf_offset, metadata_size);
 
     /// If the footer fit into the tail we read (`buf_offset` is 0 otherwise), the tail also holds what precedes the
-    /// footer: the Column Index and Offset Index. Retain that part so the ranges registered for those indexes are
-    /// served from memory rather than read again. Nothing to retain if the footer begins at the start of the tail.
-    /// Only a caller that goes on to register ranges in `prefetcher` has a use for it. The buffer is moved to the
-    /// prefetcher, which drops the footer part of it, so nothing is copied and the raw footer is not kept.
+    /// footer: the Column Index and Offset Index. Retain the last part of that, so the ranges registered for those
+    /// indexes are served from memory rather than read again. Only the bytes closest to the footer are kept, at most
+    /// `max_retained_tail_size`: the retained chunk lives as long as the reader, and an explicit
+    /// `input_format_parquet_footer_read_size` can make the tail arbitrarily large. Nothing to retain if the footer
+    /// begins at the start of the tail. Only a caller that goes on to register ranges in `prefetcher` has a use for it.
     if (retain_tail && buf_offset > 0)
-        prefetcher.retainTail(std::move(buf), buf_offset, file_size - initial_read_size);
+    {
+        size_t retained_length = std::min(buf_offset, Prefetcher::max_retained_tail_size);
+        size_t retained_offset = buf_offset - retained_length;
+        /// The footer is already parsed, and the bytes [retained_offset, buf_offset) lie before it, so this does not
+        /// overwrite anything that is still needed. The buffer is moved to the prefetcher, which drops the rest of it.
+        memmove(buf.data(), buf.data() + retained_offset, retained_length);
+        prefetcher.retainTail(std::move(buf), retained_length, file_size - initial_read_size + retained_offset);
+    }
 
     /// Some writers incorrectly set dictionary_page_offset offset to 0 when there's no dictionary
     /// page at offset 0 in the file. Work around it.
