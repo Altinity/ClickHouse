@@ -13,10 +13,14 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/defines.h>
+#include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
+#include <optional>
 #include <set>
 
 namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; extern const int NOT_IMPLEMENTED; }
@@ -944,13 +948,201 @@ TEST(CASSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
     /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
     /// (probability 2^-128 — the check documents the reservation).
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             DB::Cas::assertValidSourceEdgeId(UInt128{0});
         },
         "source_id 0 is the reserved sentinel key");
     EXPECT_NO_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{1}));
+}
+
+namespace
+{
+
+/// Every `stream` fails as an unanswered request does, so a run reads as neither present nor absent.
+class StreamFailingBackend : public InMemoryBackend
+{
+public:
+    std::unique_ptr<DB::ReadBuffer> stream(const String &, TransportAccess &) override
+    {
+        throw Poco::TimeoutException("the run stream was never answered");
+    }
+};
+
+size_t corruptedDataCount()
+{
+    return DB::ErrorCodes::values[DB::ErrorCodes::CORRUPTED_DATA].get().local.count;
+}
+
+/// The code of the exception `fn` throws: -1 for one that is not a `DB::Exception`, empty when it throws none.
+std::optional<int> failureCodeOf(const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (const DB::Exception & e)
+    {
+        return e.code();
+    }
+    catch (...)
+    {
+        return -1;
+    }
+    return std::nullopt;
+}
+
+RunRef absentRunRef(const Layout & layout)
+{
+    return RunRef{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .key_generation = 1};
+}
+
+/// What the typed open of an absent run throws, taken before any capture or counter starts.
+String absentRunText(CasOperation & op, const String & key)
+{
+    return DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)openSourceEdgeRun(op, key); });
+}
+
+}
+
+/// In `Report` mode an absent run is a refusal value: no exception is built, so nothing is logged or counted.
+TEST(CASSourceEdgeRun, AbsentRunInReportModeIsARefusalWithoutAnException)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    const Layout layout{"pool"};
+    const std::vector<RunRef> runs{absentRunRef(layout)};
+    const String expected = absentRunText(*op, runs.front().key);
+    ASSERT_NE(expected.find("is absent"), String::npos) << expected;
+
+    size_t calls = 0;
+    const AdoptedRunContext context{.gc_shards = 1, .parent_round = 1, .summary = {}, .on_absent_run = [&](const String &)
+    {
+        ++calls;
+        throw DB::Exception(DB::ErrorCodes::ABORTED, "the hook ran in Report mode");
+    }};
+    const size_t errors_before = corruptedDataCount();
+    {
+        DB::Cas::tests::ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        AdoptedRunReader reader(*op, runs, 0, context, AdoptedRunReader::OnRefusal::Report);
+        SourceEdgeRecord rec;
+        EXPECT_FALSE(reader.next(rec));
+        ASSERT_TRUE(reader.refusal().has_value());
+        EXPECT_EQ(reader.refusal()->run_key, runs.front().key);
+        EXPECT_EQ(reader.refusal()->message, expected);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(corruptedDataCount() - errors_before, 0u);
+}
+
+/// In `Throw` mode an absent run reaches the hook once, before any `CORRUPTED_DATA` exists: a hook that throws ends the
+/// reading with its own error; a hook that returns leaves today's `CORRUPTED_DATA`.
+TEST(CASSourceEdgeRun, AbsentRunInThrowModeAsksTheHookOnce)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    const Layout layout{"pool"};
+    const std::vector<RunRef> runs{absentRunRef(layout)};
+    const String expected = absentRunText(*op, runs.front().key);
+    SourceEdgeRecord rec;
+
+    {
+        SCOPED_TRACE("the hook throws");
+        size_t calls = 0;
+        String failure;
+        const AdoptedRunContext context{.gc_shards = 1, .parent_round = 1, .summary = {}, .on_absent_run = [&](const String & f)
+        {
+            ++calls;
+            failure = f;
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "a newer leader moved gc/state");
+        }};
+        const size_t errors_before = corruptedDataCount();
+        DB::Cas::tests::ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        AdoptedRunReader reader(*op, runs, 0, context);
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "a newer leader moved gc/state", [&] { reader.next(rec); });
+        EXPECT_EQ(calls, 1u);
+        EXPECT_EQ(failure, expected);
+        EXPECT_EQ(corruptedDataCount() - errors_before, 0u);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    {
+        SCOPED_TRACE("the hook returns");
+        size_t calls = 0;
+        String failure;
+        const AdoptedRunContext context{.gc_shards = 1, .parent_round = 1, .summary = {}, .on_absent_run = [&](const String & f)
+        {
+            ++calls;
+            failure = f;
+        }};
+        AdoptedRunReader reader(*op, runs, 0, context);
+        EXPECT_EQ(DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader.next(rec); }), expected);
+        EXPECT_EQ(calls, 1u);
+        EXPECT_EQ(failure, expected);
+    }
+    {
+        SCOPED_TRACE("no hook");
+        AdoptedRunReader reader(*op, runs, 0, AdoptedRunContext{.gc_shards = 1, .parent_round = 1, .summary = {}});
+        EXPECT_EQ(DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader.next(rec); }), expected);
+    }
+}
+
+/// A present run, a run that fails to decode and a run whose read fails never reach the hook, in either mode.
+TEST(CASSourceEdgeRun, OnlyAnAbsentRunReachesTheHook)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    const Layout layout{"pool"};
+    const RunRef valid = writeSourceEdgeRun(backend, layout, 1, 0, 0, {}, {{b(1), s(1)}});
+    const String garbage_key = layout.blobTargetRunKey(2, 0, 0, 0);
+    (*op).create(garbage_key, "not a run\n", Retry::once());
+    const RunRef garbage{.key = garbage_key, .checksum = {}, .shard = 0, .key_generation = 2};
+    StreamFailingBackend failing;
+    DB::Cas::tests::OperationForTest failing_op(failing);
+
+    for (const auto mode : {AdoptedRunReader::OnRefusal::Throw, AdoptedRunReader::OnRefusal::Report})
+    {
+        const bool report = mode == AdoptedRunReader::OnRefusal::Report;
+        SCOPED_TRACE(report ? "Report" : "Throw");
+        size_t calls = 0;
+        const AdoptedRunContext context{.gc_shards = 1, .parent_round = 1, .summary = {},
+                                        .on_absent_run = [&](const String &) { ++calls; }};
+        SourceEdgeRecord rec;
+        {
+            const std::vector<RunRef> runs{valid};
+            AdoptedRunReader reader(*op, runs, 0, context, mode);
+            size_t rows = 0;
+            while (reader.next(rec))
+                ++rows;
+            EXPECT_EQ(rows, 1u);
+            EXPECT_FALSE(reader.refusal().has_value());
+        }
+        {
+            const std::vector<RunRef> runs{garbage};
+            AdoptedRunReader reader(*op, runs, 0, context, mode);
+            if (report)
+            {
+                EXPECT_FALSE(reader.next(rec));
+                ASSERT_TRUE(reader.refusal().has_value());
+                EXPECT_EQ(reader.refusal()->run_key, garbage_key);
+                EXPECT_EQ(reader.refusal()->message.find("is absent"), String::npos) << reader.refusal()->message;
+            }
+            else
+            {
+                const String message = DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader.next(rec); });
+                EXPECT_EQ(message.find("is absent"), String::npos) << message;
+            }
+        }
+        {
+            const std::vector<RunRef> runs{valid};
+            AdoptedRunReader reader(*failing_op, runs, 0, context, mode, [] { return Retry::once(); });
+            const std::optional<int> code = failureCodeOf([&] { reader.next(rec); });
+            ASSERT_TRUE(code.has_value()) << "a failed read must propagate";
+            EXPECT_NE(*code, DB::ErrorCodes::CORRUPTED_DATA);
+        }
+        EXPECT_EQ(calls, 0u);
+    }
 }
 
 /// ==== schema 3 key codec (Phase 3 T3, mixed-algo pools) ====
@@ -1770,12 +1962,12 @@ TEST(CASThreeCursorMerge, NominationInASuppressedRoundIsALogicalError)
 TEST(CASThreeCursorMergeDeathTest, NominationWithoutATagIsALogicalError)
 {
     Layout layout{"pool"};
-    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); }, "carries no tag");
+    CAS_EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); }, "carries no tag");
 }
 
 TEST(CASThreeCursorMergeDeathTest, NominationInASuppressedRoundIsALogicalError)
 {
     Layout layout{"pool"};
-    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); }, "suppressed round");
+    CAS_EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); }, "suppressed round");
 }
 #endif

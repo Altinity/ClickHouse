@@ -9,6 +9,7 @@
 #include <base/defines.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SensitiveDataMasker.h>
 #include <Common/logger_useful.h>
 
 namespace ProfileEvents
@@ -43,6 +44,15 @@ namespace
 {
 
 const UInt128 kZeroSourceId{0};
+
+/// The message of the `CORRUPTED_DATA` an absent run raises, masked as `Exception` masks it, built without the exception.
+String absentRunMessage(const String & key)
+{
+    String message = fmt::format("CAS source-edge run: object {} is absent", key);
+    if (auto masker = SensitiveDataMasker::getInstance())
+        masker->wipeSensitiveData(message);
+    return message;
+}
 
 /// A digest wider than its algorithm's own width is a programming bug, not corrupted data: chassert, not throw.
 SourceEdgeKey sourceEdgeKeyOf(const BlobRef & ref, const UInt128 & source_id)
@@ -274,8 +284,23 @@ bool AdoptedRunReader::openNextRunChecked()
     drained = false;
     /// Typed open validates the NDJSON header before any row is consumed.
     const String & key = runs[next_run++].key;
-    view = openSourceEdgeRun(op, key, run_policy ? run_policy() : Retry::standard());
+    view = tryOpenSourceEdgeRun(op, key, run_policy ? run_policy() : Retry::standard());
+    if (!view)
+        return refuseAbsentRun(key);
     return true;
+}
+
+bool AdoptedRunReader::refuseAbsentRun(const String & key)
+{
+    /// No exception exists before the absence is classified: constructing a `CORRUPTED_DATA` counts it, dropping it logs it.
+    if (on_refusal == OnRefusal::Report)
+    {
+        refused = Refusal{.run_key = key, .message = absentRunMessage(key)};
+        return false;
+    }
+    if (context.on_absent_run)
+        context.on_absent_run(absentRunMessage(key));
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
 }
 
 bool AdoptedRunReader::next(SourceEdgeRecord & rec)
@@ -412,14 +437,22 @@ SourceEdgeRunView openSourceEdgeRun(std::string_view bytes)
     return SourceEdgeRunView(std::make_unique<ReadBufferFromMemory>(bytes.data(), bytes.size()));
 }
 
-SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
+std::optional<SourceEdgeRunView> tryOpenSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
 {
     /// Streaming: a forward-only read of the write-once run — nothing is materialized whole
-    /// (cas_run is object_cap = 0). Absent object => fail-closed.
+    /// (cas_run is object_cap = 0).
     auto stream = op.stream(key, policy);
     if (!stream)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
+        return std::nullopt;
     return SourceEdgeRunView(std::move(stream));
+}
+
+SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
+{
+    auto view = tryOpenSourceEdgeRun(op, key, policy);
+    if (!view)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
+    return std::move(*view);
 }
 
 void putDeterministicArtifact(CasOperation & op, const String & key, const String & bytes)

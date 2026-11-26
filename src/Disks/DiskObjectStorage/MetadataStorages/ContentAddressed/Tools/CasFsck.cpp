@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
@@ -17,6 +18,7 @@
 #include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/Stopwatch.h>
 #include <Common/scope_guard_safe.h>
 
 #include <algorithm>
@@ -44,7 +46,81 @@ namespace DB::Cas
 
 namespace
 {
-constexpr uint64_t PROGRESS_PAGES = 16;
+/// One request-bound phase of the scan as the progress sink sees it. Every sink call goes through `emit`, which
+/// drops a sink exception, so the sink cannot change what the checker reports. After the first sink failure the
+/// phase calls the sink only for its `End`. A phase left by an exception emits no `End`: the last `Start` or
+/// `Tick` names where the scan stopped.
+class FsckPhase
+{
+public:
+    FsckPhase(const FsckProgress & sink_, std::string_view name_, std::string_view unit_, uint64_t interval_)
+        : sink(sink_), name(name_), unit(unit_), interval(interval_)
+    {
+        emit(FsckProgressStep::Start);
+    }
+
+    void advance()
+    {
+        if (++done % interval == 0)
+            emit(FsckProgressStep::Tick);
+    }
+
+    void tickAt(uint64_t n)
+    {
+        done = n;
+        emit(FsckProgressStep::Tick);
+    }
+
+    void end() { emit(FsckProgressStep::End); }
+
+    /// The name its progress lines carry; a deadline error names the phase by it.
+    std::string_view phaseName() const { return name; }
+
+private:
+    void emit(FsckProgressStep step)
+    {
+        if (!sink || (sink_failed && step != FsckProgressStep::End))
+            return;
+        const bool started = step == FsckProgressStep::Start;
+        try
+        {
+            sink(step, name, unit, started ? 0 : done, started ? 0.0 : watch.elapsedSeconds());
+        }
+        catch (Exception & e)
+        {
+            /// An exception destroyed unmarked is logged again, with a stack trace.
+            if (sink_failed)
+                e.markAsLogged();
+            else
+                tryLogCurrentException("CasFsck");
+            sink_failed = true;
+        }
+        catch (...)
+        {
+            if (!sink_failed)
+                tryLogCurrentException("CasFsck");
+            sink_failed = true;
+        }
+    }
+
+    const FsckProgress & sink;
+    const std::string_view name;
+    const std::string_view unit;
+    const uint64_t interval;
+    uint64_t done = 0;
+    bool sink_failed = false;
+    Stopwatch watch;
+};
+
+/// The phase the ref walk and its re-resolve helpers run in.
+constexpr std::string_view kWalkingRefs = "walking refs";
+
+/// Keys are counted per listed key; one tick per 16 list pages.
+constexpr uint64_t kListTickKeys = 16 * CasOperation::kCasListPageKeys;
+constexpr uint64_t kSnapshotTickRows = 65536;
+constexpr uint64_t kBodyTickItems = 250;
+constexpr uint64_t kRefTickItems = 64;
+constexpr uint64_t kDefaultTickItems = 100;
 
 /// Every key under `prefix`, each page requested under `ToolDeadline::bound`.
 void forEachListedKeyBounded(CasOperation & op, const String & prefix, const ToolDeadline & deadline, std::string_view phase,
@@ -64,7 +140,7 @@ void forEachListedKeyBounded(CasOperation & op, const String & prefix, const Too
 }
 
 void listAll(CasOperation & op, const String & prefix, std::unordered_map<String, uint64_t> & out,
-             const FsckProgress & on_progress, const ToolDeadline & deadline, std::string_view phase)
+             FsckPhase * progress, const ToolDeadline & deadline, std::string_view phase)
 {
     static constexpr size_t kPageLimit = CasOperation::kCasListPageKeys;
     uint64_t pages = 0;
@@ -72,13 +148,13 @@ void listAll(CasOperation & op, const String & prefix, std::unordered_map<String
     forEachListedKeyBounded(op, prefix, deadline, phase, [&](const ListedKey & k)
     {
         out[k.key] = k.size;
+        if (progress)
+            progress->advance();
         if (++count_in_page == kPageLimit)
         {
             count_in_page = 0;
             ++pages;
             deadline.check(phase);
-            if (on_progress && pages % PROGRESS_PAGES == 0)
-                on_progress(phase, out.size(), pages);
         }
         return true;
     });
@@ -89,8 +165,6 @@ void listAll(CasOperation & op, const String & prefix, std::unordered_map<String
         ++pages;
         deadline.check(phase);
     }
-    if (on_progress)
-        on_progress(phase, out.size(), pages);
 }
 
 /// Parse (writer_epoch, build_sequence) from a manifest object key. Delegates to the one shared
@@ -177,14 +251,14 @@ std::optional<RefTableState> recoverLateRefTable(
 
 bool blobStillReferenced(CasOperation & op, Pool & store, const Layout & layout,
                           const FsckRecoveryAuthorities & authorities, const String & bkey,
-                          const std::vector<String> & labels, const ToolDeadline & deadline,
+                          const std::vector<String> & labels, const ToolDeadline & deadline, std::string_view phase,
                           const RecordRecoveryUnchecked & record_unchecked)
 {
     if (labels.empty())
         return true;
     for (const String & label : labels)
     {
-        deadline.check("re-resolving refs at HEAD-absent");
+        deadline.check(phase);
         const size_t slash = label.rfind('/');
         if (slash == String::npos)
             return true;   /// malformed label — cannot re-resolve, fail closed
@@ -244,7 +318,7 @@ bool manifestStillReferenced(CasOperation & op, const Layout & layout, const Roo
                              const String & mkey, const ToolDeadline & deadline,
                              const RecordRecoveryUnchecked & record_unchecked)
 {
-    deadline.check("re-resolving ref at missing-manifest");
+    deadline.check(kWalkingRefs);
     try
     {
         const auto authority_it = authorities.find(ns.string());
@@ -344,7 +418,7 @@ public:
     std::optional<Object> take(const String & key) override
     {
         last_key = key;
-        std::optional<Object> got = op.read(key, deadline.bound(op, "ref stream"));
+        std::optional<Object> got = op.read(key, deadline.bound(op, kWalkingRefs));
         if (got)
             ++present;
         return got;
@@ -372,13 +446,21 @@ std::optional<RefTableState> walkRefStream(
     const std::optional<RefTxnId> & greatest_listed_log, const ToolDeadline & deadline, FsckReport & report,
     NsVerdicts & verdicts)
 {
-    deadline.check("ref stream");
+    deadline.check(kWalkingRefs);
     const RootNamespace & ns = life.ns;
     std::optional<CkptSample> sample = readCkpt(op, layout, life);
+    if (!sample)
+    {
+        /// Deferred like every finding of a walked life: a janitor that deleted this `_ckpt` after the catalog cut
+        /// leaves a life the confirmation cut no longer names. No exception is built for it, because the destructor
+        /// of a `CORRUPTED_DATA` logs an error whether or not anyone catches it.
+        verdicts.recordUnchecked(report, ns, layout.namespaceStreamPrefix(life),
+            "fsck could not examine this namespace: " + String(kRecoveryGroundingNoCkptMessage));
+        return std::nullopt;
+    }
     for (size_t restarts = 0;; ++restarts)
     {
-        const RecoveryGrounding grounding = chooseRecoveryGrounding(
-            catalog_entry, sample ? std::optional<RefCkpt>{sample->ckpt} : std::nullopt);
+        const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, std::optional<RefCkpt>{sample->ckpt});
         RecordingKeyReader reader(op, deadline);
         /// Only a corrupt chain under an unchanged `_ckpt` is a finding; a failed read of the chain or of
         /// `_ckpt` itself proves nothing either way.
@@ -410,7 +492,7 @@ std::optional<RefTableState> walkRefStream(
         {
             if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
                 throw;
-            deadline.rethrowIfOutOfTime(op, e, "ref stream");
+            deadline.rethrowIfOutOfTime(op, e, kWalkingRefs);
             record_failure(e.code() == ErrorCodes::CORRUPTED_DATA, e.message());
             return std::nullopt;
         }
@@ -440,7 +522,7 @@ std::optional<RefTableState> walkRefStream(
             verdicts.recordUnchecked(report, ns, key, "ref stream: checkpoint authority changed while walking the chain");
             return std::nullopt;
         }
-        deadline.check("ref stream");
+        deadline.check(kWalkingRefs);
         sample = readCkpt(op, layout, life);
         if (!sample)
         {
@@ -448,6 +530,12 @@ std::optional<RefTableState> walkRefStream(
             return std::nullopt;
         }
     }
+}
+
+String staleEdgeNote(uint64_t edges)
+{
+    return "all " + std::to_string(edges) + " source edges name manifests that no longer exist — unreclaimable by the "
+           "incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
 }
 
 /// Counts one check the scan could not make, of an intent or of the GC snapshot, and keeps the first reason, shortened.
@@ -478,37 +566,38 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
                      const ToolDeadline & deadline, FsckReport & report)
 {
     report.intents_verified = verify;
-    uint64_t visited = 0;
     /// A summary needs only counts, so it counts each key as the listing returns it.
     if (!verify && !detail)
     {
-        forEachListedKeyBounded(op, layout.blobIntentsPrefix(), deadline, "listing blob intents", [&](const ListedKey & k)
+        FsckPhase counting(on_progress, "counting blob intents", "keys", kProgressKeys);
+        forEachListedKeyBounded(op, layout.blobIntentsPrefix(), deadline, counting.phaseName(), [&](const ListedKey & k)
         {
-            if (on_progress && ++visited % kProgressKeys == 0)
-                on_progress("counting blob intents", visited, 0);
             if (layout.isBlobIntentProbeKey(k.key))
                 return true;
+            counting.advance();
             ++(layout.parseBlobIntentKey(k.key) ? report.intents_listed : report.intent_malformed);
             report.physical_bytes += k.size;
             return true;
         });
+        counting.end();
         return;
     }
 
     std::unordered_map<String, uint64_t> listed;
-    listAll(op, layout.blobIntentsPrefix(), listed, on_progress, deadline, "listing blob intents");
+    FsckPhase listing(on_progress, "listing blob intents", "keys", kListTickKeys);
+    listAll(op, layout.blobIntentsPrefix(), listed, &listing, deadline, "listing blob intents");
+    listing.end();
     std::vector<std::pair<String, uint64_t>> intents(listed.begin(), listed.end());
     /// The detail rows are listed in key order.
     if (detail)
         std::sort(intents.begin(), intents.end());
+    FsckPhase reading(on_progress, verify ? "verifying blob intents" : "counting blob intents", "keys", kProgressKeys);
     for (const auto & [key, size] : intents)
     {
-        deadline.check("reading blob intents");
-        if (on_progress && ++visited % kProgressKeys == 0)
-            on_progress(verify ? "verifying blob intents" : "counting blob intents", visited, 0);
-
+        deadline.check(reading.phaseName());
         if (layout.isBlobIntentProbeKey(key))
             continue;   /// the capability probe's scratch object, not an intent
+        reading.advance();
         const auto parsed = layout.parseBlobIntentKey(key);
         if (parsed && !verify)
         {
@@ -524,7 +613,7 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
             bool counted = false;
             try
             {
-                const auto got = op.read(key, deadline.bound(op, "reading blob intents"));
+                const auto got = op.read(key, deadline.bound(op, reading.phaseName()));
                 if (!got)
                     continue;
                 counted = true;
@@ -533,7 +622,7 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
                 {
                     note = "the bytes are not the intent record";
                 }
-                else if (const std::optional<Meta> body = op.head(layout.blobKey(parsed->ref), deadline.bound(op, "reading blob intents"));
+                else if (const std::optional<Meta> body = op.head(layout.blobKey(parsed->ref), deadline.bound(op, reading.phaseName()));
                          !body)
                 {
                     cls = FsckClass::IntentBodyGone;
@@ -560,7 +649,7 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
             {
                 if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
                     throw;
-                deadline.rethrowIfOutOfTime(op, e, "reading blob intents");
+                deadline.rethrowIfOutOfTime(op, e, reading.phaseName());
                 report.intents_listed += !counted;
                 cls = FsckClass::IntentUnread;
                 note = "a read failed: " + e.message();
@@ -580,6 +669,7 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
         if (detail)
             report.objects.push_back(FsckObject{.key = key, .kind = ObjectKind::Blob, .size = size, .cls = cls, .reachable_from = {std::move(note)}});
     }
+    reading.end();
 }
 
 /// What the adopted GC snapshot holds about the `wanted` blobs: whether GC knows them at all, the rows it
@@ -587,6 +677,8 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
 struct GcSnapshotView
 {
     bool have_state = false;
+    /// The snapshot generation `gc/state` adopts; a round never lowers it.
+    uint64_t snap_generation = 0;
     /// `gc/state`, the seal it names and every run of it were read, and every run passed the checks a round applies.
     bool complete = false;
     uint64_t gc_shards = 1;
@@ -599,6 +691,8 @@ struct GcSnapshotView
     /// Every `pending` row, `wanted` or not: GC deletes its body when its own cut shows no reference, so a reference
     /// committed after that cut does not stop the delete.
     std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> pending_rows;
+    /// The seals and runs refused under a `gc/state` that had not moved since, each with its reason.
+    std::vector<std::pair<String, String>> confirmed_refusals;
 
     bool speaksFor(const BlobRef & ref) const
     {
@@ -621,16 +715,17 @@ struct GcSnapshotAttempt
 };
 
 GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
-                                     bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline)
+                                     bool detail, FsckPhase & progress, const ToolDeadline & deadline)
 {
     GcSnapshotAttempt attempt;
     GcSnapshotView & view = attempt.view;
-    const auto state_got = op.read(layout.gcStateKey(), deadline.bound(op, "reading gc snapshot runs"));
+    const auto state_got = op.read(layout.gcStateKey(), deadline.bound(op, progress.phaseName()));
     if (!state_got)
         return attempt;
     attempt.state_token = state_got->etag;
     view.have_state = true;
     const GcState gc_state = decodeGcState(state_got->bytes);
+    view.snap_generation = gc_state.snap_generation;
     try
     {
         requireGenerationFourGcState(gc_state);
@@ -661,7 +756,7 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
     }
     view.unread_all = true;
     const String seal_key = layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt);
-    const auto seal_got = op.read(seal_key, deadline.bound(op, "reading gc snapshot runs"));
+    const auto seal_got = op.read(seal_key, deadline.bound(op, progress.phaseName()));
     if (!seal_got)
     {
         attempt.seal_absent.emplace(gc_state.snap_generation, gc_state.snap_attempt);
@@ -685,13 +780,12 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
         runs_by_shard[run.shard].push_back(run);
     /// Each shard is read the way the GC round reads it, so a run the round refuses is a finding here, and the scan
     /// goes on with the next shard to list every one in a pass.
-    uint64_t rows = 0;
     for (uint64_t shard = 0; shard < gc_state.gc_shards; ++shard)
     {
         const std::vector<RunRef> & runs = runs_by_shard[shard];
         AdoptedRunReader reader(op, runs, shard,
             AdoptedRunContext{.gc_shards = gc_state.gc_shards, .parent_round = gc_state.round, .summary = seal.condemned_summary.at(shard)},
-            AdoptedRunReader::OnRefusal::Report, [&] { return deadline.bound(op, "reading gc snapshot runs"); });
+            AdoptedRunReader::OnRefusal::Report, [&] { return deadline.bound(op, progress.phaseName()); });
         SourceEdgeRecord rec;
         while (reader.next(rec))
         {
@@ -711,29 +805,37 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
                 if (is_wanted)
                     view.retired_by_hash.emplace(ref, std::move(row));
             }
-            if (on_progress && ++rows % 65536 == 0)
-                on_progress("reading gc snapshot runs", view.in_run_hashes.size(), rows);
+            progress.advance();
         }
         if (const auto & refusal = reader.refusal())
         {
             view.unread_shards.insert(shard);
-            attempt.refusals.emplace_back(refusal->run_key, refusal->message);
+            /// A shard with no run has no run key; the shard itself identifies the finding.
+            attempt.refusals.emplace_back(
+                refusal->run_key.empty() ? fmt::format("{}#shard-{}", seal_key, shard) : refusal->run_key, refusal->message);
         }
     }
     view.complete = attempt.refusals.empty();
     return attempt;
 }
 
+void recordCorruptedRun(FsckReport & report, const String & key, const String & reason, bool detail)
+{
+    ++report.corrupted_runs;
+    if (detail)
+        report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
+}
+
 /// Reads `gc/state`, the adopted fold seal and every source-edge run of it, once each. A seal or run a GC round refuses
 /// is counted into `report.corrupted_runs`, and listed there with `detail`, when `gc/state` has not moved since; under a
 /// moved `gc/state` a round may have pruned it, and the newer snapshot is read instead.
 GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
-                              bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline, FsckReport & report)
+                              bool detail, FsckPhase & progress, const ToolDeadline & deadline, FsckReport & report)
 {
     std::optional<std::pair<uint64_t, uint64_t>> seal_absent_before;
     for (size_t attempt_no = 1;; ++attempt_no)
     {
-        GcSnapshotAttempt attempt = readGcSnapshotOnce(op, layout, wanted, detail, on_progress, deadline);
+        GcSnapshotAttempt attempt = readGcSnapshotOnce(op, layout, wanted, detail, progress, deadline);
         if (attempt.refused_state)
         {
             countIntentUnread(report, fmt::format("{}: every GC round refuses it, so the GC snapshot and its pending rows "
@@ -756,17 +858,14 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
             return std::move(attempt.view);
         else
         {
-            const auto state_now = op.head(layout.gcStateKey(), deadline.bound(op, "reading gc snapshot runs"));
+            const auto state_now = op.head(layout.gcStateKey(), deadline.bound(op, progress.phaseName()));
             moved = !state_now || !sameVersion(state_now->etag, *attempt.state_token);
         }
         if (!moved)
         {
             for (const auto & [key, reason] : attempt.refusals)
-            {
-                ++report.corrupted_runs;
-                if (detail)
-                    report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
-            }
+                recordCorruptedRun(report, key, reason, detail);
+            attempt.view.confirmed_refusals = std::move(attempt.refusals);
             return std::move(attempt.view);
         }
         if (attempt_no == kAdoptedSnapshotReadAttempts)
@@ -790,7 +889,7 @@ String retiredNote(const CondemnedRow & row)
         + ": the deletion intent is not confirmed yet; GC creates it in a later round (expected)";
 }
 
-/// `PendingWithoutIntent` is a suspect: a finding once a second read of `gc/state` agrees.
+/// `PendingWithoutIntent` is a suspect: a finding once a second snapshot read agrees.
 struct PendingVerdict
 {
     FsckClass cls = FsckClass::PendingGc;
@@ -800,16 +899,16 @@ struct PendingVerdict
 /// A `pending` row is the one state GC deletes a body from without re-reading the intent, so the intent is read
 /// here. A read that fails is `intent_unread`: not an absent intent, and no verdict.
 PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const BlobRef & ref, const CondemnedRow & row,
-                               const ToolDeadline & deadline, FsckReport & report)
+                               const ToolDeadline & deadline, std::string_view phase, FsckReport & report)
 {
     const std::optional<CanonicalIdentity> identity = row.token.canonical();
     if (!identity)
         return {FsckClass::PendingTokenRejected, "`pending` row: the row's token has no canonical identity, so no intent key exists for it"};
     try
     {
-        if (op.read(layout.blobIntentKey(ref, *identity), deadline.bound(op, "checking pending rows")))
+        if (op.read(layout.blobIntentKey(ref, *identity), deadline.bound(op, phase)))
             return {FsckClass::PendingGc, "`pending` row: the deletion intent is present; GC deletes the body in a later round (expected)"};
-        const std::optional<Meta> body = op.head(layout.blobKey(ref), deadline.bound(op, "checking pending rows"));
+        const std::optional<Meta> body = op.head(layout.blobKey(ref), deadline.bound(op, phase));
         if (body && sameIncarnation(row.token, body->etag))
             return {FsckClass::PendingWithoutIntent, {}};
         return {FsckClass::PendingIntentAbsent,
@@ -820,7 +919,7 @@ PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const B
     {
         if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
             throw;
-        deadline.rethrowIfOutOfTime(op, e, "checking pending rows");
+        deadline.rethrowIfOutOfTime(op, e, phase);
         countIntentUnread(report, e);
         return {FsckClass::PendingGc, "`pending` row: the deletion intent could not be read: " + e.message()};
     }
@@ -832,7 +931,7 @@ PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const B
 /// intentionally left to `runFsck`, which decides whether partial results were requested.
 void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline,
                   const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents, size_t fix_concurrency,
-                  FsckReport & report)
+                  bool read_creator_slots, FsckReport & report)
 {
     if (fix_legacy_markers && !namespace_prefix.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: a fix needs a scan of the whole pool, not of namespaces under '{}'", namespace_prefix);
@@ -857,7 +956,6 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// `detail`) — the HEAD-absent re-resolve below needs it in every mode.
     std::unordered_map<String, std::vector<String>> blob_labels;
 
-    uint64_t refs_walked = 0;
     NsVerdicts verdicts;
     SCOPE_EXIT({ verdicts.publish(report); });
     /// Where an unchecked verdict of a late recheck goes: a life's own scratch while its findings wait
@@ -907,12 +1005,49 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     };
     std::vector<FsckWalkLife> walk_lives;
     walk_lives.reserve(catalog_cut.catalog.entries.size());
+    /// One mount-slot read per creator root and writer epoch, kept with its error: rows can share a creator,
+    /// and each read of a slot that keeps failing costs a whole request window.
+    struct CreatorSlotRead
+    {
+        std::optional<CreatorSlotStatus> slot;
+        String error;
+    };
+    std::map<std::pair<String, uint64_t>, CreatorSlotRead> creator_slot_reads;
+    report.catalog_has_no_walkable_row = !catalog_cut.catalog.entries.empty()
+        && std::all_of(catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+                       [](const CatalogEntry & entry) { return entry.state == NsState::Creating; });
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
         if (!entry.ns.string().starts_with(namespace_prefix))
             continue;
-        if (entry.state == NsState::Creating)
+        if (entry.state == NsState::Creating && !read_creator_slots)
             continue;
+        if (entry.state == NsState::Creating)
+        {
+            const auto [slot_read, first] = creator_slot_reads.try_emplace(
+                std::pair{entry.creator->server_root_id, entry.creator->writer_epoch});
+            if (first)
+            {
+                try
+                {
+                    slot_read->second.slot = probeCreatorSlot(op, layout, entry.creator->server_root_id,
+                        entry.creator->writer_epoch, deadline.bound(op, "reading creator mount slots"));
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
+                        throw;
+                    deadline.rethrowIfOutOfTime(op, e, "reading creator mount slots");
+                    slot_read->second.error = e.message();
+                }
+            }
+            FsckCreatingRow row{.ns = entry.ns.string(), .creator_root = entry.creator->server_root_id,
+                .writer_epoch = entry.creator->writer_epoch, .slot = slot_read->second.slot,
+                .slot_read_error = slot_read->second.error};
+            ++(row.slot == CreatorSlotStatus::Terminal ? report.stalled_creating : report.creating_unproven);
+            report.creating_rows.push_back(std::move(row));
+            continue;
+        }
         try
         {
             if (const auto life = catalog_cut.life_index.resolve(entry.incarnation))
@@ -949,8 +1084,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         };
         std::vector<CanonicalNamespaceKey> canonical_candidates;
 
+        FsckPhase namespaces_phase(on_progress, "listing namespaces", "keys", kListTickKeys);
         forEachListedKeyBounded(op, layout.namespaceRootPrefix(), deadline, "listing namespaces", [&](const ListedKey & listed)
         {
+            namespaces_phase.advance();
             std::optional<NamespaceLifePhysicalId> physical_id;
             try
             {
@@ -984,6 +1121,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             canonical_candidates.push_back(CanonicalNamespaceKey{listed.key, listed.size, *physical_id});
             return true;
         });
+        namespaces_phase.end();
 
         /// The post-observation cut. All three catalog states -- `Creating`, `Live`, `Removing` --
         /// protect a life for this purpose; only a life absent from every one of them is residue.
@@ -1053,6 +1191,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 "fsck findings for this namespace were not confirmed before the deadline");
         }
     };
+    FsckPhase refs_phase(on_progress, kWalkingRefs, "refs", kRefTickItems);
     try
     {
         for (size_t life_index = 0; life_index < walk_lives.size(); ++life_index)
@@ -1096,7 +1235,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     owned_manifest_keys.insert(mkey);
                     const String label = ns_str + "/" + ref_name;
 
-                    const auto got = op.read(mkey, deadline.bound(op, "walking refs"));
+                    const auto got = op.read(mkey, deadline.bound(op, kWalkingRefs));
                     if (!got)
                     {
                         /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
@@ -1107,7 +1246,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         /// plus a fresh checkpoint from its physical life. Count the dangle ONLY when the exact
                         /// object is HEAD-absent AND that life still names THIS exact manifest — otherwise it is
                         /// LIST/GET lag or a phantom stale-row, never a loss.
-                        if (!op.head(mkey, deadline.bound(op, "walking refs"))
+                        if (!op.head(mkey, deadline.bound(op, kWalkingRefs))
                             && manifestStillReferenced(op, layout, ns, recovery_authorities, ref_name, mkey,
                                 deadline, record_recovery_unchecked))
                         {
@@ -1122,7 +1261,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         }
                         /// A present object is GET lag. A row not named by the original-life authority is a
                         /// stale-walk artifact, not a dangle; its original owner cannot contribute blobs.
-                        ++refs_walked;
+                        refs_phase.advance();
                         continue;
                     }
 
@@ -1137,7 +1276,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         o.cls = FsckClass::Dangling;
                         o.reachable_from = {label};
                         findings.scratch.objects.push_back(std::move(o));
-                        ++refs_walked;
+                        refs_phase.advance();
                         continue;
                     }
 
@@ -1152,17 +1291,15 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         blob_labels[bkey].push_back(label);
                     }
 
-                    ++refs_walked;
-                    deadline.check("walking refs");
-                    if (on_progress && refs_walked % 64 == 0)
-                        on_progress("walking refs", reachable_blobs.size(), refs_walked);
+                    refs_phase.advance();
+                    deadline.check(kWalkingRefs);
                 }
             }
             catch (const Exception & e)
             {
                 if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
                     throw;
-                deadline.rethrowIfOutOfTime(op, e, "walking refs");
+                deadline.rethrowIfOutOfTime(op, e, kWalkingRefs);
                 findings.verdicts.recordUnchecked(findings.scratch, ns,
                     layout.namespaceStreamPrefix(life),
                     "fsck could not examine this namespace: " + e.message());
@@ -1175,6 +1312,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             report_held_as_unconfirmed();
         throw;
     }
+    refs_phase.end();
     unchecked_sink = &verdicts;
     unchecked_report = &report;
 
@@ -1291,7 +1429,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// must never be classified as a content body (it would be misread as an unreferenced blob), and a
     /// `.meta` key that does not parse as a marker's is foreign and left alone.
     std::unordered_map<String, uint64_t> present_all;
-    listAll(op, layout.blobsPrefix(), present_all, on_progress, deadline, "listing blobs");
+    FsckPhase blobs_phase(on_progress, "listing blobs", "keys", kListTickKeys);
+    listAll(op, layout.blobsPrefix(), present_all, &blobs_phase, deadline, "listing blobs");
+    blobs_phase.end();
     std::unordered_map<String, uint64_t> present_blobs;
     std::vector<std::pair<String, uint64_t>> legacy_markers;
     present_blobs.reserve(present_all.size());
@@ -1309,6 +1449,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// Reachable blobs must be present (HEAD-confirm against LIST lag before declaring loss).
     confirm_late_findings_or_report_on_deadline([&]
     {
+        FsckPhase heads_phase(on_progress, "head-checking reachable blobs", "blobs", kDefaultTickItems);
         for (const String & bkey : reachable_blobs)
         {
             auto it = present_blobs.find(bkey);
@@ -1316,6 +1457,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             uint64_t size = exists ? it->second : 0;
             if (!exists)
             {
+                heads_phase.advance();
                 if (const std::optional<Meta> h = op.head(bkey, deadline.bound(op, "head-checking reachable blobs")))
                 {
                     exists = true;
@@ -1332,7 +1474,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 /// authority. A later rebirth must not replace the old owner while this verdict is being
                 /// decided.
                 const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
-                    labels, deadline, record_late_unchecked);
+                    labels, deadline, heads_phase.phaseName(), record_late_unchecked);
                 if (!still_referenced)
                     continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
             }
@@ -1353,6 +1495,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             if (detail)
                 report.objects.push_back(std::move(o));
         }
+        heads_phase.end();
     });
 
     /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
@@ -1371,7 +1514,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// `detail` mode only: the stale-edge cross-check below needs the edge IDENTITIES so it can ask
     /// whether their source manifests still exist.
     /// Read even with no body present: a `pending` row is classified whether its body is present or not.
-    const GcSnapshotView snapshot = readGcSnapshot(op, layout, unref_hashes, detail, on_progress, deadline, report);
+    FsckPhase snapshot_phase(on_progress, "reading gc snapshot runs", "rows", kSnapshotTickRows);
+    const GcSnapshotView snapshot = readGcSnapshot(op, layout, unref_hashes, detail, snapshot_phase, deadline, report);
+    snapshot_phase.end();
     const bool have_gc_state = snapshot.have_state;
     const auto & retired_by_hash = snapshot.retired_by_hash;
     const auto & in_run_hashes = snapshot.in_run_hashes;
@@ -1402,14 +1547,20 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             const RootNamespace ns{ns_str};
             std::unordered_map<String, uint64_t> manifest_bodies;
-            listAll(op, layout.manifestNamespacePrefix(ns), manifest_bodies, on_progress, deadline,
-                    "listing manifests for the stale-edge check");
+            {
+                FsckPhase listing(on_progress, "listing manifests for the stale-edge check", "keys", kListTickKeys);
+                listAll(op, layout.manifestNamespacePrefix(ns), manifest_bodies, &listing, deadline,
+                        "listing manifests for the stale-edge check");
+                listing.end();
+            }
+            FsckPhase reading(on_progress, "reading manifests for the stale-edge check", "manifests", kDefaultTickItems);
             for (const auto & [mkey, _] : manifest_bodies)
             {
                 deadline.check("reading manifests for the stale-edge check");
                 const std::optional<ManifestId> id = layout.parseManifestKey(mkey);
                 if (!id)
                     continue;   /// foreign/malformed key under `manifests/` — contributes no source edge
+                reading.advance();
                 const auto got = op.read(mkey, deadline.bound(op, "reading manifests for the stale-edge check"));
                 if (!got)
                     continue;   /// gone between the LIST and the read — genuinely not a live source
@@ -1426,13 +1577,14 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     break;
                 }
             }
+            reading.end();
             if (!stale_edge_check_available)
                 break;
         }
     }
 
     /// A `pending` row over a present body of its token whose intent is absent. Each is confirmed against a
-    /// second read of `gc/state` below: a round may have committed since the first.
+    /// second snapshot read below (`gc/state`, its seal and the runs): a round may have committed since the first.
     struct PendingSuspect
     {
         String key;
@@ -1442,20 +1594,39 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         bool referenced = false;   /// a ref names the body: kept out of the backlog counts
     };
     std::vector<PendingSuspect> suspects;
+    /// A stale edge is provisional until the second snapshot read below still holds one of its edges: a round that
+    /// committed after the first read folds them and deletes the manifest bodies they name. It is counted and
+    /// listed only once confirmed.
+    struct StaleCandidate
+    {
+        FsckObject row;
+        BlobRef ref;
+        std::vector<UInt128> sources;
+    };
+    std::vector<StaleCandidate> stale_candidates;
     /// The `pending` rows the scan of present bodies classified.
     std::unordered_set<BlobRef, BlobRefHash> pending_rows_checked;
 
+    /// Counts retired bodies, each of which costs a `HEAD`; a pending row's check sends more requests that are not counted.
+    /// A body the snapshot has not retired costs no request and no tick.
+    FsckPhase bodies_phase(on_progress, "head-checking retired bodies", "bodies", kBodyTickItems);
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.contains(bkey))
             continue;
         ++report.unreachable;
 
-        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) falls back to the default `BlobRef{}`,
-        /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
-        /// `Unaccounted` bucket below, exactly the "debris, not ours" classification `parseBlobKey`
-        /// documents: foreign algorithm segments are debris, not pool objects.
-        const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});
+        /// A key that is no blob key has no GC identity: it is classified before any snapshot lookup or request.
+        const std::optional<BlobRef> parsed = layout.parseBlobKey(bkey);
+        if (!parsed)
+        {
+            ++report.unaccounted;
+            if (detail)
+                report.objects.push_back(FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::Unaccounted,
+                    .reachable_from = {"Malformed blob key under `blobs/`. No GC identity."}});
+            continue;
+        }
+        const BlobRef & hash = *parsed;
 
         FsckClass cls = FsckClass::Unaccounted;
         String note;
@@ -1470,10 +1641,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
         const auto rit = retired_by_hash.find(hash);
         if (rit != retired_by_hash.end())
-            deadline.check("classifying unreferenced bodies");
+        {
+            bodies_phase.advance();
+            deadline.check(bodies_phase.phaseName());
+        }
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
-            = rit != retired_by_hash.end() ? op.head(bkey, deadline.bound(op, "classifying unreferenced bodies")) : std::nullopt;
+            = rit != retired_by_hash.end() ? op.head(bkey, deadline.bound(op, bodies_phase.phaseName())) : std::nullopt;
         /// GC's identity comparison. A row whose token names no incarnation is classed by the row: GC deletes no body for it.
         const bool row_names_present = retired_head
             && (!rit->second.token.canonical() || sameIncarnation(rit->second.token, retired_head->etag));
@@ -1496,7 +1670,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             else
             {
                 pending_rows_checked.insert(hash);
-                PendingVerdict verdict = checkPendingRow(op, layout, hash, row, deadline, report);
+                PendingVerdict verdict = checkPendingRow(op, layout, hash, row, deadline, bodies_phase.phaseName(), report);
                 if (verdict.cls == FsckClass::PendingWithoutIntent)
                 {
                     suspects.push_back(PendingSuspect{bkey, sz, hash, row.token});
@@ -1527,9 +1701,11 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
             if (all_edges_stale)
             {
-                cls = FsckClass::StaleEdge;
-                note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
-                       "exist — unreclaimable by the incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
+                stale_candidates.push_back(StaleCandidate{
+                    FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::StaleEdge,
+                               .reachable_from = {staleEdgeNote(stale_edges)}},
+                    hash, unref_edge_sources.at(hash)});
+                continue;
             }
             else
             {
@@ -1555,7 +1731,6 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             case FsckClass::PendingTokenRejected: ++report.pending_token_rejected; break;
             case FsckClass::StandingPresent:      ++report.standing_present; break;
             case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
-            case FsckClass::StaleEdge:   ++report.stale_edge;   break;
             default:                     ++report.unaccounted;  break;
         }
         if (detail)
@@ -1570,15 +1745,19 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
+    bodies_phase.end();
+
     /// The same check for every other `pending` row: one whose body a ref names again, since a reference committed after
     /// GC's cut does not stop the delete, and one whose body was gone or replaced before the scan listed it.
+    FsckPhase pending_phase(on_progress, "checking pending rows", "rows", kDefaultTickItems);
     for (const auto & [ref, row] : snapshot.pending_rows)
     {
         if (pending_rows_checked.contains(ref) || !snapshot.speaksFor(ref))
             continue;
         const String bkey = layout.blobKey(ref);
         const bool referenced = reachable_blobs.contains(bkey);
-        PendingVerdict verdict = checkPendingRow(op, layout, ref, row, deadline, report);
+        pending_phase.advance();
+        PendingVerdict verdict = checkPendingRow(op, layout, ref, row, deadline, pending_phase.phaseName(), report);
         const auto it = present_blobs.find(bkey);
         const uint64_t size = it != present_blobs.end() ? it->second : 0;
         if (verdict.cls == FsckClass::PendingWithoutIntent)
@@ -1599,14 +1778,68 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             report.objects.push_back(FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = size, .cls = verdict.cls,
                 .reachable_from = {std::move(verdict.note)}});
     }
+    pending_phase.end();
+
+    /// One second snapshot read (`gc/state`, its seal and the runs) confirms both the `pending` suspects and the
+    /// stale-edge candidates.
+    GcSnapshotView reread;
+    if (!suspects.empty() || !stale_candidates.empty())
+    {
+        std::unordered_set<BlobRef, BlobRefHash> reread_refs;
+        for (const PendingSuspect & suspect : suspects)
+            reread_refs.insert(suspect.ref);
+        for (const StaleCandidate & candidate : stale_candidates)
+            reread_refs.insert(candidate.ref);
+        FsckReport reread_report;   /// only its confirmed refusals are findings, merged below
+        FsckPhase reread_phase(on_progress, "re-reading gc snapshot runs", "rows", kSnapshotTickRows);
+        reread = readGcSnapshot(op, layout, reread_refs, /*detail=*/!stale_candidates.empty(), reread_phase, deadline, reread_report);
+        reread_phase.end();
+        std::unordered_set<String> refused_keys;
+        for (const auto & [key, _] : snapshot.confirmed_refusals)
+            refused_keys.insert(key);
+        for (const auto & [key, reason] : reread.confirmed_refusals)
+            if (refused_keys.insert(key).second)
+                recordCorruptedRun(report, key, reason, detail);
+    }
+    /// A recreated `gc/state` holds no edge although no round folded one.
+    const bool reread_regressed = reread.have_state && reread.snap_generation < snapshot.snap_generation;
+
+    for (StaleCandidate & candidate : stale_candidates)
+    {
+        /// Only a snapshot that speaks for the candidate's shard can show its edges folded.
+        if (!reread.have_state || !reread.speaksFor(candidate.ref) || reread_regressed)
+        {
+            const String why = reread_regressed
+                ? fmt::format("went from snapshot generation {} back to {}", snapshot.snap_generation, reread.snap_generation)
+                : String("did not cover this blob's shard");
+            countIntentUnread(report, "inconclusive: the blob of " + candidate.row.key + " carries only stale edges, and the second read of "
+                "the GC snapshot " + why + ", so whether a GC round folded them is unknown");
+            candidate.row.cls = FsckClass::IntentUnread;
+            candidate.row.reachable_from = {"every source edge names an absent manifest; inconclusive: the second read of the GC snapshot "
+                                            + why};
+            report.objects.push_back(std::move(candidate.row));
+            continue;
+        }
+        /// A real stale edge is never folded, so any source still held in the re-read is one.
+        uint64_t still_held = 0;
+        if (const auto held = reread.edge_sources.find(candidate.ref); held != reread.edge_sources.end())
+        {
+            const std::unordered_set<UInt128, UInt128Hash> held_ids(held->second.begin(), held->second.end());
+            for (const UInt128 & source : candidate.sources)
+                still_held += held_ids.contains(source);
+        }
+        if (!still_held)
+        {
+            ++report.stale_edge_superseded;
+            continue;
+        }
+        ++report.stale_edge;
+        candidate.row.reachable_from = {staleEdgeNote(still_held)};
+        report.objects.push_back(std::move(candidate.row));
+    }
 
     if (!suspects.empty())
     {
-        std::unordered_set<BlobRef, BlobRefHash> suspect_refs;
-        for (const PendingSuspect & suspect : suspects)
-            suspect_refs.insert(suspect.ref);
-        FsckReport reread_report;   /// the run checksums were judged by the first read
-        const GcSnapshotView reread = readGcSnapshot(op, layout, suspect_refs, false, on_progress, deadline, reread_report);
         for (const PendingSuspect & suspect : suspects)
         {
             FsckObject o{.key = suspect.key, .kind = ObjectKind::Blob, .size = suspect.size, .cls = FsckClass::PendingWithoutIntent, .reachable_from = {}};
@@ -1655,14 +1888,15 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         for (const auto & [key, _] : legacy_markers)
             keys.push_back(key);
         const std::unique_ptr<ThreadPool> io_pool = makeBoundedPool(fix_concurrency);
+        FsckPhase removal_phase(on_progress, "removing legacy markers", "markers", kProgressKeys);
         const LegacyMarkerRemoval removal = removeLegacyMarkers(store, keys, *io_pool, deadline,
             [&](uint64_t deleted)
             {
                 report.legacy_markers_deleted = deleted;
-                if (on_progress)
-                    on_progress("removing legacy markers", deleted, 0);
+                removal_phase.tickAt(deleted);
             });
         report.legacy_markers_deleted = removal.deleted;
+        removal_phase.end();
         report.legacy_markers_changed = removal.changed;
     }
     }
@@ -1673,8 +1907,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// classification needs the whole pool and is intentionally skipped.
         confirm_late_findings_or_report_on_deadline([&]
         {
+            FsckPhase scoped_phase(on_progress, "head-checking scoped blobs", "blobs", kDefaultTickItems);
             for (const String & bkey : reachable_blobs)
             {
+                scoped_phase.advance();
                 const std::optional<Meta> h = op.head(bkey, deadline.bound(op, "head-checking scoped blobs"));
                 const auto lit = blob_labels.find(bkey);
                 const std::vector<String> labels = lit != blob_labels.end() ? lit->second : std::vector<String>{};
@@ -1683,7 +1919,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 {
                     /// Use the same HEAD-absent re-resolve as the global-mode loop above.
                     const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
-                        labels, deadline, record_late_unchecked);
+                        labels, deadline, scoped_phase.phaseName(), record_late_unchecked);
                     if (!still_referenced)
                         continue;   /// stale-walk artifact — neither reachable nor dangling
                 }
@@ -1704,6 +1940,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 if (detail)
                     report.objects.push_back(std::move(o));
             }
+            scoped_phase.end();
         });
     }
 
@@ -1712,12 +1949,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// never an error. The owner-visible missing-body case is the error above.
     const NamespaceListing manifest_debris_listing = store.listNamespaces(namespace_prefix);
     recordLifelessKeys(manifest_debris_listing);
+    FsckPhase debris_phase(on_progress, "listing manifests", "keys", kListTickKeys);
     for (const String & ns_str : manifest_debris_listing.namespaces)
     {
         const RootNamespace ns{ns_str};
         const String manifests_prefix = layout.manifestNamespacePrefix(ns);
         std::unordered_map<String, uint64_t> manifest_bodies;
-        listAll(op, manifests_prefix, manifest_bodies, on_progress, deadline, "listing manifests");
+        listAll(op, manifests_prefix, manifest_bodies, &debris_phase, deadline, "listing manifests");
         for (const auto & [mkey, sz] : manifest_bodies)
         {
             if (owned_manifest_keys.contains(mkey))
@@ -1740,7 +1978,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             }
         }
     }
-
+    debris_phase.end();
 }
 
 }
@@ -1748,13 +1986,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
                    const ToolDeadline & deadline,
                    bool partial_on_deadline, const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents,
-                   size_t fix_concurrency)
+                   size_t fix_concurrency, bool read_creator_slots)
 {
     FsckReport report;
     try
     {
         runFsckImpl(store, detail, on_progress, deadline, namespace_prefix, fix_legacy_markers, verify_intents, fix_concurrency,
-                    report);
+                    read_creator_slots, report);
     }
     catch (const Exception & e)
     {
@@ -1823,8 +2061,8 @@ uint64_t fsckIntentsVerified(const FsckReport & report)
     return report.intents_verified ? 1 : 0;
 }
 
-/// Every count both surfaces render, in summary-line order. Every term of `FsckReport::clean` is a column: a SQL
-/// consumer sees no other view of the report. `stale_edge` is nonzero only in `detail` mode, which the SQL scan never
+/// Every count both surfaces render, in summary-line order; a field with an empty SQL column name is on the summary
+/// line only. Every term of `FsckReport::clean` is a column: a SQL consumer sees no other view of the report. `stale_edge` is nonzero only in `detail` mode, which the SQL scan never
 /// runs, and is kept as a column because "absent" and "zero" are different facts. A SQL scan classifies intents from
 /// the listing alone, so the per-intent verdicts and the fix's counts are not columns.
 constexpr std::array kFsckFields{
@@ -1835,6 +2073,7 @@ constexpr std::array kFsckFields{
     FsckField{"awaiting_gc", "awaiting_gc", 4, fsckCount<&FsckReport::awaiting_gc>},
     FsckField{"unaccounted", "unaccounted", 5, fsckCount<&FsckReport::unaccounted>},
     FsckField{"stale_edge", "stale_edge", 6, fsckCount<&FsckReport::stale_edge>},
+    FsckField{"stale_edge_superseded", "", 0, fsckCount<&FsckReport::stale_edge_superseded>},
     FsckField{"corrupted_runs", "corrupted_runs", 7, fsckCount<&FsckReport::corrupted_runs>},
     FsckField{"chain_broken", "chain_broken", 8, fsckCount<&FsckReport::chain_broken>},
     FsckField{"lifeless_keys", "lifeless_keys", 10, fsckCount<&FsckReport::lifeless_keys>},
@@ -1855,6 +2094,8 @@ constexpr std::array kFsckFields{
     FsckField{"janitor_pending", "namespace_janitor_pending", 11, fsckCount<&FsckReport::namespace_janitor_pending>},
     FsckField{"janitor_pending_bytes", "namespace_janitor_pending_bytes", 12, fsckCount<&FsckReport::namespace_janitor_pending_bytes>},
     FsckField{"janitor_pending_lives", "namespace_janitor_pending_lives", 13, fsckCount<&FsckReport::namespace_janitor_pending_lives>},
+    FsckField{"stalled_creating", "", 0, fsckCount<&FsckReport::stalled_creating>},
+    FsckField{"creating_unproven", "", 0, fsckCount<&FsckReport::creating_unproven>},
     FsckField{"unchecked", "unchecked", 9, fsckCount<&FsckReport::unchecked>},
     FsckField{"ref_records_walked", "ref_records_walked", 14, fsckCount<&FsckReport::ref_records_walked>},
     FsckField{"physical_bytes", "physical_bytes", 15, fsckCount<&FsckReport::physical_bytes>},
@@ -1893,6 +2134,20 @@ std::vector<FsckField> fsckSqlColumns()
     return columns;
 }
 
+String formatFsckProgress(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
+{
+    switch (step)
+    {
+        case FsckProgressStep::Start:
+            return fmt::format("cas-fsck: {}: started", phase);
+        case FsckProgressStep::Tick:
+            return fmt::format("cas-fsck: {}: {} {}, {:.1f} s", phase, done, unit, seconds);
+        case FsckProgressStep::End:
+            return fmt::format("cas-fsck: {}: done, {} {}, {:.1f} s", phase, done, unit, seconds);
+    }
+    UNREACHABLE();
+}
+
 String formatFsckSummary(const FsckReport & report)
 {
     /// Field order is load-bearing for humans only; every consumer parses `key=value` tokens. `partial`
@@ -1908,6 +2163,53 @@ String formatFsckSummary(const FsckReport & report)
     if (report.partial)
         out << " partial=1 reason='" << report.partial_reason << "'";
     return out.str();
+}
+
+constexpr std::string_view kOwnerCleanupClause
+    = "a writable creator with its GC scheduler running also cancels its own idle rows of its current writer epoch";
+
+String formatFsckPipelineNote(const FsckReport & report)
+{
+    const uint64_t in_pipeline = report.pending_gc + report.awaiting_gc;
+    if (in_pipeline == 0)
+        return {};
+    /// GC suppresses every delete while it has no namespace to walk and the catalog is not empty.
+    const String verdict = report.catalog_has_no_walkable_row
+        ? fmt::format("GC deletes none of them while every catalog row is `Creating`; `stalled_creating` counts terminal "
+                      "rows, which the GC leader cancels; {}", kOwnerCleanupClause)
+        : "expected, no action needed";
+    return fmt::format(
+        "note: {} unreferenced object(s) are inside the normal GC deletion pipeline "
+        "(condemn and create the intent -> delete the body -> remove the intent takes ~3 rounds) — {}",
+        in_pipeline, verdict);
+}
+
+String formatFsckCreatingRow(const FsckCreatingRow & row)
+{
+    if (!row.slot)
+        return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is "
+                           "unreadable ({}): the GC leader keeps the row while the slot cannot be read; {}",
+                           row.ns, row.creator_root, row.writer_epoch, row.slot_read_error, kOwnerCleanupClause);
+    const char * verdict = "";
+    switch (*row.slot)
+    {
+        case CreatorSlotStatus::Terminal:
+            verdict = "terminal: the next GC round cancels the row";
+            break;
+        case CreatorSlotStatus::Live:
+            verdict = "live: the creator may still finish; the GC leader cancels the row once that server remounts or GC "
+                      "fences its unrenewed mount slot";
+            break;
+        case CreatorSlotStatus::Absent:
+            verdict = "absent on this read: the GC leader does not cancel the row while the slot is absent";
+            break;
+        case CreatorSlotStatus::Undecodable:
+            verdict = "undecodable: the GC leader cannot cancel the row while the slot does not decode";
+            break;
+    }
+    const String owner_cleanup = *row.slot == CreatorSlotStatus::Terminal ? "" : fmt::format("; {}", kOwnerCleanupClause);
+    return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is {}{}",
+                       row.ns, row.creator_root, row.writer_epoch, verdict, owner_cleanup);
 }
 
 }

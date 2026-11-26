@@ -458,7 +458,7 @@ TEST(CASGCHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
     for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
     {
         SCOPED_TRACE(entry.first);
-        EXPECT_DEATH({ (void)encodeFoldSeal(entry.second); }, "");
+        CAS_EXPECT_DEATH({ (void)encodeFoldSeal(entry.second); }, "");
     }
 }
 #endif

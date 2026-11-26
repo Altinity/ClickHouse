@@ -226,6 +226,8 @@ struct DropNamespaceStats
 {
     uint64_t committed_refs = 0;
     uint64_t precommits = 0;
+    /// The catalog had no row for the namespace, or another actor removed it during the call: this call removed nothing.
+    bool already_absent = false;
 };
 
 /// Per-owner configuration passed by value to the ref ledger. It is a projection of the flat pool

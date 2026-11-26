@@ -398,7 +398,7 @@ TEST(CASProtocol, AbandonLeavesDebrisAndDisables)
     EXPECT_TRUE(s->listRefs(ns).empty());
 
     /// Further build ops ⇒ LOGICAL_ERROR (requireAlive).
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->stageManifest({blobEntry("data.bin", "payload-X")});

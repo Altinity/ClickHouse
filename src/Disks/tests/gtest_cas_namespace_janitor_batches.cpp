@@ -279,6 +279,8 @@ TEST(CASNamespaceJanitorBatches, RoundDrainsEveryPageOfDebris)
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 311), 2500);
     backend->resetCounts();
+    /// `resetCounts` leaves this one, and the open's intent probe sent a bulk delete.
+    const size_t bulk_calls_before = backend->bulkRemoveCalls();
 
     Gc gc(store, DB::UInt128{312});
     const auto metrics = runRoundAndGetJanitorMetrics(gc);
@@ -291,7 +293,7 @@ TEST(CASNamespaceJanitorBatches, RoundDrainsEveryPageOfDebris)
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 4u);
     EXPECT_EQ(metrics.at("delete_requests"), 3u);
     /// One request per page: the in-memory store's limit is the CAS maximum.
-    EXPECT_EQ(backend->bulkRemoveCalls(), 3u);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_before, 3u);
 }
 
 TEST(CASNamespaceJanitorBatches, RoundDrainsDebrisOnBothSidesOfTheCursor)
@@ -405,6 +407,7 @@ TEST(CASNamespaceJanitorBatches, StoreKnownToHaveNoBatchDeleteSendsOneRequestPer
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 316), 1200);
     backend->resetCounts();
+    const size_t bulk_calls_before = backend->bulkRemoveCalls();
 
     Gc gc(store, DB::UInt128{317});
     const auto metrics = runRoundAndGetJanitorMetrics(gc);
@@ -412,7 +415,7 @@ TEST(CASNamespaceJanitorBatches, StoreKnownToHaveNoBatchDeleteSendsOneRequestPer
     EXPECT_EQ(countPresent(*backend, stream), 0u);
     EXPECT_EQ(metrics.at("janitor_deleted"), 1200u);
     EXPECT_EQ(metrics.at("leaked"), 0u);
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1200u);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_before, 1200u);
     EXPECT_EQ(metrics.at("delete_requests"), 1200u);
 }
 
@@ -425,6 +428,8 @@ TEST(CASNamespaceJanitorBatches, RefusedBatchGoesKeyByKeyAndLeaksOnlyTheFailedKe
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 324), 1200);
     backend->failing_key = stream[1100];
+    /// The open's intent probe deleted its one key.
+    const size_t single_key_requests_before = backend->single_key_requests.load();
 
     /// The janitor's time budget reads the same virtual clock, so the spent window still ends its pass.
     Gc gc(store, DB::UInt128{325}, {}, DB::Cas::tests::VirtualRetryClock::nowFnOf(clock));
@@ -434,7 +439,7 @@ TEST(CASNamespaceJanitorBatches, RefusedBatchGoesKeyByKeyAndLeaksOnlyTheFailedKe
     EXPECT_TRUE(present(*backend, stream[1100]));
     EXPECT_EQ(metrics.at("janitor_deleted"), 1199u);
     EXPECT_EQ(metrics.at("leaked"), 1u) << "a failure late in the chunk leaks that key, not the whole chunk";
-    EXPECT_EQ(backend->single_key_requests.load(), 1199u);
+    EXPECT_EQ(backend->single_key_requests.load() - single_key_requests_before, 1199u);
     /// One refused batch per page, then one request per key.
     EXPECT_EQ(backend->refused_batches.load(), 2u);
     EXPECT_EQ(metrics.at("delete_requests"), 1202u);

@@ -63,9 +63,9 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_interval_sec, 60, "Seconds between background GC rounds (>= 1)", 0) \
     DECLARE(String, blob_hash, "cityhash128", "Pool blob content-hash function (cityhash128 | xxh3-128 | sha256); fixed at pool creation", 0) \
     DECLARE(Bool,   blob_hash_allow_new, false, "Explicit opt-in to admit a NEW hash algo into an existing pool's algos_used", 0) \
-    DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
+    DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained. at least 1. 1 is loaded as 2: with one a round that loses its commit can delete the generation the pool still adopts. 0 is refused", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
-    DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
+    DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Maximum number of manifest keys to list per orphan-manifest sweep page (0 pauses the sweep and preserves its cursor)", 0) \
     DECLARE(UInt64, orphan_manifest_sweep_interval_sec, 3600, "Seconds to wait after a completed orphan-manifest sweep before starting the next one (0 = no wait)", 0) \
     DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row, 1 to 999: one LIST response", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
@@ -253,6 +253,15 @@ void ContentAddressedSettings::loadFromConfig(
         }
     }
 
+    /// 1 is raised so an existing configuration still loads.
+    if (candidate[ContentAddressedSetting::gc_snapshot_generations_to_keep].value == 1)
+    {
+        candidate[ContentAddressedSetting::gc_snapshot_generations_to_keep] = 2;
+        LOG_WARNING(getLogger("ContentAddressedSettings"),
+            "content_addressed disk `{}`: `cas_gc_snapshot_generations_to_keep` = 1 is loaded as 2, because with one "
+            "generation GC can remove the generation it has just adopted", config_prefix);
+    }
+
     impl.swap(candidate.impl);
 }
 
@@ -267,6 +276,11 @@ void ContentAddressedSettings::validate()
             "(got {}, {}, {})",
             settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value,
             settings[ContentAddressedSetting::gc_io_concurrency].value);
+
+    if (settings[ContentAddressedSetting::gc_snapshot_generations_to_keep] == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_gc_snapshot_generations_to_keep = 0 (keep every generation) is no longer "
+            "accepted; set a large number instead (got 0)");
 
     if (settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys] == 0
         || settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys] > 1000)

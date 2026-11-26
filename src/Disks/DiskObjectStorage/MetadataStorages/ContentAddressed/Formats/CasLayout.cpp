@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <base/hex.h>
+#include <algorithm>
 #include <charconv>
 
 namespace DB::ErrorCodes
@@ -53,14 +55,10 @@ std::optional<BlobRef> parseBlobSegments(std::string_view algo_name, std::string
     const std::optional<BlobHashAlgo> algo = algoFromPathSegment(algo_name);
     if (!algo || hex.size() != 2 * blobHashLenFor(*algo) || shard != hex.substr(0, 2))
         return std::nullopt;
-    try
-    {
-        return BlobRef{*algo, codecFor(*algo).fromHex(String(hex))};
-    }
-    catch (const Exception &)
-    {
-        return std::nullopt;   /// non-hex characters
-    }
+    /// Syntax is checked here so that no exception is read as "not a blob key": a memory limit must propagate.
+    if (std::any_of(hex.begin(), hex.end(), [](char c) { return unhex(c) == 0xff; }))
+        return std::nullopt;
+    return BlobRef{*algo, codecFor(*algo).fromHex(hex)};
 }
 
 }

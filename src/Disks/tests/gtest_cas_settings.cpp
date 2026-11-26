@@ -31,6 +31,7 @@ namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_shards;
+    extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
@@ -216,6 +217,35 @@ TEST(CASContentAddressedSettings, IntentSweepPageOutsideOneListResponseIsRefused
                 + "</cas_intent_sweep_list_budget_keys>",
             ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: cas_intent_sweep_list_budget_keys must be between 1 and 999 (got " + value + ")");
+}
+
+TEST(CASContentAddressedSettings, SnapshotGenerationsToKeepZeroIsRefused)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_snapshot_generations_to_keep>0</cas_gc_snapshot_generations_to_keep>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: cas_gc_snapshot_generations_to_keep = 0 (keep every generation) is no longer "
+        "accepted; set a large number instead (got 0)");
+}
+
+TEST(CASContentAddressedSettings, SnapshotGenerationsToKeepOneIsLoadedAsTwo)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_snapshot_generations_to_keep>1</cas_gc_snapshot_generations_to_keep>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_snapshot_generations_to_keep].value, 2u);
+}
+
+TEST(CASContentAddressedSettings, SnapshotGenerationsToKeepTwoIsAccepted)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_snapshot_generations_to_keep>2</cas_gc_snapshot_generations_to_keep>");
+    ContentAddressedSettings s;
+    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
+    EXPECT_EQ(s[ContentAddressedSetting::gc_snapshot_generations_to_keep].value, 2u);
 }
 
 TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)

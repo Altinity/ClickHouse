@@ -1181,7 +1181,7 @@ TEST(CASTransactionOps, ProjectionRekeyOntoAStagedProjectionThrows)
 /// The storage is built inside the child, so the parent of this death suite constructs none.
 TEST(CASTransactionOpsDeathTest, ProjectionRekeyOntoAStagedProjectionAborts)
 {
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         auto storage = openTxStorage();
         rekeyProjection(*storage, /*destination_staged=*/true);
     }, "");
@@ -1309,6 +1309,28 @@ TEST(CASTransactionSourceLiveness, ProjectionRekeyKeepsTheCopySource)
             EXPECT_FALSE(storage->existsFile(part + "p_1.tmp_proj/data.bin"));
         }
     }
+}
+
+/// A mutated part's projection keeps its parent's transaction for the part's whole life, so a commit drops what
+/// only the publication needed: the decoded source manifest and the source table's runtime.
+TEST(CASTransactionSourceLiveness, ACommittedTransactionReleasesItsCopySources)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_93_93_0", {{"data.bin", "a column of the source"}, {"p.proj/data.bin", "its projection"}});
+    const std::string part = table + "tmp_mut_all_93_93_0_2/";
+
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    tx->createHardLink(table + "all_93_93_0/data.bin", part + "data.bin");
+    tx->createHardLink(table + "all_93_93_0/p.proj/data.bin", part + "p.proj/data.bin");
+    std::weak_ptr<const DB::Cas::CopySource> source = ca_tx.borrowedSourceForTest(table + "all_93_93_0");
+    ASSERT_FALSE(source.expired()) << "positive control: the hardlinks borrowed the source";
+
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(storage->existsFile(part + "p.proj/data.bin"));
+    EXPECT_EQ(ca_tx.borrowedSourceForTest(table + "all_93_93_0"), nullptr);
+    EXPECT_TRUE(source.expired()) << "a staged entry still holds the copy source after the commit";
 }
 
 /// Bytes the destination uploads itself need no source: a copy of a pending upload and a copied path that is
@@ -2003,7 +2025,7 @@ TEST(CASTransactionStagedCopies, ABlobEntryWithNoUploadAndNoSourceThrows)
 /// The storage is built inside the child, so the parent of this death suite constructs none.
 TEST(CASTransactionStagedCopiesDeathTest, ABlobEntryWithNoUploadAndNoSourceAborts)
 {
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         auto storage = openTxStorage();
         commitUnprovenBlobEntry(*storage);
     }, "has neither a pending upload nor a copy source");

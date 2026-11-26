@@ -940,7 +940,7 @@ std::shared_ptr<PublicationRecordingLocalObjectStorage> makePublicationRecording
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<PublicationRecordingLocalObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<PublicationRecordingLocalObjectStorage>(std::move(settings)), root);
 }
 
 String readStorageObject(const DB::ObjectStoragePtr & storage, const String & key)
@@ -1336,7 +1336,8 @@ public:
 /// is not an ordinary answer and stays loud.
 TEST(CASObjectStorageBackend, IfMatchWriteDeclaresAnAbsentKeyExpected)
 {
-    DB::LocalObjectStorageSettings settings("test", tests::makeLocalObjectStorageForTest()->getCommonKeyPrefix(), /*read_only_=*/false);
+    const auto root_owner = tests::makeLocalObjectStorageForTest();
+    DB::LocalObjectStorageSettings settings("test", root_owner->getCommonKeyPrefix(), /*read_only_=*/false);
     auto storage = std::make_shared<Expect404RecordingLocalObjectStorage>(std::move(settings));
     auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
 
@@ -1488,7 +1489,8 @@ ThrowOnReadFixture makeThrowOnReadStorageForTest(const std::string & key_suffix)
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    auto storage = std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings));
+    auto storage = DB::Cas::tests::ownedByDirectory(
+        std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings)), root);
     const std::string key = DB::Cas::tests::nativeKeyUnder(storage, key_suffix);
 
     /// Write the object so tryGetObjectMetadata reports it present (HEAD succeeds).
@@ -1610,7 +1612,7 @@ TEST(CASObjectStorageBackendDeathTest, EmuTokenSurvivesProcessRestartAcrossRecre
     /// See EmuTokenSurvivesProcessRestartAcrossRecreate above for the property under test; a
     /// LOGICAL_ERROR aborts the process under DEBUG_OR_SANITIZER_BUILD, so this arm pins the refusal
     /// via EXPECT_DEATH instead of an exception.
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { op2.remove("k/restart", stale_token, Retry::once()); },
         "cannot be the precondition for");
 }
@@ -1672,7 +1674,7 @@ DB::ObjectStoragePtr makeFixedEtagStorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FixedEtagLocalObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FixedEtagLocalObjectStorage>(std::move(settings)), root);
 }
 
 }
@@ -1768,7 +1770,7 @@ DB::ObjectStoragePtr makeFixedNumericEtagStorageForTest(const String & etag)
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag);
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag), root);
 }
 
 class ClockEtagLocalObjectStorage final : public DB::LocalObjectStorage
@@ -1802,7 +1804,7 @@ DB::ObjectStoragePtr makeClockEtagStorageForTest(const std::shared_ptr<std::atom
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<ClockEtagLocalObjectStorage>(std::move(settings), now_ns);
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<ClockEtagLocalObjectStorage>(std::move(settings), now_ns), root);
 }
 
 }
@@ -1916,7 +1918,7 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedConnec
     /// The mismatch is a programmer error (LOGICAL_ERROR): under DEBUG_OR_SANITIZER_BUILD it aborts the
     /// process before it can be caught, so that arm pins the refusal via EXPECT_DEATH.
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+    CAS_EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
 #else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
 #endif
@@ -1932,7 +1934,7 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedAttemp
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/6000, *budget.connect_timeout_cap_ms);
     /// Same split as the connect-cap twin above: a LOGICAL_ERROR aborts under DEBUG_OR_SANITIZER_BUILD.
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+    CAS_EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
 #else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
 #endif

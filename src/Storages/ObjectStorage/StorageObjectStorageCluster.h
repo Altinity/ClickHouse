@@ -195,6 +195,10 @@ public:
 
     bool isIcebergStorage() const { return configuration->isIcebergConfiguration(); }
 
+    /// Only Iceberg can name a snapshot in its table function, through `iceberg_metadata_file_path`, which a catalog
+    /// table gets from the catalog's metadata location.
+    bool isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,

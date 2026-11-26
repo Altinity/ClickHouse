@@ -142,14 +142,19 @@ TEST(CASGCStateFormat, RejectsWrongScheduleTypes)
         EXPECT_THROW(decodeGcState(sweepScheduleWire("", "\"orphan_manifest_sweep_completed_at_ms\":" + value + ",")), DB::Exception);
 }
 
-TEST(CASGCStateFormat, ReadsPriorThreeFieldState)
+TEST(CASGCStateFormat, PreservesBothCursorsWhenUpgradingGeneration4State)
 {
-    const String old_wire = sweepScheduleWire("cursor",
-        "\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":\"1000\",\"orphan_manifest_sweep_completed_at_ms\":\"500\",");
-    const auto state = decodeGcState(old_wire);
-    EXPECT_EQ(state.manifest_sweep_cursor, "cursor");
-    EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, 500);
-    EXPECT_EQ(encodeGcState(state), sweepScheduleWire("cursor", "\"orphan_manifest_sweep_completed_at_ms\":\"500\","));
+    const String old_wire = "{\"type\":\"cas_gc_state\",\"v\":4}\n"
+        "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"3\",\"snap_pruned_through\":\"0\",\"snap_attempt\":\"3\","
+        "\"manifest_sweep_cursor\":\"manifest-key\",\"intent_sweep_cursor\":\"intent-key\","
+        "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n";
+    const GcState state = decodeGcState(old_wire);
+    EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, 0);
+    const GcState rewritten = decodeGcState(encodeGcState(state));
+    EXPECT_EQ(rewritten.header_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(rewritten.manifest_sweep_cursor, "manifest-key");
+    EXPECT_EQ(rewritten.intent_sweep_cursor, "intent-key");
+    EXPECT_EQ(rewritten.orphan_manifest_sweep_completed_at_ms, 0);
 }
 
 TEST(CASGCStateFormat, RejectsZeroGcShards)
@@ -188,7 +193,7 @@ TEST(CASGCStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 {
     GcState state;
     state.gc_shards = 0;
-    EXPECT_DEATH({ (void)encodeGcState(state); }, "");
+    CAS_EXPECT_DEATH({ (void)encodeGcState(state); }, "");
 }
 #endif
 

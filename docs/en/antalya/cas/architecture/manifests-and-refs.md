@@ -323,7 +323,8 @@ call it, and GC intake follows the same successor rule (`refChainSuccessor`).
 | Contains `RemoveNamespace` | none: the stream ends and no later key is read |
 
 History ends at the first absent key on this chain, or at a terminal record. Keys are read by exact
-`GET` in successor order. The record after a tombstone must name it in its backlink, and no other record carries a backlink.
+`GET` in successor order. A GC round's walk reads no key at or past the stop the round fixed before it started walking; see
+[the stop](/antalya/cas/architecture/garbage-collection#phase-8-fold-ref-intake). The record after a tombstone must name it in its backlink, and no other record carries a backlink.
 
 Cleanup deletes only logs strictly below the snapshot id read from `_ckpt`, and that id only grows. So a
 walk from a snapshot base re-reads `_ckpt` after its last read: an unchanged token proves that no

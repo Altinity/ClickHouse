@@ -1503,7 +1503,7 @@ TEST(CASWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_x/txn_version.txt", "A");
     writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9/txn_version.txt", "B");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    EXPECT_DEATH({ ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"); }, "");
+    CAS_EXPECT_DEATH({ ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"); }, "");
 }
 #endif
 
@@ -2179,14 +2179,14 @@ TEST(CASWiringExchangeDeathTest, PrepareAdoptRefusesATargetThatIsNotAPartDirecto
     ASSERT_NE(exchange, nullptr);
 
     std::unique_ptr<DB::ICaPreparedRelink> prepared;
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "a22/a22a22a2-2222-4222-8222-222222222222", std::string{}, prepared),
                  "does not address a content-addressed part directory");
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "a22/a22a22a2-2222-4222-8222-222222222222/tmp-fetch_all_1_1_0/data.bin",
                      std::string{}, prepared),
                  "does not address a content-addressed part directory");
-    EXPECT_DEATH(exchange->prepareAdoptFromManifest(
+    CAS_EXPECT_DEATH(exchange->prepareAdoptFromManifest(
                      "shadow/bk1/store/a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0",
                      std::string{}, prepared),
                  "does not address a content-addressed part directory");
@@ -2261,7 +2261,8 @@ std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
-    return std::make_shared<FaultyLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<FaultyLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 }
@@ -2322,8 +2323,8 @@ TEST(CASWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     const auto root = (std::filesystem::temp_directory_path()
                        / ("ca_ro_" + std::to_string(::getpid()))).string();
     std::error_code ec; std::filesystem::remove_all(root, ec); std::filesystem::create_directories(root, ec);
-    auto writable_os = std::make_shared<DB::LocalObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    auto writable_os = DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
     {
         auto w_settings = DB::Cas::tests::makeSettingsForTest(
             "test", std::filesystem::temp_directory_path() / "ca_ro_scratch");
@@ -2483,8 +2484,8 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
-    return std::make_shared<RecordingLocalObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<RecordingLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 /// True for a durable ref-object write key under `/cas/ns/stream/`. In the snapshot+log ref model the

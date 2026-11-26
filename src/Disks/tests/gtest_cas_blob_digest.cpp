@@ -264,7 +264,7 @@ TEST(CASBlobDigestDeathTest, ZeroTailChassertFiresOnNonZeroTailAtLen16)
     BlobDigest d = BlobDigest::fromU128(UInt128(1));
     d.bytes[16] = 0x42; /// corrupt a tail byte beyond the pool's 16-byte width
 
-    EXPECT_DEATH({ (void)codec16.toHex(d); }, "");
-    EXPECT_DEATH({ (void)codec16.toBytesBE(d); }, "");
+    CAS_EXPECT_DEATH({ (void)codec16.toHex(d); }, "");
+    CAS_EXPECT_DEATH({ (void)codec16.toBytesBE(d); }, "");
 }
 #endif

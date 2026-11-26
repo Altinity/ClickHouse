@@ -147,7 +147,8 @@ private:
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
         /// The committed source of each entry in `entries` adopted without reading its body, keyed by entry path.
         /// It follows the entry through staged copies and renames; `confirmCopySources` checks it before promote.
-        /// Written only by `putEntry`, `eraseEntry`, `rekeyEntry` and `clearEntries`, which keep it in step with `entries`.
+        /// Written only by `putEntry`, `eraseEntry`, `rekeyEntry` and `clearEntries`, which keep it in step with `entries`,
+        /// until a successful `commit` clears it.
         /// Entries borrowed from one source share one handle (`copy_sources_by_part`).
         std::map<std::string, std::shared_ptr<Cas::CopySource>> copy_sources;
         /// The committed manifest this transaction found under the part's name when it first staged a

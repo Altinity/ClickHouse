@@ -43,19 +43,19 @@ TEST(CASRefCodec, RenderCanonicalForm)
 
 TEST(CASRefCodec, RenderRejectsZeroComponent)
 {
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             renderRefTxnId(RefTxnId{0, 1});
         },
         "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             renderRefTxnId(RefTxnId{1, 0});
         },
         "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             renderRefTxnId(RefTxnId{0, 0});

@@ -404,17 +404,17 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openRecordingStorage(
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
 
-    out_object_storage = std::make_shared<RecordingObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    out_object_storage = ownedByDirectory(
+        std::make_shared<RecordingObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 
-    auto settings = makeSettingsForTest(
-        "test", std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique));
+    const auto scratch = std::filesystem::temp_directory_path() / ("cas_ns_file_profile_scratch_" + unique);
+    auto settings = makeSettingsForTest("test", scratch);
     /// A GC round touches `cas/ref_catalog`, `cas/ns/stream/` and `cas/manifests/`, so with the
     /// background scheduler enabled these zeros would hold only because the first tick (60s) outlives the
     /// test. A timer is not a fence.
     settings[DB::ContentAddressedSetting::gc_enabled] = false;
-    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        out_object_storage, "pool", "srv1", "", nullptr, settings);
+    auto storage = ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(out_object_storage, "pool", "srv1", "", nullptr, settings), scratch);
     storage->startup();
     return storage;
 }

@@ -47,7 +47,7 @@ timestamp); clean decommission of a permanently departed pool member
 
 **Backends.** AWS S3 (`ETag`-based conditional dialect) is validated. Google Cloud Storage's
 generation-token implementation and deterministic tests are complete, but its credentialed
-real-GCS release gate has not run. A capability probe runs at every writable mount and refuses a backend that does not enforce the
+real-GCS release gate has not run. A capability probe runs when a writable disk starts and refuses a backend that does not enforce the
 conditions CAS depends on.
 
 **Operability.** `system.cas_log`, `system.cas_gc_log`, and `system.cas_mounts` for introspection;

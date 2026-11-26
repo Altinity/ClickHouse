@@ -48,6 +48,8 @@ static struct InitFiu
     PAUSEABLE_ONCE(remote_query_executor_receive_packet_pause) \
     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
     ONCE(connection_stale_on_establish) \
+    REGULAR(unresponsive_pooled_connection) \
+    REGULAR(pooled_connection_ping_timeout) \
     PAUSEABLE(swarm_mode_before_task_request) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
@@ -262,6 +264,10 @@ static struct InitFiu
     PAUSEABLE_ONCE(iceberg_drop_partition_pause_after_discovery) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_fail) \
+    ONCE(iceberg_catalog_update_metadata_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_throw_after_apply) \
+    ONCE(iceberg_glue_update_table_fail) \
     PAUSEABLE_ONCE(iceberg_metadata_prefetch_pause) \
     REGULAR(storage_cluster_read_sleep) \
     ONCE(iceberg_writes_non_retry_cleanup) \

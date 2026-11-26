@@ -505,7 +505,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 1));
     c.entries.push_back(liveEntry("a", 2));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
@@ -513,7 +513,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
     RefCatalog c;
     c.entries.push_back(liveEntry("b", 1));
     c.entries.push_back(liveEntry("a", 2));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
@@ -521,42 +521,42 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1),
         .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorAbsentOnCreatingAborts)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1)});
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsZeroIncarnationAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 0));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNameOverByteBoundAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry(String(kMaxNamespaceBytes + 1, 'a'), 1));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("", 1));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAborts)
 {
     CatalogEntry live_with_round = liveEntry("live", 8);
     live_with_round.removal_started_round = 20;
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); }, "removal_started_round");
 }
 
@@ -673,7 +673,7 @@ TEST(CASRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
-    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
+    CAS_EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
 #endif
 
@@ -968,7 +968,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
         CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-        EXPECT_DEATH(
+        CAS_EXPECT_DEATH(
             { (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog &) { return RefCatalog{}; }); },
             "cannot add or delete catalog entries");
     }
@@ -979,7 +979,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
         CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-        EXPECT_DEATH(
+        CAS_EXPECT_DEATH(
             {
                 (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
                 {
@@ -1205,7 +1205,7 @@ TEST(CASRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
     CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -1355,7 +1355,7 @@ TEST(CASRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
         .incarnation = UInt128{7},
         .removal_started_round = 13};
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { (void)CasRefCatalog::casAdmitEntry(op, layout, 1, removing); },
         "cannot admit namespace.*directly as Removing");
 }
@@ -1949,19 +1949,19 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return false; }),
+        op, layout, creating, [](const CreatorFence &) { return false; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     CatalogEntry stale = creating;
     stale.creator->writer_epoch = 2;
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, stale, [](const CreatorFence &) { return true; }),
+        op, layout, stale, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return true; }),
+        op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1);
@@ -2158,7 +2158,6 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     state.gc_shards = 1;
     state.snap_generation = 1;
     state.snap_attempt = 1;
-    state.orphan_manifest_sweep_completed_at_ms = 1000;
     seedObject(op, layout.gcStateKey(), encodeGcState(state));
 
     const uint64_t signals_before
@@ -2167,9 +2166,9 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
     const uint64_t append_writes_before = backend->writes(unreadable_ref_log_key);
     ScopedCasGcLogCapture log_capture;
-    Gc first_process(store, gc_id, [] { return 1001; });
+    Gc first_process(store, gc_id);
     EXPECT_TRUE(first_process.runRegularRound().acquired_lease);
-    Gc restarted_process(store, gc_id, [] { return 1001; });
+    Gc restarted_process(store, gc_id);
     EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals] - signals_before, 2u);
@@ -2353,7 +2352,7 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
     /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
     const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
-    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
               CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
@@ -2981,7 +2980,7 @@ TEST(CASRefCatalogDeathTest, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoomAbo
 
     /// The lane's re-render on a fresh read cannot rescue this, because constructing the
     /// `LOGICAL_ERROR` for the hint's own duplicate aborts before the reread ever happens.
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -3019,7 +3018,7 @@ TEST(CASRefCatalogDeathTest, ATrueRefusalCasAdmitEntrySeesItsRowStillPresentAbor
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
 }
 #endif
 

@@ -4,7 +4,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
 #include <Common/ThreadPool.h>
+#include <base/types.h>
 
+#include <array>
 #include <atomic>
 #include <exception>
 #include <functional>
@@ -17,6 +19,30 @@
 
 namespace DB::Cas
 {
+
+/// The source a tagged read belongs to, for the fold's per-family intake accounting. `Other` is never counted.
+enum class ReadFamily : uint8_t
+{
+    RefCheckpoint,
+    RefLog,
+    Manifest,
+    Other,
+};
+
+/// Owner-thread counts and elapsed time of one family's reads; see `GcReadAhead::enableFamilyAccounting`.
+struct ReadFamilyStats
+{
+    UInt64 issued = 0;
+    UInt64 takes = 0;
+    UInt64 awaited = 0;
+    UInt64 wait_ns = 0;
+    UInt64 apply_ns = 0;
+
+    bool operator==(const ReadFamilyStats &) const = default;
+};
+
+/// `std::chrono::steady_clock` in nanoseconds; noexcept, unlike `clock_gettime_ns`.
+UInt64 steadyNowNs() noexcept;
 
 /// Read-ahead in front of ONE admitted operation. A caller HINTS keys the sequential code will read
 /// next; workers fetch them on `pool`, each through an operation resumed under the SAME admitted
@@ -33,9 +59,9 @@ namespace DB::Cas
 /// read lands yields the same hold a slightly earlier sequential read yields.
 ///
 /// Only the result TAKEN, in the walk's order, decides anything; a hint never does. So a hint can cost
-/// a wasted read, never change a verdict. The fold's ref-log hints stay inside the epoch of the key
-/// the walk reads next, up to the greatest id the round's listing shows in that epoch, and, while the
-/// walk has a read budget, within it. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
+/// a wasted read, never change a verdict. The walk's ref-log hints are the ids above the key the walk reads
+/// next, in its epoch, up to the greatest key planning read present there. At most the window of them are
+/// in flight, within the walk's read budget, and bodies planning kept are skipped. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
 /// current epoch, up to a generation 1 or 2 `committed_through` when it has one. A hinted key the walk
 /// never takes -- past a tombstone, past the chain's end, or after a hold -- is discarded and counted
 /// wasted.
@@ -54,11 +80,27 @@ public:
     GcReadAhead(const GcReadAhead &) = delete;
     GcReadAhead & operator=(const GcReadAhead &) = delete;
 
-    void hintRead(const String & key);
+    void hintRead(const String & key, ReadFamily family = ReadFamily::Other);
     void hintHead(const String & key);
 
-    std::optional<Object> takeRead(const String & key);
+    std::optional<Object> takeRead(const String & key, ReadFamily family = ReadFamily::Other);
     std::optional<Meta> takeHead(const String & key);
+
+    /// The body of a hinted read whose worker already answered present, without taking it. Null when `key` is not
+    /// hinted, not answered yet, answered absent, or failed. Never blocks and counts nothing. Owner thread only; the
+    /// pointer is valid until `key` is taken or discarded.
+    const Object * peekRead(const String & key) const;
+
+    /// Starts counting tagged reads on this object; off until called, and then an untagged read is still
+    /// not counted, polls nothing and reads no clock. Per family: `issued` counts accepted hints and inline
+    /// takes; `takes` every take, absent or throwing included; `awaited` inline takes and hinted takes
+    /// whose result was not ready at one poll before `get`; `wait_ns` the time from the take's entry
+    /// to its result (the whole read when inline); `apply_ns` the time from a take's return to the next tagged take
+    /// or `closeApply`. Owner thread only; `clock` is the seam for a fake clock.
+    void enableFamilyAccounting(UInt64 (*clock)() noexcept = &steadyNowNs);
+    /// Ends the open apply interval, so time after this point is charged to no family.
+    void closeApply();
+    const ReadFamilyStats & familyStats(ReadFamily family) const { return stats[static_cast<size_t>(family)]; }
 
     /// Drops a hinted key the caller will never take. The request is already in flight or done; the
     /// wait is bounded by that one request, its result and its exception are dropped, and the slot is
@@ -88,11 +130,14 @@ public:
     size_t window() const { return concurrency <= 1 ? 0 : 4 * concurrency; }
 
 private:
+    /// The worker writes `result` before it completes `promise`, so a ready `future` makes `result` readable on the
+    /// owner thread without taking it. A worker exception travels through `promise` and leaves `result` empty.
     template <typename T>
     struct Slot
     {
-        std::promise<std::optional<T>> promise;
-        std::future<std::optional<T>> future;
+        std::optional<T> result;
+        std::promise<void> promise;
+        std::future<void> future;
         Slot() : future(promise.get_future()) {}
     };
 
@@ -100,10 +145,13 @@ private:
     using Slots = std::unordered_map<String, std::shared_ptr<Slot<T>>>;
 
     template <typename T, typename Request>
-    void hint(Slots<T> & slots, const String & key, Request request);
+    void hint(Slots<T> & slots, const String & key, Request request, ReadFamily family);
 
     template <typename T, typename Inline>
-    std::optional<T> take(Slots<T> & slots, const String & key, Inline inline_request);
+    std::optional<T> take(Slots<T> & slots, const String & key, Inline inline_request, ReadFamily family);
+
+    bool accounts(ReadFamily family) const { return clock_ns != nullptr && family != ReadFamily::Other; }
+    void closeApplyAt(UInt64 now_ns);
 
     template <typename T>
     void discard(Slots<T> & slots, const String & key);
@@ -130,6 +178,12 @@ private:
     std::unordered_map<uint64_t, std::future<IntentCreateResult>> creates;
     uint64_t next_create = 0;
     const std::shared_ptr<CreateFailure> create_failure = std::make_shared<CreateFailure>();
+
+    /// Null while accounting is off.
+    UInt64 (*clock_ns)() noexcept = nullptr;
+    std::array<ReadFamilyStats, 4> stats{};
+    std::optional<ReadFamily> apply_family;
+    UInt64 apply_since_ns = 0;
 };
 
 }

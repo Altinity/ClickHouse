@@ -163,6 +163,12 @@ void CasGcScheduler::stop()
     i_am_leader.store(false, std::memory_order_relaxed);
 }
 
+bool CasGcScheduler::stopRequested()
+{
+    std::lock_guard lock(mutex);
+    return scheduler_state == SchedulerState::Stopped;
+}
+
 void CasGcScheduler::requestRoundSoon()
 {
     {
@@ -369,6 +375,18 @@ void CasGcScheduler::loop()
 {
     setThreadName(ThreadName::CAS_GC_SCHEDULER);
     size_t consecutive_backoffs = 0;
+    const auto exit_if_pool_terminal = [this]
+    {
+        if (!poolTerminalOrForgetting())
+            return false;
+        i_am_leader.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard exit_lock(terminal_exit_mutex);
+            loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
+        }
+        terminal_exit_cv.notify_all();
+        return true;
+    };
     while (true)
     {
         {
@@ -393,17 +411,10 @@ void CasGcScheduler::loop()
         /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer leads). The thread exits
         /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
         /// finished thread cleanly.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
-        {
-            i_am_leader.store(false, std::memory_order_relaxed);
-            {
-                std::lock_guard exit_lock(terminal_exit_mutex);
-                loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
-            }
-            terminal_exit_cv.notify_all();
+        if (exit_if_pool_terminal())
             return;
-        }
+        if (before_tick_lock_hook_for_test)
+            before_tick_lock_hook_for_test();
         try
         {
             /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
@@ -419,6 +430,32 @@ void CasGcScheduler::loop()
             if (store->teardownBegun())
                 return;
 
+            /// Before the round, so a follower runs it too. A stop request ends it before its catalog read or its
+            /// next cancel.
+            const auto stop_requested = [this] { return stopRequested(); };
+            try
+            {
+                store->cancelIdleOwnCreatingRows(stop_requested);
+            }
+            catch (...)
+            {
+                /// Nothing here may throw: a failed cleanup must not skip the round.
+                try
+                {
+                    if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
+                        LOG_INFO(log, "CA GC cleanup of this mount's own `Creating` rows stopped by the disk's teardown: {}",
+                            getCurrentExceptionMessage(false));
+                    else
+                        tryLogCurrentException(log, "CA GC cleanup of this mount's own `Creating` rows failed (will retry next tick)");
+                }
+                catch (...) // NOLINT(bugprone-empty-catch)
+                {
+                }
+            }
+            /// The pass can outlast a `FORGET` intent or a terminal transition, as it can a teardown.
+            if (store->teardownBegun() || exit_if_pool_terminal())
+                return;
+
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
             /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
             /// on_lease_acquired (onLeaseAcquired, shared with runOneRoundNow) fires the instant the
@@ -427,6 +464,9 @@ void CasGcScheduler::loop()
             /// follower observing the frozen (owner, seq) across two of its own ticks would steal
             /// deterministically once that first round outlasts them. allow_steal defaults to true here
             /// (the loop is the ONLY caller allowed to execute the steal CAS).
+            /// Only the background round: a manual round runs on a stopped scheduler too.
+            gc.setStopSignal(stop_requested);
+            SCOPE_EXIT({ gc.setStopSignal({}); });
             const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)
@@ -509,8 +549,7 @@ void CasGcScheduler::heartbeatLoop()
         /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
         /// `loop()`. A terminal pool's advisory pulses would target a deleted `gc/hb` key (`IdentityLost`) or
         /// a FOREIGN pool's key (`VanishedReplaced`) — stop pulsing the moment the pool goes terminal.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
+        if (poolTerminalOrForgetting())
         {
             {
                 std::lock_guard exit_lock(terminal_exit_mutex);
@@ -556,6 +595,12 @@ CasGcScheduler::GcHealth CasGcScheduler::gcHealth() const
     }
     h.wedged_namespace_count = store->wedgedRefLaneCount();
     return h;
+}
+
+bool CasGcScheduler::poolTerminalOrForgetting() const
+{
+    return store->isVanished() || store->vanishedIntentPublished()
+        || store->lifecycle() == Cas::PoolLifecycle::IdentityLost;
 }
 
 bool CasGcScheduler::waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout)

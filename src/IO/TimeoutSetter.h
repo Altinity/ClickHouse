@@ -8,6 +8,7 @@ namespace DB
 {
 /// Temporarily overrides socket send/receive timeouts and reset them back into destructor (or manually by calling reset method)
 /// If "limit_max_timeout" is true, timeouts could be only decreased (maxed by previous value).
+/// A zero timeout means no limit, so a finite value still replaces it.
 struct TimeoutSetter
 {
     TimeoutSetter(Poco::Net::StreamSocket & socket_,

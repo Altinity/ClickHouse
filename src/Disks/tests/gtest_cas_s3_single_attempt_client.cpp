@@ -416,7 +416,8 @@ TEST(CASEnvelopeWiring, ProductionDispatchSelectsTheFrozenSingleAttemptClientPer
 {
     (void)contextForTest(); // getThreadPoolWriter/BlobStorageLogWriter::create fall back to the global context
 
-    constexpr auto server_delay = std::chrono::milliseconds(1000);
+    /// At least 4x the single-attempt timeout, so a slow client still times out before the reply arrives.
+    constexpr auto server_delay = std::chrono::milliseconds(400);
     constexpr long base_request_timeout_ms = 10000;
     constexpr uint64_t single_attempt_timeout_ms = 100;
 
@@ -729,7 +730,7 @@ TEST(CASEnvelopeWiring, BucketVersioningProbeSingleAttemptOutlastsTheFirstAttemp
 {
     (void)contextForTest();
 
-    DelayedResponseServer server(std::chrono::milliseconds(1000), [](Poco::Net::HTTPServerResponse & response)
+    DelayedResponseServer server(std::chrono::milliseconds(600), [](Poco::Net::HTTPServerResponse & response)
     {
         static const std::string body
             = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>"
@@ -739,7 +740,7 @@ TEST(CASEnvelopeWiring, BucketVersioningProbeSingleAttemptOutlastsTheFirstAttemp
         response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
         response.send() << body;
     });
-    auto storage = makeDispatchStorageForTest(server.getUrl(), /*base_request_timeout_ms=*/300, /*adaptive_timeouts=*/true);
+    auto storage = makeDispatchStorageForTest(server.getUrl(), /*base_request_timeout_ms=*/200, /*adaptive_timeouts=*/true);
 
     const auto versioned = storage->isBucketVersioningEnabled(DB::ObjectStorageControlRequest{
         .profile = DB::ObjectStorageRetryProfile::SingleAttempt,

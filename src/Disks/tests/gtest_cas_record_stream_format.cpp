@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -274,7 +275,7 @@ TEST(CASRecordStream, AppendOutOfOrderThrows)
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
     writer.append(edge(chRef(2), 1));
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             writer.append(edge(chRef(1), 1));

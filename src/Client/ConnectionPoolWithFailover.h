@@ -54,13 +54,20 @@ public:
     /** Allocates up to the specified number of connections to work.
       * Connections provide access to different replicas of one shard.
       */
+    /// `ping_pooled_connection` pings a connection that the pool returned already established.
+    /// Used by cluster reads of a remote shard. A server that stopped without closing the socket
+    /// sends no `Pong` within `sync_request_timeout`. The pooled socket is dropped and one new
+    /// connection is opened, with the handshake capped by `sync_request_timeout`. A live server
+    /// accepts that connection. A stopped server stops at the cap instead of `handshake_timeout_ms`.
+    /// A socket the server has already closed reconnects once with the usual handshake timeout.
     std::vector<Entry> getMany(
         const ConnectionTimeouts & timeouts,
         const Settings & settings,
         PoolMode pool_mode,
         AsyncCallback async_callback = {},
         std::optional<bool> skip_unavailable_endpoints = std::nullopt,
-        GetPriorityForLoadBalancing::Func priority_func = {});
+        GetPriorityForLoadBalancing::Func priority_func = {},
+        bool ping_pooled_connection = false);
 
     /// The same as getMany(), but return std::vector<TryResult>.
     std::vector<TryResult> getManyForTableFunction(const ConnectionTimeouts & timeouts,
@@ -132,7 +139,8 @@ private:
             std::string & fail_message,
             const Settings & settings,
             const QualifiedTableName * table_to_check = nullptr,
-            AsyncCallback async_callback = {});
+            AsyncCallback async_callback = {},
+            bool ping_pooled_connection = false);
 
     GetPriorityForLoadBalancing::Func makeGetPriorityFunc(const Settings & settings);
 

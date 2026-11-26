@@ -3,6 +3,8 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <IO/WriteHelpers.h>
+#include <Storages/System/StorageSystemContentAddressedMounts.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
@@ -2789,6 +2791,27 @@ TEST(CASListMounts, NestedSridIsNotTruncated)
     EXPECT_EQ(mounts[0].state, "live");
 }
 
+/// `system.cas_mounts.server_uuid` must read as the server's uuid file does. The halves differ, so
+/// reading the number as a `UUID` directly swaps them.
+TEST(CASListMounts, ServerUuidRendersAsTheUuidFile)
+{
+    const String uuid_file = "35578f40-9661-41c4-a18d-426eec6f5a16";
+    String hex = uuid_file;
+    std::erase(hex, '-');
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const uint64_t now_ms = 1'000'000;
+    const uint64_t ttl_ms = 10'000;
+    Ops ops(backend);
+    ASSERT_EQ(claimMount(ops.op, layout, "a", hexToU128(hex), /*our_epoch=*/1, now_ms, ttl_ms).kind,
+              MountClaimResult::Claimed);
+
+    auto mounts = listMounts(ops.op, layout, now_ms, /*skew_margin_ms=*/ttl_ms / 2);
+    ASSERT_EQ(mounts.size(), 1u);
+    EXPECT_EQ(DB::toString(DB::casServerIdToUuid(mounts[0].lease.server_uuid)), uuid_file);
+}
+
 /// "A fence costs an epoch": a same-(uuid, epoch) re-claim must NOT refresh a `gc_fenced` body in
 /// place — that would reactivate a fenced incarnation. It is terminal for THIS epoch; only a
 /// DIFFERENT (fresh) epoch may reclaim the slot.
@@ -3202,6 +3225,20 @@ TEST(CASFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
 
     EXPECT_FALSE(isCreatorFenceTerminal(ops.op, l, "r", 7))
         << "expiry alone is never a certificate of death, exactly like claimMount's own discipline";
+}
+
+/// The four answers `probeCreatorSlot` gives, which the GC drain logs and `cas-fsck` reports.
+TEST(CASFenceTerminal, TheSlotProbeTellsAbsentUndecodableLiveAndTerminalApart)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l{"p"};
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "never-mounted", 1), CreatorSlotStatus::Absent);
+    mustCommit(ops.op.create(l.mountKey("garbled"), "garbage-not-a-lease", Retry::standard()), "undecodable lease");
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "garbled", 1), CreatorSlotStatus::Undecodable);
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 7), CreatorSlotStatus::Live);
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 8), CreatorSlotStatus::Live) << "a lower epoch in the slot certifies nothing";
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 6), CreatorSlotStatus::Terminal);
 }
 
 /// The absent-epoch path's post-conflict recheck is a CHECK, not a blanket refusal, and both halves

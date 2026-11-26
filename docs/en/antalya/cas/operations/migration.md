@@ -217,7 +217,8 @@ intents have ceiling 2 or 3. The behavior of those builds below follows from the
 
 - **A server that mounts after step M8** fails to start the disk with `UNKNOWN_FORMAT_VERSION`:
   `CAS pool meta: pool requires reader generation 4 but this build supports at most 1` (`at most 3` or `2` on a 26.8
-  build without deletion intents).
+  build without deletion intents). A 26.6.x server is refused the same way from step M6 on, even if a later step fails. Between M6 and M8 the
+  message names reader generation 3; after M8 it names 4.
 - **A server that stays up** cannot remount after a lost mount lease or a fence, and stays unmounted until it is
   upgraded.
 - **An older GC leader that stays up** holds every stamped namespace and suppresses destructive GC steps; see
@@ -278,11 +279,11 @@ that is already migrated runs M9 only.
 Writers read and `GC` writes under `<pool>/blob-intents/`. The credential of every server of the pool needs the
 rights listed under [deletion intents](/antalya/cas/bucket-requirements#deletion-intents).
 
-A writable mount, pool creation and the tool (at M1) prove these rights before they write anything, with one object
+A writable mount and pool creation (unless the disk sets `skip_access_check`) and the tool (at M1) prove these rights before they write anything, with one object
 under `<pool>/blob-intents/_probe/<128-bit hex>/intent`: an exact `GET` of the absent key, a `LIST` of one key of
 `blob-intents/` itself (the request `GC`'s sweep sends; a store may grant `LIST` by the exact prefix; not sent on local
 object storage, which has no such grants), a conditional
-`PUT`, a `LIST` of `_probe/`, a `DELETE`, and a second exact `GET`. Each missing right stops the run with a message that
+`PUT`, a `LIST` of `_probe/`, a `DELETE` with no precondition (as `GC` deletes intents), and a second exact `GET`. Each missing right stops the run with a message that
 names the right, and the probe object is removed again. Every reader skips the `_probe/` prefix, so debris from a
 stopped probe does no harm. A `--dry-run` sends only the first `GET` and the `LIST`s. A read-only open runs no
 probe. The tool runs this probe, and checks the token form with a `HEAD` of `_pool_meta`, also when the disk sets
@@ -293,7 +294,7 @@ probe. The tool runs this probe, and checks the token form with a `HEAD` of `_po
 | `CasProbe: an exact GET of the absent key '<key>' before the create failed (<error>): the credential cannot tell an absent intent from a denied one: grant GET and LIST on '<pool>/blob-intents/'` | `GET` of an absent key, which on S3 needs the list right |
 | `CasProbe: the store refused the conditional create of '<key>' (<error>): grant PUT with If-None-Match on '<pool>/blob-intents/'` | Conditional `PUT` |
 | `CasProbe: a LIST of '<prefix>' failed (<error>): grant LIST on '<pool>/blob-intents/'` | `LIST` |
-| `CasProbe: the delete of '<key>' failed (<error>): grant DELETE on '<pool>/blob-intents/'` | `DELETE` |
+| `CasProbe: the delete of '<key>' failed (<error>): grant DELETE on '<pool>/blob-intents/'` | `DELETE` with no precondition |
 
 ### What the tool does {#migrate-generation-4-steps}
 

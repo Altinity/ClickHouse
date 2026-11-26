@@ -23,7 +23,7 @@ rows.
 
 - `disk` ([String](/sql-reference/data-types/string)) — Name of the content-addressed disk.
 - `server_root_id` ([String](/sql-reference/data-types/string)) — Server root id owning the mount slot.
-- `server_uuid` ([UUID](/sql-reference/data-types/uuid)) — UUID of the server incarnation holding the lease.
+- `server_uuid` ([UUID](/sql-reference/data-types/uuid)) — UUID of the server incarnation holding the lease, which is the content of that server's `uuid` file. A row that shows no lease, such as that of a disk that is not mounted or was forgotten, shows the zero UUID.
 - `hostname` ([String](/sql-reference/data-types/string)) — Hostname recorded in the lease body.
 - `process_id` ([UInt64](/sql-reference/data-types/int-uint)) — Process id recorded in the lease body.
 - `writer_epoch` ([UInt64](/sql-reference/data-types/int-uint)) — Fenced writer epoch of the incarnation.
