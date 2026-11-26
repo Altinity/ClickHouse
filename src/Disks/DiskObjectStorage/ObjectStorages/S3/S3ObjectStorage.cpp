@@ -33,6 +33,8 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/diskSettings.h>
 
+#include <base/scope_guard.h>
+
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
 #include <Common/SipHash.h>
@@ -626,10 +628,16 @@ void S3ObjectStorage::removeObjectImpl(const StoredObject & object, bool if_exis
 {
     auto blob_storage_log = BlobStorageLogWriter::create(disk_name);
 
+    /// Runs when the delete throws too. A `DeleteObject` whose response was lost can still have removed the
+    /// object, and the cache must not keep the previous size and ETag.
+    SCOPE_EXIT(
+    {
+        invalidateCachedIdentity(object.remote_path);
+    });
+
     deleteFileFromS3(client.get(), uri.bucket, object.remote_path, if_exists,
                       blob_storage_log, object.local_path, object.bytes_size,
                       ProfileEvents::DiskS3DeleteObjects);
-    invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_exists)
@@ -655,12 +663,18 @@ void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_e
 
     auto settings_ptr = s3_settings.get();
 
+    /// Runs when the batch throws too. Chunks sent before the failing one have already deleted their keys,
+    /// and a chunk whose response was lost may have as well.
+    SCOPE_EXIT(
+    {
+        for (const auto & object : objects)
+            invalidateCachedIdentity(object.remote_path);
+    });
+
     deleteFilesFromS3(client.get(), uri.bucket, keys, if_exists,
                       s3_capabilities, settings_ptr->request_settings[S3RequestSetting::objects_chunk_size_to_delete],
                       blob_storage_log, local_paths_for_blob_storage_log, file_sizes_for_blob_storage_log,
                       ProfileEvents::DiskS3DeleteObjects);
-    for (const auto & object : objects)
-        invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectIfExists(const StoredObject & object)
@@ -740,6 +754,10 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
         return {ConditionalRemoveOutcome::NotFound, false};
     }
 
+    /// Any other error leaves the outcome unknown: a lost response or a timeout can follow a delete that
+    /// was applied. The next read must not send the previous ETag.
+    invalidateCachedIdentity(object.remote_path);
+
     throw S3Exception(err.GetErrorType(),
         "{} (Code: {}, S3 exception: '{}') while conditionally removing object with path {} from S3",
         err.GetMessage(), static_cast<size_t>(err.GetErrorType()), err.GetExceptionName(), object.remote_path);
@@ -767,10 +785,14 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     if (objects.size() == 1)
     {
         const StoredObject & object = objects.front();
+        /// Runs when the delete throws too: a lost response can follow an applied delete.
+        SCOPE_EXIT(
+        {
+            invalidateCachedIdentity(object.remote_path);
+        });
         deleteFileFromS3(used_client, uri.bucket, object.remote_path, /*if_exists=*/ true,
                          BlobStorageLogWriter::create(disk_name), object.local_path, object.bytes_size,
                          ProfileEvents::DiskS3DeleteObjects, attempt_seed);
-        invalidateCachedIdentity(object.remote_path);
         return;
     }
 
@@ -834,6 +856,11 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             s3_capabilities.setIsBatchDeleteSupported(false);
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
         }
+
+        /// The request failed as a whole, so which keys were deleted is unknown (a lost response can follow
+        /// an applied batch).
+        for (const auto & object : objects)
+            invalidateCachedIdentity(object.remote_path);
 
         throw S3Exception(
             PreformattedMessage::create("{} (Code: {}) while removing {} objects from S3 in one request",

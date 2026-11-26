@@ -1,6 +1,7 @@
 #include <Backups/BackupIO_S3.h>
 
 #if USE_AWS_S3
+#include <base/scope_guard.h>
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
 #include <Common/HTTPHeaderFilter.h>
@@ -838,9 +839,13 @@ std::unique_ptr<WriteBuffer> BackupWriterS3::writeFileIfNotExists(const String &
 void BackupWriterS3::removeFile(const String & file_name)
 {
     const String object_key = fs::path(s3_uri.key) / file_name;
+    /// Runs when the delete throws too: a lost response can follow an applied delete.
+    SCOPE_EXIT(
+    {
+        invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, object_key);
+    });
     deleteFileFromS3(client, s3_uri.bucket, object_key, /* if_exists = */ true,
                      blob_storage_log);
-    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, object_key);
 }
 
 void BackupWriterS3::removeFiles(const Strings & file_names)
@@ -853,11 +858,16 @@ void BackupWriterS3::removeFiles(const Strings & file_names)
     /// One call of DeleteObjects() cannot remove more than 1000 keys.
     size_t batch_size = 1000;
 
+    /// A key that was deleted, or was already gone, must not keep its previous size and ETag. This also runs
+    /// when a later batch throws: earlier batches have already deleted their keys.
+    SCOPE_EXIT(
+    {
+        for (const auto & key : keys)
+            invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, key);
+    });
+
     deleteFilesFromS3(client, s3_uri.bucket, keys, /* if_exists = */ true,
                       s3_capabilities, batch_size, blob_storage_log);
-    /// A key that was deleted, or was already gone, must not keep its previous size and ETag.
-    for (const auto & key : keys)
-        invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, key);
 }
 
 }
