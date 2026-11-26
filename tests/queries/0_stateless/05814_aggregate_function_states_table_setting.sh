@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
 # `allow_aggregate_function_states_in_open_formats` in a table's `SETTINGS` is stored with the table and decides
-# for every query on it, also after the table is re-attached. Without it in the table, the query setting decides.
+# for every query on it, also after the table is re-attached. Without it, the table has the server's value, disabled by
+# default, whatever the query sets: the recorded types are not applied, and a table with aggregate function states is refused.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -15,11 +16,12 @@ ICEBERG="t_${CLICKHOUSE_DATABASE}_${RANDOM}_states"
 ICEBERG_PATH="${USER_FILES_PATH}/${ICEBERG}/"
 ICEBERG_NOT_STORED="${ICEBERG}_not_stored"
 ICEBERG_NOT_STORED_PATH="${USER_FILES_PATH}/${ICEBERG_NOT_STORED}/"
-ICEBERG_REFUSED="${ICEBERG}_refused"
+ICEBERG_DISABLED="${ICEBERG}_disabled"
+ICEBERG_ENABLED="${ICEBERG}_enabled"
 
 cleanup()
 {
-    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_REFUSED}" file_states file_states_not_stored \
+    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_DISABLED}" "${ICEBERG_ENABLED}" file_states file_states_not_stored \
         file_states_refused; do
         ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS ${table}"
     done
@@ -83,15 +85,22 @@ select_states "${ICEBERG}" ${OFF}
 ${CLIENT} ${OFF} --query "ALTER TABLE ${ICEBERG} UPDATE k = k + 10 WHERE k = 0"
 select_states "${ICEBERG}" ${OFF}
 
-echo "-- Iceberg, setting not stored in the table"
-expect_refusal "${CREATE_OR_ALTER_REFUSED}" run ${OFF} --query "CREATE TABLE ${ICEBERG_NOT_STORED} (${COLUMNS}) ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}')"
-${CLIENT} "--${SETTING}=1" --query "CREATE TABLE ${ICEBERG_NOT_STORED} (${COLUMNS}) ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}')"
+echo "-- Iceberg, setting not stored in the table, queries enable it"
+ON="--${SETTING}=1"
+expect_refusal "${CREATE_OR_ALTER_REFUSED}" run ${ON} --query "CREATE TABLE ${ICEBERG_NOT_STORED} (${COLUMNS}) ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}')"
+# The same data as `${ICEBERG}`, through a table without the setting.
+expect_refusal "${READ_REFUSED}" run ${ON} --query "CREATE TABLE ${ICEBERG_NOT_STORED} ENGINE = IcebergLocal('${ICEBERG_PATH}')"
+# A `SimpleAggregateFunction` holds ordinary values of its storage type, so it needs no setting. Its type is recorded,
+# but only a table with the setting applies it.
+${CLIENT} ${ON} --query "
+    CREATE TABLE ${ICEBERG_NOT_STORED} (k Int32, s SimpleAggregateFunction(sum, Int64)) ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}')"
 ${CLIENT} --query "SHOW CREATE TABLE ${ICEBERG_NOT_STORED}" | grep -c "${SETTING}" || true
 reattach "${ICEBERG_NOT_STORED}"
-expect_refusal "Column 'extra' ${CREATE_OR_ALTER_REFUSED}" run ${OFF} --query "ALTER TABLE ${ICEBERG_NOT_STORED} ADD COLUMN extra AggregateFunction(max, UInt64)"
-# A `SimpleAggregateFunction` holds ordinary values of its storage type, so it needs no setting.
-run ${OFF} --query "ALTER TABLE ${ICEBERG_NOT_STORED} ADD COLUMN simple SimpleAggregateFunction(anyLast, Nullable(String))"
-expect_refusal "${READ_REFUSED}" select_states "${ICEBERG_NOT_STORED}" ${OFF}
+run ${ON} --query "INSERT INTO ${ICEBERG_NOT_STORED} SELECT toInt32(number % 2), toInt64(number) FROM numbers(10)"
+run ${ON} --query "ALTER TABLE ${ICEBERG_NOT_STORED} ADD COLUMN simple SimpleAggregateFunction(anyLast, Nullable(String))"
+run ${ON} --query "SELECT toTypeName(s), toTypeName(simple), sum(s) FROM ${ICEBERG_NOT_STORED} GROUP BY ALL"
+${CLIENT} --query "CREATE TABLE ${ICEBERG_ENABLED} ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}') SETTINGS ${SETTING} = 1"
+run ${OFF} --query "SELECT toTypeName(s), toTypeName(simple), sum(s) FROM ${ICEBERG_ENABLED} GROUP BY ALL"
 
 echo "-- File, setting stored in the table, queries disable it"
 ${CLIENT} --query "CREATE TABLE file_states (${COLUMNS}) ENGINE = File(Parquet) SETTINGS ${SETTING} = 1"
@@ -99,14 +108,14 @@ reattach file_states
 insert_states file_states ${OFF}
 select_states file_states ${OFF}
 
-echo "-- File, setting not stored in the table"
+echo "-- File, setting not stored in the table, queries enable it"
 ${CLIENT} --query "CREATE TABLE file_states_not_stored (${COLUMNS}) ENGINE = File(Parquet)"
-expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_not_stored ${OFF}
+expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_not_stored ${ON}
 
 echo "-- Iceberg, setting 0 stored in the table, queries enable it"
-expect_refusal "${READ_REFUSED}" run "--${SETTING}=1" --query "
-    CREATE TABLE ${ICEBERG_REFUSED} ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}') SETTINGS ${SETTING} = 0"
+expect_refusal "${READ_REFUSED}" run ${ON} --query "
+    CREATE TABLE ${ICEBERG_DISABLED} ENGINE = IcebergLocal('${ICEBERG_PATH}') SETTINGS ${SETTING} = 0"
 
 echo "-- File, setting 0 stored in the table, queries enable it"
 ${CLIENT} --query "CREATE TABLE file_states_refused (${COLUMNS}) ENGINE = File(Parquet) SETTINGS ${SETTING} = 0"
-expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_refused "--${SETTING}=1"
+expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_refused ${ON}

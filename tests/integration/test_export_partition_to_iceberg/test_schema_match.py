@@ -995,8 +995,7 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
     columns = (
         "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
     )
-    # The profile disables the setting, so the export worker can write the states only with the value the
-    # export query recorded for it.
+    # The destination enables the setting in its own `SETTINGS`, which decide over the profile and the query.
     states = {"allow_aggregate_function_states_in_open_formats": 1}
 
     make_source(node, mt_table, columns, "k", engine=source_engine, order_by="k", replica_name="replica1")
@@ -1005,7 +1004,7 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
         iceberg_table,
         columns,
         partition_by="k",
-        settings=states,
+        table_settings="allow_aggregate_function_states_in_open_formats = 1",
     )
 
     node.query(

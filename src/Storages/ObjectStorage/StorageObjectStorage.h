@@ -295,7 +295,7 @@ protected:
     /// `object_storage` to allow direct access to data storage.
     const ObjectStoragePtr object_storage;
     const std::optional<FormatSettings> format_settings;
-    /// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
+    /// The table's `allow_aggregate_function_states_in_open_formats`. A table function has none, and the query decides.
     const std::optional<bool> table_allow_aggregate_function_states;
     /// Whether this engine is a part of according Cluster engine implementation.
     /// (One of the reading replicas, not the initiator).

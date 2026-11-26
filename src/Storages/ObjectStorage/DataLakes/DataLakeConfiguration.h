@@ -487,9 +487,11 @@ public:
         if (const auto & iceberg_metadata_file_path = (*settings)[DataLakeStorageSetting::iceberg_metadata_file_path];
             iceberg_metadata_file_path.changed)
             table_settings.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+        /// Only an enabled value is passed on, so a node of an older version is not sent a setting it may not know.
+        /// `StorageObjectStorageCluster` disables it in the query when the table has it disabled but the query enables it.
         if (const auto & allow_aggregate_function_states = (*settings)[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
-            allow_aggregate_function_states.changed)
-            table_settings.setSetting("allow_aggregate_function_states_in_open_formats", allow_aggregate_function_states.value);
+            allow_aggregate_function_states.changed && allow_aggregate_function_states.value)
+            table_settings.setSetting("allow_aggregate_function_states_in_open_formats", true);
 
         if (!table_settings.empty())
         {

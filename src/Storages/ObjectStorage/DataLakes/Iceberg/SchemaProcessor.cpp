@@ -447,23 +447,6 @@ std::pair<size_t, size_t> parseDecimal(const String & type_name)
     return {precision, scale};
 }
 
-/// The ClickHouse type recorded for an Iceberg field, gated by the table's own setting or, if it has none, the query's.
-DataTypePtr resolveFieldTypeAnnotation(Int32 field_id, const String & type_name, std::optional<bool> table_allow, const ContextPtr & context)
-{
-    auto type = resolveClickHouseTypeAnnotation(type_name, allowAggregateFunctionStates(table_allow, context));
-    if (!type)
-        throw Exception(
-            ErrorCodes::SUPPORT_IS_DISABLED,
-            "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`, which has aggregate "
-            "function states: enable setting allow_aggregate_function_states_in_open_formats in the table's SETTINGS or, if the "
-            "table does not set it, in the query",
-            field_id,
-            type_name,
-            Iceberg::f_clickhouse_type,
-            field_id);
-    return type;
-}
-
 }
 
 namespace Iceberg
@@ -495,11 +478,8 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
     if (!schema_ptr->isArray(f_fields) || schema_ptr->getArray(f_fields)->size() == 0)
         return;
 
-    auto schema_annotations = getClickHouseTypeAnnotationsOfSchema(schema_ptr, clickhouse_type_annotations);
-
-    /// Checked on every call, including for an already registered schema: unless the table sets it, the setting belongs to the current query.
-    for (const auto & [field_id, annotation] : schema_annotations)
-        resolveFieldTypeAnnotation(field_id, annotation.type_name, table_allow_aggregate_function_states, context_);
+    auto schema_annotations
+        = getAppliedClickHouseTypeAnnotations(getClickHouseTypeAnnotationsOfSchema(schema_ptr, clickhouse_type_annotations));
 
     std::unordered_map<String, String> type_mapping;
     if (allow_geo_parser)
@@ -862,7 +842,7 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
 
     const auto & annotation = annotation_it->second;
     const String & annotated_name = annotation.type_name;
-    auto annotated_type = resolveFieldTypeAnnotation(field_id, annotated_name, table_allow_aggregate_function_states, context_);
+    auto annotated_type = resolveClickHouseTypeAnnotation(annotated_name, /*allow_aggregate_function_states=*/ true);
 
     /// The annotation is valid only for the Iceberg type ClickHouse writes for it. The format version affects only
     /// whether `timestamp_ns` may be written, so the latest one is used and the field's own type decides.
@@ -892,7 +872,12 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
 DataTypePtr IcebergSchemaProcessor::getClickHouseFieldType(
     const Poco::JSON::Object::Ptr & field, const ClickHouseTypeAnnotations & clickhouse_type_annotations, ContextPtr context_)
 {
-    return getFieldType(field, f_type, context_, clickhouse_type_annotations, field->getValue<bool>(f_required));
+    return getFieldType(
+        field,
+        f_type,
+        context_,
+        getAppliedClickHouseTypeAnnotations(clickhouse_type_annotations),
+        field->getValue<bool>(f_required));
 }
 
 /**
@@ -1224,6 +1209,28 @@ ClickHouseTypeAnnotations IcebergSchemaProcessor::getClickHouseTypeAnnotationsOf
             result.emplace(it->first, it->second);
     }
     return result;
+}
+
+ClickHouseTypeAnnotations
+IcebergSchemaProcessor::getAppliedClickHouseTypeAnnotations(const ClickHouseTypeAnnotations & clickhouse_type_annotations) const
+{
+    if (use_clickhouse_type_annotations)
+        return clickhouse_type_annotations;
+
+    for (const auto & [field_id, annotation] : clickhouse_type_annotations)
+    {
+        if (!resolveClickHouseTypeAnnotation(annotation.type_name, /*allow_aggregate_function_states=*/ false))
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`, which has aggregate "
+                "function states: enable setting allow_aggregate_function_states_in_open_formats in the table's SETTINGS (for a "
+                "table function or a `DataLakeCatalog` table, in the query)",
+                field_id,
+                annotation.type_name,
+                f_clickhouse_type,
+                field_id);
+    }
+    return {};
 }
 
 bool IcebergSchemaProcessor::clickHouseTypeAnnotationsUnchanged(Int32 schema_id, const ClickHouseTypeAnnotations & schema_annotations) const

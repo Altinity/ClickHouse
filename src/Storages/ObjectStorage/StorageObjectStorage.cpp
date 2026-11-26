@@ -244,13 +244,7 @@ StorageObjectStorage::StorageObjectStorage(
     }
 
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(
-            columns,
-            object_storage,
-            configuration,
-            withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context),
-            sample_path,
-            context);
+        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -748,8 +742,7 @@ void StorageObjectStorage::read(
         && settings[Setting::optimize_count_from_files]
         && !VirtualColumnUtils::hasRowDependentVirtualColumns(read_from_format_info.requested_virtual_columns);
 
-    auto modified_format_settings
-        = withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, local_context);
+    auto modified_format_settings{format_settings};
     if (!modified_format_settings.has_value())
         modified_format_settings.emplace(getFormatSettings(local_context));
 
@@ -786,14 +779,7 @@ SinkToStoragePtr StorageObjectStorage::write(
         configuration->update(object_storage, local_context);
     }
 
-    return createSink(
-        configuration,
-        object_storage,
-        storage_id,
-        withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, local_context),
-        catalog,
-        metadata_snapshot,
-        local_context);
+    return createSink(configuration, object_storage, storage_id, format_settings, catalog, metadata_snapshot, local_context);
 }
 
 SinkToStoragePtr StorageObjectStorage::createSink(
@@ -865,13 +851,7 @@ bool StorageObjectStorage::optimize(
     bool /*cleanup*/,
     [[maybe_unused]] ContextPtr context)
 {
-    return configuration->optimize(
-        object_storage,
-        metadata_snapshot,
-        context,
-        withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context),
-        catalog,
-        getStorageID());
+    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings, catalog, getStorageID());
 }
 
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
@@ -903,9 +883,7 @@ IStorage::ImportResult StorageObjectStorage::import(
     ContextPtr local_context)
 {
     /// The export brings its own format settings, but the table's own `allow_aggregate_function_states_in_open_formats` decides over them.
-    auto import_format_settings = format_settings_
-        ? format_settings_
-        : withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, local_context);
+    auto import_format_settings = format_settings_ ? format_settings_ : format_settings;
     if (format_settings_ && table_allow_aggregate_function_states)
         import_format_settings->parquet.allow_aggregate_function_states = *table_allow_aggregate_function_states;
 
@@ -1302,14 +1280,7 @@ void StorageObjectStorage::mutate([[maybe_unused]] const MutationCommands & comm
     updateExternalDynamicMetadataIfExists(context_);
     auto metadata_snapshot = getInMemoryMetadataPtr(context_, false);
     auto storage = getStorageID();
-    configuration->mutate(
-        commands,
-        context_,
-        shared_from_this(),
-        storage,
-        metadata_snapshot,
-        catalog,
-        withAllowAggregateFunctionStatesForQuery(format_settings, table_allow_aggregate_function_states, context_));
+    configuration->mutate(commands, context_, shared_from_this(), storage, metadata_snapshot, catalog, format_settings);
 }
 
 void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & commands, const Settings & /* settings */) const

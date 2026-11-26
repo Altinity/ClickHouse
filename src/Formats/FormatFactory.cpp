@@ -105,32 +105,22 @@ FormatSettings getFormatSettings(const ContextPtr & context)
     return getFormatSettings(context, settings);
 }
 
-std::optional<bool> extractTableAllowAggregateFunctionStates(FormatSettings & table_format_settings, const SettingsChanges * table_settings)
+bool extractTableAllowAggregateFunctionStates(
+    FormatSettings & table_format_settings, const SettingsChanges * table_settings, const ContextPtr & global_context)
 {
-    std::optional<bool> table_allow;
+    bool table_allow = global_context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats];
     if (table_settings)
     {
         if (const auto * value = table_settings->tryGet("allow_aggregate_function_states_in_open_formats"))
             table_allow = SettingFieldBool(*value).value;
     }
-    table_format_settings.parquet.allow_aggregate_function_states = table_allow.value_or(false);
+    table_format_settings.parquet.allow_aggregate_function_states = table_allow;
     return table_allow;
 }
 
 bool allowAggregateFunctionStates(std::optional<bool> table_allow, const ContextPtr & context)
 {
     return table_allow.value_or(context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats]);
-}
-
-std::optional<FormatSettings> withAllowAggregateFunctionStatesForQuery(
-    const std::optional<FormatSettings> & table_format_settings, std::optional<bool> table_allow, const ContextPtr & context)
-{
-    if (!table_format_settings)
-        return std::nullopt;
-
-    auto result = table_format_settings;
-    result->parquet.allow_aggregate_function_states = allowAggregateFunctionStates(table_allow, context);
-    return result;
 }
 
 FormatSettings getFormatSettings(const ContextPtr & context, const Settings & settings)

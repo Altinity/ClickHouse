@@ -1523,7 +1523,7 @@ def test_export_part_aggregate_function_states(cluster):
     )
 
     make_mt(node, mt, columns, "k", order_by="k")
-    make_iceberg_s3(node, iceberg, columns, "k", settings=states)
+    make_iceberg_s3(node, iceberg, columns, "k", table_settings="allow_aggregate_function_states_in_open_formats = 1")
 
     node.query(
         f"INSERT INTO {mt} "

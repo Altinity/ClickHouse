@@ -159,7 +159,6 @@ StoragePtr TableFunctionFile::getStorage(
         ConstraintsDescription{},
         String{},
         global_context->getSettingsRef()[Setting::rename_files_after_processing],
-        std::nullopt /*table_allow_aggregate_function_states*/,
     };
 
     if (fd >= 0)

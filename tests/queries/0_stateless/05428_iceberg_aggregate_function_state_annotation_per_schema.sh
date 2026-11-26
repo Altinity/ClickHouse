@@ -23,7 +23,8 @@ CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1"
 
 ${CLIENT} --query "
     CREATE TABLE ${TABLE} (k Int32, x SimpleAggregateFunction(max, Int32))
-    ENGINE = IcebergLocal('${TABLE_PATH}')"
+    ENGINE = IcebergLocal('${TABLE_PATH}')
+    SETTINGS allow_aggregate_function_states_in_open_formats = 1"
 ${CLIENT} --query "INSERT INTO ${TABLE} VALUES (1, 10)"
 SNAPSHOT=$(${CLIENT} --query "SELECT snapshot_id FROM system.iceberg_history WHERE database = currentDatabase() AND table = '${TABLE}'")
 
@@ -31,7 +32,9 @@ check()
 {
     ${CLIENT} --query "DESCRIBE TABLE ${TABLE}" | cut -f1,2
     ${CLIENT} --query "SELECT k, x, toTypeName(x) FROM ${TABLE} ORDER BY k"
-    ${CLIENT} --query "SELECT k, x, toTypeName(x) FROM icebergLocal('${TABLE_PATH}') ORDER BY k"
+    ${CLIENT} --query "
+        SELECT k, x, toTypeName(x) FROM icebergLocal('${TABLE_PATH}') ORDER BY k
+        SETTINGS allow_aggregate_function_states_in_open_formats = 1"
     echo "time travel"
     ${CLIENT} --query "SELECT k, x, toTypeName(x) FROM ${TABLE} ORDER BY k SETTINGS iceberg_snapshot_id = ${SNAPSHOT}"
 }

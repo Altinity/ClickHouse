@@ -63,7 +63,7 @@ def test_aggregate_states_with_spark(started_cluster_iceberg_with_spark, storage
         started_cluster_iceberg_with_spark,
         SPARK_SCHEMA,
         format_version=2,
-        settings=STATES,
+        additional_settings=["allow_aggregate_function_states_in_open_formats = 1"],
     )
     insert_states(instance, TABLE_NAME)
 
@@ -143,7 +143,7 @@ def test_aggregate_states_after_spark_schema_evolution(started_cluster_iceberg_w
         started_cluster_iceberg_with_spark,
         "(k Int32, u AggregateFunction(uniq, UInt64), m SimpleAggregateFunction(max, Int32))",
         format_version=2,
-        settings=STATES,
+        additional_settings=["allow_aggregate_function_states_in_open_formats = 1"],
     )
     instance.query(
         f"""

@@ -52,7 +52,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.8.39.20001.altinityantalya",
         {
-            {"allow_aggregate_function_states_in_open_formats", false, false, "New setting allowing aggregate function states in Parquet files and Iceberg tables. With it disabled, writing a state throws `SUPPORT_IS_DISABLED`, a Parquet state column reads as `String`, and a query on an Iceberg table with a state column throws `SUPPORT_IS_DISABLED`."},
+            {"allow_aggregate_function_states_in_open_formats", false, false, "New setting allowing aggregate function states in Parquet files and Iceberg tables. With it disabled, the ClickHouse types recorded in them are not applied, a Parquet state column reads as `String`, and writing a state or querying an Iceberg table with a state column throws `SUPPORT_IS_DISABLED`."},
         });
         addSettingsChanges(settings_changes_history, "26.8.35.20001.altinityantalya",
         {

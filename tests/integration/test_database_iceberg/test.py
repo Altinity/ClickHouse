@@ -4296,10 +4296,11 @@ ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{ns}/', '{minio_access_key
     catalog.load_table(f"{ns}.{tbl}").append(
         pa.Table.from_pylist([{"id": 1, "s": 2}], schema=arrow_schema))
     assert annotations()["s"] == "SimpleAggregateFunction(sum, Int64)"
-    # 3. ClickHouse still sees the type
-    assert "SimpleAggregateFunction" in node.query(f"DESCRIBE {CATALOG_NAME}.`{ns}.{tbl}`")
+    # 3. ClickHouse still sees the type. A catalog table applies it with the query's setting.
+    states = {"allow_aggregate_function_states_in_open_formats": 1}
+    assert "SimpleAggregateFunction" in node.query(f"DESCRIBE {CATALOG_NAME}.`{ns}.{tbl}`", settings=states)
     # 4. ALTER through the catalog records the annotation and clears it
-    alter_settings = {"allow_insert_into_iceberg": 1}
+    alter_settings = {"allow_insert_into_iceberg": 1, **states}
     node.query(
         f"ALTER TABLE {CATALOG_NAME}.`{ns}.{tbl}` ADD COLUMN m SimpleAggregateFunction(max, Nullable(Int64))",
         settings=alter_settings)

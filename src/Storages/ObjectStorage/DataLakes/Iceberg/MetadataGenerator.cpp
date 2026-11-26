@@ -1,6 +1,7 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/transformTypesRecursively.h>
+#include <Formats/FormatFactory.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Context.h>
@@ -934,7 +935,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
                 Iceberg::IcebergSchemaProcessor schema_processor(
                     context,
                     context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
-                    table_allow_aggregate_function_states);
+                    allowAggregateFunctionStates(table_allow_aggregate_function_states, context));
                 const auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, annotations, context);
 
                 if (!current_ch_type->equals(*type))

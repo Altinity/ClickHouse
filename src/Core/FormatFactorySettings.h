@@ -1744,17 +1744,18 @@ Use geo column parser to convert Array(UInt8) into Point/MultiPoint/Linestring/P
 Read a Parquet group that has no `VARIANT` logical type, but has the layout of an unshredded variant (a `metadata` and a `value` field of type `BYTE_ARRAY`), as a variant, i.e. as `Dynamic`, instead of `Tuple`. Spark 4.0 writes variant columns this way. Groups annotated with the `VARIANT` logical type are always read as a variant.
 )", 0) \
     DECLARE(Bool, allow_aggregate_function_states_in_open_formats, false, R"(
-Allow `AggregateFunction` states in Parquet files and Iceberg tables. A state is stored as binary, with its ClickHouse
-type recorded in `clickhouse.column_types` (Parquet file metadata) or `clickhouse.type.<field-id>.<schema-id>`
-(Iceberg table properties). The recorded type chooses the deserializer for the stored bytes, so enable the setting
-only for trusted sources.
+Apply the ClickHouse types recorded in Parquet files and Iceberg tables, and allow writing `AggregateFunction` states to
+them. A state is stored as binary, with its ClickHouse type recorded in `clickhouse.column_types` (Parquet file metadata)
+or `clickhouse.type.<field-id>.<schema-id>` (Iceberg table properties). The recorded type chooses the deserializer for
+the stored bytes, so enable the setting only for trusted sources.
 
-When disabled, writing a state throws `SUPPORT_IS_DISABLED`. On read, a Parquet state column reads as `String`, and a
-query on an Iceberg table with a state column throws `SUPPORT_IS_DISABLED`. `SimpleAggregateFunction` columns are not
-affected.
+When disabled, the recorded types are not applied, so a `SimpleAggregateFunction(f, T)` column is `T` and a Parquet state
+column reads as `String`. Writing an `AggregateFunction` column throws `SUPPORT_IS_DISABLED`, and so does any query on an
+Iceberg table with a state column. `SimpleAggregateFunction` types are recorded on write either way.
 
-A table can also set it in the `SETTINGS` clause of its engine (for example `S3` or `IcebergS3`). That value is stored
-with the table and applies to every query on it, whatever the query sets.
+A table (for example with the `S3`, `File` or `IcebergS3` engine) takes the value from the `SETTINGS` clause of its
+engine, or the server's value (from the server settings profile) without one. The query's value does not apply to a
+table, only to a table function.
 More [in Parquet](/reference/formats/Parquet/Parquet#aggregate-function-states) and
 [in Iceberg](/reference/engines/table-engines/integrations/iceberg#aggregate-function-states).
 )", 0) \

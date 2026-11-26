@@ -32,17 +32,10 @@ Poco::JSON::Object::Ptr parseSchema(const std::string & json)
     return parser.parse(json).extract<Poco::JSON::Object::Ptr>();
 }
 
-DB::ContextMutablePtr contextWithAggregateFunctionStates(bool allow)
-{
-    auto context = DB::Context::createCopy(getContext().context);
-    context->setSetting("allow_aggregate_function_states_in_open_formats", DB::Field(allow));
-    return context;
-}
-
 void expectAnnotatedSchemaRejected(const Poco::JSON::Object::Ptr & schema, const ClickHouseTypeAnnotations & annotations)
 {
-    auto context = contextWithAggregateFunctionStates(true);
-    IcebergSchemaProcessor processor(context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
     try
     {
         processor.addIcebergTableSchema(schema, context, annotations);
@@ -567,8 +560,8 @@ TEST(IcebergSchemaProcessor, ChangedAnnotationReparsesIdenticalSchema)
 {
     tryRegisterAggregateFunctions();
     const std::string schema_json = R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json";
-    auto context = contextWithAggregateFunctionStates(false);
-    IcebergSchemaProcessor processor(context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
 
     processor.addIcebergTableSchema(parseSchema(schema_json), context, {{1, {"SimpleAggregateFunction(sum, Int64)"}}});
     EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
@@ -581,8 +574,8 @@ TEST(IcebergSchemaProcessor, ChangedAnnotationReparsesIdenticalSchema)
 TEST(IcebergSchemaProcessor, SchemasKeepTheAnnotationsTheyWereRegisteredWith)
 {
     tryRegisterAggregateFunctions();
-    auto context = contextWithAggregateFunctionStates(false);
-    IcebergSchemaProcessor processor(context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
 
     processor.addIcebergTableSchema(
         parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json"),
@@ -608,8 +601,8 @@ TEST(IcebergSchemaProcessor, AnnotationMustDescribeTheFieldType)
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
 
     /// ClickHouse writes both `Int64` and `UInt64` as `long`.
-    auto context = contextWithAggregateFunctionStates(false);
-    IcebergSchemaProcessor processor(context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
     processor.addIcebergTableSchema(schema, context, {{1, {"SimpleAggregateFunction(sum, UInt64)"}}});
     EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, UInt64)");
 
@@ -626,8 +619,8 @@ TEST(IcebergSchemaProcessor, AnnotationMustDescribeTheFieldType)
 TEST(IcebergSchemaProcessor, InheritedAnnotationDoesNotApplyToAnEvolvedField)
 {
     tryRegisterAggregateFunctions();
-    auto context = contextWithAggregateFunctionStates(true);
-    IcebergSchemaProcessor processor(context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
 
     /// `int` promoted to `long`.
     processor.addIcebergTableSchema(
@@ -651,25 +644,34 @@ TEST(IcebergSchemaProcessor, InheritedAnnotationDoesNotApplyToAnEvolvedField)
     EXPECT_EQ(processor.getClickHouseTableSchemaById(3)->front().type->getName(), "AggregateFunction(uniq, UInt64)");
 }
 
-TEST(IcebergSchemaProcessor, AggregateFunctionStateSchemaRegisteredByAllowedQueryIsRefusedWithoutSetting)
+/// Without allow_aggregate_function_states_in_open_formats the annotations are not applied, so a field has its Iceberg type,
+/// and a field with aggregate function states is refused.
+TEST(IcebergSchemaProcessor, AnnotationsAreNotAppliedWithoutTheSetting)
 {
     tryRegisterAggregateFunctions();
-    const std::string schema_json = R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"binary"}]})json";
-    const ClickHouseTypeAnnotations annotations{{1, {"AggregateFunction(uniq, UInt64)"}}};
-    IcebergSchemaProcessor processor(getContext().context);
+    auto context = getContext().context;
+    IcebergSchemaProcessor processor(context);
 
-    processor.addIcebergTableSchema(parseSchema(schema_json), contextWithAggregateFunctionStates(true), annotations);
-    ASSERT_TRUE(processor.hasClickHouseTableSchemaById(0));
+    processor.addIcebergTableSchema(
+        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json"),
+        context,
+        {{1, {"SimpleAggregateFunction(sum, UInt64)"}}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "Int64");
+    EXPECT_FALSE(processor.hasClickHouseTypeAnnotation(0, 1));
 
     try
     {
-        processor.addIcebergTableSchema(parseSchema(schema_json), contextWithAggregateFunctionStates(false), annotations);
-        FAIL() << "A query without the setting must be refused even when the schema is already registered";
+        processor.addIcebergTableSchema(
+            parseSchema(R"json({"schema-id":1,"fields":[{"id":2,"name":"u","required":true,"type":"binary"}]})json"),
+            context,
+            {{2, {"AggregateFunction(uniq, UInt64)"}}});
+        FAIL() << "A field with aggregate function states must be refused without the setting";
     }
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
     }
+    EXPECT_FALSE(processor.hasClickHouseTableSchemaById(1));
 }
 
 #if USE_AVRO
@@ -685,7 +687,7 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
                         .extract<Poco::JSON::Object::Ptr>();
 
     auto log = getLogger("IcebergSchemaProcessorTest");
-    auto context = contextWithAggregateFunctionStates(false);
+    auto context = getContext().context;
     DB::Iceberg::IcebergSchemaProcessor processor(context);
 
     Int32 schema_id = -1;
@@ -698,13 +700,15 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
     EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "u").has_value());
 
-    auto allowed_context = contextWithAggregateFunctionStates(true);
-    ASSERT_NO_THROW(DB::IcebergMetadata::parseTableSchema(
-        metadata, processor, allowed_context, log, DB::IcebergMetadata::SchemaParsing::Parse));
-    auto columns = processor.getClickHouseTableSchemaById(0);
-    ASSERT_EQ(columns->size(), 1u);
-    EXPECT_EQ(columns->front().name, "u");
-    EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+    try
+    {
+        DB::IcebergMetadata::parseTableSchema(metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Parse);
+        FAIL() << "Parsing a schema with aggregate function states must be refused without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
 }
 
 /// Per field, the property with the greatest schema id not above the requested one is in effect.

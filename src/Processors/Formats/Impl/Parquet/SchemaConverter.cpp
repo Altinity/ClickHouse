@@ -62,8 +62,9 @@ SchemaConverter::SchemaConverter(
         }
     }
 
-    /// An explicit structure takes precedence over type annotations in the footer.
-    if (!sample_block)
+    /// An explicit structure takes precedence over type annotations in the footer. Without
+    /// allow_aggregate_function_states_in_open_formats they are not looked at, and every column has its parquet type.
+    if (!sample_block && options.format.parquet.allow_aggregate_function_states)
     {
         for (const auto & kv : file_metadata.key_value_metadata)
         {
@@ -149,7 +150,7 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
     DataTypePtr annotated_type;
     try
     {
-        annotated_type = resolveClickHouseTypeAnnotation(type_name, options.format.parquet.allow_aggregate_function_states);
+        annotated_type = resolveClickHouseTypeAnnotation(type_name, /*allow_aggregate_function_states=*/ true);
     }
     catch (Exception & e)
     {
@@ -159,10 +160,6 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
             "server cannot resolve: {}",
             type_name, column_name, clickhouse_column_types_key, e.message());
     }
-
-    /// With aggregate function states disabled, a recorded type that has one is ignored.
-    if (!annotated_type)
-        return derived_type;
 
     if (!annotatedTypeMatchesDerived(annotated_type, derived_type))
         throw Exception(

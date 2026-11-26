@@ -39,11 +39,13 @@ then
     echo 1
 fi
 
-echo '-- a SimpleAggregateFunction is an ordinary value of its storage type, so it needs no setting'
+echo '-- a SimpleAggregateFunction is an ordinary value of its storage type, so writing it needs no setting'
 ${CLICKHOUSE_CLIENT} ${NO_STATES} --query "
     INSERT INTO FUNCTION file('${SIMPLE}', Parquet) SELECT sumSimpleState(number) AS s FROM numbers(10)
 "
+echo '-- its recorded type is applied only with the setting'
 ${CLICKHOUSE_CLIENT} ${NO_STATES} --query "DESC file('${SIMPLE}', Parquet)"
+${CLICKHOUSE_CLIENT} ${STATES} --query "DESC file('${SIMPLE}', Parquet)"
 
 ${CLICKHOUSE_CLIENT} ${STATES} --query "
     INSERT INTO FUNCTION file('${FILE}', Parquet)

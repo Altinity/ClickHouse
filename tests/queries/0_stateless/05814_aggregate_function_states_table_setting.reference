@@ -8,15 +8,16 @@
 1	23	20000
 1	23	20000
 10	23	19800
--- Iceberg, setting not stored in the table
+-- Iceberg, setting not stored in the table, queries enable it
+refused
 refused
 0
-refused
-refused
+Int64	Nullable(String)	45
+SimpleAggregateFunction(sum, Int64)	SimpleAggregateFunction(anyLast, Nullable(String))	45
 -- File, setting stored in the table, queries disable it
 0	23	9900
 1	23	10000
--- File, setting not stored in the table
+-- File, setting not stored in the table, queries enable it
 refused
 -- Iceberg, setting 0 stored in the table, queries enable it
 refused

@@ -32,8 +32,7 @@ StoragePtr TableFunctionFileCluster::getStorage(
             columns,
             ConstraintsDescription{},
             String{},
-            context->getSettingsRef()[Setting::rename_files_after_processing],
-            std::nullopt /*table_allow_aggregate_function_states*/};
+            context->getSettingsRef()[Setting::rename_files_after_processing]};
 
         storage = std::make_shared<StorageFile>(StorageFile::FileSource::parse(filename, context), /* distributed_processing = */ true, args);
     }

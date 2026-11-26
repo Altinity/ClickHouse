@@ -98,8 +98,7 @@ protected:
         const HTTPHeaderEntries & headers_ = {},
         const String & method_ = "",
         ASTPtr partition_by = nullptr,
-        bool distributed_processing_ = false,
-        std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt);
+        bool distributed_processing_ = false);
 
     String uri;
     CompressionMethod compression_method;
@@ -109,8 +108,6 @@ protected:
     // For `url` table function, we use settings from current query context.
     // In this case, format_settings is not set.
     std::optional<FormatSettings> format_settings;
-    /// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
-    std::optional<bool> table_allow_aggregate_function_states;
     HTTPHeaderEntries headers;
     String http_method; /// For insert can choose Put instead of default Post.
     ASTPtr partition_by;
@@ -358,8 +355,7 @@ public:
         const HTTPHeaderEntries & headers_ = {},
         const String & method_ = "",
         ASTPtr partition_by_ = nullptr,
-        bool distributed_processing_ = false,
-        std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt);
+        bool distributed_processing_ = false);
 
     String getName() const override
     {

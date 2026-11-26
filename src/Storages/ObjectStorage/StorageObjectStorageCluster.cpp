@@ -12,6 +12,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Storages/AlterCommands.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
@@ -53,6 +54,12 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
+}
+
+namespace DataLakeStorageSetting
+{
+    extern const DataLakeStorageSettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace ErrorCodes
@@ -193,13 +200,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     std::string sample_path;
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(
-            columns,
-            object_storage,
-            configuration,
-            withAllowAggregateFunctionStatesForQuery(format_settings_, table_allow_aggregate_function_states_, context_),
-            sample_path,
-            context_);
+        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings_, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -441,6 +442,26 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     function_ast->name = table_function_name;
 
     function_ast->arguments = configuration->createArgsWithAccessData();
+
+    /// The table function on the other nodes is passed the table's `allow_aggregate_function_states_in_open_formats` only
+    /// when it is enabled, and takes the query's value otherwise, so the query has to carry a disabled one.
+    if (configuration->isDataLakeConfiguration() && context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats])
+    {
+        const auto & table_allow
+            = configuration->getDataLakeSettings()[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
+        if (table_allow.changed && !table_allow.value)
+        {
+            if (auto settings = select_query->settings())
+                settings->as<ASTSetQuery &>().changes.setSetting("allow_aggregate_function_states_in_open_formats", false);
+            else
+            {
+                auto settings_ast = make_intrusive<ASTSetQuery>();
+                settings_ast->is_standalone = false;
+                settings_ast->changes.setSetting("allow_aggregate_function_states_in_open_formats", false);
+                select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, std::move(settings_ast));
+            }
+        }
+    }
     function_ast->children.push_back(function_ast->arguments);
     function_ast->setAlias(table_alias);
 

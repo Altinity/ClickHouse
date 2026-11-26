@@ -292,7 +292,7 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
         .schema_processor = std::make_shared<IcebergSchemaProcessor>(
             context_,
             context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
-            getTableAllowAggregateFunctionStates(configuration->getDataLakeSettings())),
+            allowAggregateFunctionStates(getTableAllowAggregateFunctionStates(configuration->getDataLakeSettings()), context_)),
         .metadata_cache = cache_ptr,
         .format_version = format_version,
         .table_location = table_location,
@@ -1116,7 +1116,8 @@ static void checkAggregateFunctionStatesAllowed(
         ErrorCodes::SUPPORT_IS_DISABLED,
         "Column '{}' has type {}, which Iceberg cannot express natively: the aggregate state is stored as "
         "binary and its ClickHouse type is recorded in the table properties. To allow this, enable setting "
-        "allow_aggregate_function_states_in_open_formats in the table's SETTINGS or, if the table does not set it, in the query",
+        "allow_aggregate_function_states_in_open_formats in the table's SETTINGS (for a table function or a `DataLakeCatalog` "
+        "table, in the query)",
         column_name,
         type->getName());
 }

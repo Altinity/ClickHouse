@@ -19,11 +19,12 @@ cleanup()
 }
 trap cleanup EXIT
 
-CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1 --allow_aggregate_function_states_in_open_formats=1"
+CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1"
 
 ${CLIENT} --query "
     CREATE TABLE ${TABLE} (k Int32, q AggregateFunction(quantileDeterministic(0.5), Float64, UInt64))
-    ENGINE = IcebergLocal('${TABLE_PATH}')"
+    ENGINE = IcebergLocal('${TABLE_PATH}')
+    SETTINGS allow_aggregate_function_states_in_open_formats = 1"
 ${CLIENT} --query "
     INSERT INTO ${TABLE} SELECT 1, quantileDeterministicState(0.5)(toFloat64(number), number) FROM numbers(100)"
 

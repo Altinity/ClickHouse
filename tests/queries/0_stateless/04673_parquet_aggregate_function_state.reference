@@ -1,6 +1,8 @@
 -- with the setting disabled writing a state is refused
 1
--- a SimpleAggregateFunction is an ordinary value of its storage type, so it needs no setting
+-- a SimpleAggregateFunction is an ordinary value of its storage type, so writing it needs no setting
+-- its recorded type is applied only with the setting
+s	UInt64					
 s	SimpleAggregateFunction(sum, UInt64)					
 -- states round-trip: merged per group
 0	17	1683

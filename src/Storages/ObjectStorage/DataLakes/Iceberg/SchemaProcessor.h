@@ -114,11 +114,10 @@ public:
         ManifestFile,
     };
 
-    explicit IcebergSchemaProcessor(
-        ContextPtr context_, bool allow_geo_parser_ = false, std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt)
+    explicit IcebergSchemaProcessor(ContextPtr context_, bool allow_geo_parser_ = false, bool use_clickhouse_type_annotations_ = false)
         : WithContext(context_)
         , allow_geo_parser(allow_geo_parser_)
-        , table_allow_aggregate_function_states(table_allow_aggregate_function_states_)
+        , use_clickhouse_type_annotations(use_clickhouse_type_annotations_)
     {
     }
 
@@ -196,6 +195,9 @@ private:
     /// The subset of `clickhouse_type_annotations` that refers to the fields of `schema`.
     static ClickHouseTypeAnnotations getClickHouseTypeAnnotationsOfSchema(
         const Poco::JSON::Object::Ptr & schema, const ClickHouseTypeAnnotations & clickhouse_type_annotations);
+    /// All of `clickhouse_type_annotations` with allow_aggregate_function_states_in_open_formats, and none without it, so
+    /// that every field has its Iceberg type. Without it, an annotation with aggregate function states is refused.
+    ClickHouseTypeAnnotations getAppliedClickHouseTypeAnnotations(const ClickHouseTypeAnnotations & clickhouse_type_annotations) const;
     bool clickHouseTypeAnnotationsUnchanged(Int32 schema_id, const ClickHouseTypeAnnotations & schema_annotations) const
         TSA_REQUIRES_SHARED(mutex);
 
@@ -229,8 +231,8 @@ private:
 
     mutable SharedMutex mutex;
     bool allow_geo_parser = true;
-    /// The table's own `allow_aggregate_function_states_in_open_formats`; when not set, the query's value decides.
-    std::optional<bool> table_allow_aggregate_function_states;
+    /// allow_aggregate_function_states_in_open_formats of the table: whether the ClickHouse types recorded in table properties apply.
+    const bool use_clickhouse_type_annotations;
 };
 
 using IcebergSchemaProcessorPtr = std::shared_ptr<IcebergSchemaProcessor>;

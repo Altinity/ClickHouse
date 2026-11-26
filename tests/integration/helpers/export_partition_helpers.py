@@ -336,10 +336,11 @@ def make_iceberg_s3(
     s3_retry_attempts=3,
     if_not_exists=False,
     settings=None,
+    table_settings="",
 ):
     """Create an IcebergS3 table at a MinIO prefix.
 
-    *url* defaults to ``http://minio1:9001/root/data/{name}/``.
+    *url* defaults to ``http://minio1:9001/root/data/{name}/``. *table_settings* are added to its ``SETTINGS`` clause.
     """
     if url is None:
         url = f"http://minio1:9001/root/data/{name}/"
@@ -350,7 +351,7 @@ def make_iceberg_s3(
         CREATE TABLE {ine}{name} ({columns})
         ENGINE = IcebergS3('{url}', '{MINIO_USER}', '{MINIO_PASS}')
         {pclause}
-        SETTINGS s3_retry_attempts = {s3_retry_attempts}
+        SETTINGS s3_retry_attempts = {s3_retry_attempts}{", " + table_settings if table_settings else ""}
         """,
         settings=settings,
     )

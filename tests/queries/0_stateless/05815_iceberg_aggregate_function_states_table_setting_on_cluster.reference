@@ -1,3 +1,6 @@
 -- the query disables the setting, the table enables it
 0	23
 1	23
+-- the query enables the setting, the table disables it
+0	20
+1	25

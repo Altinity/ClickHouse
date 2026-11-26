@@ -34,11 +34,13 @@ namespace Setting
 {
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_experimental_paimon_storage_engine;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace DataLakeStorageSetting
 {
     extern const DataLakeStorageSettingsString disk;
+    extern const DataLakeStorageSettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace
@@ -81,7 +83,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     }
 
     const auto table_allow_aggregate_function_states = extractTableAllowAggregateFunctionStates(
-        *format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr);
+        *format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr, args.getContext());
 
     ASTPtr partition_by;
     if (args.storage_def->partition_by)
@@ -1099,6 +1101,11 @@ void registerStorageObjectStorage(StorageFactory & factory)
     auto storage_settings = std::make_shared<DataLakeStorageSettings>();
     if (storage_def.settings)
         storage_settings->loadFromQuery(*storage_def.settings);
+    /// A table has the value from its own `SETTINGS`, or the server's without one, and never the query's.
+    auto & allow_aggregate_function_states = (*storage_settings)[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
+    if (!allow_aggregate_function_states.changed)
+        allow_aggregate_function_states
+            = Context::getGlobalContextInstance()->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats].value;
     return storage_settings;
 }
 
@@ -1285,22 +1292,23 @@ SETTINGS allow_aggregate_function_states_in_open_formats = 1;
 SELECT k, uniqMerge(u), sum(s) FROM agg GROUP BY k;
 ```
 
-States are controlled by
+The recorded types are applied only with
 [`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats),
 disabled by default. The table metadata chooses the deserializer for the stored bytes, so enable the setting only for
-tables from trusted sources. When it is disabled, creating an `AggregateFunction` column and any query on a table
+tables from trusted sources. When it is disabled, the `clickhouse.type` properties are not applied, so a
+`SimpleAggregateFunction(f, T)` column reads as `T`. Creating an `AggregateFunction` column and any query on a table
 that has one (`SELECT`, `INSERT`, `ALTER TABLE ... UPDATE`, `OPTIMIZE TABLE`, ...) throw `SUPPORT_IS_DISABLED`.
-`SimpleAggregateFunction` is not affected: its type is always recorded and restored on read, so the column reads as
-`SimpleAggregateFunction(f, T)`, not `T`. Fields without a `clickhouse.type` property read as their Iceberg type.
+`SimpleAggregateFunction` types are recorded either way.
 
-If the table sets the setting in its `SETTINGS` clause, that value is stored with the table and applies to every
-query on it. Otherwise the query's value applies, as for table functions such as `icebergS3` and for tables of a
-`DataLakeCatalog` database. On a cluster (`object_storage_cluster`), a table sends its own value to the other nodes,
-so all of them must know the setting.
+A table takes the value from its `SETTINGS` clause, or the server's value (from the server settings profile) without
+one; the query's value does not change it. The query's value applies to table functions such as `icebergS3` and to
+tables of a `DataLakeCatalog` database. On a cluster (`object_storage_cluster`), a table that enables the setting sends
+it to the other nodes, so all of them must know the setting.
 
 `ALTER TABLE ... EXPORT PART` and `ALTER TABLE ... EXPORT PARTITION` move states from an `AggregatingMergeTree` table
-into such a table without finalizing them. `EXPORT PARTITION` records the query's value with the task, so every
-replica that executes it uses that value.
+into such a table without finalizing them. The destination table uses its own value. For a table function or a
+`DataLakeCatalog` table the query's value applies, and `EXPORT PARTITION` records it with the task, so every replica that
+executes it uses that value.
 
 ```sql
 ALTER TABLE mt EXPORT PART 'all_1_1_0' TO TABLE agg;

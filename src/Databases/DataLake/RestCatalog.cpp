@@ -2560,7 +2560,8 @@ bool RestCatalog::getTableMetadataImpl(
     {
         const bool allow_geo_parser
             = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
-        auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_, allow_geo_parser);
+        auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(
+            context_, allow_geo_parser, DB::allowAggregateFunctionStates(/*table_allow=*/ std::nullopt, context_));
         auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
         auto schema = schema_processor.getClickHouseTableSchemaById(id);
         result.setSchema(*schema);
