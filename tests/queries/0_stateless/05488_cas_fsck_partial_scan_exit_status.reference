@@ -1,0 +1,4 @@
+complete 0 1 0 0
+complete walked ref records: 1
+cut_partial 1 1 1 1
+cut_without_partial 1 0 0 1

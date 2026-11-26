@@ -992,6 +992,232 @@ def test_optimize_manifest_with_catalog(started_cluster):
     assert rows_after == rows_before
 
 
+def _split_object_path(path):
+    """Split `s3://bucket/key` or `http://host:port/bucket/key` into (bucket, key)."""
+    if path.startswith("s3://"):
+        return path[len("s3://"):].split("/", 1)
+    match = re.match(r"^https?://[^/]+/([^/]+)/(.+)$", path)
+    assert match, f"unexpected object path {path}"
+    return match.group(1), match.group(2)
+
+
+def _read_avro_records(minio_client, path):
+    # pyiceberg rejects the manifest lists written by ClickHouse (no field-ids), so read them directly.
+    import avro.datafile
+    import avro.io
+
+    bucket, key = _split_object_path(path)
+    data = minio_client.get_object(bucket, key).read()
+    with avro.datafile.DataFileReader(io.BytesIO(data), avro.io.DatumReader()) as reader:
+        return list(reader)
+
+
+def _create_table_for_manifest_compaction(
+    started_cluster, node, test_ref, num_inserts=5, table_suffix="table", location=None
+):
+    table_name = f"{test_ref}_{table_suffix}"
+    root_namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    if (root_namespace,) not in catalog.list_namespaces():
+        catalog.create_namespace(root_namespace)
+    # Unpartitioned table, so every per-insert data manifest can consolidate into a single one.
+    # Own location by default: `create_table` puts every table at the same location, so files of other tests
+    # would be mixed with the files of this table.
+    catalog.create_table(
+        identifier=f"{root_namespace}.{table_name}",
+        schema=DEFAULT_SCHEMA,
+        location=location or f"s3://warehouse-rest/{table_name}",
+        partition_spec=PartitionSpec(),
+        sort_order=DEFAULT_SORT_ORDER,
+    )
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    for i in range(num_inserts):
+        node.query(
+            f"INSERT INTO {table_ref} VALUES (NULL, 'sym{i}', {100 + i}, {200 + i}, tuple('bot'));",
+            settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+        )
+    return catalog, f"{root_namespace}.{table_name}", table_ref
+
+
+def _optimize_manifest_with_failpoint(node, table_ref, failpoint):
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        node.query(
+            f"OPTIMIZE TABLE {table_ref} MANIFEST",
+            settings={
+                "allow_experimental_iceberg_compaction": 1,
+                "iceberg_manifest_min_count_to_compact": 2,
+                "allow_insert_into_iceberg": 1,
+                "write_full_path_in_iceberg_metadata": 1,
+            },
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+
+
+def _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts):
+    """Every manifest and the manifest list named by the current snapshot must still exist."""
+    minio_client = started_cluster.minio_client
+    metadata = catalog.load_table(table_identifier).metadata
+    manifest_list = metadata.snapshot_by_id(metadata.current_snapshot_id).manifest_list
+    manifests = [record["manifest_path"] for record in _read_avro_records(minio_client, manifest_list)]
+    assert 0 < len(manifests) < num_inserts, f"expected consolidated manifests, got {manifests}"
+    for manifest in manifests:
+        minio_client.stat_object(*_split_object_path(manifest))
+
+
+def test_optimize_manifest_commit_state_unknown(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must not delete the files of a snapshot the catalog has applied.
+
+    The failpoint makes the REST catalog apply the update and then report a retryable failure
+    (commit state unknown, e.g. a proxy turning the response into a 5xx). The compaction must
+    notice that its snapshot is current instead of removing the manifests it names.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_unknown_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    _optimize_manifest_with_failpoint(node, table_ref, "iceberg_catalog_update_metadata_reported_as_failed")
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    # The applied commit is detected, so there is no second `replace` snapshot from a retry.
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
+def test_optimize_manifest_catalog_rejection_retries(started_cluster):
+    """When the catalog rejects the update without applying it, the compaction retries and commits once.
+
+    A rejection may also mean an unknown outcome, so the files of the rejected attempt are left in place.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_rejection_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    _optimize_manifest_with_failpoint(node, table_ref, "iceberg_catalog_update_metadata_fail")
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
+def test_optimize_manifest_catalog_throws_after_apply(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must not delete the files of a snapshot the catalog applied before an error.
+
+    The failpoint makes the REST catalog apply the update and then throw, as for a lost response.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_throw_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    failpoint = "iceberg_catalog_update_metadata_throw_after_apply"
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        error = node.query_and_get_error(
+            f"OPTIMIZE TABLE {table_ref} MANIFEST",
+            settings={
+                "allow_experimental_iceberg_compaction": 1,
+                "iceberg_manifest_min_count_to_compact": 2,
+                "allow_insert_into_iceberg": 1,
+                "write_full_path_in_iceberg_metadata": 1,
+            },
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    assert "Injected failure after the catalog applied the update" in error, error
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
+def test_optimize_manifest_uses_catalog_metadata(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must compact the metadata the catalog names for the table.
+
+    Two tables share one location. The other table has more metadata versions, so the latest metadata file
+    found by listing the storage belongs to it. Compacting the first table must not pick that file.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    test_ref = f"test_optimize_manifest_shared_location_{uuid.uuid4()}"
+    location = f"s3://warehouse-rest/{test_ref}"
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, test_ref, num_inserts, table_suffix="table", location=location
+    )
+    _, other_identifier, other_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, test_ref, num_inserts + 3, table_suffix="other", location=location
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    other_metadata_before = catalog.load_table(other_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+    other_rows_before = node.query(f"SELECT symbol, bid, ask FROM {other_ref} ORDER BY ALL")
+
+    node.query(
+        f"OPTIMIZE TABLE {table_ref} MANIFEST",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_manifest_min_count_to_compact": 2,
+            "allow_insert_into_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+    # The new snapshot must descend from this table's own history, not from the other table's.
+    assert (
+        metadata_after.snapshot_by_id(metadata_after.current_snapshot_id).parent_snapshot_id
+        == metadata_before.current_snapshot_id
+    )
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    other_metadata_after = catalog.load_table(other_identifier).metadata
+    assert other_metadata_after.current_snapshot_id == other_metadata_before.current_snapshot_id
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+    assert node.query(f"SELECT symbol, bid, ask FROM {other_ref} ORDER BY ALL") == other_rows_before
+
+
 @pytest.mark.parametrize(
     "fields_to_remove",
     [
@@ -1447,6 +1673,278 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
+def test_object_storage_cluster_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` "
+            "SETTINGS object_storage_cluster = 'cluster_simple' FORMAT Null",
+            query_id=query_id,
+        )
+        == ""
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {CATALOG_NAME}.`{namespace}.{table_name}` AS t "
+            f"INNER JOIN {memory_table} AS m ON t.symbol = m.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_right_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_right_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_right_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {memory_table} AS m "
+            f"INNER JOIN {CATALOG_NAME}.`{namespace}.{table_name}` AS t ON m.symbol = t.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_right_in_subquery_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_right_in_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_right_in_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {memory_table} AS m "
+            f"INNER JOIN {CATALOG_NAME}.`{namespace}.{table_name}` AS t ON m.symbol = t.symbol "
+            "WHERE t.symbol IN (SELECT 'kek' FROM system.one) "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_secondary_query_returns_shard_identifiers(started_cluster):
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    test_ref = f"test_object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node1, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node2, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    assert (
+        node1.query(
+            f"SELECT symbol FROM remote('node2', '{CATALOG_NAME}', '{namespace}.{table_name}') "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node2.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node2.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE initial_query_id = '{query_id}' AND type = 'QueryFinish' "
+            "AND startsWith(query, 'SELECT') "
+            "AND position(query, 'iceberg') = 0 "
+            "AND position(query, 'system.query_log') = 0"
+        )
+        == "1\n"
+    )
+
+    node2.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+
+
+def test_object_storage_cluster_count_where_returns_filtered_rows(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_count_where_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    other = generate_record()
+    other["symbol"] = "other"
+    table.append(pa.Table.from_pylist([generate_record(), other]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_count_where_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT count() FROM {CATALOG_NAME}.`{namespace}.{table_name}` "
+            "WHERE symbol = 'kek' "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "1\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_union_all_returns_both_tables(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_union_{uuid.uuid4().hex}"
+    namespace = f"{test_ref}_namespace"
+    first_table_name = f"{test_ref}_first"
+    second_table_name = f"{test_ref}_second"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    first_table = create_table(catalog, namespace, first_table_name)
+    second = generate_record()
+    second["symbol"] = "lol"
+    first_table.append(pa.Table.from_pylist([generate_record()]))
+    second_table = create_table(catalog, namespace, second_table_name)
+    second_table.append(pa.Table.from_pylist([second]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_union_{uuid.uuid4().hex}"
+    result = node.query(
+        f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{first_table_name}` "
+        f"UNION ALL SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{second_table_name}` "
+        "SETTINGS object_storage_cluster = 'cluster_simple'",
+        query_id=query_id,
+    )
+    assert sorted(result.splitlines()) == ["kek", "lol"]
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "2\n"
+    )
+
+
 def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -1548,6 +2046,502 @@ def test_cluster_insert(started_cluster):
     )
     assert table_name not in node1.query(f"SHOW TABLES FROM {CATALOG_NAME}")
 
+
+def _setup_distributed_join_tables(started_cluster, nodes, test_ref):
+    """Three DataLake-catalog tables: a driver and two dimensions, so a query can have a nested JOIN
+    on the right-hand side rather than a single partner table."""
+    root_namespace = f"{test_ref}_namespace"
+    fact_table = f"{test_ref}_fact"
+    dim_table = f"{test_ref}_dim"
+    weight_table = f"{test_ref}_weight"
+
+    load_catalog_impl(started_cluster)
+    for node in nodes:
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node = nodes[0]
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, fact_table, "(tag Int32, name String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, dim_table, "(id Int32, city String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, weight_table, "(city String, weight Int32)"
+    )
+
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{fact_table}` VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{dim_table}` VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{weight_table}` VALUES ('berlin', 10), ('paris', 20), ('berlin', 5);",
+        settings=insert_settings,
+    )
+
+    return (
+        f"{CATALOG_NAME}.`{root_namespace}.{fact_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{dim_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{weight_table}`",
+    )
+
+
+def _assert_dispatched_whole(nodes, query_id):
+    """Checks the runtime invariants of a whole-query dispatch, from system.query_log:
+
+    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query;
+    2. it names no catalog table: the driver arrives as the one `*Cluster` table function, which reads the
+       initiator's file-task queue, and every other table as a plain table function, which reads in full;
+    3. every secondary query of this dispatch is that whole query. A partner table fanning out again from
+       a worker would show up as a further secondary query without the JOIN in it;
+    4. the driver and each partner table function name the metadata file the initiator resolved, through
+       `iceberg_metadata_file_path`. A worker resolves a partner on its own, so without it a commit during the
+       query would give different driver files different partner snapshots.
+    """
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+
+    whole_query = 0
+    for node in nodes:
+        whole_query += int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') != 0
+                  AND positionCaseInsensitive(query, 'group by') != 0
+                """
+            ).strip()
+        )
+    assert whole_query > 0, f"query {query_id} was not dispatched whole to the cluster"
+
+    for node in nodes:
+        misdirected = node.query(
+            f"""
+            SELECT query
+            FROM system.query_log
+            WHERE type = 'QueryStart' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND (countSubstringsCaseInsensitive(query, 'cluster(') != 1
+                   OR position(query, '{CATALOG_NAME}.') != 0)
+            """
+        ).strip()
+        assert misdirected == "", (
+            f"query {query_id}: a dispatched query on {node.name} does not have exactly one cluster table "
+            f"function, or names a catalog table: {misdirected}"
+        )
+
+        unpinned = node.query(
+            f"""
+            SELECT query
+            FROM system.query_log
+            WHERE type = 'QueryStart' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'join') != 0
+              AND countSubstrings(query, 'iceberg_metadata_file_path') < 2
+            """
+        ).strip()
+        assert unpinned == "", (
+            f"query {query_id}: a dispatched query on {node.name} does not pin both the driver and its partner "
+            f"with `iceberg_metadata_file_path`: {unpinned}"
+        )
+
+        partner_fanout = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') = 0
+                """
+            ).strip()
+        )
+        assert partner_fanout == 0, (
+            f"query {query_id}: a secondary query without the JOIN was issued on {node.name} -- "
+            "a table fanned out again instead of being read locally"
+        )
+
+
+def test_distributed_join_dispatch(started_cluster):
+    """allow_object_storage_cluster_distributed_join=1: a JOIN whose driving table is a DataLake-catalog
+    table is dispatched whole to the driver's cluster and finalized on the initiator.
+
+    Correctness is checked against the same queries with the setting off (ordinary local planning),
+    which is the oracle -- dispatch must not change results, only where the work happens.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, weight = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_{uuid.uuid4()}"
+    )
+
+    def run(query, distributed_join, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+            },
+        )
+
+    # The driver is the immediate leftmost table of the JOIN.
+    direct_driver = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    # The driver is buried in a see-through subquery on the JOIN's left, the aggregation sits on the
+    # enclosing query, and the right-hand side is itself a JOIN over a grouped subquery -- all of which
+    # every worker recomputes in full.
+    buried_driver = f"""
+        SELECT dims.city, count() AS c
+        FROM
+        (
+            SELECT tag, name
+            FROM {fact}
+            WHERE tag < 10
+        ) AS f
+        LEFT JOIN
+        (
+            SELECT d.id AS id, d.city AS city
+            FROM {dim} AS d
+            LEFT JOIN
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ) AS p ON d.city = p.city
+        ) AS dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    # The same shape written with CTEs rather than derived tables. The setting documents CTE support,
+    # and the analyzer represents a CTE as a QueryNode just like a derived table, but the serializer has to
+    # inline the CTE body for the worker to resolve it -- so this is worth exercising directly.
+    buried_driver_cte = f"""
+        WITH
+            f AS
+            (
+                SELECT tag, name
+                FROM {fact}
+                WHERE tag < 10
+            ),
+            p AS
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ),
+            dims AS
+            (
+                SELECT d.id AS id, d.city AS city
+                FROM {dim} AS d
+                LEFT JOIN p ON d.city = p.city
+            )
+        SELECT dims.city, count() AS c
+        FROM f
+        LEFT JOIN dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    for name, query in (
+        ("direct driver", direct_driver),
+        ("buried driver", buried_driver),
+        ("buried driver via CTE", buried_driver_cte),
+    ):
+        expected = run(query, 0)
+        assert expected == "berlin\t2\nparis\t1\n", f"{name} oracle result changed: {expected!r}"
+
+        query_id = uuid.uuid4().hex
+        assert run(query, 1, query_id=query_id) == expected, f"{name} differs under dispatch"
+        _assert_dispatched_whole(nodes, query_id)
+
+
+def test_distributed_join_dispatch_records_access_info(started_cluster):
+    """A dispatched query names table functions to the workers, so the initiator records the original
+    catalog tables and the columns read from them in system.query_log, for both sides of the JOIN and
+    also for tables inside subqueries and CTEs, which the header analysis does not plan."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, [node1, node2], f"test_distributed_join_access_{uuid.uuid4()}"
+    )
+
+    queries = {
+        "direct tables": f"""
+            SELECT d.city, count() AS c
+            FROM {fact} AS f
+            INNER JOIN {dim} AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in subqueries": f"""
+            SELECT d.city, count() AS c
+            FROM (SELECT tag FROM {fact}) AS f
+            INNER JOIN (SELECT id, city FROM {dim}) AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in CTEs": f"""
+            WITH f AS (SELECT tag FROM {fact}), d AS (SELECT id, city FROM {dim})
+            SELECT d.city, count() AS c
+            FROM f
+            INNER JOIN d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+    }
+
+    for name, query in queries.items():
+        query_id = uuid.uuid4().hex
+        node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": 1,
+            },
+        )
+        _assert_dispatched_whole([node1, node2], query_id)
+
+        node1.query("SYSTEM FLUSH LOGS system.query_log")
+
+        # `columns` holds `table.column` entries, so each side must have recorded at least the columns it was
+        # joined or grouped on.
+        tables = node1.query(
+            f"SELECT arrayStringConcat(tables, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        columns = node1.query(
+            f"SELECT arrayStringConcat(columns, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        for table, used_columns in ((fact, ("tag",)), (dim, ("id", "city"))):
+            assert table in tables, f"{name}: {table} is missing from query_log.tables: {tables!r}"
+            for column in used_columns:
+                assert f"{table}.{column}" in columns or f"{table}`.`{column}" in columns, (
+                    f"{name}: {table}.{column} is missing from query_log.columns: {columns!r}"
+                )
+
+
+def test_distributed_join_dispatch_aggregates_across_workers(started_cluster):
+    """Several workers read different driver files and each contributes to every group, so the initiator
+    has to merge partial aggregate states. count, sum and avg must match ordinary execution."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_workers_{uuid.uuid4()}"
+    )
+
+    # One INSERT writes one data file. Every file holds every tag, so a worker that reads any file has rows
+    # for both cities, and each city is aggregated from rows read by both workers.
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    extra_files = 19
+    for _ in range(extra_files):
+        node1.query(
+            f"INSERT INTO {fact} VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+            settings=insert_settings,
+        )
+    files = extra_files + 1
+
+    query = f"""
+        SELECT d.city, count() AS c, sum(f.tag) AS s, avg(f.tag) AS a
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def run(distributed_join, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+                # A worker that finishes its files may steal another worker's after this long. The default
+                # (500 ms) lets a fast worker take a slow starter's files, so that one contributes nothing.
+                # A worker only waits this long while the other still has files, so it does not slow the query.
+                "lock_object_storage_task_distribution_ms": 30000,
+            },
+        )
+
+    # berlin joins tags 1 and 3, paris joins tag 2.
+    expected = f"berlin\t{2 * files}\t{4 * files}\t2\nparis\t{files}\t{2 * files}\t2\n"
+    assert run(0) == expected, "oracle result changed"
+
+    query_id = uuid.uuid4().hex
+    assert run(1, query_id=query_id) == expected
+    _assert_dispatched_whole(nodes, query_id)
+
+    # Each worker returned a partial result with a row for both cities, so both of them contributed to
+    # each group. Without files for both workers, this fails instead of passing vacuously.
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+        partial_rows = node.query(
+            f"""
+            SELECT result_rows
+            FROM system.query_log
+            WHERE type = 'QueryFinish' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'group by') != 0
+            """
+        ).split()
+        assert partial_rows == ["2"], (
+            f"{node.name} did not contribute a partial result for both groups: {partial_rows!r}"
+        )
+
+
+def test_distributed_join_dispatch_falls_back(started_cluster):
+    """Tables the dispatch cannot prove safe fall back to ordinary planning instead of failing: a local
+    Memory JOIN partner is not resolvable on a worker, so the candidate must be rejected."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_fallback_{uuid.uuid4()}"
+    fact, _, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    # `test_ref` carries a UUID with hyphens, which is not a valid unquoted identifier.
+    local_table = f"{test_ref.replace('-', '_')}_local"
+    node1.query(f"CREATE TABLE {local_table} (id Int32, city String) ENGINE = Memory()")
+    node1.query(f"INSERT INTO {local_table} VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin')")
+
+    query = f"""
+        SELECT l.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {local_table} AS l ON f.tag = l.id
+        GROUP BY l.city
+        ORDER BY ALL
+    """
+
+    def run(distributed_join):
+        return node1.query(
+            query,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+            },
+        )
+
+    assert run(1) == run(0)
+
+
+def test_distributed_join_dispatch_declines_in_table_name(started_cluster):
+    """`x IN db.table` keeps the right side as a catalog table name, which is not sent as a table function.
+    A worker would resolve it in its own catalog, which node2 lacks here, and would read its latest snapshot
+    instead of the initiator's, so the query must not be dispatched."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_in_table_{uuid.uuid4()}"
+    fact, dim, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    root_namespace = f"{test_ref}_namespace"
+    keys_table = f"{test_ref}_keys"
+    create_clickhouse_iceberg_table(started_cluster, node1, root_namespace, keys_table, "(k Int32)")
+    keys = f"{CATALOG_NAME}.`{root_namespace}.{keys_table}`"
+    node1.query(
+        f"INSERT INTO {keys} VALUES (1), (3)",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag IN {keys}
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def settings(distributed_join):
+        return {
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": distributed_join,
+        }
+
+    plan = node1.query(f"EXPLAIN {query}", settings=settings(1))
+    assert "ReadFromClusterQuery" not in plan, plan
+
+    expected = node1.query(query, settings=settings(0))
+    assert expected == "berlin\t2\n", expected
+    assert node1.query(query, settings=settings(1)) == expected
+
+
+def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
+    """A whole-query dispatch must not let the parallel-replicas settings change what a worker reads.
+
+    A DataLake-catalog table resolved on a worker decides in `StorageObjectStorageCluster`'s constructor,
+    from the cluster name plus the parallel-replicas settings, whether it consumes the initiator's
+    file-task queue -- whichever table it is. A partner answering yes would read the driver's files under
+    its own schema. A dispatched query names no catalog table: every partner arrives as a plain table
+    function, which never consumes the queue. The settings below are the combination that would make a
+    catalog table answer yes.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_pr_{uuid.uuid4()}"
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    expected = node1.query(
+        query,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": 0,
+        },
+    )
+    assert expected == "berlin\t2\nparis\t1\n", f"oracle result changed: {expected!r}"
+
+    query_id = uuid.uuid4().hex
+    got = node1.query(
+        query,
+        query_id=query_id,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": 1,
+            "parallel_replicas_for_cluster_engines": 1,
+            "enable_parallel_replicas": 1,
+            "cluster_for_parallel_replicas": "cluster_simple",
+            "max_parallel_replicas": 2,
+        },
+    )
+    assert got == expected, (
+        "dispatch with the parallel-replicas settings on returned a different result than ordinary "
+        f"planning: {got!r} != {expected!r} -- a partner table most likely consumed the driver's "
+        "file-task queue"
+    )
+
+    # Without this the test would silently stop covering anything if the candidate were rejected
+    # whenever the parallel-replicas settings are set.
+    _assert_dispatched_whole(nodes, query_id)
 
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]
@@ -1844,7 +2838,7 @@ def test_create_table_as_rejects_source_storage_clauses(
     )
     primary_key = "PRIMARY KEY id" if source_property == "primary_key" else ""
     node.query(
-        f"CREATE TABLE default.{src_table} (id UInt64, name String{index}) "
+        f"CREATE TABLE default.{src_table} (id Int64, name String{index}) "
         f"ENGINE = MergeTree {primary_key} ORDER BY (id, name)"
     )
     engine = (
@@ -2266,7 +3260,7 @@ def test_show_create_table_round_trip_partition_and_sort_order(started_cluster):
     target_table = f"{CATALOG_NAME}.`{namespace}.{target_table_name}`"
     node.query(
         f"""
-        CREATE TABLE {source_table} (id UInt64, dt Date, name String)
+        CREATE TABLE {source_table} (id Int64, dt Date, name String)
         PARTITION BY (toYearNumSinceEpoch(dt), icebergBucket(8, id))
         ORDER BY (id, name DESC)
         """,
@@ -3723,7 +4717,7 @@ def test_catalog_commit_conflict_reaches_caller_at_once(started_cluster):
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     create_clickhouse_iceberg_table(
-        started_cluster, node, root_namespace, table_name, "(x UInt64)"
+        started_cluster, node, root_namespace, table_name, "(x Int64)"
     )
 
     # Every sink reads the branch tip in its constructor, and all `max_insert_threads` sinks are

@@ -121,6 +121,14 @@ public:
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    bool updateMetadataAndProperties(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr new_snapshot,
+        const std::map<String, String> & properties_to_set,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool updateSchema(
         const String & namespace_name,
         const String & table_name,
@@ -609,10 +617,13 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
     Int32 previous_schema_id,
     Int32 new_last_column_id);
 
+/// Builds the JSON body that commits `new_snapshot` (and sets `properties_to_set` in the same commit)
+/// via the Iceberg REST catalog.
 Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
     const String & namespace_name,
     const String & table_name,
-    Poco::JSON::Object::Ptr new_snapshot);
+    Poco::JSON::Object::Ptr new_snapshot,
+    const std::map<String, String> & properties_to_set = {});
 
 }
 

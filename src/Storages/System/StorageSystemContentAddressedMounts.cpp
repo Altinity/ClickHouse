@@ -14,9 +14,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/Pipe.h>
 #include <Interpreters/Context.h>
+#include <IO/ReadHelpers.h>
 #include <Common/assert_cast.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -29,6 +31,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INVALID_STATE;
+}
+
+UUID casServerIdToUuid(const UInt128 & server_id)
+{
+    /// `UUID(server_id)` would swap the 64-bit halves: the id keeps the text's digits in numeric order.
+    return parseFromString<UUID>(Cas::u128ToHex(server_id));
 }
 
 StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const StorageID & table_id_)
@@ -202,7 +210,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                 {
                     col_disk->insert(disk_name);
                     col_srid->insert(m.srid);
-                    assert_cast<ColumnUUID &>(*col_uuid).insertValue(UUID(m.lease.server_uuid));
+                    assert_cast<ColumnUUID &>(*col_uuid).insertValue(casServerIdToUuid(m.lease.server_uuid));
                     col_host->insert(m.lease.hostname);
                     col_pid->insert(m.lease.pid);
                     col_epoch->insert(m.lease.writer_epoch);

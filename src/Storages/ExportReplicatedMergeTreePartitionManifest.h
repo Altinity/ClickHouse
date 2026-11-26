@@ -173,7 +173,6 @@ struct ExportReplicatedMergeTreePartitionManifest
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
-    bool allow_lossy_cast = false;
     String iceberg_metadata_json;
 
     /// Optional because of backwards compatibility
@@ -183,6 +182,9 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::optional<UInt64> parquet_row_group_size_bytes;
     std::optional<MergeTreePartExportSchemaMatchMode> schema_match_mode;
     std::optional<bool> ignore_extra_source_columns;
+    /// Optional because of backwards compatibility. An absent value means 0, a fresh fetch for every part.
+    std::optional<UInt64> check_destination_schema_staleness_ms;
+    std::optional<UInt64> min_bytes_to_use_direct_io;
 
     /// this is a controversial setting. As far as I can infer from the iceberg docs, the transforms are always UTC.
     /// this setting allows to specify different timezones. Since it is already implemented, we must respect it.
@@ -221,7 +223,6 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("retry_max_backoff_seconds", retry_max_backoff_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
-        json.set("allow_lossy_cast", allow_lossy_cast);
         if (parquet_compression_method)
             json.set("parquet_compression_method", *parquet_compression_method);
         if (output_format_compression_level)
@@ -236,6 +237,10 @@ struct ExportReplicatedMergeTreePartitionManifest
             json.set("schema_match_mode", String(magic_enum::enum_name(*schema_match_mode)));
         if (ignore_extra_source_columns)
             json.set("ignore_extra_source_columns", *ignore_extra_source_columns);
+        if (check_destination_schema_staleness_ms)
+            json.set("check_destination_schema_staleness_ms", *check_destination_schema_staleness_ms);
+        if (min_bytes_to_use_direct_io)
+            json.set("min_bytes_to_use_direct_io", *min_bytes_to_use_direct_io);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -298,11 +303,6 @@ struct ExportReplicatedMergeTreePartitionManifest
 
         manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
 
-        /// Default to true for tasks created before this field existed, so an in-flight
-        /// export scheduled with the old permissive worker behavior is not wrongly rejected
-        /// on upgrade. New tasks always persist the initiator's actual choice.
-        manifest.allow_lossy_cast = json->has("allow_lossy_cast") ? json->getValue<bool>("allow_lossy_cast") : true;
-
         /// Left unset (nullopt) for tasks created before these fields existed - such tasks were
         /// always scheduled under the old, strict column-matching check (a mismatch could never
         /// reach scheduling in the first place), so callers should treat an absent value as
@@ -317,6 +317,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("ignore_extra_source_columns"))
         {
             manifest.ignore_extra_source_columns = json->getValue<bool>("ignore_extra_source_columns");
+        }
+
+        if (json->has("check_destination_schema_staleness_ms"))
+        {
+            manifest.check_destination_schema_staleness_ms = json->getValue<UInt64>("check_destination_schema_staleness_ms");
         }
 
         if (json->has("parquet_compression_method"))
@@ -342,6 +347,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("iceberg_partition_timezone"))
         {
             manifest.iceberg_partition_timezone = json->getValue<String>("iceberg_partition_timezone");
+        }
+
+        if (json->has("min_bytes_to_use_direct_io"))
+        {
+            manifest.min_bytes_to_use_direct_io = json->getValue<UInt64>("min_bytes_to_use_direct_io");
         }
 
         return manifest;

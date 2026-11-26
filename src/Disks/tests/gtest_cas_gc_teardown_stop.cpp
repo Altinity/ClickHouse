@@ -101,7 +101,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage()
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
-    return storage;
+    return DB::Cas::tests::ownedByDirectory(std::move(storage), scratch);
 }
 
 /// Completes the first read of `key`, then withholds its return until released, so the round that
@@ -385,6 +385,7 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
     GateOpenedOnExit opener(*release);
     backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
     sched.start();
+    sched.requestRoundSoon();
     entered->wait("entered");
 
     store->beginTeardown();

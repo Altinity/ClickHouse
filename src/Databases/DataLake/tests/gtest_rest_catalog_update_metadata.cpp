@@ -131,6 +131,28 @@ TEST(RestCatalogUpdateMetadataBody, SnapshotUpdateParentMinusOneNoRequirement)
     EXPECT_FALSE(req->has("snapshot-id"));
 }
 
+TEST(RestCatalogUpdateMetadataBody, PropertiesAreSetInTheSameCommit)
+{
+    Poco::JSON::Object::Ptr snapshot = new Poco::JSON::Object;
+    snapshot->set("snapshot-id", static_cast<Int64>(7));
+
+    auto without_properties = DataLake::buildUpdateMetadataRequestBody("ns", "t", snapshot);
+    ASSERT_TRUE(without_properties);
+    EXPECT_FALSE(findUpdateByAction(without_properties->getArray("updates"), "set-properties"));
+
+    auto body = DataLake::buildUpdateMetadataRequestBody(
+        "ns", "t", snapshot, {{"schema.name-mapping.default", R"([{"field-id":1,"names":["a"]}])"}});
+    ASSERT_TRUE(body);
+    auto updates = body->getArray("updates");
+    ASSERT_TRUE(findUpdateByAction(updates, "add-snapshot"));
+    ASSERT_TRUE(findUpdateByAction(updates, "set-snapshot-ref"));
+    auto set_properties = findUpdateByAction(updates, "set-properties");
+    ASSERT_TRUE(set_properties);
+    EXPECT_EQ(
+        set_properties->getObject("updates")->getValue<std::string>("schema.name-mapping.default"),
+        R"([{"field-id":1,"names":["a"]}])");
+}
+
 TEST(RestCatalogUpdateSchemaBody, EquivalentSchemaDeduplicates)
 {
     Poco::JSON::Object::Ptr metadata = new Poco::JSON::Object;

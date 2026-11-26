@@ -522,9 +522,9 @@ def test_export_partition_day_source_into_year_metadata(cluster, source_engine):
     )
 
 
-def test_export_partition_lossy_cast_dynamic_accept(cluster, source_engine):
+def test_export_partition_narrowing_cast_dynamic_accept(cluster, source_engine):
     """
-    A lossy Int64 -> Int32 partition-column cast is accepted by the dynamic proof when the
+    A narrowing Int64 -> Int32 partition-column cast is accepted by the dynamic proof when the
     partition's values fit the destination type and map to a single Iceberg bucket. Source and
     destination use different truncate widths, so the field is proven via min/max rather than a
     structural match.
@@ -544,10 +544,7 @@ def test_export_partition_lossy_cast_dynamic_accept(cluster, source_engine):
     pid = first_partition_id(node, mt_table)
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
-        settings={
-            "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_allow_lossy_cast": 1,
-        },
+        settings={"allow_insert_into_iceberg": 1},
     )
     wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
     assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 2
@@ -752,6 +749,35 @@ def test_export_partition_bucket_type_change_rejected(cluster, source_engine):
     assert "BAD_ARGUMENTS" in error, (
         f"Expected BAD_ARGUMENTS for a type-changing bucket transform, got: {error!r}"
     )
+
+
+def test_export_partition_bucket_into_nullable_destination_column(cluster, source_engine):
+    """A non-nullable source column bucketed into an optional (Nullable) Iceberg field is accepted by the
+    structural match. Iceberg tables created by Spark have optional fields, so the destination column is
+    `Nullable(Int64)` over a source `Int64`. A non-null source never produces a NULL, so the bucket is
+    the same, and a hash such as icebergBucket could not be proven single-valued by the dynamic proof."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_bucket_nullable_{uid}"
+    iceberg_table = f"iceberg_bucket_nullable_{uid}"
+
+    make_source(node, mt_table, "id Int64, key Int64", "icebergBucket(16, key)",
+             replica_name="replica1", engine=source_engine)
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 42), (2, 42)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, key Nullable(Int64)",
+                    partition_by="icebergBucket(16, key)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    result = node.query(f"SELECT id, key FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "1\t42\n2\t42", f"Unexpected exported data:\n{result}"
 
 
 def test_export_partition_truncate_type_change_rejected(cluster, source_engine):
@@ -1017,8 +1043,7 @@ def test_export_partition_multicolumn_identity_metadata_matches_data(cluster, so
     mt_table = f"mt_multicol_{uid}"
     iceberg_table = f"iceberg_multicol_{uid}"
 
-    # Iceberg has no unsigned types, so retention widens UInt64 -> Int64; the cast is
-    # not value-preserving per canBeSafelyCast, hence the lossy opt-in below.
+    # Iceberg has no unsigned types, so retention widens UInt64 -> Int64.
     make_source(node, mt_table, "id Int64, event_date Date, retention UInt64",
              "(event_date, retention)", replica_name="replica1", engine=source_engine)
     node.query(
@@ -1032,10 +1057,7 @@ def test_export_partition_multicolumn_identity_metadata_matches_data(cluster, so
     pid = first_partition_id(node, mt_table)
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
-        settings={
-            "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_allow_lossy_cast": 1,
-        },
+        settings={"allow_insert_into_iceberg": 1},
     )
     wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
 

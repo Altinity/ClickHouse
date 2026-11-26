@@ -2321,8 +2321,28 @@ Possible values:
 - `local` — Deprecated legacy alias of `allow`.
 - `global` — `INNER`, `LEFT`, and `CROSS` run on the nodes. The initiator reads the right table once and sends it to each node. For `CROSS JOIN`, every table after the first is sent. `RIGHT` and `FULL` stay on the initiator, so unmatched rows of the preserved side are returned once.
 
-See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
+See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode) and [`allow_object_storage_cluster_distributed_join`](#allow_object_storage_cluster_distributed_join).
 )", 0) \
+    DECLARE(Bool, allow_object_storage_cluster_distributed_join, false, R"(
+Experimental. Dispatches a whole `JOIN` query to the cluster of its driving table, so the `JOIN` and any `GROUP BY` run on the cluster's nodes instead of on the initiator, which then only merges the partial aggregate states. The driving table is found by walking down the left side of the query -- through `INNER ALL`/`LEFT JOIN`s and through a subquery or CTE that does not itself aggregate, deduplicate, sort or limit -- and must be a `DataLake` catalog table distributed via [`object_storage_cluster`](#object_storage_cluster).
+
+This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query as set by [`object_storage_cluster_join_mode`](#object_storage_cluster_join_mode). No narrower, nested candidate is attempted, and nothing falls back per level.
+
+Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. Every other table must also be an Iceberg table whose catalog metadata location is sent to the workers, so that each worker reads the snapshot the initiator resolved. A `DeltaLake` or `Paimon` table cannot be pinned this way, so a query that reads one is not dispatched. The combination is disabled outright when `additional_table_filters` is set, `object_storage_remote_initiator` is enabled, or a nested subquery or CTE has its own `SETTINGS` clause.
+
+Performance characteristic to be aware of: only the driving table is partitioned across the cluster. Every other table in the query is read and recomputed **in full on every node**, including any `JOIN` or `GROUP BY` over them. That is a win when those relations are small relative to the driver and a loss when they are not; ClickHouse does not estimate this cost when deciding to dispatch.
+
+Every table is sent to the nodes as the table function that reads it -- the driving table as its `*Cluster` function -- so, as for an ordinary cluster read, the storage credentials travel in the query text, and access to the table functions is checked on the nodes.
+
+ClickHouse also does not verify that the dictionaries or user-defined functions the query references are configured identically on every node of the driver's cluster -- as with `Distributed`, that consistency is the deployment's responsibility.
+
+Possible values:
+
+- `0` — Default. Never dispatch a whole query; `object_storage_cluster_join_mode` applies.
+- `1` — Dispatch an eligible query whole. Any other query is planned as set by `object_storage_cluster_join_mode`.
+
+See [Distributed JOIN](../../sql-reference/statements/select/join.md#allow-object-storage-cluster-distributed-join).
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
@@ -8193,6 +8213,16 @@ Enables throwing an exception if there was an error when analyzing scan predicat
     DECLARE(Bool, delta_lake_enable_engine_predicate, true, R"(
 Enables delta-kernel internal data pruning.
 )", 0) \
+    DECLARE(Bool, delta_lake_clustering_predicate_fallback, true, R"(
+For a Delta Lake table with liquid clustering: when translating the query filter to a delta-kernel
+predicate throws an exception, push only the top-level `AND` conjuncts of the filter that reference
+nothing but clustering columns, so that file-level data skipping on clustering columns still works.
+Filters that the kernel only partially supports do not need this: their translatable conjuncts are
+pushed anyway. Files without statistics for the clustering columns are not skipped.
+
+Has no effect when `delta_lake_enable_engine_predicate` is disabled or when
+`delta_lake_throw_on_engine_predicate_error` is enabled (the query throws the translation exception).
+)", 0) \
     DECLARE(NonZeroUInt64, delta_lake_insert_max_rows_in_data_file, 1000000, R"(
 Defines a rows limit for a single inserted data file in delta lake.
 )", 0) \
@@ -8929,11 +8959,6 @@ Has no effect on `EXPORT PARTITION <id>` (single-partition export).
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_part_allow_lossy_cast, false, R"(
-Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
-
-When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
-)", 0) \
     DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::POSITION, R"(
 Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns.
 Possible values:
@@ -8948,6 +8973,15 @@ Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` c
 - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `POSITION` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `NAME` mode, this allows source columns whose name has no destination counterpart.
 
 Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_check_destination_schema_staleness_ms, 5000, R"(
+How stale, in milliseconds, the destination's latest metadata version may be when each part export task of `EXPORT PART`/`EXPORT PARTITION` to an Apache Iceberg table checks, before reading or writing anything, that the destination's schema and partition spec are still the ones the export was scheduled against. If they changed, the task fails with `METADATA_MISMATCH`.
+
+The latest version is looked up through the Iceberg metadata files cache, shared by all part tasks of the table on a node, so a node lists the table at most once per window however many parts it exports.
+- `0` - the latest version is fetched from the object storage for every part.
+- a larger value - fewer requests, but a change of the destination schema or partition spec can go unnoticed by this check for up to that long. It is then noticed by the commit, after the data files were written, which are left behind.
+
+The destination column types of an export always come from the table metadata saved when the export was scheduled, whatever this setting is.
 )", 0) \
     \
     /* ####################################################### */ \
@@ -9293,6 +9327,9 @@ Default age threshold in seconds for orphan file removal in Iceberg tables. File
     DECLARE(Bool, allow_experimental_expire_snapshots, false, R"(
 Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE expire_snapshots`.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_add_files, false, R"(
+Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE add_files`, which registers existing Parquet files under the table location without rewriting them.
+)", EXPERIMENTAL) \
     DECLARE(Bool, write_full_path_in_iceberg_metadata, false, R"(
 Write full paths (including s3://) into iceberg metadata files.
 )", EXPERIMENTAL) \
@@ -9502,6 +9539,7 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, distributed_cache_use_clients_cache_for_write, false) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
+    MAKE_OBSOLETE(M, Bool, export_merge_tree_part_allow_lossy_cast, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_query_deduplication, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_ai_functions, false) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \

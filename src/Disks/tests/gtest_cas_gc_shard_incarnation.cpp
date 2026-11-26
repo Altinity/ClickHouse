@@ -312,6 +312,7 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
+    EXPECT_TRUE(report.deferred);
     EXPECT_TRUE(report.anomalies.empty());
     EXPECT_FALSE(op.list(layout.namespaceStreamPrefix(forgotten_life), "", 100, Retry::once()).keys.empty());
 }

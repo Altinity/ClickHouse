@@ -73,6 +73,7 @@
 #include <Interpreters/ProcessList.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/AddFilesExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/RemoveOrphanFilesExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
@@ -165,8 +166,10 @@ extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+extern const SettingsUInt64 export_merge_tree_part_check_destination_schema_staleness_ms;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
+extern const SettingsBool allow_experimental_iceberg_add_files;
 extern const SettingsSeconds lock_acquire_timeout;
 extern const SettingsSeconds iceberg_compaction_delay_bias;
 extern const SettingsSeconds iceberg_compaction_data_cleanup;
@@ -230,6 +233,21 @@ bool isExportPartitionTransactionAlreadyCommitted(const Poco::JSON::Object::Ptr 
     }
 
     return false;
+}
+
+void checkNoUInt64(const ColumnsDescription & columns)
+{
+    for (const auto & column : columns.getAllPhysical())
+    {
+        bool has_uint64 = column.type->getTypeId() == TypeIndex::UInt64;
+        column.type->forEachChild([&](const IDataType & child) { has_uint64 |= child.getTypeId() == TypeIndex::UInt64; });
+        if (has_uint64)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Column {} of type {} cannot be stored in Iceberg: the widest Iceberg integer type is the signed 64-bit `long`, "
+                "which cannot represent every UInt64 value. Use Int64 or Decimal(20, 0) instead",
+                column.name, column.type->getName());
+    }
 }
 
 }
@@ -1152,6 +1170,21 @@ Pipe IcebergMetadata::executeCommand(
         return Iceberg::executeRemoveOrphanFiles(
             args, context, object_storage_, data_lake_settings, persistent_components, *external_storages);
     }
+    else if (command_name == "add_files")
+    {
+        if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_add_files].value)
+        {
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg add_files is experimental. "
+                "To allow its usage, enable setting allow_experimental_iceberg_add_files");
+        }
+
+        checkTableRootIsQueriedPath("add_files");
+        return Iceberg::executeAddFiles(
+            args, context, object_storage_, data_lake_settings, persistent_components,
+            write_format, catalog_, storage_id.getTableName(), *external_storages);
+    }
     else
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown EXECUTE command '{}' for Iceberg table", command_name);
@@ -1172,6 +1205,9 @@ void IcebergMetadata::createInitial(
     auto configuration_ptr = configuration.lock();
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
+
+    if (columns)
+        checkNoUInt64(*columns);
 
     const bool catalog_manages_location = catalog && catalog->managesTableLocation();
     /// Either way the catalog writes the first metadata file, so the existence check and the prewrite move to it.
@@ -2266,11 +2302,6 @@ namespace FailPoints
     extern const char iceberg_writes_post_publish_throw[];
 }
 
-namespace
-{
-
-/// Find the partition spec object with the given spec-id inside a metadata JSON document.
-/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
 Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
 {
     auto specs = meta->getArray(Iceberg::f_partition_specs);
@@ -2297,6 +2328,9 @@ Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64
     throw Exception(ErrorCodes::METADATA_MISMATCH,
         "Schema with id {} not found in table metadata", schema_id);
 }
+
+namespace
+{
 
 /// Derive the Iceberg partition tuple for an exported part from a representative source row.
 /// The MergeTree `partition.value` is the source partition-key expression result; it is neither
@@ -2579,9 +2613,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
         }
 
         {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
+            std::string json_representation = stringifyJSON(metadata, 4);
 
             LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
             auto hint_path = filename_generator.generateVersionHint();
@@ -2836,6 +2868,106 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         log,
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
+}
+
+std::shared_ptr<const IcebergMetadata::ExportDestinationInfo>
+IcebergMetadata::getExportDestinationInfo(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    {
+        std::lock_guard lock(export_destination_cache_mutex);
+        for (const auto & [cached_json, cached_info] : export_destination_cache)
+            if (cached_json == iceberg_metadata_json_string)
+                return cached_info;
+    }
+
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+    auto info = std::make_shared<ExportDestinationInfo>();
+    info->schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
+    info->spec_id = metadata_json->getValue<Int64>(Iceberg::f_default_spec_id);
+
+    /// A scratch processor: the live one of the table is not touched. It derives the columns the way a reader does, for
+    /// example `int` is `Int32` and `long` is `Int64`. The table already exists with these types, so geometry and
+    /// geography are accepted without `allow_experimental_geo_types_in_iceberg`, which a replica may not have set.
+    IcebergSchemaProcessor schema_processor(context, /* allow_geo_parser_ */ true);
+    schema_processor.addIcebergTableSchema(lookupSchema(metadata_json, info->schema_id), context);
+    info->columns = *schema_processor.getClickHouseTableSchemaById(static_cast<Int32>(info->schema_id));
+
+    std::lock_guard lock(export_destination_cache_mutex);
+    for (const auto & [cached_json, cached_info] : export_destination_cache)
+        if (cached_json == iceberg_metadata_json_string)
+            return cached_info;
+
+    if (export_destination_cache.size() >= export_destination_cache_capacity)
+        export_destination_cache.erase(export_destination_cache.begin());
+    export_destination_cache.emplace_back(iceberg_metadata_json_string, info);
+    return info;
+}
+
+void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    const auto pinned = getExportDestinationInfo(iceberg_metadata_json_string, context);
+
+    /// The latest metadata version is looked up through the metadata files cache, which every part task of the table on
+    /// this node shares. A version younger than the staleness window is reused, so a node lists the table at most once
+    /// per window however many parts it exports. A window of 0 reads the latest version for every part.
+    auto window_context = Context::createCopy(context);
+    window_context->setSetting("iceberg_metadata_staleness_ms", context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_staleness_ms].value);
+    const auto latest_metadata_file = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        window_context,
+        log.get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method,
+        /* force_fetch_latest_metadata= */ false);
+
+    /// A metadata file never changes, so its ids are read and parsed once, for as long as it is the latest one.
+    LatestExportDestinationIds latest;
+    {
+        std::lock_guard lock(export_destination_cache_mutex);
+        if (export_latest_ids && export_latest_ids->metadata_path == latest_metadata_file.path)
+            latest = *export_latest_ids;
+    }
+
+    if (latest.metadata_path.empty())
+    {
+        const auto latest_metadata = getMetadataJSONObject(
+            latest_metadata_file.path,
+            object_storage,
+            persistent_components.metadata_cache,
+            context,
+            log,
+            latest_metadata_file.compression_method,
+            persistent_components.table_uuid);
+
+        latest.metadata_path = latest_metadata_file.path;
+        latest.schema_id = latest_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+        latest.spec_id = latest_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        std::lock_guard lock(export_destination_cache_mutex);
+        export_latest_ids = latest;
+    }
+
+    if (latest.schema_id != pinned->schema_id)
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
+            "Table schema changed after the export was scheduled (expected schema {}, got {}). "
+            "Restart the export operation.",
+            pinned->schema_id, latest.schema_id);
+
+    if (latest.spec_id != pinned->spec_id)
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
+            "Partition spec changed after the export was scheduled (expected spec {}, got {}). "
+            "Restart the export operation.",
+            pinned->spec_id, latest.spec_id);
+}
+
+NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    return getExportDestinationInfo(iceberg_metadata_json_string, context)->columns;
 }
 
 }

@@ -29,7 +29,7 @@
 
 namespace ProfileEvents
 {
-extern const Event CASGCRetiredRedeleteFailed;
+extern const Event CASGCRetiredBodyDeleteFailed;
 }
 
 namespace DB::ErrorCodes
@@ -49,12 +49,6 @@ constexpr uint64_t kFaultedBlob = 3;
 constexpr uint64_t kReplacedBlob = 5;
 constexpr uint64_t kAbsentBlob = 4;
 constexpr uint64_t kShards = 4;
-
-DB::UInt128 blobHash(uint64_t blob)
-{
-    const DB::UInt128 value(blob);
-    return (value << 64) | value;
-}
 
 class WorkerFaultBackend : public InMemoryBackend
 {
@@ -197,7 +191,7 @@ PoolPtr openPoolWithIoConcurrency(
 
 String blobKeyOf(const Pool & store, uint64_t blob)
 {
-    return store.layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHash(blob))});
+    return store.layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(numberedBlobHash(blob))});
 }
 
 std::set<String> allBlobKeys(const Pool & store)
@@ -211,7 +205,7 @@ std::set<String> allBlobKeys(const Pool & store)
 bool allBlobsAbsent(Backend & backend, const Pool & store)
 {
     for (uint64_t b = 1; b <= kBlobs; ++b)
-        if (!blobAbsent(backend, store.layout(), blobHash(b)))
+        if (!blobAbsent(backend, store.layout(), numberedBlobHash(b)))
             return false;
     return true;
 }
@@ -223,15 +217,15 @@ void publishThenDrop(Backend & backend, const PoolPtr & store, Gc & gc)
     std::vector<ManifestEntry> entries;
     for (uint64_t b = 1; b <= kBlobs; ++b)
     {
-        writeBlobBody(backend, store->layout(), blobHash(b));
-        entries.push_back(blobEntryFor("f" + std::to_string(b), blobHash(b)));
+        writeBlobBody(backend, store->layout(), numberedBlobHash(b));
+        entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
     }
     writeManifestRaw(backend, store->layout(), ns, r, entries);
     publishCommittedTransition(backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    ASSERT_FALSE(blobAbsent(backend, store->layout(), blobHash(1)));
+    ASSERT_FALSE(blobAbsent(backend, store->layout(), numberedBlobHash(1)));
 
     dropRefTransition(backend, store->layout(), ns, "tbl", r);
 }
@@ -280,7 +274,7 @@ void runRedeleteScenario(uint64_t concurrency, RedeleteRun & out, uint64_t outco
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        out.reports.push_back({rep.redeleted, rep.deleted, rep.absent, rep.replaced, rep.spared});
+        out.reports.push_back({rep.bodies_deleted, rep.deleted, rep.absent, rep.replaced, rep.spared});
         collectOutcomeLogs(*backend, out.outcome_logs);
     }
     ASSERT_TRUE(allBlobsAbsent(*backend, *store));
@@ -316,8 +310,8 @@ GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPha
 std::vector<Gc::PreviewEntry> previewPendingDeletes(Gc & gc)
 {
     std::vector<Gc::PreviewEntry> result;
-    for (Gc::PreviewEntry entry : gc.previewDeletes())
-        if (entry.reason == "delete_pending")
+    for (Gc::PreviewEntry entry : gc.previewDeletes().deletes)
+        if (entry.reason == "pending")
             result.push_back(std::move(entry));
     return result;
 }
@@ -349,9 +343,9 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        redeleted += rep.redeleted;
+        redeleted += rep.bodies_deleted;
         deleted += rep.deleted;
-        redelete_failed += rep.redelete_failed;
+        redelete_failed += rep.body_delete_failed;
     }
 
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
@@ -415,7 +409,7 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob)});
-    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
+    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed];
     std::map<String, std::vector<OutcomeRow>> outcome_logs_before;
     collectOutcomeLogs(*backend, outcome_logs_before);
     RoundReport progress;
@@ -427,17 +421,18 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     EXPECT_EQ(outcome_logs_after.size(), outcome_logs_before.size());
     for (const auto & log : outcome_logs_after)
         EXPECT_TRUE(outcome_logs_before.contains(log.first)) << "the failed round wrote outcome log " << log.first;
-    EXPECT_EQ(progress.redeleted, kBlobs - 1);
+    EXPECT_EQ(progress.bodies_deleted, kBlobs - 1);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     EXPECT_TRUE(backend->allFired()) << "the faulted blob delete never ran on a pool worker";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed] - failed_before, 1u);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed] - failed_before, 1u);
+    /// The bodies the failed round deleted read absent at the next delete HEAD: `standing`, no request.
+    EXPECT_EQ(next.bodies_deleted, 1u);
     EXPECT_EQ(next.deleted, 1u);
-    EXPECT_EQ(next.absent, kBlobs - 1);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -468,8 +463,8 @@ TEST(CASGCRedeleteConcurrency, SequentialWorkerFailureStillAttemptsLaterEntries)
 
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_TRUE(backend->allFired());
-    EXPECT_EQ(progress.redeleted, preview.size() - 1);
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.bodies_deleted, preview.size() - 1);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     for (size_t i = 1; i < preview.size(); ++i)
     {
@@ -539,11 +534,6 @@ private:
     std::atomic<bool> replacement_committed{false};
 };
 
-BlobRef blobRefOf(uint64_t blob)
-{
-    return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHash(blob))};
-}
-
 void driveUntilAllGraduated(Backend & backend, Gc & gc, const PoolPtr & store, uint64_t marked_blob)
 {
     bool graduated = false;
@@ -551,19 +541,18 @@ void driveUntilAllGraduated(Backend & backend, Gc & gc, const PoolPtr & store, u
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        ASSERT_EQ(rep.redeleted, 0u) << "no delete may run before the replacement is in place";
-        graduated = rep.graduated == kBlobs;
+        ASSERT_EQ(rep.bodies_deleted, 0u) << "no delete may run before the replacement is in place";
+        graduated = rep.intent_confirmed == kBlobs;
     }
-    ASSERT_TRUE(graduated) << "the six blobs never became delete_pending together";
+    ASSERT_TRUE(graduated) << "the six blobs never became pending together";
 
-    OperationForTest op(backend);
-    ASSERT_TRUE((*op).head(store->layout().blobMetaKey(blobRefOf(marked_blob)), Retry::standard()).has_value())
-        << "the condemn marker must exist before the redelete round, or the meta assertion is vacuous";
+    const auto intent = intentKeyOfCurrentBody(backend, store->layout(), blobRefOf(marked_blob));
+    ASSERT_TRUE(intent && objectPresent(backend, *intent)) << "the intent must exist before the delete round";
 }
 
 void expectOnlyReplacedBlobSurvives(Backend & backend, const Pool & store, const RoundReport & rep)
 {
-    EXPECT_EQ(rep.redeleted, kBlobs);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs);
     EXPECT_EQ(rep.deleted, kBlobs - 1);
     EXPECT_EQ(rep.replaced, 1u);
 
@@ -571,9 +560,7 @@ void expectOnlyReplacedBlobSurvives(Backend & backend, const Pool & store, const
     {
         OperationForTest op(backend);
         const bool body_present = (*op).head(blobKeyOf(store, b), Retry::standard()).has_value();
-        const bool meta_present = (*op).head(store.layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value();
         EXPECT_EQ(body_present, b == kReplacedBlob) << "blob " << b;
-        EXPECT_EQ(meta_present, b == kReplacedBlob) << "meta of blob " << b;
     }
 
     std::map<String, std::vector<OutcomeRow>> logs;
@@ -618,9 +605,17 @@ TEST(CASGCRedeleteConcurrency, ReplacedBlobInsideParallelBatchSurvivesWhileSibli
             (*op).replace(blobKeyOf(*store, kReplacedBlob), current->bytes, current->etag, Retry::standard())));
     }
 
+    /// The replaced body is seen at its delete HEAD: its row moves to the new token and no delete is sent.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    expectOnlyReplacedBlobSurvives(*backend, *store, rep);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs - 1);
+    EXPECT_EQ(rep.deleted, kBlobs - 1);
+    EXPECT_EQ(rep.replaced, 0u);
+    for (uint64_t b = 1; b <= kBlobs; ++b)
+    {
+        OperationForTest op(*backend);
+        EXPECT_EQ((*op).head(blobKeyOf(*store, b), Retry::standard()).has_value(), b == kReplacedBlob) << "blob " << b;
+    }
 }
 
 TEST(CASGCRedeleteConcurrency, BlobReplacedBetweenHeadAndDeleteSurvivesWhileSiblingsDelete)
@@ -640,7 +635,7 @@ TEST(CASGCRedeleteConcurrency, BlobReplacedBetweenHeadAndDeleteSurvivesWhileSibl
     expectOnlyReplacedBlobSurvives(*backend, *store, rep);
 }
 
-TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbsent)
+TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchGoesStanding)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolWithIoConcurrency(backend, 4);
@@ -655,18 +650,18 @@ TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbs
         ASSERT_EQ((*op).remove(blobKeyOf(*store, kAbsentBlob), current->etag, Retry::standard()), Removal::Removed);
     }
 
+    /// The absent body is seen at its delete HEAD: its row goes `standing` and no delete is sent.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    EXPECT_EQ(rep.redeleted, kBlobs);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs - 1);
     EXPECT_EQ(rep.deleted, kBlobs - 1);
-    EXPECT_EQ(rep.absent, 1u);
+    EXPECT_EQ(rep.absent, 0u);
     EXPECT_EQ(rep.replaced, 0u);
 
     for (uint64_t b = 1; b <= kBlobs; ++b)
     {
         OperationForTest op(*backend);
         EXPECT_FALSE((*op).head(blobKeyOf(*store, b), Retry::standard()).has_value()) << "blob " << b;
-        EXPECT_FALSE((*op).head(store->layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value()) << "meta of blob " << b;
     }
 
     std::map<String, std::vector<OutcomeRow>> logs;
@@ -689,7 +684,7 @@ TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbs
             }
         }
     }
-    EXPECT_EQ(absent_rows, 1u);
+    EXPECT_EQ(absent_rows, 0u) << "no delete was sent for the absent body, so it has no outcome row";
     EXPECT_EQ(deleted_rows, kBlobs - 1);
 }
 
@@ -698,13 +693,13 @@ namespace
 
 uint64_t failedCounter()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
+    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed];
 }
 
 void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std::set<uint64_t> & present)
 {
     for (uint64_t b = 1; b <= kBlobs; ++b)
-        EXPECT_EQ(blobAbsent(backend, store.layout(), blobHash(b)), !present.contains(b)) << "blob " << b;
+        EXPECT_EQ(blobAbsent(backend, store.layout(), numberedBlobHash(b)), !present.contains(b)) << "blob " << b;
 }
 
 struct ApplyHookState
@@ -758,8 +753,8 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     EXPECT_NE(message.find(first_fault_key), String::npos);
     EXPECT_TRUE(backend->allFired()) << "both faulted deletes must have run on pool workers";
     EXPECT_EQ(failedCounter() - failed_before, 2u);
-    EXPECT_EQ(progress.redeleted, kBlobs - 2);
-    EXPECT_EQ(progress.redelete_failed, 2u);
+    EXPECT_EQ(progress.bodies_deleted, kBlobs - 2);
+    EXPECT_EQ(progress.body_delete_failed, 2u);
     ASSERT_EQ(rows->rows.size(), 1u);
     ASSERT_TRUE(rows->lastRowHas("jobs_failed")) << "the phase metrics must survive the round's exception";
     EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
@@ -767,9 +762,9 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob, kReplacedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, 2u);
     EXPECT_EQ(next.deleted, 2u);
-    EXPECT_EQ(next.absent, kBlobs - 2);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -789,19 +784,18 @@ TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)
     EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
     store->renewWatermarkOnce();
 
-    EXPECT_TRUE(backend->allFired()) << "the faulted HEAD must have run on a pool worker";
+    EXPECT_TRUE(backend->allFired()) << "the faulted HEAD must have run on a read-ahead worker";
     EXPECT_EQ(failedCounter() - failed_before, 1u);
-    EXPECT_EQ(progress.redeleted, kBlobs - 1);
-    EXPECT_EQ(progress.redelete_failed, 1u);
-    ASSERT_EQ(rows->rows.size(), 1u);
-    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("jobs_failed"), 1u);
-    expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
+    /// The HEAD runs in the fold, so its failure ends the round before the delete batch starts.
+    EXPECT_EQ(progress.bodies_deleted, 0u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
+    EXPECT_TRUE(rows->rows.empty());
+    expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
-    EXPECT_EQ(next.deleted, 1u);
-    EXPECT_EQ(next.absent, kBlobs - 1);
+    EXPECT_EQ(next.bodies_deleted, kBlobs);
+    EXPECT_EQ(next.deleted, kBlobs);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -846,8 +840,8 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
 
     ASSERT_TRUE(injected->load()) << "the fault was never armed before pending_deletes";
     EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
-    EXPECT_EQ(progress.redeleted, 0u);
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.bodies_deleted, 0u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     ASSERT_EQ(rows->rows.size(), 1u);
     ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
@@ -856,7 +850,7 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
     expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, kBlobs);
     EXPECT_EQ(next.deleted, kBlobs);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
@@ -888,7 +882,7 @@ TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
     }
     store->renewWatermarkOnce();
 
-    EXPECT_EQ(progress.redelete_failed, 2u);
+    EXPECT_EQ(progress.body_delete_failed, 2u);
     EXPECT_EQ(failedCounter() - failed_before, 2u);
     EXPECT_EQ(rows->total("jobs_scheduled"), 3u);
     EXPECT_EQ(rows->total("jobs_failed"), 2u);
@@ -904,8 +898,10 @@ TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    EXPECT_EQ(next.redelete_failed, 0u);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.body_delete_failed, 0u);
+    /// Only the bodies the failed round left (the first and every unscheduled one) are deleted; the two it
+    /// deleted go `standing` at their delete HEAD.
+    EXPECT_EQ(next.bodies_deleted, kBlobs - 2);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -941,7 +937,7 @@ TEST(CASGCRedeleteConcurrency, SingletonWorkerFailureIsCountedWithoutScheduling)
 
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_TRUE(backend->allFired());
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
     EXPECT_EQ(rows->total("jobs_failed"), 1u);
@@ -1028,19 +1024,15 @@ TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
     store->renewWatermarkOnce();
 
     EXPECT_NE(message.find("injected apply fault"), String::npos) << message;
-    EXPECT_EQ(progress.redeleted, state->applied);
+    EXPECT_EQ(progress.bodies_deleted, state->applied);
     EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed apply is not a failed delete";
     EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the apply walk started";
 
+    /// The next round's delete HEADs find every body gone: each row goes `standing` with no delete.
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
-    EXPECT_EQ(next.absent, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, 0u);
     EXPECT_EQ(next.deleted, 0u);
-    for (uint64_t b = 1; b <= kBlobs; ++b)
-    {
-        OperationForTest op(*backend);
-        EXPECT_FALSE((*op).head(store->layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value()) << "meta of blob " << b;
-    }
+    EXPECT_TRUE(previewPendingDeletes(gc).empty()) << "every row left `pending`";
 }
 
 namespace
@@ -1098,11 +1090,11 @@ TEST(CASGCRedeleteConcurrency, BlobDeleteEventsMatchAppliedEntriesInAFailedRound
         if (b != kFaultedBlob)
             EXPECT_EQ(failed_round[blobKeyOf(*store, b)], "deleted") << "blob " << b;
 
+    /// The next round deletes only the body the failed round left; the others read absent at their HEAD.
     runRegularRoundReclaiming(gc);
     auto [next_round, next_round_count] = events->take();
-    EXPECT_EQ(next_round_count, kBlobs);
-    for (uint64_t b = 1; b <= kBlobs; ++b)
-        EXPECT_EQ(next_round[blobKeyOf(*store, b)], b == kFaultedBlob ? "deleted" : "absent") << "blob " << b;
+    EXPECT_EQ(next_round_count, 1u);
+    EXPECT_EQ(next_round[blobKeyOf(*store, kFaultedBlob)], "deleted");
 }
 
 TEST(CASGCRedeleteConcurrency, OutcomeBudgetCapsAuditRowsButNotDeletes)
@@ -1153,9 +1145,9 @@ TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        ASSERT_EQ(rep.redeleted, 0u);
+        ASSERT_EQ(rep.bodies_deleted, 0u);
         ASSERT_EQ(rep.spared, 0u);
-        graduated = rep.graduated == kBlobs;
+        graduated = rep.intent_confirmed == kBlobs;
         collectOutcomeLogs(*backend, logs);
     }
     ASSERT_TRUE(graduated) << "the scenario must reach graduation, or the rounds under test did nothing";

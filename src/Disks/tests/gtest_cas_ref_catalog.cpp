@@ -52,7 +52,7 @@ public:
     using FoldSignature = decltype(&Gc::fold);
     using ExpectedFoldSignature = Gc::FoldResult (Gc::*)(
         GcState &, std::optional<Etag> &, RoundReport &, uint64_t, const RefPlan &, UniversePolicy,
-        GcRoundWorkBudget &);
+        GcRoundWorkBudget &, bool);
     using BuilderSignature = decltype(&buildRefWalkPlan);
     using ExpectedBuilderSignature = RefPlan (*)(RoundInput &&);
 
@@ -409,7 +409,7 @@ TEST(CASRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLo
     EXPECT_THROW(CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current) { return current; }), DB::Exception);
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
     EXPECT_EQ(after->bytes, before->bytes);
 
     const auto unique = CasRefCatalog::lifeIfCataloged(op, layout, RootNamespace{"c"});
@@ -505,7 +505,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 1));
     c.entries.push_back(liveEntry("a", 2));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
@@ -513,7 +513,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
     RefCatalog c;
     c.entries.push_back(liveEntry("b", 1));
     c.entries.push_back(liveEntry("a", 2));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
@@ -521,42 +521,42 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1),
         .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorAbsentOnCreatingAborts)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1)});
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsZeroIncarnationAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 0));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNameOverByteBoundAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry(String(kMaxNamespaceBytes + 1, 'a'), 1));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("", 1));
-    EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
+    CAS_EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
 }
 
 TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAborts)
 {
     CatalogEntry live_with_round = liveEntry("live", 8);
     live_with_round.removal_started_round = 20;
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); }, "removal_started_round");
 }
 
@@ -673,7 +673,7 @@ TEST(CASRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
-    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
+    CAS_EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
 #endif
 
@@ -968,7 +968,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
         CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-        EXPECT_DEATH(
+        CAS_EXPECT_DEATH(
             { (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog &) { return RefCatalog{}; }); },
             "cannot add or delete catalog entries");
     }
@@ -979,7 +979,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
         CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-        EXPECT_DEATH(
+        CAS_EXPECT_DEATH(
             {
                 (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
                 {
@@ -1205,7 +1205,7 @@ TEST(CASRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
     CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -1355,7 +1355,7 @@ TEST(CASRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
         .incarnation = UInt128{7},
         .removal_started_round = 13};
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { (void)CasRefCatalog::casAdmitEntry(op, layout, 1, removing); },
         "cannot admit namespace.*directly as Removing");
 }
@@ -1949,19 +1949,19 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return false; }),
+        op, layout, creating, [](const CreatorFence &) { return false; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::CreatorFenceStillLive);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     CatalogEntry stale = creating;
     stale.creator->writer_epoch = 2;
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, stale, [](const CreatorFence &) { return true; }),
+        op, layout, stale, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed);
 
     EXPECT_EQ(CasRefCatalog::cancelStalledCreating(
-        op, layout, creating, [](const CreatorFence &) { return true; }),
+        op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1);
@@ -1997,10 +1997,6 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     ordinary_scan.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{4, 4}}});
     ordinary_scan.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
-    ordinary_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
-    ordinary_scan.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
-    ordinary_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 9});
-    ordinary_scan.checkpoint_observations.emplace(UInt128{2}, RefTxnId{2, 9});
     ordinary_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 10});
     ordinary_scan.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 10});
 
@@ -2009,10 +2005,6 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     rebuild_scan.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{5, 5}}});
     rebuild_scan.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
-    rebuild_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
-    rebuild_scan.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
-    rebuild_scan.checkpoint_observations.emplace(UInt128{1}, RefTxnId{1, 11});
-    rebuild_scan.checkpoint_observations.emplace(UInt128{3}, RefTxnId{3, 11});
     rebuild_scan.max_log_by_life.emplace(UInt128{1}, RefTxnId{1, 12});
     rebuild_scan.max_log_by_life.emplace(UInt128{3}, RefTxnId{3, 12});
 
@@ -2034,9 +2026,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_EQ(ordinary.lifeIds(), expected);
     EXPECT_EQ(rebuild.lifeIds(), expected);
 
-    EXPECT_TRUE(ordinary.row(UInt128{2}).listed_hint);
-    ASSERT_TRUE(ordinary.row(UInt128{2}).fold_state.coverage.hold);
-    EXPECT_EQ(ordinary.row(UInt128{2}).checkpoint_observation, (RefTxnId{2, 9}));
+    EXPECT_EQ(ordinary.droppedListedLives(), 2u);
     EXPECT_EQ(ordinary.row(UInt128{2}).tail_observation, (RefTxnId{2, 10}));
     const std::optional<RefCleanupEvidence> cleanup_evidence{
         RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}};
@@ -2045,9 +2035,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_FALSE(ordinary.contains(UInt128{1}));
     EXPECT_FALSE(ordinary.contains(UInt128{4}));
 
-    EXPECT_TRUE(rebuild.row(UInt128{3}).listed_hint);
-    ASSERT_TRUE(rebuild.row(UInt128{3}).fold_state.coverage.hold);
-    EXPECT_EQ(rebuild.row(UInt128{3}).checkpoint_observation, (RefTxnId{3, 11}));
+    EXPECT_EQ(rebuild.droppedListedLives(), 2u);
     EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
     EXPECT_FALSE(rebuild.contains(UInt128{1}));
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
@@ -2061,8 +2049,6 @@ TEST(CASGCStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
         .fold_state = {},
         .removal_started_round = 10,
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
 
     EXPECT_FALSE(stuckRemovalWarning(row, /*current_round=*/12, /*threshold_rounds=*/3, layout));
@@ -2088,8 +2074,6 @@ TEST(CASGCStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
         .fold_state = {},
         .removal_started_round = std::numeric_limits<uint64_t>::max(),
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
     EXPECT_FALSE(stuckRemovalWarning(row, 0, 1, layout));
 
@@ -2124,8 +2108,6 @@ TEST(CASGCStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
         .fold_state = {},
         .removal_started_round = 1,
         .has_parent_fold_state = false,
-        .listed_hint = false,
-        .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
     const uint64_t writes_before = backend->writeTotal();
     EXPECT_TRUE(stuckRemovalWarning(row, 11, 10, layout));
@@ -2370,7 +2352,7 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
     /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
     const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
-    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
               CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
@@ -2998,7 +2980,7 @@ TEST(CASRefCatalogDeathTest, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoomAbo
 
     /// The lane's re-render on a fresh read cannot rescue this, because constructing the
     /// `LOGICAL_ERROR` for the hint's own duplicate aborts before the reread ever happens.
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -3036,7 +3018,7 @@ TEST(CASRefCatalogDeathTest, ATrueRefusalCasAdmitEntrySeesItsRowStillPresentAbor
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
+    CAS_EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
 }
 #endif
 

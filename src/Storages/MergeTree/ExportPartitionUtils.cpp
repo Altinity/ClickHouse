@@ -76,6 +76,7 @@ namespace ErrorCodes
     extern const int SUPPORT_IS_DISABLED;
     extern const int TYPE_MISMATCH;
     extern const int CANNOT_CONVERT_TYPE;
+    extern const int CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
@@ -104,7 +105,6 @@ namespace ErrorCodes
 
 namespace Setting
 {
-    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
 #if USE_AVRO
     extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsTimezone iceberg_partition_timezone;
@@ -136,6 +136,7 @@ namespace ExportPartitionUtils
             ErrorCodes::BAD_ARGUMENTS,
             ErrorCodes::TYPE_MISMATCH,
             ErrorCodes::CANNOT_CONVERT_TYPE,
+            ErrorCodes::CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN,
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
@@ -283,6 +284,7 @@ namespace ExportPartitionUtils
         context_copy->setSetting(
             "export_merge_tree_part_ignore_extra_source_columns",
             manifest.ignore_extra_source_columns.value_or(false));
+        context_copy->setSetting("export_merge_tree_part_check_destination_schema_staleness_ms", manifest.check_destination_schema_staleness_ms.value_or(0));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
@@ -304,16 +306,13 @@ namespace ExportPartitionUtils
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
 
-        /// Reapply the initiator's lossy-cast decision (persisted in the manifest) so the
-        /// worker's schema revalidation honors the user's choice. Without this, a task
-        /// scheduled without the opt-in could still apply a lossy cast if the destination
-        /// schema drifts to a lossy target between scheduling and execution.
-        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
-
         if (manifest.iceberg_partition_timezone)
         {
             context_copy->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);
         }
+
+        if (manifest.min_bytes_to_use_direct_io)
+            context_copy->setSetting("min_bytes_to_use_direct_io", *manifest.min_bytes_to_use_direct_io);
 
         return context_copy;
     }
@@ -324,13 +323,7 @@ namespace ExportPartitionUtils
         const ContextPtr &, const MergeTreePartitionExportTask &);
 
 #if USE_AVRO
-    std::string verifyAndExtractDestinationIcebergMetadataJson(
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata,
-        const StoragePtr & dest_storage,
-        const MergeTreeData::DataPartsVector & parts,
-        const String & partition_id,
-        const ContextPtr & context)
+    std::string getDestinationIcebergMetadataJson(const StoragePtr & dest_storage, const ContextPtr & context)
     {
         if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg])
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
@@ -354,15 +347,39 @@ namespace ExportPartitionUtils
 
         const auto metadata_object = iceberg_metadata->getMetadataJSON(context);
 
-        verifyIcebergPartitionCompatibility(
-            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
-
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         metadata_object->stringify(oss);
         return oss.str();
     }
+
+    void verifyDestinationIcebergPartitionCompatibility(
+        const std::string & iceberg_metadata_json,
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+        const auto metadata_object = parser.parse(iceberg_metadata_json).extract<Poco::JSON::Object::Ptr>();
+
+        verifyIcebergPartitionCompatibility(
+            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
+    }
 #endif
+
+    std::optional<std::string> getDestinationIcebergMetadataJsonIfDataLake(const StoragePtr & dest_storage, const ContextPtr & context)
+    {
+        if (!dest_storage->isDataLake())
+            return std::nullopt;
+#if USE_AVRO
+        return getDestinationIcebergMetadataJson(dest_storage, context);
+#else
+        (void)context;
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
+    }
 
     IStorage::ExportPartitionCommitInfo commitExportOnDestination(
         const String & transaction_id,
@@ -717,9 +734,17 @@ namespace
     /// is too weak here: it deliberately treats DateTime and DateTime64 with different time zones as equal,
     /// since they are interchangeable for INSERT, but a time zone changes what a temporal transform returns,
     /// so the same expression over the two types can produce different partitions.
-    bool isSameTypeForPartitioning(const DataTypePtr & lhs, const DataTypePtr & rhs)
+    ///
+    /// A destination column that is `Nullable` over a source column that is not counts as the same type: the source
+    /// never produces a NULL, so every transform returns the same value for the two. An Iceberg table created by
+    /// Spark has optional fields, so this is the usual case there. The other direction does not: a `Nullable` source
+    /// may hold NULLs, which a non-nullable destination cannot.
+    bool isSameTypeForPartitioning(const DataTypePtr & source, const DataTypePtr & destination)
     {
-        return lhs->getName() == rhs->getName();
+        if (!source->isNullable() && destination->isNullable())
+            return source->getName() == removeNullable(destination)->getName();
+
+        return source->getName() == destination->getName();
     }
 
     /// The structural match is kind of permissive and is matching terms by name, not by type.
@@ -1051,24 +1076,6 @@ namespace
             return true;
         }
 
-        void verifyExportColumnCastIsSafe(
-            const ColumnWithTypeAndName & source_column,
-            const ColumnWithTypeAndName & destination_column,
-            const StorageID & destination_storage_id)
-        {
-            if (canBeSafelyCast(source_column.type, destination_column.type))
-                return;
-
-            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
-                "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
-                "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
-                "to allow lossy casts during export.",
-                destination_storage_id.getFullTableName(),
-                destination_column.name,
-                source_column.type->getName(),
-                destination_column.type->getName());
-        }
-
         void verifyPartitionKeyColumn(
             const ColumnWithTypeAndName & source_column,
             const ColumnWithTypeAndName & destination_column,
@@ -1178,8 +1185,6 @@ namespace
             partition_key_owner_columns.insert(column_name);
         }
 
-        const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
-
         switch (schema_match_mode)
         {
             case MergeTreePartExportSchemaMatchMode::NAME: {
@@ -1204,10 +1209,6 @@ namespace
                             source_it->second,
                             destination_storage_id,
                             /*match_by_name=*/true);
-
-                    /// Lossy casts may silently change values, so reject them unless the user opts in.
-                    if (!allow_lossy_cast)
-                        verifyExportColumnCastIsSafe(source_column, destination_column, destination_storage_id);
                 }
                 break;
             }
@@ -1222,10 +1223,6 @@ namespace
                             i,
                             destination_storage_id,
                             /*match_by_name=*/false);
-
-                    /// Lossy casts may silently change values, so reject them unless the user opts in.
-                    if (!allow_lossy_cast)
-                        verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
                 }
                 break;
             }

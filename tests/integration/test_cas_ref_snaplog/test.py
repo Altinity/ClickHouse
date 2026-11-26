@@ -1,3 +1,5 @@
+import io
+import re
 import shlex
 import time
 
@@ -71,6 +73,37 @@ def _disks(node, query):
     )
 
 
+def _disks_status(node, query):
+    # Like `_disks`, but returns (exit status, stdout, stderr) instead of raising on a failing command.
+    script = (
+        "/usr/bin/clickhouse disks -C /etc/clickhouse-server/config.xml --disk {} --save-logs --query {} "
+        ">/tmp/disks_out 2>/tmp/disks_err; echo $?; echo ===OUT===; cat /tmp/disks_out; "
+        "echo ===ERR===; cat /tmp/disks_err"
+    ).format(RO_DISK, shlex.quote(query))
+    raw = node.exec_in_container(["bash", "-c", script])
+    status, rest = raw.split("\n===OUT===\n", 1)
+    out, err = rest.split("\n===ERR===\n", 1) if "\n===ERR===\n" in rest else rest.split("===ERR===\n", 1)
+    return int(status), out, err
+
+
+def _read_object(key):
+    resp = cluster.rustfs_client.get_object(cluster.rustfs_bucket, key)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+        resp.release_conn()
+
+
+def _adopted_fold_seal_key():
+    # `gc/state` spells the adopted (generation, attempt) as plain text fields.
+    text = _read_object(POOL + "/gc/state").decode("utf-8", errors="replace")
+    generation = re.search(r'"snap_generation":"(\d+)"', text)
+    attempt = re.search(r'"snap_attempt":"(\d+)"', text)
+    assert generation and attempt and int(generation.group(1)) > 0, text[:400]
+    return "{}/gc/gen/{}/attempt/{}/fold_seal".format(POOL, generation.group(1), attempt.group(1))
+
+
 def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     node = cluster.instances["node"]
 
@@ -125,12 +158,18 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     # (5) THE RECLAMATION: the pool's CONTENT (blobs + part manifests) drains back to baseline. Polled
     #     with an early exit, then cross-checked against GC's own bookkeeping — a pool that shrank for
     #     some other reason must not pass for a round that reclaimed it.
-    final = _content_objects()
+    #     A body is deleted a round after the round that condemned it, which can be after the manifests
+    #     are gone, so the count alone does not show the end: poll until the dry run has nothing to delete.
+    def drained():
+        if _content_objects() > content_baseline:
+            return False
+        return "preview_deletes=0" in _disks(node, "cas-gc-dryrun")
+
     for _ in range(RECLAIM_RETRIES):
-        if final <= content_baseline:
+        if drained():
             break
         time.sleep(RECLAIM_SLEEP)
-        final = _content_objects()
+    final = _content_objects()
 
     assert final <= content_baseline, (
         "the dropped namespaces' content was not reclaimed: baseline={}, "
@@ -168,3 +207,24 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     #     `cas-gc-dryrun` on a fully drained pool has nothing left to preview.
     dryrun = _disks(node, "cas-gc-dryrun")
     assert "preview_deletes=0" in dryrun, dryrun
+    assert "snapshot=adopted" in dryrun, dryrun
+
+    # (7) A damaged pool must fail the dry run: with the server stopped (no round can move `gc/state`),
+    #     remove the adopted fold seal. The command exits non-zero with `CORRUPTED_DATA` and prints no
+    #     `preview_deletes=` line, which a healthy empty pool would print.
+    #     The seal and the server are put back afterwards: the cluster is module-scoped.
+    node.stop_clickhouse()
+    seal_key = _adopted_fold_seal_key()
+    seal_bytes = _read_object(seal_key)
+    cluster.rustfs_client.remove_object(cluster.rustfs_bucket, seal_key)
+    try:
+        status, out, err = _disks_status(node, "cas-gc-dryrun")
+        assert status != 0, (status, out, err)
+        assert "CORRUPTED_DATA" in err, err
+        assert seal_key in err, err
+        assert "preview_deletes=" not in out, out
+    finally:
+        cluster.rustfs_client.put_object(
+            cluster.rustfs_bucket, seal_key, io.BytesIO(seal_bytes), len(seal_bytes)
+        )
+        node.start_clickhouse()

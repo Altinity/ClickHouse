@@ -7,8 +7,17 @@
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/CurrentThread.h>
+#include <Common/ThreadStatus.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
+#include <base/scope_guard.h>
+#include <Interpreters/ContentAddressedGarbageCollectionLog.h>
 
+#include <algorithm>
 #include <condition_variable>
+#include <map>
 #include <functional>
 #include <optional>
 #include <thread>
@@ -26,6 +35,11 @@
 /// ProfileEvents capture. The `profile_events` map is therefore EXPECTED to be empty here and this
 /// test does NOT assert it non-empty (the on-server paths are attached; the functional/soak coverage
 /// asserts non-empty there).
+
+namespace ProfileEvents
+{
+    extern const Event S3ListObjects;
+}
 
 namespace DB::ErrorCodes
 {
@@ -421,7 +435,7 @@ TEST(CASGCLog, FinishLogLineMatchesCasGcLogRow)
 }
 
 /// A `Deferred` round completed as leader: it counts as a success for health, and like `NotALeader` it
-/// writes no `Information` line. On an empty pool with the default defer bound the first round defers.
+/// writes no `Information` line.
 TEST(CASGCLog, ADeferredRoundCountsAsASuccessAndLogsNoFinishLine)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -542,9 +556,185 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
     /// is dropped whole and names the conflict rather than a transport error.
     EXPECT_EQ(fin.error_code, DB::ErrorCodes::ABORTED);
     EXPECT_EQ(fin.round, 0u) << "the commit never landed, so the round number must stay unstamped";
-    EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_graduated
-              + fin.entries_redeleted + fin.objects_deleted + fin.fence_outs, 0u)
+    EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_intent_confirmed
+              + fin.entries_bodies_deleted + fin.objects_deleted + fin.fence_outs, 0u)
         << "the pre-CAS work the round performed must survive into its failure row";
+}
+
+namespace
+{
+/// The `GcFoldBegin`, `GcFoldEnd` and `GcFence` events and the `Finish` row of ONE round, sliced out of
+/// a growing sink and record vector by the counts taken before the round ran.
+struct RoundSlice
+{
+    std::vector<CasEvent> begins;
+    std::vector<CasEvent> ends;
+    std::vector<CasEvent> fences;
+    std::vector<Rec> finishes;
+};
+
+RoundSlice sliceRound(
+    const DB::Cas::tests::SharedEventLog & sink, size_t events_before, const std::vector<Rec> & rows, size_t rows_before)
+{
+    RoundSlice out;
+    const auto events = sink.snapshot();
+    for (size_t i = events_before; i < events.size(); ++i)
+    {
+        if (events[i].type == CasEventType::GcFoldBegin)
+            out.begins.push_back(events[i]);
+        else if (events[i].type == CasEventType::GcFoldEnd)
+            out.ends.push_back(events[i]);
+        else if (events[i].type == CasEventType::GcFence)
+            out.fences.push_back(events[i]);
+    }
+    for (size_t i = rows_before; i < rows.size(); ++i)
+        if (rows[i].event_type == Rec::EventType::Finish)
+            out.finishes.push_back(rows[i]);
+    return out;
+}
+}
+
+/// Both fold-boundary events carry the number the round's commit writes, which is `Finish.round`, so a
+/// `WHERE round = <Finish.round>` over `system.cas_log` finds them.
+TEST(CASGCLog, FoldBoundariesCarryTheCommittedRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend, 0);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    UInt64 previous_round = 0;
+    UInt64 previous_gen = 0;
+    for (int i = 0; i < 2; ++i)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        sched.runOneRoundNow(Rec::Trigger::Manual);
+        const RoundSlice slice = sliceRound(*sink, events_before, rows, rows_before);
+
+        ASSERT_EQ(slice.begins.size(), 1u) << "round " << i;
+        ASSERT_EQ(slice.ends.size(), 1u) << "round " << i;
+        ASSERT_EQ(slice.finishes.size(), 1u) << "round " << i;
+        const Rec & fin = slice.finishes[0];
+        ASSERT_EQ(fin.outcome, Rec::Outcome::Success) << "round " << i;
+        ASSERT_GT(fin.round, 0u) << "round " << i;
+
+        EXPECT_EQ(slice.begins[0].round, fin.round) << "begin of round " << i;
+        EXPECT_EQ(slice.ends[0].round, fin.round) << "end of round " << i;
+        if (i > 0)
+        {
+            EXPECT_EQ(fin.round, previous_round + 1);
+            EXPECT_EQ(slice.begins[0].gen, previous_gen) << "begin carries the parent generation";
+        }
+        EXPECT_EQ(slice.ends[0].gen, slice.begins[0].gen + 1) << "end carries the new generation";
+        previous_round = fin.round;
+        previous_gen = slice.ends[0].gen;
+    }
+}
+
+/// A round whose commit is lost still stamps its candidate number, and the retry that commits reuses it.
+TEST(CASGCLog, LostCommitKeepsCandidateAndRetryReusesIt)
+{
+    auto backend = std::make_shared<StateCommitRefusingBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend, 0);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    auto run = [&](bool expect_throw)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        if (expect_throw)
+            EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+        else
+            sched.runOneRoundNow(Rec::Trigger::Manual);
+        return sliceRound(*sink, events_before, rows, rows_before);
+    };
+
+    const RoundSlice first = run(false);
+    ASSERT_EQ(first.finishes.size(), 1u);
+    ASSERT_EQ(first.finishes[0].outcome, Rec::Outcome::Success);
+    const UInt64 n1 = first.finishes[0].round;
+    ASSERT_GT(n1, 0u);
+
+    backend->arm.store(true);
+    const RoundSlice lost = run(true);
+    ASSERT_EQ(lost.begins.size(), 1u);
+    ASSERT_EQ(lost.ends.size(), 1u);
+    ASSERT_EQ(lost.finishes.size(), 1u);
+    EXPECT_EQ(lost.finishes[0].outcome, Rec::Outcome::Aborted);
+    EXPECT_EQ(lost.finishes[0].round, 0u);
+    EXPECT_EQ(lost.begins[0].round, n1 + 1);
+    EXPECT_EQ(lost.ends[0].round, n1 + 1);
+
+    const RoundSlice retry = run(false);
+    ASSERT_EQ(retry.begins.size(), 1u);
+    ASSERT_EQ(retry.ends.size(), 1u);
+    ASSERT_EQ(retry.finishes.size(), 1u) << "the refusing backend disarms itself after one refusal";
+    ASSERT_EQ(retry.finishes[0].outcome, Rec::Outcome::Success);
+    EXPECT_EQ(retry.finishes[0].round, n1 + 1);
+    EXPECT_EQ(retry.begins[0].round, n1 + 1);
+    EXPECT_EQ(retry.ends[0].round, n1 + 1);
+    EXPECT_NE(lost.finishes[0].round_id, retry.finishes[0].round_id);
+}
+
+/// CONTROL: a deferred round emits no fold events, and its `deferred` fence carries the last committed
+/// round, not the candidate.
+TEST(CASGCLog, DeferredRoundKeepsTheLastCommittedRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+    publishPart(store, "srv1/tbl", "all_0_0_0", "deferred-control");
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    UInt64 committed = 0;
+    bool reached = false;
+    for (int i = 0; i < 4 && !reached; ++i)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        sched.runOneRoundNow(Rec::Trigger::Manual);
+        const RoundSlice slice = sliceRound(*sink, events_before, rows, rows_before);
+        ASSERT_EQ(slice.finishes.size(), 1u) << "round " << i;
+        const Rec & fin = slice.finishes[0];
+        if (fin.outcome == Rec::Outcome::Deferred)
+        {
+            reached = true;
+            ASSERT_GT(committed, 0u) << "a fold must precede the deferred round";
+            EXPECT_TRUE(slice.begins.empty());
+            EXPECT_TRUE(slice.ends.empty());
+            std::vector<CasEvent> deferred_fences;
+            for (const CasEvent & f : slice.fences)
+                if (f.outcome == "deferred")
+                    deferred_fences.push_back(f);
+            ASSERT_EQ(deferred_fences.size(), 1u);
+            EXPECT_EQ(deferred_fences[0].round, committed);
+            EXPECT_EQ(fin.round, committed);
+        }
+        else
+        {
+            ASSERT_EQ(fin.outcome, Rec::Outcome::Success) << "round " << i;
+            ASSERT_GT(fin.round, 0u);
+            committed = fin.round;
+        }
+    }
+    ASSERT_TRUE(reached) << "no round deferred within four rounds";
 }
 
 /// The pacing loop drops leadership only on a NON-transient round failure. A transient failure
@@ -749,9 +939,9 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
 
     const std::vector<String> expected = {
         "lease", "pre_fold_ref_drain", "heartbeat_floor", "defer_decision", "parent_seal_read",
-        "fold_ref_group", "fold_seal_read", "fold_ref_intake",
+        "fold_ref_group", "fold_seal_read", "fold_ref_intake", "intent_sweep_list",
         "fold_reduce", "fold_seal_write",
-        "pending_deletes", "meta_pool_wait", "round_commit", "handoff_reclaim",
+        "pending_deletes", "round_commit", "handoff_reclaim",
         "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};
     EXPECT_EQ(phaseNames(rows, 0), expected);
 
@@ -786,12 +976,6 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
     /// reached its Finish -- which is the point: the column is the round's own attestation.
     EXPECT_EQ(metricsOf(rows, 0, "fold_reduce").at("transactions_unapplied"), 0u);
 
-    /// The honest gap: the meta pool's work runs on other threads, so this row's ProfileEvents delta is
-    /// empty by construction and these two counts are its ONLY signal. They must be real numbers.
-    const auto meta = metricsOf(rows, 0, "meta_pool_wait");
-    EXPECT_GT(meta.at("jobs_scheduled"), 0u) << "this round condemns, so it schedules condemn-marker writes";
-    EXPECT_EQ(meta.at("jobs_completed"), meta.at("jobs_scheduled"))
-        << "every scheduled job must have finished by the time the wait returns";
 }
 
 /// A round that never leads emits ONLY the phase it reached. `round` does not exist for such a round,
@@ -847,7 +1031,7 @@ TEST(CASGCHealth, ReflectsLeadershipAndPendingReclaim)
     EXPECT_TRUE(h1.is_leader);
     EXPECT_TRUE(h1.ever_succeeded);
     EXPECT_EQ(h1.pending_reclaim,
-              static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
+              static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.bodies_deleted));
     EXPECT_EQ(h1.wedged_namespace_count, 0u);
     EXPECT_LT(h1.last_success_age_seconds, 60u);
 }
@@ -933,4 +1117,86 @@ TEST(CASGCLog, NonTransientFailureCoincidingWithTeardownStaysFailed)
     EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed)
         << "a bug that coincides with a restart is not masked as Stopped";
     EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::CORRUPTED_DATA);
+}
+
+namespace
+{
+
+/// Counts the `LIST` of `blob-intents/` as an S3 `ListObjects`, the counter a phase row of an S3 pool carries.
+class IntentListCountingBackend : public InMemoryBackend
+{
+public:
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        if (prefix.ends_with("/blob-intents/"))
+            ProfileEvents::increment(ProfileEvents::S3ListObjects);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
+    }
+};
+
+}
+
+/// The intent sweep's `LIST` and its counts are in its own phase row and in no other row of the round.
+TEST(CASGcIntents, IntentSweepListIsMeasuredInItsOwnPhaseOnly)
+{
+    /// Phase rows carry the thread's `ProfileEvents` only on a thread with a `ThreadStatus`.
+    DB::ThreadStatus * const saved_thread = DB::current_thread;
+    DB::current_thread = nullptr;
+    SCOPE_EXIT({ DB::current_thread = saved_thread; });
+    DB::ThreadStatus thread_status;
+
+    auto backend = std::make_shared<IntentListCountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    publishPart(store, "srv1/tbl", "all_0_0_0", "hello-intent-sweep");
+    store->dropRef(RootNamespace{"srv1/tbl"}, "all_0_0_0");
+    store->renewWatermarkOnce();
+    {
+        /// An intent with no row, so the page lists and nominates one key.
+        const BlobRef orphan{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("orphan-of-the-sweep"))};
+        const String key = store->layout().blobIntentKey(orphan, *canonicalIdentity(Dialect::Emulated, "900001"));
+        DB::Cas::tests::OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, blobIntentRecord(), Retry::standard())));
+    }
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+    const auto sweep = metricsOf(rows, 0, "intent_sweep_list");
+    EXPECT_EQ(sweep.at("listed"), 1u);
+    EXPECT_EQ(sweep.at("nominated"), 1u);
+    EXPECT_EQ(sweep.at("unparsed"), 0u);
+    EXPECT_EQ(sweep.at("wrapped"), 1u);
+    EXPECT_EQ(sweep.at("list_budget_keys"), PoolConfig{}.intent_sweep_list_budget_keys);
+
+    std::map<String, UInt64> lists_by_phase;
+    for (const Rec & r : rows)
+        if (r.event_type == Rec::EventType::Phase)
+            if (const auto it = r.profile_events.find("S3ListObjects"); it != r.profile_events.end())
+                lists_by_phase[r.phase] += it->second;
+    EXPECT_EQ(lists_by_phase, (std::map<String, UInt64>{{"intent_sweep_list", 1}}));
+}
+
+/// The three columns that left the marker protocol's names keep their old names as aliases of the new ones.
+TEST(CASGCLog, RenamedColumnsKeepTheirOldNamesAsAliases)
+{
+    const DB::ColumnsDescription columns = DB::ContentAddressedGarbageCollectionLogElement::getColumnsDescription();
+    const DB::NamesAndAliases aliases = DB::ContentAddressedGarbageCollectionLogElement::getNamesAndAliases();
+    const std::map<String, String> expected{
+        {"entries_graduated", "entries_intent_confirmed"},
+        {"entries_redeleted", "entries_bodies_deleted"},
+        {"entries_redelete_failed", "entries_body_delete_failed"}};
+    ASSERT_EQ(aliases.size(), expected.size());
+    for (const auto & alias : aliases)
+    {
+        const auto it = expected.find(alias.name);
+        ASSERT_NE(it, expected.end()) << alias.name;
+        EXPECT_EQ(alias.expression, it->second);
+        EXPECT_TRUE(columns.has(it->second)) << "the alias names a column that exists";
+        EXPECT_FALSE(columns.has(alias.name)) << "the old name is not also a stored column";
+        EXPECT_TRUE(alias.type->equals(*columns.get(it->second).type));
+    }
 }

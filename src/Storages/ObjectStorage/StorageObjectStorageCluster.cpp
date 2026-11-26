@@ -126,6 +126,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
+    , is_datalake_catalog_table(is_datalake_query)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
     configuration->check(context_);
@@ -475,6 +476,24 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     return true;
 }
 
+bool StorageObjectStorageCluster::isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const
+{
+    if (!configuration->isIcebergConfiguration())
+        return false;
+
+    const auto * function = table_function ? table_function->as<ASTFunction>() : nullptr;
+    const auto * arguments = function && function->arguments ? function->arguments->as<ASTExpressionList>() : nullptr;
+    if (!arguments)
+        return false;
+
+    for (const auto & argument : arguments->children)
+        if (const auto * settings = argument->as<ASTSetQuery>())
+            if (const auto * path = settings->changes.tryGet("iceberg_metadata_file_path"))
+                return !path->safeGet<String>().empty();
+
+    return false;
+}
+
 void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     ASTPtr & query,
     const DB::StorageSnapshotPtr & storage_snapshot,
@@ -705,6 +724,11 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// Catalog tables may defer initialization until their first read.
+    /// Task creation must also initialize them: whole-query dispatch lists files without a table read.
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),
@@ -1245,6 +1269,25 @@ IStorage::ImportResult StorageObjectStorageCluster::import(
         iceberg_metadata_json_string,
         format_settings_,
         context);
+}
+
+StorageMetadataHandle StorageObjectStorageCluster::getExportDestinationMetadata(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->getExportDestinationMetadata(iceberg_metadata_json, context);
+    return IStorageCluster::getExportDestinationMetadata(iceberg_metadata_json, context);
+}
+
+void StorageObjectStorageCluster::checkExportDestinationUnchanged(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr context) const
+{
+    if (pure_storage)
+        pure_storage->checkExportDestinationUnchanged(iceberg_metadata_json, context);
+    else
+        IStorageCluster::checkExportDestinationUnchanged(iceberg_metadata_json, context);
 }
 
 IStorage::ExportPartitionCommitInfo StorageObjectStorageCluster::commitExportPartitionTransaction(

@@ -51,6 +51,14 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    StorageMetadataHandle getExportDestinationMetadata(
+        const std::optional<std::string> & iceberg_metadata_json,
+        ContextPtr context) const override;
+
+    void checkExportDestinationUnchanged(
+        const std::optional<std::string> & iceberg_metadata_json,
+        ContextPtr context) const override;
+
     void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void prepareForDrop(ContextPtr query_context) override;
 
@@ -195,6 +203,10 @@ public:
 
     bool isIcebergStorage() const { return configuration->isIcebergConfiguration(); }
 
+    /// Only Iceberg can name a snapshot in its table function, through `iceberg_metadata_file_path`, which a catalog
+    /// table gets from the catalog's metadata location.
+    bool isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
@@ -207,6 +219,10 @@ private:
 
     /// Whether this query is served by `pure_storage` instead of being distributed over a cluster.
     bool readsFromPureStorage(ContextPtr context) const;
+    /// Only `DataLakeCatalog` tables may reuse the resolved query tree for the header. Re-analyzing their
+    /// AST resolves the table through the REST catalog again. Other cluster reads keep re-analyzing the AST,
+    /// so their headers do not change.
+    bool canReuseResolvedQueryTreeForHeader() const override { return is_datalake_catalog_table; }
 
     void readFallBackToPure(
         QueryPlan & query_plan,
@@ -247,6 +263,8 @@ private:
     const ObjectStoragePtr object_storage;
     /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
     bool cluster_name_from_function_argument = false;
+    /// True only for tables resolved through a `DataLakeCatalog` database.
+    bool is_datalake_catalog_table = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;

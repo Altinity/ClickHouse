@@ -24,6 +24,9 @@ private:
 protected:
     bool nextImpl() override;
 
+    /// The stream buffer the fills read from, or nullptr once detached.
+    const Poco::Net::HTTPBasicStreamBuf * sourceBuf() const { return stream_holder ? &stream_holder->buf : nullptr; }
+
 public:
     explicit ReadBufferFromIStream(std::istream & istr_, size_t size = DBMS_DEFAULT_BUFFER_SIZE);
 

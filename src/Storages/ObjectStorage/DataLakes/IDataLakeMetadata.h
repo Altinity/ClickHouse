@@ -221,6 +221,21 @@ public:
         return false;
     }
 
+    /// The columns of the table schema in `iceberg_metadata_json_string`, the table metadata an export was validated
+    /// against, as a reader derives them.
+    virtual NamesAndTypesList getExportDestinationColumns(
+        const std::string & /* iceberg_metadata_json_string */, ContextPtr /* context */) const
+    {
+        throwNotImplemented("getExportDestinationColumns");
+    }
+
+    /// Throws `METADATA_MISMATCH` if the schema or the partition spec of the table are not the ones of
+    /// `iceberg_metadata_json_string`, the table metadata an export was validated against.
+    virtual void checkExportDestinationUnchanged(const std::string & /* iceberg_metadata_json_string */, ContextPtr /* context */) const
+    {
+        throwNotImplemented("checkExportDestinationUnchanged");
+    }
+
     virtual SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> /* catalog */,
         const std::function<void(const std::string &)> & /* new_file_path_callback */,
