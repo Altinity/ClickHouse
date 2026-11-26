@@ -552,6 +552,10 @@ void HostResolversPool::dropCache()
     MemoryTrackerSwitcher switcher{&total_memory_tracker};
     std::lock_guard lock(mutex);
     host_pools.clear();
+    /// Detach the in-flight lookups: their leaders and waiters keep their own references, but a
+    /// caller arriving after the drop starts a fresh lookup instead of joining one that began
+    /// before it, and a leader that finds its slot gone does not publish its result (see `getResolver`).
+    pending_resolvers.clear();
 }
 
 HostResolver::Ptr HostResolversPool::getResolver(const String & host)
@@ -627,15 +631,27 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
         auto created = factory ? factory(host) : HostResolver::create(host);
 
         std::lock_guard lock(mutex);
-        resolver = host_pools.try_emplace(host, std::move(created)).first->second;
-        pending_resolvers.erase(host);
+        /// `dropCache` removes the slot of a lookup in flight. Then this result may come from DNS
+        /// data older than the drop, so answer the callers of this lookup with it but do not cache it.
+        auto slot = pending_resolvers.find(host);
+        if (slot != pending_resolvers.end() && slot->second == pending)
+        {
+            resolver = host_pools.try_emplace(host, std::move(created)).first->second;
+            pending_resolvers.erase(slot);
+        }
+        else
+        {
+            resolver = std::move(created);
+        }
     }
     catch (...)
     {
         {
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
             std::lock_guard lock(mutex);
-            pending_resolvers.erase(host);
+            /// Only this lookup's own slot: after `dropCache` the key may belong to a newer lookup.
+            if (auto slot = pending_resolvers.find(host); slot != pending_resolvers.end() && slot->second == pending)
+                pending_resolvers.erase(slot);
         }
         /// Store an immutable copy as the template for the waiters so this caller can mutate its
         /// own exception up the stack without racing with `copyMutableException` in a waiter.

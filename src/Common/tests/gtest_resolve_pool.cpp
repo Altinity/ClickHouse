@@ -1695,3 +1695,66 @@ TEST_F(ResolvePoolTest, LeaderQueryMemoryLimitDoesNotFailGetResolverOrWaiter)
 
     ASSERT_EQ(Int64(0), drop_delta) << "dropCache credited the caller's query tracker";
 }
+
+TEST_F(ResolvePoolTest, DropCacheDuringColdHostLookupDoesNotCacheTheStaleResult)
+{
+    /// Regression test: `getResolver` runs the lookup outside the pool lock, so `dropCache` can run
+    /// while it is in flight. The result of a lookup that started before the drop must not be
+    /// published into the cache afterwards, and callers arriving after the drop must not join the
+    /// pre-drop lookup: they start their own.
+    const String host = "drop-cache-in-flight-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    std::future<DB::HostResolver::Ptr> first;
+    std::future<DB::HostResolver::Ptr> second;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            /// Only the first (pre-drop) lookup blocks.
+            if (factory_calls.fetch_add(1) == 0)
+            {
+                first_entered.set_value();
+                allow_finish_future.wait();
+            }
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    DB::HostResolversPool::instance().dropCache();
+
+    /// A caller after the drop starts its own lookup instead of joining the pre-drop one.
+    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, second.wait_for(5s));
+    auto post_drop_resolver = second.get();
+    ASSERT_NE(nullptr, post_drop_resolver);
+    ASSERT_EQ(size_t(2), factory_calls.load());
+    ASSERT_EQ(post_drop_resolver, DB::HostResolversPool::instance().tryGetResolver(host));
+
+    allow_finish.set_value();
+    released = true;
+
+    /// The pre-drop lookup still answers its own caller, but it must not replace the cached entry.
+    auto pre_drop_resolver = first.get();
+    ASSERT_NE(nullptr, pre_drop_resolver);
+    ASSERT_NE(pre_drop_resolver, post_drop_resolver);
+    ASSERT_EQ(post_drop_resolver, DB::HostResolversPool::instance().tryGetResolver(host));
+}
