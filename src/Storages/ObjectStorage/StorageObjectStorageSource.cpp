@@ -1261,6 +1261,15 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     /// response. Skip the shortcut when `_headers` is requested so the real `GET` headers are used.
     const bool headers_requested = read_from_format_info.requested_virtual_columns.contains("_headers");
 
+    /// Validate the schema evolution of the file before any shortcut below can answer without reading it.
+    /// Both the constant columns taken from the file statistics and the cached row count bypass the schema
+    /// transformation, which is where a data lake rejects metadata that violates its specification
+    /// (for Iceberg, `ICEBERG_SPECIFICATION_VIOLATION`). Without this call the outcome for the same
+    /// metadata would depend on the statistics of the file and on whether the row count was cached:
+    /// a clean exception, a `BAD_GET` from a value of the file's type inserted into a column of the current
+    /// type, or no error at all. The result is cached per pair of schemas, so repeated calls are cheap.
+    configuration->getSchemaTransformer(context_, object_info);
+
     /// List of columns with constant value in current file, and values
     std::map<size_t, ConstColumnWithValue> constant_columns_with_values;
     std::unordered_set<String> constant_columns;
