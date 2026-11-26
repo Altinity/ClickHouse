@@ -261,8 +261,28 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
         = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt, CompressionMethod::None, /* force_fetch_latest_metadata */ false);
     const auto & [metadata_version, metadata_file_path, compression_method] = latest_metadata;
     LOG_DEBUG(log, "Latest metadata file path is {}, version {}", metadata_file_path, metadata_version);
-    auto metadata_json_str = readMetadataJSONString(metadata_file_path, object_storage, cache_ptr != nullptr, context_, log, compression_method);
-    auto metadata_object = parseMetadataJSONString(metadata_json_str);
+
+    /// A catalog (Iceberg REST) already knows the `table-uuid` from its `LoadTable` response. With it the
+    /// metadata files cache can be keyed on this very first read, so opening a table whose metadata file is
+    /// cached does not read the file again. Without it (a bare path, a version hint, a catalog that does not
+    /// report it) the uuid can only be learned by reading the file, and the cache is filled afterwards.
+    std::optional<String> known_table_uuid;
+    if (!configuration->catalog_iceberg_table_uuid.empty())
+        known_table_uuid = normalizeUuid(configuration->catalog_iceberg_table_uuid);
+
+    Poco::JSON::Object::Ptr metadata_object;
+    size_t metadata_json_size = 0;
+    if (known_table_uuid)
+    {
+        metadata_object = getMetadataJSONObject(
+            metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, known_table_uuid);
+    }
+    else
+    {
+        auto metadata_json_str = readMetadataJSONString(metadata_file_path, object_storage, cache_ptr != nullptr, context_, log, compression_method);
+        metadata_object = parseMetadataJSONString(metadata_json_str);
+        metadata_json_size = metadata_json_str.size();
+    }
     Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
     String table_location = metadata_object->getValue<String>(f_location);
     std::optional<String> table_uuid = std::nullopt;
@@ -281,10 +301,20 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
                 Iceberg::f_table_uuid);
         }
     }
-    if (cache_ptr && table_uuid)
+    /// `table-uuid` is optional in a format version 1 metadata file. A file without it cannot contradict the
+    /// catalog, and such a table is opened with `table_uuid` empty exactly as it is without a catalog uuid.
+    if (known_table_uuid && table_uuid && *known_table_uuid != *table_uuid)
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Iceberg table-uuid '{}' returned by the catalog doesn't match the one in metadata file '{}': '{}'",
+            *known_table_uuid,
+            metadata_file_path,
+            *table_uuid);
+    /// With a known uuid `getMetadataJSONObject` has already stored the entry.
+    if (cache_ptr && table_uuid && !known_table_uuid)
         cache_ptr->getOrSetTableMetadata(
-            IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path),
-            [&]() { return std::make_shared<IcebergMetadataFilesCacheCell>(metadata_object, metadata_json_str.size()); });
+            IcebergMetadataFilesCache::getKey(*object_storage, *table_uuid, metadata_file_path),
+            [&]() { return std::make_shared<IcebergMetadataFilesCacheCell>(metadata_object, metadata_json_size); });
     auto table_path = configuration->getPathForRead().path;
     auto root_derivation = IcebergPathResolver::deriveTableRoot(table_location, table_path, metadata_file_path);
     PersistentTableComponents persistent_components{

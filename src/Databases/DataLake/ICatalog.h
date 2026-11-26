@@ -64,6 +64,10 @@ enum class DataLakeTableFormat : uint8_t
 struct DataLakeSpecificProperties
 {
     std::string iceberg_metadata_file_location;
+    /// The `table-uuid` of the Iceberg metadata file at that location, empty if the catalog does not report it.
+    /// Unlike `TableMetadata::getTableUUID`, which is whatever identifier the catalog uses for the table
+    /// (Unity returns its own table id there), this is the uuid inside the metadata file.
+    std::string iceberg_table_uuid = {};
 };
 
 /// A class representing table metadata,

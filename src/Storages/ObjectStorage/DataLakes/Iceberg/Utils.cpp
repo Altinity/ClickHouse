@@ -686,7 +686,7 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
         return parseMetadataJSONString(read_fn());
 
     return metadata_cache->getOrSetTableMetadata(
-        IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path),
+        IcebergMetadataFilesCache::getKey(*object_storage, *table_uuid, metadata_file_path),
         [&]()
         {
             auto metadata_json_str = read_fn();

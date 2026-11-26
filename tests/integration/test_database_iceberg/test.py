@@ -2593,6 +2593,55 @@ def test_used_storages_in_query_log(started_cluster):
     ), f"Cluster: expected IcebergS3 in used_storages, got {result_cluster}"
 
 
+def test_first_metadata_read_uses_catalog_table_uuid(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_first_metadata_read_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    load_catalog_impl(started_cluster)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, table_name, "(x String)"
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES ('a'), ('b');",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+
+    def count_rows(use_cache):
+        query_id = uuid.uuid4().hex
+        result = node.query(
+            f"SELECT count() FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`",
+            query_id=query_id,
+            settings={"use_iceberg_metadata_files_cache": use_cache},
+        )
+        assert result == "2\n"
+        return query_id
+
+    def parsed_metadata_files(query_id):
+        node.query("SYSTEM FLUSH LOGS")
+        return int(
+            node.query(
+                f"SELECT ProfileEvents['IcebergJsonFileParsing'] FROM system.query_log"
+                f" WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+            )
+        )
+
+    # The first read fills the metadata files cache. The catalog already returns the Iceberg `table-uuid`
+    # with the metadata location, so the next query finds the metadata file in the cache on its very first
+    # read instead of reading and parsing it again.
+    count_rows(use_cache=1)
+    assert parsed_metadata_files(count_rows(use_cache=1)) == 0
+
+    # Control: without the cache the metadata file is parsed on every query.
+    assert parsed_metadata_files(count_rows(use_cache=0)) > 0
+
+
 def test_not_specified_catalog_type(started_cluster):
     node = started_cluster.instances["node1"]
     settings = {

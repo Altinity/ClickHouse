@@ -1047,6 +1047,10 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     const auto configuration = getConfiguration(storage_type, storage_settings, table_metadata.getTableFormat());
 
+    if (const auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
+        table_specific_properties && !table_specific_properties->iceberg_metadata_file_location.empty())
+        configuration->catalog_iceberg_table_uuid = table_specific_properties->iceberg_table_uuid;
+
     /// HACK: Hacky-hack to enable lazy load
     ContextMutablePtr context_copy = Context::createCopy(context_);
     Settings settings_copy = context_copy->getSettingsCopy();
