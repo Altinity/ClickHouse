@@ -8178,6 +8178,16 @@ std::shared_lock<SharedMutex> Context::lockSwarmMode() const
     return std::shared_lock(shared->swarm_mode_mutex);
 }
 
+bool Context::runWithSwarmTaskAdmission(bool server_cancelled, std::function<void()> send) const
+{
+    auto admission = lockSwarmMode();
+    if (server_cancelled || !isSwarmModeEnabled())
+        return false;
+
+    send();
+    return true;
+}
+
 Context::ApplicationType Context::getApplicationType() const
 {
     return shared->application_type;
