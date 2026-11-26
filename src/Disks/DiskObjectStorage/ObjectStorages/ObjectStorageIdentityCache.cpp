@@ -78,6 +78,7 @@ void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIde
     if (last_seq > read.seq)
         return;
     last_seq = read.seq;
+    identity.key_capacity = key.capacity();
     /// `Base::set` takes the cache mutex after `epoch_mutex`, the same order as `remove` and `clear`.
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }
