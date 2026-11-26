@@ -31,8 +31,7 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
     if (catalog_state->state != NsState::Live && catalog_state->state != NsState::Removing)
         throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace has an unsupported lifecycle state");
     if (!ckpt || !ckpt->life_epoch)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS recovery grounding: a Live or Removing namespace requires a readable _ckpt with life_epoch");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", kRecoveryGroundingNoCkptMessage);
 
     checkRefCkptInvariants(*ckpt, "recovery grounding");
     RecoveryGrounding result;
@@ -183,7 +182,7 @@ CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, c
 
 MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current)
 {
-    if (current && !(*current == sampled))
+    if (current && !identicalToken(*current, sampled))
         return MissingBaseVerdict::RestartRecovery;
     return MissingBaseVerdict::Corrupted;
 }

@@ -75,6 +75,9 @@ def get_spark(log_dir=None):
             "spark.sql.catalog.spark_catalog.warehouse",
             "/var/lib/clickhouse/user_files/test_storage_delta",
         )
+        .config(
+            "spark.databricks.delta.clusteredTable.enableClusteringTablePreview", "true"
+        )
         .config("spark.driver.memory", "2g")
         .config("spark.executor.memory", "2g")
         .config("spark.databricks.delta.writeChecksumFile.enabled", "false")
@@ -167,7 +170,7 @@ def started_cluster():
             ],
             user_configs=["configs/users.d/users.xml"],
             with_installed_binary=True,
-            image="clickhouse/clickhouse-server",
+            image="altinity/clickhouse-server",
             tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
             with_minio=True,
             with_azurite=True,
@@ -6145,3 +6148,370 @@ def test_delta_kernel_retry_on_stale_token_via_catalog_callback(started_cluster)
         f"Expected the catalog-callback retry log line to fire for query {retry_query_id}, "
         f"found {retry_hits} hits — the stale-token retry path was not exercised."
     )
+
+
+def test_liquid_clustering(started_cluster):
+    """Test reading a Delta Lake table that uses liquid clustering.
+
+    Creates a table with CLUSTER BY via Spark SQL, writes data, runs OPTIMIZE,
+    then reads it from ClickHouse via the delta-kernel-rs path.  Liquid
+    clustering tables require the `v2Checkpoint` and `domainMetadata` reader
+    features, which are only supported by the delta-kernel-rs path.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering")
+
+    # Create a liquid-clustered Delta table via Spark SQL.
+    # delta-spark 3.3.0 supports CLUSTER BY.
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a, b)
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id as a, CAST(id + 1 AS STRING) as b FROM range(100)
+    """)
+    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+
+    files = default_upload_directory(
+        started_cluster,
+        "s3",
+        delta_path,
+        "",
+    )
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    # Verify row count and data.
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 100
+    assert instance.query(f"SELECT * FROM {TABLE_NAME} ORDER BY a") == instance.query(
+        "SELECT number as a, toString(number + 1) as b FROM numbers(100)"
+    )
+
+    # Verify predicate pushdown on the clustering column.
+    result = instance.query(f"SELECT a FROM {TABLE_NAME} WHERE a = 42")
+    assert result.strip() == "42"
+
+    # Verify aggregation works.
+    assert int(instance.query(f"SELECT sum(a) FROM {TABLE_NAME}")) == sum(range(100))
+
+
+def optimize_into_small_files(spark, delta_path):
+    """Run OPTIMIZE so that a small dataset is split into several files.
+
+    OPTIMIZE targets ~1GB cubes/files by default, which would pack a small
+    dataset into a single file and leave nothing to skip. The size targets are
+    shrunk only for this OPTIMIZE and then unset, because the Spark session is
+    shared by all tests in the module.
+    """
+    small_file_conf = {
+        "spark.databricks.delta.optimize.maxFileSize": "10240",
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.targetCubeSize": "10240",
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.threshold": "1024",
+    }
+    try:
+        for key, value in small_file_conf.items():
+            spark.conf.set(key, value)
+        spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+    finally:
+        for key in small_file_conf:
+            spark.conf.unset(key)
+
+
+def test_liquid_clustering_data_skipping(started_cluster):
+    """Verify that filtering on a clustering column skips files at the kernel level.
+
+    Creates a liquid-clustered Delta table with multiple batches so that OPTIMIZE
+    produces several output files, then checks that a point-lookup on the
+    clustering column reads fewer files than a full scan.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering_ds")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a, b)
+    """)
+
+    # Insert multiple batches to produce several files after OPTIMIZE.
+    for i in range(5):
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
+            FROM range(1000)
+        """)
+    optimize_into_small_files(spark, delta_path)
+
+    files = default_upload_directory(started_cluster, "s3", delta_path, "")
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    total_rows = int(instance.query(f"SELECT count() FROM {TABLE_NAME}"))
+    assert total_rows == 5000
+
+    # Full scan — note the total scanned files.
+    full_scan_id = f"{TABLE_NAME}_full_scan"
+    instance.query(
+        f"SELECT count() FROM {TABLE_NAME} SETTINGS optimize_trivial_count_query = 0",
+        query_id=full_scan_id,
+    )
+    instance.query("SYSTEM FLUSH LOGS")
+    full_scan_files = int(
+        instance.query(
+            f"SELECT ProfileEvents['DeltaLakeScannedFiles'] "
+            f"FROM system.query_log WHERE query_id = '{full_scan_id}' AND type = 'QueryFinish'"
+        ).strip()
+    )
+
+    # Point query on the clustering column — should scan fewer files.
+    point_query_id = f"{TABLE_NAME}_point_query"
+    result = instance.query(
+        f"SELECT a FROM {TABLE_NAME} WHERE a = 42", query_id=point_query_id
+    )
+    assert result.strip() == "42"
+    instance.query("SYSTEM FLUSH LOGS")
+    point_scan_files = int(
+        instance.query(
+            f"SELECT ProfileEvents['DeltaLakeScannedFiles'] "
+            f"FROM system.query_log WHERE query_id = '{point_query_id}' AND type = 'QueryFinish'"
+        ).strip()
+    )
+
+    assert point_scan_files < full_scan_files, (
+        f"Expected clustering to enable file skipping: point query scanned {point_scan_files} files "
+        f"but full scan scanned {full_scan_files} files"
+    )
+
+
+def test_liquid_clustering_predicate_fallback(started_cluster):
+    """Verify that the clustering-column predicate fallback replaces the scan after
+    the full predicate translation throws, that it skips files, and that it is never
+    stricter than the full filter.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering_fb")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING, c STRING)
+        USING DELTA CLUSTER BY (a, b)
+    """)
+
+    for i in range(5):
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT id + {i * 1000} as a,
+                   CAST(id + {i * 1000} AS STRING) as b,
+                   CAST(id + {i * 1000} + 1 AS STRING) as c
+            FROM range(1000)
+        """)
+    # Several files are needed so that the fallback predicate has files to skip.
+    optimize_into_small_files(spark, delta_path)
+
+    files = default_upload_directory(started_cluster, "s3", delta_path, "")
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    # `cityHash64(c) != 0` cannot be translated to a delta-kernel predicate. Without an
+    # exception it becomes Unknown inside `AND`, the original scan still prunes on `a = 42`,
+    # and no fallback scan is built.
+    noop_query_id = f"{TABLE_NAME}_no_fallback"
+    result = instance.query(
+        f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
+        query_id=noop_query_id,
+    )
+    assert result.strip() == "42"
+
+    # A translation exception makes the fallback scan replace the original one.
+    fallback_query_id = f"{TABLE_NAME}_fallback"
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    try:
+        result = instance.query(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
+            query_id=fallback_query_id,
+        )
+    finally:
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    assert result.strip() == "42"
+
+    # The fallback predicate must never be stricter than the full filter. The clustering
+    # conjuncts `a >= 42` and `a <= 4043` are top-level `AND` atoms next to the non-clustering
+    # `NOT startsWith(c, '43')`; only the clustering conjuncts may be pushed.
+    range_query = (
+        f"SELECT count(), sum(a) FROM {TABLE_NAME} "
+        f"WHERE a >= 42 AND a <= 4043 AND NOT startsWith(c, '43')"
+    )
+    expected = instance.query(f"{range_query} SETTINGS delta_lake_enable_engine_predicate = 0")
+    range_query_id = f"{TABLE_NAME}_fallback_range"
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    try:
+        result = instance.query(range_query, query_id=range_query_id)
+    finally:
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    assert result == expected
+
+    # Full scan as the baseline for file skipping.
+    full_scan_id = f"{TABLE_NAME}_full_scan"
+    instance.query(
+        f"SELECT count() FROM {TABLE_NAME} SETTINGS optimize_trivial_count_query = 0",
+        query_id=full_scan_id,
+    )
+
+    instance.query("SYSTEM FLUSH LOGS")
+
+    def profile_event(query_id, event):
+        return int(
+            instance.query(
+                f"SELECT ProfileEvents['{event}'] "
+                f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+            ).strip()
+        )
+
+    assert profile_event(noop_query_id, "DeltaLakeClusteringPredicateFallbacks") == 0
+    assert profile_event(fallback_query_id, "DeltaLakeClusteringPredicateFallbacks") >= 1, (
+        "Expected the clustering predicate fallback to fire after a translation exception"
+    )
+    assert profile_event(range_query_id, "DeltaLakeClusteringPredicateFallbacks") >= 1, (
+        "Expected the clustering predicate fallback to fire for the range query"
+    )
+
+    # The fallback scan must actually prune files, not just be counted.
+    full_scan_files = profile_event(full_scan_id, "DeltaLakeScannedFiles")
+    fallback_scan_files = profile_event(fallback_query_id, "DeltaLakeScannedFiles")
+    assert fallback_scan_files < full_scan_files, (
+        f"Expected the fallback predicate to enable file skipping: fallback query scanned "
+        f"{fallback_scan_files} files but full scan scanned {full_scan_files} files"
+    )
+    range_scan_files = profile_event(range_query_id, "DeltaLakeScannedFiles")
+    assert range_scan_files < full_scan_files, (
+        f"Expected the range fallback predicate to enable file skipping: range query scanned "
+        f"{range_scan_files} files but full scan scanned {full_scan_files} files"
+    )
+
+
+def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cluster):
+    """A stale-credentials retry while reading the clustering metadata must stay on the
+    table version the query already resolved.
+
+    The clustering metadata is read only after the full predicate translation throws, so
+    `delta_kernel_fail_literal_visitor` forces that. The query is paused after its snapshot
+    version is resolved and before the clustering metadata is read. A newer version V+1 is
+    committed while it is paused, then the read fails once with `ExpiredToken` and the scan
+    state is rebuilt. If the rebuild resolved "latest" again, the query would list V+1's
+    files and return the row added by V+1.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_clustering_stale_token_pin")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING, c STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id AS a, CAST(id AS STRING) AS b, CAST(id AS STRING) AS c FROM range(100)
+    """)
+
+    default_upload_directory(started_cluster, "s3", delta_path, "")
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    pause = "delta_kernel_pause_before_clustering_read"
+    stale = "delta_kernel_force_stale_token_error_on_clustering_read"
+    query_id = f"{TABLE_NAME}_retry"
+    instance.query("SYSTEM ENABLE FAILPOINT object_storage_force_refresh_callback_success")
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {stale}")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {pause}")
+    try:
+        request = instance.get_query_request(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42 ORDER BY a",
+            query_id=query_id,
+        )
+        instance.query(f"SYSTEM WAIT FAILPOINT {pause} PAUSE")
+
+        # Commit V+1 with one more row matching the filter while the query is paused.
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT 42 AS a, 'new' AS b, 'new' AS c
+        """)
+        default_upload_directory(started_cluster, "s3", delta_path, "")
+
+        instance.query(f"SYSTEM NOTIFY FAILPOINT {pause}")
+        result = request.get_answer()
+    finally:
+        instance.query(f"SYSTEM DISABLE FAILPOINT {pause}")
+        instance.query(f"SYSTEM DISABLE FAILPOINT {stale}")
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+        instance.query("SYSTEM DISABLE FAILPOINT object_storage_force_refresh_callback_success")
+
+    # Only V's row. Two rows would mean the retry moved the query to V+1.
+    assert result.split() == ["42"], f"Retry moved the query to a newer table version: {result!r}"
+
+    instance.query("SYSTEM FLUSH LOGS")
+    retry_hits = int(instance.query(
+        "SELECT count() FROM system.text_log "
+        f"WHERE query_id = '{query_id}' "
+        "  AND message ILIKE '%stale credentials during scan iteration; rebuilding%'"
+    ).strip())
+    assert retry_hits >= 1, (
+        f"Expected the stale-token retry of the clustering metadata read to fire for query {query_id}, "
+        f"found {retry_hits} hits"
+    )
+
+
+def test_clustering_metadata_not_read_for_non_clustered_table(started_cluster):
+    """On a table without the `clustering` table feature the clustering metadata must not be
+    read, even when the clustering predicate fallback would be used.
+
+    The full predicate translation is forced to throw, and the clustering metadata read is
+    forced to fail with `ExpiredToken`. No credentials refresh is available, so the query
+    would fail if the read happened.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_clustering_not_read")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id AS a, CAST(id AS STRING) AS b FROM range(100)
+    """)
+
+    default_upload_directory(started_cluster, "s3", delta_path, "")
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    stale = "delta_kernel_force_stale_token_error_on_clustering_read"
+    query_id = f"{TABLE_NAME}_query"
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {stale}")
+    try:
+        result = instance.query(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42",
+            query_id=query_id,
+        )
+    finally:
+        instance.query(f"SYSTEM DISABLE FAILPOINT {stale}")
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+
+    assert result.strip() == "42"
+
+    instance.query("SYSTEM FLUSH LOGS")
+    fallbacks = int(instance.query(
+        "SELECT ProfileEvents['DeltaLakeClusteringPredicateFallbacks'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ).strip())
+    assert fallbacks == 0

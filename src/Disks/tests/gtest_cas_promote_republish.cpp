@@ -334,7 +334,7 @@ TEST(CASPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
     build->abandon();
 
     auto rebuild = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    EXPECT_DEATH({ rebuild->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
+    CAS_EXPECT_DEATH({ rebuild->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
 }
 #endif
 
@@ -400,6 +400,6 @@ TEST(CASPromoteRepublishDeathTest, PrecommitAddRejectsAnIdThisTxnDidNotStageAbor
     txn1->abandon();
 
     auto txn2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    EXPECT_DEATH({ txn2->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
+    CAS_EXPECT_DEATH({ txn2->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
 }
 #endif

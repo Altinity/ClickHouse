@@ -370,7 +370,7 @@ TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
 
     auto cancel_op = requests.admit();
     ASSERT_EQ(CasRefCatalog::cancelStalledCreating(
-        cancel_op, layout, creating, [](const CreatorFence &) { return true; }),
+        cancel_op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     auto read_op = requests.admit();
     EXPECT_TRUE(CasRefCatalog::read(read_op, layout).catalog.entries.empty());
@@ -753,7 +753,7 @@ TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
 /// A page of 1000 keys needs a second store request for its sentinel; the janitor and every GC walk must
 /// ask for the page size that fits one response. A regular round, `rebuildBaseline` and the fsck scan are
 /// driven; every recorded limit is a probe (1 or 32) or the one-response page. The orphan-manifest sweep
-/// takes a configured budget and is left out.
+/// and the intent sweep take a configured budget and are left out.
 TEST(CASNamespaceJanitorIntegration, GcRoundListsEveryWalkWithTheOneResponsePageSize)
 {
     auto backend = std::make_shared<ListLimitRecordingBackend>();
@@ -774,6 +774,8 @@ TEST(CASNamespaceJanitorIntegration, GcRoundListsEveryWalkWithTheOneResponsePage
     for (const auto & [prefix, limit] : backend->list_limits)
     {
         if (prefix == layout.casManifestsPrefix())
+            continue;
+        if (prefix == layout.blobIntentsPrefix() && limit == store->poolConfig().intent_sweep_list_budget_keys)
             continue;
         if (prefix == layout.namespaceRootPrefix())
             namespace_root_listed = true;

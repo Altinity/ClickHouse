@@ -763,7 +763,7 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
 
     const auto ckpt_after = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_after);
-    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag)
+    EXPECT_EQ(tokenText(ckpt_after->etag), tokenText(ckpt_before->etag))
         << "an unchanged checkpoint makes the missing committed id corruption, not a shorter stream";
 }
 
@@ -1300,7 +1300,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
         << "no predecessor checkpoint CAS may be sent after exact retirement";
     const auto predecessor_ckpt_after = readAt(*backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after);
-    EXPECT_EQ(predecessor_ckpt_after->etag, predecessor_ckpt_before->etag);
+    EXPECT_EQ(tokenText(predecessor_ckpt_after->etag), tokenText(predecessor_ckpt_before->etag));
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the detached predecessor result was installed";
     EXPECT_EQ(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "the detached predecessor reached the recovery publication point";
@@ -1310,7 +1310,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
             << "predecessor recovery retargeted storage I/O into successor key " << key;
     const auto successor_ckpt_after = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_after);
-    EXPECT_EQ(successor_ckpt_after->etag, successor_ckpt_before->etag);
+    EXPECT_EQ(tokenText(successor_ckpt_after->etag), tokenText(successor_ckpt_before->etag));
     EXPECT_EQ(successor_ckpt_after->bytes, successor_ckpt_before->bytes);
 }
 
@@ -1341,7 +1341,7 @@ TEST(CASRefRecoveryCasWalk, FenceBumpedAfterTheTombstoneInstallsNothingAndWrites
 
     const auto ckpt_after = readCkptForTest(backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_after.has_value());
-    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag) << "no `_ckpt` write follows the tombstone";
+    EXPECT_EQ(tokenText(ckpt_after->etag), tokenText(ckpt_before->etag)) << "no `_ckpt` write follows the tombstone";
 
     backend->on_key = nullptr;
     fenceOutMountForRemount(*backend, layout.mountKey("test"));
@@ -1668,7 +1668,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
     ASSERT_TRUE(ckpt_before);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(readCkptForTest(backend, layout, life)->etag, ckpt_before->etag) << "a refused recovery writes no `_ckpt`";
+    EXPECT_EQ(tokenText(readCkptForTest(backend, layout, life)->etag), tokenText(ckpt_before->etag)) << "a refused recovery writes no `_ckpt`";
 }
 
 TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorSeal)

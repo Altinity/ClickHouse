@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 
+#include <optional>
+
 namespace DB::Cas
 {
 
@@ -57,7 +59,8 @@ enum class BootstrapResidual : uint8_t
 /// NEVER writes, and it IGNORES probe debris exactly so a normal restart after a crash-mid-battery still
 /// bootstraps cleanly. On non-strong-LIST backends this is the single best-effort authoritative check the
 /// weaker guarantee allows — still fail-closed on any residual object found. Used by `Pool::open` BEFORE
-/// the capability battery so that no probe write ever precedes the emptiness proof.
-BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout);
+/// the capability battery so that no probe write ever precedes the emptiness proof. `pool_meta_bytes` receives
+/// the bytes of `_pool_meta` when the exact read found it, and stays empty when only the listing did.
+BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout, std::optional<String> & pool_meta_bytes);
 
 }

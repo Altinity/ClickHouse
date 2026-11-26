@@ -371,6 +371,9 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
         const auto current_entry = std::find_if(
             current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns.string() == ns_str; });
+        /// The claim raised the victim's epoch, so the GC leader may cancel a `Creating` row first.
+        if (current_entry == current_catalog.catalog.entries.end() && selected_entry.state == NsState::Creating)
+            continue;
         if (current_entry == current_catalog.catalog.entries.end() || *current_entry != selected_entry)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "ca-decommission: namespace '{}' changed incarnation after the validated catalog cut; "
@@ -395,12 +398,15 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
         }
 
         const auto stats = admin.dropNamespace(life);
+        if (selected_entry.state != NsState::Creating)
+            gc_round_needed = true;
+        /// Another actor, such as the GC leader cancelling a `Creating` row, removed it after the check above.
+        if (stats.already_absent)
+            continue;
         ++report.namespaces_removed;
         report.committed_refs_removed += stats.committed_refs;
         report.precommits_removed += stats.precommits;
         report.edge_deltas_emitted += stats.committed_refs + stats.precommits;
-        if (selected_entry.state != NsState::Creating)
-            gc_round_needed = true;
 
         EventEmitter{admin}.emit([&](CasEvent & e)
         {

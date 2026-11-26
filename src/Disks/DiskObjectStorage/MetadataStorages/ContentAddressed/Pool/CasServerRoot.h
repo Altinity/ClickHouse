@@ -424,7 +424,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
-/// dead mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
+/// dead mounts (liveness only — row decisions pace on GC rounds, not on heartbeat acks).
 /// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active_build_sequence == UINT64_MAX`, the farewell sentinel stamped by
@@ -581,6 +581,19 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 /// no path where this function answers `true` on evidence weaker than one of the three certificates.
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
                             uint64_t writer_epoch, const Retry & policy = Retry::standard());
+
+/// What `server_root_id`'s mount slot says about a creator at `writer_epoch`.
+enum class CreatorSlotStatus : uint8_t
+{
+    Terminal,     /// one of the three certificates `isCreatorFenceTerminal` accepts
+    Live,         /// the slot decodes and certifies nothing against this epoch: the creator may still finish
+    Absent,       /// no mount slot
+    Undecodable,  /// the slot body does not decode
+};
+
+/// The one read behind `isCreatorFenceTerminal`, which is true exactly for `Terminal`. A store failure throws.
+CreatorSlotStatus probeCreatorSlot(CasOperation & op, const Layout & layout, const String & server_root_id,
+                                   uint64_t writer_epoch, const Retry & policy = Retry::standard());
 
 /// Which mount-slot body this renewer owns: the last one it landed, and the one it is writing.
 /// A takeover or fence writes a new body, so the slot read is either one we wrote or one `holds`

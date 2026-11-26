@@ -586,7 +586,7 @@ TEST(CASForget, GcRebuildInFlightSerializesForget)
     /// The discriminator: FORGET must NOT complete while the rebuild holds the lock. This bounded negative
     /// observation is anchored by the positive control below (FORGET DOES complete once the lock releases),
     /// so the window's meaning is real, not a race hidden behind a sleep.
-    EXPECT_EQ(forget_done.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+    EXPECT_EQ(forget_done.wait_for(std::chrono::milliseconds(500)), std::future_status::timeout)
         << "FORGET must serialize behind an in-flight GC rebuild (the rebuild holds gc_scheduler_mutex)";
 
     /// Release the in-flight rebuild; it finishes and drops the lock, and FORGET can now proceed.

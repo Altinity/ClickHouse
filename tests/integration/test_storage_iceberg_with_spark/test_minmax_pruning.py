@@ -81,6 +81,15 @@ def test_minmax_pruning(started_cluster_iceberg_with_spark, storage_type, is_tab
         ))
         creation_expression = TABLE_NAME
 
+    spark_timestamps = spark.sql(
+        f"SELECT unix_micros(ts), unix_micros(time_struct.b) FROM {TABLE_NAME} ORDER BY tag"
+    ).collect()
+    expected_timestamps = "".join(f"{row[0]}\t{row[1]}\n" for row in spark_timestamps)
+    assert instance.query(
+        f"SELECT toUnixTimestamp64Micro(ts), toUnixTimestamp64Micro(time_struct.b) "
+        f"FROM {creation_expression} ORDER BY tag"
+    ) == expected_timestamps
+
     def check_validity_and_get_prunned_files(select_expression):
         settings1 = {
             "use_iceberg_partition_pruning": 0,

@@ -94,7 +94,7 @@ std::shared_ptr<ContentAddressedMetadataStorage> openGcStorage()
     auto storage = std::make_shared<ContentAddressedMetadataStorage>(
         Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
-    return storage;
+    return DB::Cas::tests::ownedByDirectory(std::move(storage), scratch);
 }
 
 void commitOnePart(ContentAddressedMetadataStorage & storage)
@@ -170,10 +170,10 @@ constexpr std::chrono::milliseconds kRoundWait{60000};
 constexpr std::chrono::milliseconds kSelfExitWait{15000};
 
 /// A bounded OBSERVATION window (not a sleep-to-fix-a-race) for the "stays stopped across recovery" test:
-/// comfortably above the 1s pacing interval so a running scheduler would have filled it with several
-/// rounds, yet short enough to keep the negative assertion cheap. Its meaning is anchored by a positive
-/// control (an explicit START right after DOES produce a round through the same sink).
-constexpr std::chrono::milliseconds kStayStoppedWindow{3000};
+/// above the 1s pacing interval, so a running scheduler would have ticked inside it, yet short enough to
+/// keep the negative assertion cheap. Its meaning is anchored by a positive control (an explicit START
+/// right after DOES produce a round through the same sink).
+constexpr std::chrono::milliseconds kStayStoppedWindow{1500};
 
 }
 
@@ -186,12 +186,13 @@ constexpr std::chrono::milliseconds kStayStoppedWindow{3000};
 TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
 
     RoundLogSink sink;
-    /// 1s interval: the loop ticks ~1s; the cv wait below (never a sleep) synchronizes on real records.
+    /// A round is requested at once; the cv wait below (never a sleep) synchronizes on real records.
     CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitTest", "ca-disk", sink.logger());
     sched.start();
+    sched.requestRoundSoon();
 
     /// Prove the loop is genuinely RUNNING first: a background round must land and acquire the lease.
     ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
@@ -200,6 +201,7 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
     /// A natural terminal transition (forced here via the seam; in production `VanishedReplaced` and
     /// `IdentityLost` arrive identically, WITHOUT anyone calling stop() on this scheduler).
     store->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
+    sched.requestRoundSoon();
 
     ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
         << "both the pacing and heartbeat loops must self-exit once the pool is Vanished";
@@ -219,15 +221,17 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
 TEST(CASGCStopStart, SchedulerSelfExitsOnIdentityLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
 
     RoundLogSink sink;
     CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcIdentityLostTest", "ca-disk", sink.logger());
     sched.start();
+    sched.requestRoundSoon();
 
     ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
 
     store->setLifecycleForTest(PoolLifecycle::IdentityLost);
+    sched.requestRoundSoon();
 
     ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
         << "IdentityLost is terminal (rev.8): both the pacing and heartbeat loops must self-exit";
@@ -245,14 +249,16 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnIdentityLost)
 TEST(CASGCStopStart, StopAndDestroyCleanAfterSelfExit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     {
         RoundLogSink sink;
         CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitCleanupTest", "ca-disk", sink.logger());
         sched.start();
+        sched.requestRoundSoon();
         ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
 
         store->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
+        sched.requestRoundSoon();
         ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait));
 
         EXPECT_NO_THROW(sched.stop()) << "stop() must cleanly join the self-exited threads";
@@ -295,15 +301,15 @@ TEST(CASGCStopStart, StopJoinsWorkersAndClearsLeadershipHint)
 TEST(CASGCStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
 
     RoundLogSink sink;
-    /// 1s interval: the background loop's first round fires ~1s after start(); the cv wait (not a sleep)
-    /// synchronizes on the actual Finish record.
+    /// Each start() requests a round at once; the cv wait (not a sleep) synchronizes on the actual Finish record.
     CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopStartTest", "ca-disk", sink.logger());
 
     /// First run: background rounds start and one acquires the lease.
     sched.start();
+    sched.requestRoundSoon();
     const auto first = sink.waitForSuccessFinish(/*from=*/0, kRoundWait);
     ASSERT_TRUE(first.has_value()) << "the background scheduler must run a round and acquire the lease after start()";
     EXPECT_TRUE(sched.gcHealth().is_leader) << "leadership is held after the first background round";
@@ -318,6 +324,7 @@ TEST(CASGCStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
     /// Restart the SAME instance: a NEW background round must land, re-acquiring the lease, and it must
     /// carry the SAME gc_id (proving the instance -- and its lease observer -- survived the restart).
     sched.start();
+    sched.requestRoundSoon();
     const auto second = sink.waitForSuccessFinish(/*from=*/after_stop, kRoundWait);
     ASSERT_TRUE(second.has_value()) << "background rounds must resume after START (start() is re-enterable post-join)";
     EXPECT_EQ(second->gc_id, gc_id_before) << "the restarted scheduler must preserve its gc_id (same instance)";
@@ -524,20 +531,21 @@ TEST(CASGCStopStart, RequestRoundSoonConcurrentWithStopStartDoesNotRace)
 /// and NOTHING restarts the GC scheduler. Recovery is a Pool-internal operation with no reference to the
 /// scheduler; only an explicit START (`SYSTEM CAS GC START`) resumes it. We prove the scheduler
 /// was genuinely running+leading first, STOP it, drive a real transient→Live recovery on the pool, then show
-/// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
-/// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the
-/// SAME instance (`gc_id` preserved). The positive control makes the negative meaningful: the sink IS live.
+/// it stays stopped across a bounded observation window (a running scheduler would have ticked inside it), and
+/// finally that an explicit START — the ONLY resumption path — brings rounds back on the SAME instance
+/// (`gc_id` preserved). The positive control makes the negative meaningful: the sink IS live.
 TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
 
     RoundLogSink sink;
-    /// 1s interval so a RUNNING scheduler would pace rounds within the observation window below.
+    /// A RUNNING scheduler ticks within the observation window below.
     CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopPersistTest", "ca-disk", sink.logger());
 
     /// The operator has GC running and leading.
     sched.start();
+    sched.requestRoundSoon();
     ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
         << "the scheduler must be pacing rounds and leading before the operator stops it";
     ASSERT_TRUE(sched.gcHealth().is_leader);
@@ -556,16 +564,19 @@ TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
     ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live) << "the pool must auto-recover to Live";
 
     /// The operator's STOP persists: recovery restarted NOTHING. The scheduler is still not leading and
-    /// still quiescent, and NO background round appears across a window a running scheduler would have
-    /// filled many times over.
+    /// still quiescent, and NO background round appears across a window a running scheduler
+    /// would have ticked inside.
     EXPECT_FALSE(sched.gcHealth().is_leader);
     EXPECT_TRUE(sched.isQuiescent());
+    /// A no-op unless a worker is running: a wrongly restarted one would round at once.
+    sched.requestRoundSoon();
     EXPECT_FALSE(sink.waitForSuccessFinish(after_stop, kStayStoppedWindow).has_value())
         << "a self-remount recovery must NOT restart an operator-STOPped GC scheduler";
 
     /// Positive control: only an explicit START resumes rounds, on the SAME instance (gc_id preserved).
     /// This also proves the sink WOULD have caught a round, so the negative above is meaningful.
     sched.start();
+    sched.requestRoundSoon();
     const auto resumed = sink.waitForSuccessFinish(after_stop, kRoundWait);
     ASSERT_TRUE(resumed.has_value()) << "an explicit START must resume background rounds after the recovery";
     EXPECT_TRUE(sched.gcHealth().is_leader);

@@ -258,8 +258,8 @@ CaTxnRollbackFixture makeCaWiringFixture()
     storage->startup();
 
     CaTxnRollbackFixture fx;
-    fx.storage = storage;
-    fx.namespace_ = storage->liveNamespace(CaTxnRollbackFixture::kTableUuid);
+    fx.storage = DB::Cas::tests::ownedByDirectory(std::move(storage), scratch);
+    fx.namespace_ = fx.storage->liveNamespace(CaTxnRollbackFixture::kTableUuid);
     return fx;
 }
 

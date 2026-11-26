@@ -17,19 +17,30 @@ class ConnectionEstablisher
 public:
     using TryResult = PoolWithFailoverBase<IConnectionPool>::TryResult;
 
+    /// `ping_pooled_connection` sends a `Ping` on a connection taken from the pool already
+    /// established. A zero-timeout poll cannot see a server that stopped without closing the
+    /// socket, and a cluster read would then wait for `receive_timeout`. No `Pong` within
+    /// `sync_request_timeout` reconnects once. That handshake is capped by `sync_request_timeout`,
+    /// also when `handshake_timeout_ms` is `0`: a live server finishes `Hello` in one round trip,
+    /// and a stopped server stops at the cap. A socket the server has already closed also
+    /// reconnects once, with the usual handshake timeout. Callers that can run without this
+    /// replica (cluster reads of a remote shard) pass true. The default keeps the poll, with no
+    /// round trip.
     ConnectionEstablisher(ConnectionPoolPtr pool_,
                           const ConnectionTimeouts * timeouts_,
                           const Settings & settings_,
                           LoggerPtr log,
-                          const QualifiedTableName * table_to_check = nullptr);
+                          const QualifiedTableName * table_to_check = nullptr,
+                          bool ping_pooled_connection_ = false);
 
     /// Establish connection and save it in result, write possible exception message in fail_message.
     /// The connection is returned from the connection pool and it can be stale (the server may have
-    /// closed it while it was idle). The pooled connection is not pinged before use: pinging it adds
-    /// an unnecessary Ping-Pong round trip when the connection is still alive. Instead, a stale
-    /// connection is detected by a zero-timeout poll (see Connection::forceConnected) or, failing
-    /// that, by retrying - either here (a pooled connection that fails its first request is
-    /// reconnected once) or at a higher level (ConnectionPoolWithFailover retries the next replica).
+    /// closed it while it was idle). Unless `ping_pooled_connection` was set, the pooled connection
+    /// is not pinged before use: pinging it adds an unnecessary Ping-Pong round trip when the
+    /// connection is still alive. Instead, a stale connection is detected by a zero-timeout poll
+    /// (see `Connection::forceConnected`) or, failing that, by retrying - either here (a pooled
+    /// connection that fails its first request is reconnected once) or at a higher level
+    /// (`ConnectionPoolWithFailover` retries the next replica).
     void run(TryResult & result, std::string & fail_message);
 
     /// Set async callback that will be called when reading from socket blocks.
@@ -41,6 +52,7 @@ private:
     const Settings & settings;
     LoggerPtr log;
     const QualifiedTableName * table_to_check;
+    bool ping_pooled_connection;
 
     AsyncCallback async_callback = {};
 };
@@ -62,7 +74,8 @@ public:
                                const ConnectionTimeouts * timeouts_,
                                const Settings & settings_,
                                LoggerPtr log_,
-                               const QualifiedTableName * table_to_check_ = nullptr);
+                               const QualifiedTableName * table_to_check_ = nullptr,
+                               bool ping_pooled_connection_ = false);
 
     /// Get file descriptor that can be added in epoll and be polled,
     /// when this fd becomes ready, you call resume establishing connection.

@@ -1100,8 +1100,8 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
-    const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
+    const bool proven_dead = proven_dead_incarnation && identicalToken(*proven_dead_incarnation, got->etag);
+    const bool unsafe_authorized = unsafe_reclaim_authorization && identicalToken(*unsafe_reclaim_authorization, got->etag);
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
@@ -1295,7 +1295,7 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!observed || !identicalToken(*observed, *current_etag))
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
@@ -1405,13 +1405,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
+                const bool stable = it != obs.end() && identicalToken(it->second.etag, observed->etag)
                     && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
                     /// A sample from before this read would count the walk to the slot as time watched.
-                    if (it == obs.end() || it->second.etag != observed->etag)
+                    if (it == obs.end() || !identicalToken(it->second.etag, observed->etag))
                         obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
@@ -1596,9 +1596,15 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
                             uint64_t writer_epoch, const Retry & policy)
 {
+    return probeCreatorSlot(op, layout, server_root_id, writer_epoch, policy) == CreatorSlotStatus::Terminal;
+}
+
+CreatorSlotStatus probeCreatorSlot(CasOperation & op, const Layout & layout, const String & server_root_id,
+                                   uint64_t writer_epoch, const Retry & policy)
+{
     const auto got = op.read(layout.mountKey(server_root_id), policy);
     if (!got)
-        return false;   /// absence proves nothing about liveness -- see the header doc
+        return CreatorSlotStatus::Absent;   /// absence proves nothing about liveness -- see the header doc
 
     MountLease lease;
     try
@@ -1607,7 +1613,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     }
     catch (...)
     {
-        return false;   /// undecodable -- fail closed, never wave through
+        return CreatorSlotStatus::Undecodable;   /// fail closed, never wave through
     }
 
     /// EXHAUSTIVE switch, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
@@ -1619,19 +1625,19 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     /// is safe).
     /// The initializer is dead: the exhaustive switch below assigns every enumerator, and a future
     /// enumerator left unassigned fails the build via `-Wswitch`, not this value.
-    bool terminal = false;
+    CreatorSlotStatus status = CreatorSlotStatus::Live;
     switch (classifyFenceCertificate(lease, writer_epoch))
     {
         case FenceCertificate::None:
-            terminal = false;
+            status = CreatorSlotStatus::Live;
             break;
         case FenceCertificate::GcFenced:
         case FenceCertificate::CleanFarewell:
         case FenceCertificate::SupersededEpoch:
-            terminal = true;
+            status = CreatorSlotStatus::Terminal;
             break;
     }
-    return terminal;
+    return status;
 }
 
 /// The farewell's FLOOR, not its whole budget: a departing mount is holding shutdown open, so the
@@ -1702,7 +1708,7 @@ bool MountSlotOwnership::holds(const Object & slot) const
         return false;
     /// The pair alone is not enough: another writer of the same pair leaves a different ETag.
     std::lock_guard lock(mutex);
-    return (last_etag && slot.etag == *last_etag)
+    return (last_etag && sameVersion(slot.etag, *last_etag))
         || (in_flight_attempt_id && lease.write_attempt_id == *in_flight_attempt_id);
 }
 
@@ -2066,7 +2072,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 /// safe because a call with an unclear attempt returns `Conflict` only once the token
                 /// moved, so this call left no copy of ours that could land.
                 const Object * seen = std::get_if<Object>(&conflict->seen);
-                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                if (!seen || !sameVersion(seen->etag, expected) || seen->bytes != last_body)
                     break;
                 pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
             }

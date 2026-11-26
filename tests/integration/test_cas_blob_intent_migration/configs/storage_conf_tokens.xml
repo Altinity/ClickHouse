@@ -1,0 +1,51 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Two pools on RustFS, one per staging backend: a body is published by a streamed upload (single or
+                 multipart) from local staging, or by a server-side copy (single or multipart) from S3 staging. -->
+            <disk_cas_local_stage>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>token_node_local</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/token_pool_local/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>100000</cas_gc_interval_sec>
+            </disk_cas_local_stage>
+            <disk_cas_s3_stage>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>token_node_s3</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/token_pool_s3/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_staging_backend>s3</cas_staging_backend>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>100000</cas_gc_interval_sec>
+            </disk_cas_s3_stage>
+        </disks>
+        <policies>
+            <cas_local_stage>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_local_stage</disk>
+                    </main>
+                </volumes>
+            </cas_local_stage>
+            <cas_s3_stage>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_s3_stage</disk>
+                    </main>
+                </volumes>
+            </cas_s3_stage>
+        </policies>
+    </storage_configuration>
+</clickhouse>

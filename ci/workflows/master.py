@@ -54,6 +54,12 @@ workflow = Workflow.Config(
         #     )
         #     for job in JobConfigs.special_build_jobs
         # ],
+        *[
+            job.set_run_after(REGULAR_BUILD_NAMES)
+            for job in JobConfigs.special_build_jobs
+            if "ppc64le" in job.name
+        ],
+        JobConfigs.smoke_test_ppc64le,
         *JobConfigs.unittest_jobs,
         # *JobConfigs.unittest_llvm_coverage_job,
         JobConfigs.docker_server,

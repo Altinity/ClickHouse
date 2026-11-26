@@ -19,11 +19,9 @@ namespace DB::Cas
 /// to an empty map on a thread with no `ThreadStatus` (a bare gtest thread) -- the same degradation the
 /// round-level capture already accepts and documents.
 ///
-/// WHAT THE DELTA DOES NOT COVER: work this phase hands to another thread. `meta_pool_wait` is the one
-/// phase where that is the whole content of the phase, so its row carries explicit `jobs_scheduled` /
-/// `jobs_completed` metrics instead; see its instrumentation site in `Gc::runRegularRound`. Anywhere
-/// else, a phase that shows a long duration and an empty delta means the time went somewhere this
-/// instrumentation cannot see, and that is a finding rather than a blank to be ignored.
+/// WHAT THE DELTA DOES NOT COVER: work this phase hands to another thread. A phase that shows a long
+/// duration and an empty delta means the time went somewhere this instrumentation cannot see, and that
+/// is a finding rather than a blank to be ignored.
 ///
 /// RAII AND FAILURE: the record is emitted from the destructor, so a phase that THREW still produces its
 /// row while the stack unwinds. That is deliberate -- a round that failed is the round a reader most
