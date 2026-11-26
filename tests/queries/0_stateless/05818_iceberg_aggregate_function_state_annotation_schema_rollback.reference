@@ -1,0 +1,4 @@
+k	Int32
+x	Int64
+y	Nullable(Int32)
+w	Nullable(Int32)

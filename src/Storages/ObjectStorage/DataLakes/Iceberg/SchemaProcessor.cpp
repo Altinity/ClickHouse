@@ -844,12 +844,7 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
     const String & annotated_name = annotation.type_name;
     auto annotated_type = resolveClickHouseTypeAnnotation(annotated_name, /*allow_aggregate_function_states=*/ true);
 
-    /// The annotation is valid only for the Iceberg type ClickHouse writes for it. The format version affects only
-    /// whether `timestamp_ns` may be written, so the latest one is used and the field's own type decides.
-    Int32 unused_field_id = 0;
-    const auto [annotated_iceberg_type, annotated_required]
-        = getIcebergType(annotated_type, unused_field_id, /*format_version=*/ 3);
-    if (annotated_required != required || !icebergTypesEqualIgnoringIds(field->get(type_key), annotated_iceberg_type))
+    if (!clickHouseTypeAnnotationFitsField(annotated_type, field->get(type_key), required))
     {
         /// The field has evolved since the annotation was recorded for a lower schema id, e.g. another engine
         /// promoted `int` to `long` or made the field optional.

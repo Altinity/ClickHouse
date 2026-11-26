@@ -308,6 +308,14 @@ bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Va
     return false;
 }
 
+/// The format version affects only whether `timestamp_ns` may be written, so the latest one is used and the field's own type decides.
+bool clickHouseTypeAnnotationFitsField(const DataTypePtr & annotated_type, const Poco::Dynamic::Var & iceberg_type, bool required)
+{
+    Int32 unused_field_id = 0;
+    const auto [annotated_iceberg_type, annotated_required] = getIcebergType(annotated_type, unused_field_id, /*format_version=*/ 3);
+    return annotated_required == required && icebergTypesEqualIgnoringIds(iceberg_type, annotated_iceberg_type);
+}
+
 }
 
 #if USE_AVRO

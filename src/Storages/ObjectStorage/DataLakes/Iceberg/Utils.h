@@ -29,6 +29,10 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 /// Whether two Iceberg type descriptors denote the same type, ignoring the ids of nested fields.
 bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type);
 
+/// Whether a ClickHouse type annotation of type `annotated_type` is valid for a field of Iceberg type `iceberg_type`:
+/// ClickHouse writes that Iceberg type for it.
+bool clickHouseTypeAnnotationFitsField(const DataTypePtr & annotated_type, const Poco::Dynamic::Var & iceberg_type, bool required);
+
 }
 
 #if USE_AVRO

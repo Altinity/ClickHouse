@@ -178,20 +178,63 @@ Int32 getNextSchemaId(Poco::JSON::Object::Ptr metadata_object)
     return max_id + 1;
 }
 
+void collectFieldsById(const Poco::JSON::Array::Ptr & fields, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result);
+
+/// Collects the struct fields nested in Iceberg type `type` by their ids.
+void collectNestedFieldsById(const Poco::Dynamic::Var & type, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result)
+{
+    if (type.isString())
+        return;
+    const auto type_object = type.extract<Poco::JSON::Object::Ptr>();
+    const auto kind = type_object->getValue<String>(Iceberg::f_type);
+    if (kind == Iceberg::f_list)
+        collectNestedFieldsById(type_object->get(Iceberg::f_element), result);
+    else if (kind == Iceberg::f_map)
+    {
+        collectNestedFieldsById(type_object->get(Iceberg::f_key), result);
+        collectNestedFieldsById(type_object->get(Iceberg::f_value), result);
+    }
+    else if (kind == Iceberg::f_struct)
+        collectFieldsById(type_object->getArray(Iceberg::f_fields), result);
+}
+
+/// Collects `fields` and the struct fields nested in their types by their ids.
+void collectFieldsById(const Poco::JSON::Array::Ptr & fields, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result)
+{
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        const auto field = fields->getObject(i);
+        result.emplace(field->getValue<Int32>(Iceberg::f_id), field);
+        collectNestedFieldsById(field->get(Iceberg::f_type), result);
+    }
+}
+
 /// Appends `schema` as the current schema `schema_id`. Its fields keep the ClickHouse type annotations they had
-/// in the previous current schema, which need not be the one with the highest id.
+/// in the previous current schema, which need not be the one with the highest id. An annotation that no longer fits
+/// the Iceberg type of its field is dropped.
 void addCurrentSchema(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr schema, Int32 schema_id)
 {
     const auto previous_annotations
         = Iceberg::getClickHouseTypeAnnotations(metadata_object, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
+    std::unordered_map<Int32, Poco::JSON::Object::Ptr> fields_by_id;
+    collectFieldsById(schema->getArray(Iceberg::f_fields), fields_by_id);
     schema->set(Iceberg::f_schema_id, schema_id);
     metadata_object->set(Iceberg::f_current_schema_id, schema_id);
     metadata_object->getArray(Iceberg::f_schemas)->add(schema);
     for (const auto & [name, field_id] : Iceberg::IcebergSchemaProcessor::traverseSchema(schema->getArray(Iceberg::f_fields)))
     {
-        const auto it = previous_annotations.find(static_cast<Int32>(field_id));
-        Iceberg::setClickHouseTypeAnnotation(
-            metadata_object, static_cast<Int32>(field_id), schema_id, it == previous_annotations.end() ? String{} : it->second.type_name);
+        String annotation;
+        if (const auto it = previous_annotations.find(static_cast<Int32>(field_id)); it != previous_annotations.end())
+        {
+            const auto field = fields_by_id.find(static_cast<Int32>(field_id));
+            if (field == fields_by_id.end()
+                || Iceberg::clickHouseTypeAnnotationFitsField(
+                    resolveClickHouseTypeAnnotation(it->second.type_name, /*allow_aggregate_function_states=*/ true),
+                    field->second->get(Iceberg::f_type),
+                    field->second->getValue<bool>(Iceberg::f_required)))
+                annotation = it->second.type_name;
+        }
+        Iceberg::setClickHouseTypeAnnotation(metadata_object, static_cast<Int32>(field_id), schema_id, annotation);
     }
 }
 
