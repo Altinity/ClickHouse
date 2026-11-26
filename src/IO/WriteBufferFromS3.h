@@ -86,6 +86,8 @@ private:
     bool completeMultipartUpload();
     void abortMultipartUpload();
     void tryToAbortMultipartUpload() noexcept;
+    /// Runs `on_upload_complete` at most once.
+    void notifyUploadComplete();
 
     S3::PutObjectRequest getPutRequest(PartData & data);
     void makeSinglepartUpload(PartData && data);
@@ -107,6 +109,7 @@ private:
     /// finalize barrier (happens-before), so no extra synchronization is needed.
     std::optional<String> object_etag;
     OnUploadComplete on_upload_complete;
+    bool upload_complete_notified = false;
     /// Set by the upload worker immediately before `PutObject` or `CompleteMultipartUpload`. A lost
     /// response can still have committed the object. Read after `waitAll` (happens-before).
     bool object_creation_request_sent = false;

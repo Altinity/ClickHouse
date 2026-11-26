@@ -206,8 +206,8 @@ void WriteBufferFromS3::preFinalize()
             /// With `max_inflight_parts_for_one_file` of 1, `TaskTracker::add` waits for the upload and
             /// rethrows its failure here, outside the `try` of `finalizeImpl`. A `PutObject` whose response
             /// was lost may have replaced the object, so drop the cached identity as `finalizeImpl` does.
-            if (object_creation_request_sent && on_upload_complete)
-                on_upload_complete();
+            if (object_creation_request_sent)
+                notifyUploadComplete();
             throw;
         }
     }
@@ -263,19 +263,35 @@ void WriteBufferFromS3::finalizeImpl()
         /// request failed (a lost response is reported as an error). Drop the cached identity so the
         /// next read does not send the previous ETag. A part upload that failed before either request
         /// leaves `object_creation_request_sent` false: the visible object is unchanged.
-        if (object_creation_request_sent && on_upload_complete)
-            on_upload_complete();
+        if (object_creation_request_sent)
+            notifyUploadComplete();
         throw;
     }
 
-    if (on_upload_complete)
-        on_upload_complete();
+    notifyUploadComplete();
 }
 
 void WriteBufferFromS3::cancelImpl() noexcept
 {
     WriteBufferFromFileBase::cancelImpl();
     tryToAbortMultipartUpload();
+
+    /// A buffer cancelled after `preFinalize` can already have sent `PutObject` or `CompleteMultipartUpload`:
+    /// `tryToAbortMultipartUpload` waits for those tasks and drops their errors, so the object may have been
+    /// replaced. The wait has finished, so the flag written by the worker is visible here.
+    if (object_creation_request_sent)
+        notifyUploadComplete();
+}
+
+void WriteBufferFromS3::notifyUploadComplete()
+{
+    /// A failed `preFinalize` or `finalize` runs this before it propagates, and `finalize` then cancels the
+    /// buffer, which would run it again. Once is enough: no request is sent after the first call.
+    if (on_upload_complete && !upload_complete_notified)
+    {
+        upload_complete_notified = true;
+        on_upload_complete();
+    }
 }
 
 String WriteBufferFromS3::getVerboseLogDetails() const

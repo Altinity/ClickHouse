@@ -1174,6 +1174,45 @@ TEST_P(SyncAsync, ExceptionOnUploadPartWithOneInflightPartSkipsUploadCallback) {
     EXPECT_EQ(callbacks, 0u);
 }
 
+/// `preFinalize` can start `PutObject` (or schedule `CompleteMultipartUpload`) before the buffer is cancelled.
+/// `cancel` waits for that request, so the object may have been replaced and the upload callback must run.
+TEST_P(SyncAsync, CancelAfterPreFinalizeSinglePartRunsUploadCallback) {
+    size_t callbacks = 0;
+    auto buffer = getWriteBuffer("cancel_after_prefinalize_single_part", {}, [&]() { ++callbacks; });
+    buffer->write('A');
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->preFinalize();
+    buffer->cancel();
+
+    EXPECT_EQ(callbacks, 1u);
+}
+
+TEST_P(SyncAsync, CancelAfterPreFinalizeMultipartRunsUploadCallback) {
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0; // no single part
+    getSettings()[Setting::s3_min_upload_part_size] = 1; // small parts are ok
+
+    size_t callbacks = 0;
+    auto buffer = getWriteBuffer("cancel_after_prefinalize_multipart", {}, [&]() { ++callbacks; });
+    buffer->write('A');
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->preFinalize();
+    buffer->cancel();
+
+    EXPECT_EQ(callbacks, 1u);
+}
+
+/// No object-creating request was sent, so the visible object is unchanged and the cached identity must stay.
+TEST_P(SyncAsync, CancelBeforeAnyRequestSkipsUploadCallback) {
+    size_t callbacks = 0;
+    auto buffer = getWriteBuffer("cancel_before_any_request", {}, [&]() { ++callbacks; });
+    buffer->write('A');
+    buffer->cancel();
+
+    EXPECT_EQ(callbacks, 0u);
+}
+
 TEST_P(SyncAsync, ExceptionOnCompleteMPU) {
     setInjectionModel(std::make_shared<MockS3::CompleteMPUFailIngection>());
 
