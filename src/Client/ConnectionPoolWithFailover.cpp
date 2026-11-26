@@ -134,10 +134,11 @@ std::vector<IConnectionPool::Entry> ConnectionPoolWithFailover::getMany(
     PoolMode pool_mode,
     AsyncCallback async_callback,
     std::optional<bool> skip_unavailable_endpoints,
-    GetPriorityForLoadBalancing::Func priority_func)
+    GetPriorityForLoadBalancing::Func priority_func,
+    bool ping_pooled_connection)
 {
     TryGetEntryFunc try_get_entry = [&](const NestedPoolPtr & pool, std::string & fail_message)
-    { return tryGetEntry(pool, timeouts, fail_message, settings, nullptr, async_callback); };
+    { return tryGetEntry(pool, timeouts, fail_message, settings, nullptr, async_callback, ping_pooled_connection); };
 
     std::vector<TryResult> results = getManyImpl(settings, pool_mode, try_get_entry, skip_unavailable_endpoints, priority_func);
 
@@ -251,12 +252,14 @@ ConnectionPoolWithFailover::tryGetEntry(
         std::string & fail_message,
         const Settings & settings,
         const QualifiedTableName * table_to_check,
-        [[maybe_unused]] AsyncCallback async_callback)
+        [[maybe_unused]] AsyncCallback async_callback,
+        bool ping_pooled_connection)
 {
 #if defined(OS_LINUX)
     if (async_callback)
     {
-        ConnectionEstablisherAsync connection_establisher_async(pool, &timeouts, settings, log, table_to_check);
+        ConnectionEstablisherAsync connection_establisher_async(
+            pool, &timeouts, settings, log, table_to_check, ping_pooled_connection);
         while (true)
         {
             connection_establisher_async.resume();
@@ -277,7 +280,7 @@ ConnectionPoolWithFailover::tryGetEntry(
     }
 #endif
 
-    ConnectionEstablisher connection_establisher(pool, &timeouts, settings, log, table_to_check);
+    ConnectionEstablisher connection_establisher(pool, &timeouts, settings, log, table_to_check, ping_pooled_connection);
     TryResult result;
     connection_establisher.run(result, fail_message);
     return result;

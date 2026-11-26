@@ -48,6 +48,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int UNKNOWN_FORMAT_VERSION;
 }
 
@@ -441,9 +442,9 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
         << "THE CRUX: the sha256 blob must be condemned by the fold -- a silent-leak regression (a "
            "reverted CasGc.cpp codec.fromHex port) leaves this at 0";
 
-    /// previewDeletes streams the SAME adopted seal via the run's own SourceEdgeKeyCodec (never pool
-    /// meta) and must report exactly our blob, at its real 32-byte digest.
-    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    /// previewDeletes streams the SAME adopted seal from the run's own rows (never pool meta) and must
+    /// report exactly our blob, at its real 32-byte digest.
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
     ASSERT_EQ(preview.size(), 1u) << "THE CRUX: previewDeletes must surface the condemned sha256 blob";
     EXPECT_EQ(preview[0].ref, id);
     EXPECT_EQ(preview[0].key, blob_key);
@@ -671,7 +672,7 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     runRegularRoundReclaiming(gc);   /// folds both -1s: both transition to zero
 
     /// The fold condemns exactly the two OWN blobs -- never the foreign object.
-    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
     ASSERT_EQ(preview.size(), 2u);
     std::unordered_set<BlobRef, BlobRefHash> condemned_refs;
     for (const auto & p : preview)
@@ -742,20 +743,20 @@ TEST(CASPoolMetaFloor, RaiseMinReaderGenerationIsMonotone)
 /// ============================================================================================
 /// CAS reader-generation gate (`CasFormat.h`'s `G_BUILD`). This test's assertions read `G_BUILD`
 /// itself rather than a hardcoded generation number, so a future bump does not silently make them
-/// false. A new pool starts at `G_REF_MOVE`, and hash admission never raises it past the
+/// false. A new pool starts at `G_BLOB_INTENTS`, and hash admission never raises it past the
 /// algorithm's own requirement. `decodePoolMeta` fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
 /// `compatibility_version` is below the format-generation baseline (see `CasPoolMetaFormat.cpp`).
-TEST(CASPluggableHash, ReaderGenerationFloorIsGenerationTwoAndGatesFailClosed)
+TEST(CASPluggableHash, ReaderGenerationFloorIsTheMountFloorAndGatesFailClosed)
 {
-    /// A new pool is stamped at generation 2, not at the build's read ceiling.
+    /// A new pool is stamped at the mount floor.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_MOVE);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_BLOB_INTENTS);
 
         const auto meta_bytes = readAt(*backend, store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_REF_MOVE);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_BLOB_INTENTS);
     }
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
     /// THIS build's floor) fails closed at open -- the startup gate (`decodePoolMeta`) rejects it.
@@ -764,8 +765,13 @@ TEST(CASPluggableHash, ReaderGenerationFloorIsGenerationTwoAndGatesFailClosed)
         const Layout layout("p");
         OperationForTest meta_op(*backend);
         PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
-        pm.min_reader_generation = G_BUILD + 1;
-        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), encodePoolMeta(pm), (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
+        /// Edited at the text layer: the encoder refuses a meta at generation 4 or above that has no token dialect.
+        String future_bytes = encodePoolMeta(pm);
+        const String floor_field = "\"min_reader_generation\":" + std::to_string(pm.min_reader_generation);
+        const auto floor_at = future_bytes.find(floor_field);
+        ASSERT_NE(floor_at, String::npos);
+        future_bytes.replace(floor_at, floor_field.size(), "\"min_reader_generation\":" + std::to_string(G_BUILD + 1));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), future_bytes, (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
 
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
@@ -844,11 +850,12 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
     runRegularRoundReclaiming(gc);   /// folds both +1s
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/2, "tbl_sh");
-    runRegularRoundReclaiming(gc);   /// folds both -1s: both condemned in the same round
+    const RoundReport condemning = runRegularRoundReclaiming(gc);   /// folds both -1s: both condemned in the same round
+    EXPECT_EQ(condemning.intent_confirmed, 2u) << "both algos' intents must be confirmed in the condemning round";
 
     /// previewDeletes covers BOTH refs from the adopted seal -- never just one algo.
     {
-        const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+        const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
         ASSERT_EQ(preview.size(), 2u);
         std::unordered_set<BlobRef, BlobRefHash> refs;
         for (const auto & p : preview)
@@ -857,21 +864,15 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
         EXPECT_TRUE(refs.count(sh.ref));
     }
 
-    /// Drive the round-paced pipeline to actual physical deletion: the fold condemned both at its
-    /// round; the VERY NEXT round graduates them (unconditionally, round-paced); the round after that
-    /// executes the exact-token delete for both.
+    /// The condemning round created both intents; the next round deletes both bodies.
+    EXPECT_TRUE(existsAt(*backend, ch_key));   // pending: still present after the condemning round
+    EXPECT_TRUE(existsAt(*backend, sh_key));
     {
         const RoundReport rep1 = runRegularRoundReclaiming(gc);
-        EXPECT_EQ(rep1.graduated, 2u) << "both algos' blobs must graduate together in one round";
-        EXPECT_TRUE(existsAt(*backend, ch_key));   // pending: still present this pass
-        EXPECT_TRUE(existsAt(*backend, sh_key));
-    }
-    {
-        const RoundReport rep2 = runRegularRoundReclaiming(gc);
-        EXPECT_EQ(rep2.redeleted, 2u) << "both algos' pending deletes must execute together in one round";
+        EXPECT_EQ(rep1.bodies_deleted, 2u) << "both algos' pending deletes must execute together in one round";
     }
 
-    /// THE CRUX: after graduation the backend holds ZERO blob bodies of EITHER algo.
+    /// THE CRUX: after the body deletes the backend holds ZERO blob bodies of EITHER algo.
     EXPECT_FALSE(existsAt(*backend, ch_key)) << "the ch128 blob must be physically reclaimed";
     EXPECT_FALSE(existsAt(*backend, sh_key)) << "the sha256 blob must be physically reclaimed";
 
@@ -903,7 +904,9 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 
     /// SAME 16-byte digest VALUE under two different algos -- deliberately NOT derived from either
     /// body's real content hash: the crux under test is identity distinctness (the pair), not hash
-    /// correctness (already covered by the sha256/xxh3 write-path tests above).
+    /// correctness (already covered by the sha256/xxh3 write-path tests above). A streamed
+    /// publication refuses a payload that does not hash to its key, so both bodies and their clean
+    /// markers are planted directly and `putBlob` adopts them.
     const BlobDigest shared_digest = BlobDigest::fromU128(UInt128(0xC0FFEE));
     const BlobRef ref_ch{BlobHashAlgo::CityHash128, shared_digest};
     const BlobRef ref_xx{BlobHashAlgo::XXH3_128, shared_digest};
@@ -917,6 +920,18 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 
     const RootNamespace ns{"srv1/tbl"};
 
+    const auto plantBlob = [&](const BlobRef & ref, const std::string & payload)
+    {
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.incarnation_tag = UInt128(0x1234);
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobKey(ref),
+            encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload, Retry::standard())));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobMetaKey(ref),
+            encodeBlobMetaForTest(BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()}), Retry::standard())));
+    };
+
     PartWriteInfo info_a;
     info_a.intended_ref = ns.string() + "/part_a";
     auto build_a = store->beginPartWrite(info_a);
@@ -924,6 +939,7 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     e_a.path = "a.bin"; e_a.placement = EntryPlacement::Blob; e_a.ref = ref_ch; e_a.blob_size = body_ch.size();
     const ManifestId mid_a = build_a->stageManifest({e_a});
     build_a->precommitAdd(ns, "part_a", mid_a);
+    ASSERT_NO_FATAL_FAILURE(plantBlob(ref_ch, body_ch));
     build_a->putBlob(ref_ch, BlobSource::fromString(body_ch));
     build_a->promote(ns, "part_a", build_a->buildId(), mid_a);
 
@@ -934,6 +950,7 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     e_b.path = "b.bin"; e_b.placement = EntryPlacement::Blob; e_b.ref = ref_xx; e_b.blob_size = body_xx.size();
     const ManifestId mid_b = build_b->stageManifest({e_b});
     build_b->precommitAdd(ns, "part_b", mid_b);
+    ASSERT_NO_FATAL_FAILURE(plantBlob(ref_xx, body_xx));
     build_b->putBlob(ref_xx, BlobSource::fromString(body_xx));
     build_b->promote(ns, "part_b", build_b->buildId(), mid_b);
     store->renewWatermarkOnce();
@@ -988,4 +1005,43 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(frep.clean());
     EXPECT_EQ(frep.dangling, 0u);
+}
+
+/// A streamed body that does not hash to its key under the pool's own algorithm is refused.
+TEST(CASPluggableHash, WrongDigestIsRefusedForXxh3AndSha256)
+{
+    for (const BlobHashAlgo algo : {BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
+    {
+        SCOPED_TRACE(static_cast<int>(algo));
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_hash_algo = algo});
+        const RootNamespace ns{"srv1/tbl"};
+        const std::string payload = makeMultiBlockPayload();
+        std::string wrong = payload;
+        wrong[wrong.size() / 2] ^= 1;
+        const BlobRef id{algo, codecFor(algo).fromHex(blobHashHexOneShot(algo, payload))};
+
+        const auto precommitted = [&](const String & part)
+        {
+            PartWriteInfo info;
+            info.intended_ref = ns.string() + "/" + part;
+            auto build = store->beginPartWrite(info);
+            ManifestEntry e;
+            e.path = "data.bin";
+            e.placement = EntryPlacement::Blob;
+            e.ref = id;
+            e.blob_size = payload.size();
+            build->precommitAdd(ns, part, build->stageManifest({e}));
+            return build;
+        };
+
+        auto refused = precommitted("refused");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { refused->putBlob(id, BlobSource::fromString(wrong)); });
+        EXPECT_FALSE(existsAt(*backend, store->layout().blobKey(id)));
+
+        /// Positive control: the true payload lands at the same key.
+        auto accepted = precommitted("accepted");
+        accepted->putBlob(id, BlobSource::fromString(payload));
+        EXPECT_TRUE(existsAt(*backend, store->layout().blobKey(id)));
+    }
 }

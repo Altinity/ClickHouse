@@ -1,0 +1,4 @@
+<clickhouse>
+    <cas_log remove="1"/>
+    <cas_gc_log remove="1"/>
+</clickhouse>

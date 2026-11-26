@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <string>
@@ -8,6 +9,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Formats/FormatFactory.h>
 #include <Databases/DataLake/Common.h>
+#include <Databases/DataLake/ICatalog.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/CompressionMethod.h>
 #include <Interpreters/FileCache/FileSegment.h>
@@ -160,23 +162,7 @@ static bool isCurrentManifestListAboveThreshold(
 {
     LoggerPtr log = getLogger("IcebergCompaction::isCurrentManifestListAboveThreshold");
 
-    if (!metadata_object->has(Iceberg::f_current_snapshot_id))
-        return false;
-    Int64 current_snapshot_id = metadata_object->getValue<Int64>(Iceberg::f_current_snapshot_id);
-    if (current_snapshot_id < 0)
-        return false;
-
-    String current_manifest_list_path;
-    auto snapshots = metadata_object->get(Iceberg::f_snapshots).extract<Poco::JSON::Array::Ptr>();
-    for (size_t i = 0; i < snapshots->size(); ++i)
-    {
-        const auto snapshot = snapshots->getObject(static_cast<UInt32>(i));
-        if (snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == current_snapshot_id)
-        {
-            current_manifest_list_path = snapshot->getValue<String>(Iceberg::f_manifest_list);
-            break;
-        }
-    }
+    String current_manifest_list_path = getCurrentManifestListPath(metadata_object);
     if (current_manifest_list_path.empty())
         return false;
 
@@ -217,7 +203,7 @@ static Plan getPlan(
         persistent_table_components.metadata_compression_method);
 
     Poco::JSON::Object::Ptr initial_metadata_object
-        = getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        = deepCopy(getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid));
 
     /// Exactly version 2: v1 lacks the sequence-number machinery the rewrite relies on, and
     /// a v3 table must not be accepted either -- writeMetadataFiles rebuilds the metadata
@@ -500,6 +486,7 @@ static bool writeConsolidatedManifestFile(
     const DataLakeStorageSettings & data_lake_settings,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
+    const String & raw_catalog_metadata_location,
     ExternalStorageCache & external_storages)
 {
     auto log = getLogger("IcebergManifestConsolidation");
@@ -832,9 +819,21 @@ static bool writeConsolidatedManifestFile(
     /// Parallel to consolidated_manifest_paths: each manifest's partition fields (value + type), used to recompute the manifest-list `partitions` summary.
     std::vector<std::vector<std::pair<Field, DataTypePtr>>> entry_partition_summaries;
 
+    /// Whether the new snapshot may be visible to readers: through the metadata file and version hint
+    /// in storage, or through the catalog pointer. From then on the new manifests and manifest list may be
+    /// referenced by the current snapshot, so they must never be deleted: an orphaned file is harmless,
+    /// a deleted live one makes the table unreadable.
+    bool published = false;
+
     /// Cleanup for both commit conflict and exceptions; paths are tracked before writeObject so partially-created objects are removed (removeObjectIfExists tolerates missing objects).
     auto cleanup = [&]()
     {
+        if (published)
+        {
+            LOG_INFO(log, "Not removing the new manifest files: the new snapshot may already be visible");
+            return;
+        }
+
         for (const auto & mp : consolidated_manifest_paths)
         {
             try
@@ -983,9 +982,7 @@ static bool writeConsolidatedManifestFile(
 
         // Commit: write metadata file with If-None-Match + ETag-based CAS version hint; returns false if another writer claimed this version, so the caller retries.
         {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata_object, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
+            std::string json_representation = stringifyJSON(metadata_object, 4);
 
             auto hint_path = generator.generateVersionHint();
             LOG_INFO(log, "Committing metadata file: {}",
@@ -1009,15 +1006,30 @@ static bool writeConsolidatedManifestFile(
                 return false;
             }
 
+            /// From here on the new snapshot may be live: through the metadata file and version hint in storage,
+            /// or through a catalog request that may have landed even if it is reported as failed.
+            published = true;
+
             /// Advance the catalog pointer to the new metadata so catalog-based readers see the compacted snapshot.
+            /// `updateMetadataIfCurrent` applies the update only if the catalog still points at the base:
+            /// REST through the update requirements, Glue by comparing the location and sending `UpdateTable`
+            /// with the `VersionId` of that same read.
             if (catalog)
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot.snapshot, context->getForwardedAuthToken()))
+                if (!catalog->updateMetadataIfCurrent(
+                        namespace_name, table_name, catalog_filename, new_snapshot.snapshot, raw_catalog_metadata_location,
+                        context->getForwardedAuthToken()))
                 {
-                    LOG_INFO(log, "Metadata commit conflict detected via catalog, cleaning up temporary files");
-                    cleanup();
+                    /// A catalog reports both a lost race and a request whose outcome is unknown (a timeout or
+                    /// a 5xx response) as a rejection, so the snapshot may still be live: the files stay.
+                    /// The retry reads the current metadata from the catalog: if this commit landed, there is
+                    /// nothing left to compact, otherwise it compacts again on top of the current snapshot.
+                    LOG_WARNING(
+                        log,
+                        "Catalog did not accept manifest compaction snapshot {}; files written by this attempt were left in place",
+                        new_snapshot.snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id));
                     return false;
                 }
             }
@@ -1536,26 +1548,12 @@ void compactIcebergManifests(
         if (attempt > 0)
             LOG_INFO(log, "Retrying manifest compaction (attempt {}/{})", attempt + 1, MAX_COMPACTION_RETRIES);
 
-        const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
-            object_storage_,
-            persistent_table_components.table_path,
-            data_lake_settings,
-            persistent_table_components.metadata_cache,
-            context_,
-            log.get(),
-            persistent_table_components.table_uuid,
-            persistent_table_components.metadata_compression_method,
-            /* force_fetch_latest_metadata */ true,
-            /* ignore_explicit_metadata_file_path */ true);
-
-        auto metadata_object = getMetadataJSONObject(
-            metadata_file_path,
-            object_storage_,
-            persistent_table_components.metadata_cache,
-            context_,
-            log,
-            persistent_table_components.metadata_compression_method,
-            persistent_table_components.table_uuid);
+        /// With a catalog, the catalog names the current metadata file. Listing the storage instead may pick the
+        /// metadata of another table that shares the location, or miss a commit that is visible only in the catalog.
+        /// The new version is above every file in the directory, so a file left by an attempt whose catalog
+        /// update was rejected does not make every later attempt collide with it.
+        const auto [metadata_version, metadata_object, catalog_metadata_location, raw_catalog_metadata_location, metadata_file_path]
+            = readLatestMetadata(persistent_table_components, object_storage_, data_lake_settings, context_, catalog, table_id, log);
 
         /// Validate the format version on the freshly-fetched metadata (before the threshold early-return), since the table may have been upgraded to v3 by another writer after this table object was created.
         const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
@@ -1591,6 +1589,7 @@ void compactIcebergManifests(
                 data_lake_settings,
                 catalog,
                 table_id,
+                raw_catalog_metadata_location,
                 external_storages))
         {
             // Invalidate metadata cache so the next reader picks up the new state

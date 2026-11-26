@@ -135,12 +135,11 @@ class CIDB:
                     break
 
         # Build failure pattern filter line
-        # NOTE (strtgbb): our db does not have test_context_raw column
-        # if matched_pattern:
-        #     failure_filter = f"    AND test_context_raw LIKE '%{matched_pattern}%'"
-        # else:
-        #     # Add commented placeholder for manual editing
-        #     failure_filter = "    -- AND test_context_raw LIKE '%pattern%'  -- uncomment and edit to filter by failure pattern"
+        if matched_pattern:
+            failure_filter = f"    AND test_context_raw LIKE '%{matched_pattern}%'"
+        else:
+            # Add commented placeholder for manual editing
+            failure_filter = "    -- AND test_context_raw LIKE '%pattern%'  -- uncomment and edit to filter by failure pattern"
 
         # Build PR filter based on pr_base_branches parameter
         if pr_base_branches:
@@ -172,6 +171,7 @@ WHERE (now() - toIntervalDay(interval_days)) <= check_start_time
     -- AND check_name = '{jn}'
     AND test_status IN ('FAIL', 'ERROR')
 {pr_filter}
+{failure_filter}
 GROUP BY day
 ORDER BY day DESC
 """

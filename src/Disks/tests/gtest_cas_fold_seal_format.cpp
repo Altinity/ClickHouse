@@ -1,4 +1,5 @@
 #include "cas_format_test_battery.h"
+#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <limits>
@@ -95,7 +96,7 @@ TEST(CASFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut
         RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .key_generation = 7},
         RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .key_generation = 7}};
     seal.condemned_summary[0] = CondemnedSummary{};
-    EXPECT_DEATH({ validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
+    CAS_EXPECT_DEATH({ validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
 }
 #else
 TEST(CASFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)

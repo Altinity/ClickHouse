@@ -3,6 +3,7 @@
 #include <pcg_random.hpp>
 #include <Common/randomSeed.h>
 
+#include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Functions/FunctionsLogical.h>
 #include <Functions/IFunctionAdaptors.h>
 
@@ -54,6 +55,8 @@
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/stripQuerySettings.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -441,10 +444,10 @@ or (object_storage_cluster_join_mode='global')
 void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     ASTPtr & query_to_send,
     SelectQueryInfo query_info,
-    const ContextPtr & context)
+    const ContextPtr & context,
+    QueryTreeNodePtr * resolved_query_tree)
 {
-    auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
-    switch (object_storage_cluster_join_mode)
+    switch (context->getSettingsRef()[Setting::object_storage_cluster_join_mode])
     {
     case ObjectStorageClusterJoinMode::LOCAL: /// Legacy alias of `allow`
     case ObjectStorageClusterJoinMode::ALLOW:
@@ -453,7 +456,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
         if (!needsInitiatorLocalJoin(info))
             return;
 
-        rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+        rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context, resolved_query_tree);
         return;
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
@@ -464,7 +467,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             if (queryHasRightOrFullJoin(query_to_send))
             {
                 auto info = getQueryJoinInfoFromAST(query_to_send);
-                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context, resolved_query_tree);
             }
             return;
         }
@@ -690,7 +693,8 @@ void IStorageCluster::read(
         /// The remote may resolve OSC, fall back locally, or use its own OSC when local OSC is empty.
         updateConfigurationIfNeeded(context);
         updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
-        updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
+        updateQueryToSendIfNeeded(
+            query_to_send, storage_snapshot, context, /*make_cluster_function=*/false, /*add_structure_and_format=*/true);
 
         /// ENGINE tables keep object_storage_cluster on the storage, not in the initiator query context.
         /// Propagate it into the context copied for remote() so the remote sees the same OSC as alt-syntax.
@@ -723,14 +727,50 @@ void IStorageCluster::read(
     storage_snapshot->check(column_names);
 
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
+    ///
+    /// The header must match what the shard returns for `query_to_send`. The shard re-analyzes that AST and
+    /// numbers `__tableN` from 1, so both cases below renumber a clone of the resolved tree and avoid a second
+    /// catalog resolution:
+    /// 1. A join stays on the initiator and `query_to_send` was rewritten: use the rewritten left-scan tree.
+    /// 2. `query_to_send` is unchanged: use the original resolved tree. `FetchColumns` plans it directly,
+    ///    and higher stages use `getHeaderForProcessingStage`.
 
     SharedHeader sample_block;
 
-    updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
+    /// A join kept on the initiator replaces `query_to_send` but already has a resolved left-scan tree.
+    QueryTreeNodePtr resolved_query_tree;
+    updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context, &resolved_query_tree);
 
     if (settings[Setting::allow_experimental_analyzer])
     {
-        sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
+        /// Re-analyzing the shard AST resolves a `DataLakeCatalog` table again and repeats a remote catalog lookup.
+        if (canReuseResolvedQueryTreeForHeader() && resolved_query_tree)
+        {
+            /// The rewritten left scan keeps the outer alias (`__table2` when this table is not leftmost).
+            /// A shard re-analyzes the sent AST and `createUniqueAliasesIfNecessary` restarts at `__table1`.
+            auto header_tree = resolved_query_tree->clone();
+            createUniqueAliasesIfNecessary(header_tree, context);
+            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(
+                header_tree, context, SelectQueryOptions(processed_stage));
+        }
+        else if (canReuseResolvedQueryTreeForHeader() && query_to_send == query_info.query && query_info.query_tree)
+        {
+            /// A shard re-analyzes this query and `createUniqueAliasesIfNecessary` restarts `__tableN` at 1.
+            /// The resolved tree still has the outer alias (`__table2` when this table is not leftmost).
+            auto query_info_for_header = query_info;
+            query_info_for_header.query_tree = query_info.query_tree->clone();
+            createUniqueAliasesIfNecessary(query_info_for_header.query_tree, context);
+            /// A `SECONDARY_QUERY` is planned only to `FetchColumns`. `getHeaderForProcessingStage` then
+            /// returns snapshot names (`symbol`), while the shard interpreter returns `__table1.symbol`.
+            /// Planning the resolved tree keeps those identifiers and does not resolve the catalog again.
+            if (processed_stage == QueryProcessingStage::FetchColumns)
+                sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(
+                    query_info_for_header.query_tree, context, SelectQueryOptions(processed_stage));
+            else
+                sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info_for_header, context, processed_stage);
+        }
+        else
+            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
     }
     else
     {
@@ -739,7 +779,8 @@ void IStorageCluster::read(
         query_to_send = interpreter.getQueryInfo().query->clone();
     }
 
-    updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ true);
+    updateQueryToSendIfNeeded(
+        query_to_send, storage_snapshot, context, /*make_cluster_function=*/true, /*add_structure_and_format=*/true);
 
     /// In case the current node is not supposed to initiate the clustered query
     /// Sends this query to a remote initiator using the `remote` table function
@@ -813,6 +854,69 @@ void IStorageCluster::read(
         cluster,
         log,
         external_tables);
+
+    query_plan.addStep(std::move(reading));
+}
+
+ASTPtr IStorageCluster::getTableFunctionToSend(
+    const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks)
+{
+    /// Reuse `updateQueryToSendIfNeeded` with a query containing only this table.
+    auto select_query = make_intrusive<ASTSelectQuery>();
+    select_query->replaceDatabaseAndTable(getStorageID());
+    ASTPtr query = select_query;
+    /// A `SELECT` is sent, so every node needs the structure and format to produce the initiator's header.
+    updateQueryToSendIfNeeded(
+        query, storage_snapshot, context, /*make_cluster_function=*/read_initiator_file_tasks, /*add_structure_and_format=*/true);
+
+    auto table_function = extractTableFunctionASTPtrFromSelectQuery(query);
+    if (!table_function)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Storage {} of table {} has no table function to send", getName(), getStorageID().getNameForLogs());
+    return table_function;
+}
+
+bool IStorageCluster::canDispatchToCluster(ContextPtr context) const
+{
+    return !resolveClusterRead(context).fallback_to_pure;
+}
+
+/// The planner has already prepared the query and its header.
+void IStorageCluster::readPreparedClusterQuery(
+    QueryPlan & query_plan,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    QueryProcessingStage::Enum processed_stage,
+    ASTPtr query_to_send,
+    SharedHeader sample_block,
+    std::shared_ptr<const ActionsDAG> driver_filter)
+{
+    /// Honors `object_storage_cluster_fallback_to_local_if_empty` like an ordinary read. A dispatch is
+    /// only built for a cluster that is not read locally (see `canDispatchToCluster`).
+    auto resolved = resolveClusterRead(context);
+    if (resolved.fallback_to_pure)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Whole-query dispatch for table {} that is read locally", getStorageID().getNameForLogs());
+
+    ClusterPtr cluster = resolved.object_storage_cluster;
+    if (!cluster)
+        cluster = getClusterImpl(
+            context, getClusterName(context), isObjectStorage() ? context->getSettingsRef()[Setting::object_storage_max_nodes] : 0);
+
+    std::optional<Tables> external_tables = std::nullopt;
+    if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
+        external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
+
+    auto reading = std::make_unique<ReadFromClusterQuery>(
+        sample_block,
+        std::static_pointer_cast<IStorageCluster>(shared_from_this()),
+        storage_snapshot,
+        context,
+        std::move(query_to_send),
+        processed_stage,
+        cluster,
+        log,
+        std::move(external_tables),
+        std::move(driver_filter));
 
     query_plan.addStep(std::move(reading));
 }
@@ -909,14 +1013,25 @@ SinkToStoragePtr IStorageCluster::write(
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
 }
 
-void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+namespace
 {
-    const Scalars & scalars = context->hasQueryContext() ? context->getQueryContext()->getScalars() : Scalars{};
-    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
 
-    Pipes pipes;
-    auto new_context = updateSettings(context->getSettingsRef());
+/// Shared transport for `ReadFromCluster` and `ReadFromClusterQuery`.
+/// Each replica acts as a shard with one connection; all replicas share the file-task iterator.
+Pipe buildClusterFunctionRemotePipe(
+    const ASTPtr & query_to_send,
+    const SharedHeader & output_header,
+    const ContextPtr & new_context,
+    const ClusterPtr & cluster,
+    QueryProcessingStage::Enum processed_stage,
+    const RemoteQueryExecutor::Extension & extension,
+    const std::optional<Tables> & external_tables,
+    LoggerPtr log)
+{
+    const Scalars & scalars = new_context->hasQueryContext() ? new_context->getQueryContext()->getScalars() : Scalars{};
+    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
     const auto & current_settings = new_context->getSettingsRef();
+
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
 
     size_t replica_index = 0;
@@ -924,10 +1039,9 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
 
-    createExtension();
-
     ProfileEvents::increment(ProfileEvents::Shards, max_replicas_to_use);
 
+    Pipes pipes;
     for (const auto & shard_info : cluster->getShardsInfo())
     {
         if (pipes.size() >= max_replicas_to_use)
@@ -935,12 +1049,22 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
 
         /// We're taking all replicas as shards,
         /// so each shard will have only one address to connect to.
+        ///
+        /// A remote shard is pinged before the pooled connection is used. `ReplicasAsShards` gives
+        /// this server's own address a real TCP pool too, and `isLocal` is how that shard is told
+        /// apart: pinging it cannot discover a dead peer. A remote peer that stopped without
+        /// closing the socket otherwise stays in the pipeline and the query waits for
+        /// `receive_timeout`. No `Pong` within `sync_request_timeout` drops that socket and opens
+        /// one new connection. The handshake on that connection is capped by `sync_request_timeout`.
+        const bool ping_pooled_connection = !shard_info.isLocal();
         auto try_results = shard_info.pool->getMany(
             timeouts,
             current_settings,
             PoolMode::GET_ONE,
             {},
-            /*skip_unavailable_endpoints=*/true);
+            /*skip_unavailable_endpoints=*/true,
+            /*priority_func=*/{},
+            ping_pooled_connection);
 
         if (try_results.empty())
             continue;
@@ -950,14 +1074,14 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
         auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
             std::vector<IConnectionPool::Entry>{try_results.front()},
             query_to_send->formatWithSecretsOneLine(),
-            getOutputHeader(),
+            output_header,
             new_context,
             /*throttler=*/nullptr,
             scalars,
             external_tables.has_value() ? *external_tables : Tables(),
             processed_stage,
             nullptr,
-            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)},
+            RemoteQueryExecutor::Extension{.task_iterator = extension.task_iterator, .replica_info = std::move(replica_info)},
             shard_info.pool);
 
         remote_query_executor->setLogger(log);
@@ -973,11 +1097,78 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (pipes.empty())
         throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "Cannot connect to any replica for query execution");
 
-    auto pipe = Pipe::unitePipes(std::move(pipes));
+    return Pipe::unitePipes(std::move(pipes));
+}
+
+}
+
+void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = updateSettings(context->getSettingsRef());
+
+    /// The query-text half of resetting the setting in `updateSettings`: a worker applies the query's own
+    /// SETTINGS clause on top of the settings it received. Drops both `name = value` and `name = DEFAULT`
+    /// and detaches a clause left empty, which would otherwise be sent as a bare `SETTINGS`.
+    static constexpr std::string_view dispatch_only_setting_names[] = {"allow_object_storage_cluster_distributed_join"};
+    removeSettingsFromQuery(query_to_send, dispatch_only_setting_names);
+
+    createExtension();
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, *extension, external_tables, log);
+
     for (const auto & processor : pipe.getProcessors())
         processors.emplace_back(processor);
 
     pipeline.init(std::move(pipe));
+}
+
+ContextPtr ReadFromClusterQuery::createRemoteContext() const
+{
+    auto remote_context = Context::createCopy(context);
+
+    /// Initiator-only settings such as `limit` would cut each worker's partial result, as in `ReadFromCluster`.
+    Settings settings = remote_context->getSettingsCopy();
+    ClusterProxy::stripInitiatorOnlySettings(settings);
+
+    /// A worker runs the dispatched query as sent and must not dispatch it again. Not sending the setting
+    /// also keeps a worker that does not know it from rejecting the settings.
+    settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
+    remote_context->setSettings(settings);
+
+    /// Cluster table functions should always skip unavailable shards.
+    remote_context->setSetting("skip_unavailable_shards", true);
+
+    /// Partners read locally. Only the driver's explicit `*Cluster` function consumes the initiator's file tasks.
+    remote_context->setSetting("object_storage_cluster", String{});
+
+    return remote_context;
+}
+
+void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = createRemoteContext();
+
+    /// The planner supplies a predicate over the driver's columns for file pruning.
+    const ActionsDAG::Node * predicate = driver_filter ? driver_filter->getOutputs().front() : nullptr;
+    auto extension = driver_storage->getTaskIteratorExtension(
+        predicate, driver_filter.get(), new_context, cluster, driver_snapshot->metadata);
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, extension, external_tables, log);
+
+    for (const auto & processor : pipe.getProcessors())
+        processors.emplace_back(processor);
+
+    pipeline.init(std::move(pipe));
+}
+
+void ReadFromClusterQuery::describeActions(FormatSettings & format_settings) const
+{
+    std::string prefix(format_settings.offset, format_settings.indent_char);
+    format_settings.out << prefix << "Cluster: " << cluster->getName() << '\n';
+    format_settings.out << prefix << "File tasks from: " << driver_storage->getStorageID().getNameForLogs() << '\n';
+    format_settings.out << prefix << "Query: " << query_to_send->formatForLogging() << '\n';
 }
 
 IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context)
@@ -1060,7 +1251,8 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
     ASTPtr & query_to_send,
     const SelectQueryInfo & query_info,
     const QueryTreeInfo & info,
-    const ContextPtr & context)
+    const ContextPtr & context,
+    QueryTreeNodePtr * resolved_query_tree)
 {
     /// Analyzer path: reuse `extractLeftTableExpression` and `buildQueryToReadColumnsFromTableExpression`
     /// (same helpers the planner uses when wrapping `IStorageCluster` in a subquery).
@@ -1101,6 +1293,9 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         auto & rewritten_query_node = rewritten_query_tree->as<QueryNode &>();
         rewritten_query_node.getPrewhere() = query_node.getPrewhere();
         rewritten_query_node.getWhere() = query_node.getWhere();
+
+        if (resolved_query_tree)
+            *resolved_query_tree = rewritten_query_tree;
 
         query_to_send = queryNodeToDistributedSelectQuery(rewritten_query_tree);
         return;
@@ -1205,7 +1400,7 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
-    auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
+    const auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     const auto join_info = getQueryJoinInfo(query_info, context);
     /// `global` still fetches columns for `RIGHT`/`FULL`/`PASTE`: those joins stay on the initiator.
     const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
@@ -1253,6 +1448,10 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// to the remote servers, where they would re-shape the per-shard subquery a second time or
     /// break it (e.g. `format = 'Null'`). This mirrors the `Distributed` fan-out.
     ClusterProxy::stripInitiatorOnlySettings(new_settings);
+
+    /// Whole-query dispatch is decided on the initiator. Workers neither need the setting nor, if they
+    /// predate it, recognize it.
+    new_settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);

@@ -21,6 +21,7 @@ SETTINGS non_replicated_deduplication_window = 100, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
+    cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_04285',
     name = '${CLICKHOUSE_DATABASE}_04285_cas_deduplication',
     path = '${CLICKHOUSE_DATABASE}_04285_cas_deduplication_pool/');

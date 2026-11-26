@@ -49,7 +49,9 @@ public:
 
     /// Reads a manifest like `readManifest` but returns the immutable shared decode. This preserves
     /// the cache's value on the part-folder path and avoids copying all manifest entries on success.
-    std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
+    /// `OnMemoryLimit::Propagate` fails a cold read at once when its GET hits the memory limit.
+    std::shared_ptr<const PartManifest> readManifestShared(
+        const ManifestId & id, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
 
     /// Computes the object key and payload window for a `Blob` entry without performing I/O. An
     /// `Inline` entry, or any unsupported placement value, throws `BAD_ARGUMENTS` because it has no

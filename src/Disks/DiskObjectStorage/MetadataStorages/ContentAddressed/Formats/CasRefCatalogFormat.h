@@ -48,7 +48,8 @@ NsState nsStateFromWord(std::string_view w);
 /// the writer epoch and admission fence generation captured at the moment `Creating` was minted. It
 /// is what a reconciler compares against `CasServerRoot`'s liveness/fence machinery before a stalled
 /// `Creating` entry may be CAS-reconciled away (INV-3: "stalled creators occupy entries until
-/// fence-terminal reconciliation").
+/// fence-terminal reconciliation"). The one exception is the creator itself: the mount holding this
+/// exact fence may cancel its own row while no admission of the name is in flight there.
 struct CreatorFence
 {
     String server_root_id;

@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include <base/defines.h>
+#include <base/scope_guard.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
@@ -13,6 +14,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
@@ -20,13 +22,18 @@
 
 #include <Poco/Exception.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -60,16 +67,21 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int NETWORK_ERROR;
 extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int LOGICAL_ERROR;
+extern const int ABORTED;
 }
 
 namespace ProfileEvents
 {
     extern const Event CASRelinkConfirmRefusedRefMutationInFlight;
     extern const Event CASRelinkConfirmRefusedLaneWedged;
+    extern const Event CASRelinkConfirmRefusedSlotUnreadable;
     extern const Event CASRelinkConfirmRefusedLaneBroken;
     extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
+    extern const Event CASRelinkConfirmRefusedSlotMoved;
+    extern const Event CASRelinkConfirmRefusedStateLockBusy;
 }
 
 using namespace DB::Cas;
@@ -320,7 +332,7 @@ ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const S
 }
 
 /// Every request `CountingBackend` observes, summed: reads, heads, stream opens, writes, lists,
-/// deletes and publications. The zero-I/O contract is asserted against this total, so a confirm that
+/// deletes and publications. The no-request expectations are asserted against this total, so a confirm that
 /// quietly grew any one of them fails the test rather than the review. `writeTotal` and not `putTotal`:
 /// a write that carried a precondition is still a write, and counting only the create-shaped ones left
 /// the replace path unwatched.
@@ -361,6 +373,36 @@ void armOneShotInstallFailure(const PoolPtr & store)
 
 }
 
+
+/// The remote relink confirm does not wait for the table's state lock: asked while another thread holds it
+/// (here a commit inside its install region), it answers `Unknown` at once and counts `StateLockBusy`.
+TEST(CASConfirmExactRef, TryLockAnswersUnknownWhileTheStateLockIsHeld)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_state_lock_busy"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    std::optional<ConfirmAnswer> answer_while_held;
+    uint64_t busy_refusals = 0;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([&, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        const uint64_t before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy);
+        std::thread([&] { answer_while_held = store->confirmExactRef(ns, "x", id.ref); }).join();
+        busy_refusals = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy) - before;
+    });
+    SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
+
+    publishEmptyPart(store, ns, "y");
+    ASSERT_TRUE(fired->load()) << "the install region never ran";
+    EXPECT_EQ(answer_while_held, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    EXPECT_EQ(busy_refusals, 1u);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "positive control: the lock is free again";
+}
 
 /// Rule 5, the affirmative case: a warm, quiescent, `Ready`, fenced table whose committed row for
 /// the ref names EXACTLY the asked-about manifest answers `Yes`. Its two negatives share the test
@@ -709,7 +751,8 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
     EXPECT_EQ(unknown_for_second_carved_ref_at_boundary.load(), boundaries.load())
         << "rule 3 must scan the whole carved mirror: 'bbb_' is its second entry and has no committed "
            "row, so a rule that examined only the front entry would answer No here";
-    EXPECT_EQ(requests_at_boundary.load(), 0) << "the mid-tenure confirm must still be I/O-free";
+    EXPECT_EQ(requests_at_boundary.load(), boundaries.load())
+        << "only the seed's Yes may issue a request, and only its one mount-slot read";
 
     /// The tenure is over: the seed ref confirms as before.
     EXPECT_EQ(store->confirmExactRef(ns, "seed", id.ref), ConfirmAnswer::Yes);
@@ -911,7 +954,7 @@ TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
     RefOp add;
     add.kind = RefOpKind::OwnerTransition;
     add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000003, 1, 1}};
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         store->appendRefOps(ns, MutationScope::ref("x"),
                             [add](const RefTableState &) { return std::vector<RefOp>{add}; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
@@ -919,7 +962,7 @@ TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
 
     RefOp remove_namespace;
     remove_namespace.kind = RefOpKind::RemoveNamespace;
-    EXPECT_DEATH({
+    CAS_EXPECT_DEATH({
         store->appendRefOps(ns, MutationScope::ref("x"),
                             [remove_namespace](const RefTableState &) { return std::vector<RefOp>{remove_namespace}; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
@@ -1278,7 +1321,7 @@ TEST(CASConfirmExactRefDeathTest, MoveOpsOutsideTheirScopeFailTheFlushCheckAbort
     move.kind = RefOpKind::OwnerTransition;
     move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", id_a.ref};
     move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "c", id_a.ref};
-    EXPECT_DEATH(store->appendRefOps(ns, MutationScope::refs("a", "b"),
+    CAS_EXPECT_DEATH(store->appendRefOps(ns, MutationScope::refs("a", "b"),
                                      [move](const RefTableState &) { return std::vector<RefOp>{move}; },
                                      RootMutationOrigin::Writer, RootMutationKind::Move),
                  "names ref 'c'");
@@ -1729,4 +1772,1382 @@ TEST(CASConfirmExactRef, StorageConfirmIsUnknownWhenTheDiskCannotSpeakForItsView
     storage->shutdown();
     EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
               DB::CasConfirmAnswer::Unknown);
+}
+
+
+/// The relink sender serves a remote query, so it must not wait for the table's state lock: asked while a commit
+/// holds it in its install region, it answers `Unknown` and counts `StateLockBusy`.
+TEST(CASConfirmExactRef, StorageConfirmAnswersUnknownWhileTheStateLockIsHeld)
+{
+    auto storage = makeExchangeStorage("test");
+    storage->startup();
+    commitExchangePart(*storage);
+    const DB::CasRelinkSourceToken token = readSourceToken(*storage);
+    const PoolPtr store = storage->store();
+
+    std::promise<DB::CasConfirmAnswer> answer;
+    auto answer_future = answer.get_future();
+    std::thread confirmer;
+    SCOPE_EXIT({ if (confirmer.joinable()) confirmer.join(); });
+    std::optional<DB::CasConfirmAnswer> answer_while_held;
+    uint64_t busy_refusals = 0;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([&, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        const uint64_t before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy);
+        confirmer = std::thread([&]
+        {
+            answer.set_value(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text));
+        });
+        /// Bounded so that a confirm waiting for this lock fails the assertions below instead of deadlocking;
+        /// short enough that the commit still has lease budget left afterwards.
+        if (answer_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready)
+            answer_while_held = answer_future.get();
+        busy_refusals = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy) - before;
+    });
+    SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
+
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    auto buf = ca_tx.writeFile(kExchangeTableDir + "/tmp_insert_all_2_2_0/data.bin", 65536, DB::WriteMode::Rewrite, {});
+    const std::string bytes = "a second part of the same table";
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+    tx->moveDirectory(kExchangeTableDir + "/tmp_insert_all_2_2_0", kExchangeTableDir + "/all_2_2_0");
+    tx->commit(DB::NoCommitOptions{});
+    ASSERT_TRUE(fired->load()) << "the install region never ran";
+    confirmer.join();
+
+    EXPECT_EQ(answer_while_held, std::optional<DB::CasConfirmAnswer>(DB::CasConfirmAnswer::Unknown))
+        << "the relink sender waited for the state lock";
+    EXPECT_EQ(busy_refusals, 1u);
+    EXPECT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Yes) << "positive control: the lock is free again";
+    storage->shutdown();
+}
+
+
+/// ---------------------------------------------------------------------------------------------
+/// The mount-slot read on the way to `Yes`
+/// ---------------------------------------------------------------------------------------------
+///
+/// A successor can claim this mount's lease slot while the local fence still says live (a frozen VM
+/// clock). The ledger answers from memory, so only a read of the slot itself can see the takeover.
+
+namespace
+{
+
+/// Fires `before_read` once, just before the next read of `watched_key`, `after_read` once, just after
+/// the next read of it is served, and `after_write` once, just after the next landed write of it. Each
+/// hook is moved out before it runs, so it may itself read or write the key.
+class MountSlotProbeBackend : public CountingBackend
+{
+public:
+    String watched_key;
+    std::function<void()> before_read;
+    std::function<void()> after_read;
+    std::function<void()> after_write;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == watched_key)
+            fire(before_read);
+        auto result = CountingBackend::read(key, access);
+        if (key == watched_key)
+            fire(after_read);
+        return result;
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        auto result = CountingBackend::write(key, bytes, expected_value, access);
+        if (key == watched_key && result.has_value())
+            fire(after_write);
+        return result;
+    }
+
+private:
+    static void fire(std::function<void()> & hook)
+    {
+        if (!hook)
+            return;
+        auto once = std::move(hook);
+        hook = nullptr;
+        once();
+    }
+};
+
+String mountSlotKey(const PoolPtr & store)
+{
+    return store->layout().mountKey("test");
+}
+
+/// Rewrite the slot the way another actor would: a conditional replace that mints a new ETag.
+void rewriteMountSlot(DB::Cas::Backend & backend, const String & key, const std::function<void(MountLease &)> & change)
+{
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const std::optional<Object> current = op.read(key, Retry::standard());
+    ASSERT_TRUE(current.has_value());
+    MountLease lease = decodeMountLease(current->bytes);
+    change(lease);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(key, encodeMountLease(lease), current->etag, Retry::standard())));
+}
+
+uint64_t slotMovedCount()
+{
+    return refusalCount(ProfileEvents::CASRelinkConfirmRefusedSlotMoved);
+}
+
+uint64_t slotUnreadableCount()
+{
+    return refusalCount(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+}
+
+/// Runs `while_parked` while a renewal of ours has landed in the slot and its response is held back.
+/// The renewal is released and joined on every exit, so a failing assertion cannot strand the thread.
+void whileRenewalLandedUnanswered(MountSlotProbeBackend & backend, const PoolPtr & store,
+                                  const std::function<void()> & while_parked)
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool landed = false;
+    bool release = false;
+    backend.watched_key = mountSlotKey(store);
+    backend.after_write = [&]
+    {
+        std::unique_lock lock(mutex);
+        landed = true;
+        cv.notify_all();
+        cv.wait(lock, [&]
+        {
+            return release;
+        });
+    };
+    std::thread renewal([&]
+    {
+        try
+        {
+            store->renewWatermarkOnce();
+        }
+        catch (...)
+        {
+            ADD_FAILURE() << "the renewal threw: " << DB::getCurrentExceptionMessage(false);
+        }
+    });
+    SCOPE_EXIT({
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+        renewal.join();
+        backend.after_write = nullptr;
+    });
+
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(20), [&]
+        {
+            return landed;
+        })) << "the renewal never wrote the slot";
+    }
+    while_parked();
+}
+
+}
+
+TEST(CASConfirmExactRef, ForeignClaimWhileFenceLiveAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_foreign"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease) { lease.server_uuid += 1; });
+    ASSERT_TRUE(store->mayMutate()) << "the local fence must still say live, or the fence answers instead";
+
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+}
+
+/// Our `(server_uuid, writer_epoch)` in a body this renewer did not write: only the ETag tells it apart.
+TEST(CASConfirmExactRef, SamePairNewAttemptAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_same_pair"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease) { lease.write_attempt_id += 1; });
+
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+}
+
+TEST(CASConfirmExactRef, SlotDeletedAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_deleted"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(*backend);
+    CasOperation op = requests.admit();
+    ASSERT_EQ(op.removeCurrent(mountSlotKey(store), Retry::standard()), Removal::Removed);
+
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+}
+
+/// The slot moves after the ledger snapshot: the read must be issued after the snapshot, never served
+/// from an earlier observation. A slot read moved before the snapshot would still see our own body and
+/// answer `Yes`, which is why the rewrite runs at the snapshot boundary rather than at the next read.
+TEST(CASConfirmExactRef, SlotMovedBetweenSnapshotAndGetAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_moved_late"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    const String key = mountSlotKey(store);
+    bool moved = false;
+    uint64_t slot_reads_before_boundary = 0;
+    backend->resetCounts();
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        slot_reads_before_boundary = backend->getCount(key);
+        rewriteMountSlot(*backend, key, [](MountLease & lease)
+        {
+            lease.server_uuid += 1;
+        });
+        moved = true;
+    });
+
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+    ASSERT_TRUE(moved);
+    EXPECT_EQ(slot_reads_before_boundary, 0u) << "the slot was read before the ledger snapshot";
+}
+
+/// A remount between the ledger snapshot and the slot read installs a new renewer whose slot is
+/// genuinely ours, but the snapshot came from the discarded incarnation's table.
+TEST(CASConfirmExactRef, RemountBetweenSnapshotAndGetAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_remount"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    const String key = mountSlotKey(store);
+    const uint64_t epoch_before = store->liveWriterEpoch();
+    bool remounted = false;
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        rewriteMountSlot(*backend, key, [](MountLease & lease)
+        {
+            lease.gc_fenced = true;
+            lease.seq += 1;
+        });
+        remounted = store->tryRemountOnce();
+    });
+
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+    ASSERT_TRUE(remounted) << "the remount must complete inside the window";
+    ASSERT_NE(store->liveWriterEpoch(), epoch_before);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+
+    ASSERT_TRUE(store->resolveRef(ns, "x").has_value());
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+}
+
+/// A remount between the ownership capture and the ledger snapshot: the snapshot then comes from the
+/// new incarnation, but the captured ownership belongs to the old one and cannot hold the new slot.
+/// Capturing after the snapshot would validate the old snapshot against the new slot and answer `Yes`.
+TEST(CASConfirmExactRef, RemountBetweenCaptureAndSnapshotAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_capture_remount"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    const String key = mountSlotKey(store);
+    bool remounted = false;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&]
+    {
+        rewriteMountSlot(*backend, key, [](MountLease & lease)
+        {
+            lease.gc_fenced = true;
+            lease.seq += 1;
+        });
+        remounted = store->tryRemountOnce();
+        store->resolveRef(ns, "x");
+    });
+
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    store->setConfirmAfterOwnershipCaptureHookForTest(nullptr);
+    ASSERT_TRUE(remounted) << "the remount must complete inside the window";
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes)
+        << "the ledger alone answers Yes after the remount; only the slot check refuses";
+}
+
+/// GC fences the slot while our renewal's response is still pending. The fenced body keeps our pair and
+/// the in-flight `write_attempt_id`, but it revokes the lease.
+TEST(CASConfirmExactRef, GcFenceOverInFlightRenewalAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_fenced_inflight"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    std::optional<ConfirmAnswer> answer;
+    const uint64_t moved_before = slotMovedCount();
+    whileRenewalLandedUnanswered(*backend, store, [&]
+    {
+        rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease)
+        {
+            lease.gc_fenced = true;
+            lease.seq += 1;
+        });
+        answer = store->confirmExactRef(ns, "x", id.ref);
+    });
+
+    EXPECT_EQ(answer, ConfirmAnswer::Unknown);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+}
+
+/// A renewal of ours has landed and its response has not come back: the slot holds the in-flight
+/// attempt's body, whose ETag the renewer does not know yet. That is still ours.
+TEST(CASConfirmExactRef, OwnRenewInFlightAnswersYes)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_inflight"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    std::optional<ConfirmAnswer> answer;
+    whileRenewalLandedUnanswered(*backend, store, [&]
+    {
+        answer = store->confirmExactRef(ns, "x", id.ref);
+    });
+
+    EXPECT_EQ(answer, ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "and after the response";
+}
+
+TEST(CASConfirmExactRef, OwnSlotAnswersYesWithOneRead)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_own"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    backend->resetCounts();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+    EXPECT_EQ(backend->getCount(mountSlotKey(store)), 1u);
+    EXPECT_EQ(backendRequests(*backend), 1u) << "the slot read is the only request a Yes may cost";
+}
+
+/// A slot that cannot be read proves nothing. The pool throws, and the storage layer answers `Unknown`.
+TEST(CASConfirmExactRef, FailedSlotReadThrowsAndIsCounted)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_unreadable"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const String key = mountSlotKey(store);
+
+    const uint64_t moved_before = slotMovedCount();
+    const uint64_t unreadable_before = slotUnreadableCount();
+    backend->watched_key = key;
+    backend->before_read = []
+    {
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected slot read failure");
+    };
+    tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)store->confirmExactRef(ns, "x", id.ref);
+    });
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(*backend);
+    CasOperation op = requests.admit();
+    const std::optional<Object> original = op.read(key, Retry::standard());
+    ASSERT_TRUE(original.has_value());
+    const WriteResult garbled = op.replace(key, "not a mount lease", original->etag, Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Committed>(garbled));
+    tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)store->confirmExactRef(ns, "x", id.ref);
+    });
+    /// Put a decodable body back, so the pool's farewell at teardown meets an ordinary conflict.
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(key, original->bytes, std::get<Committed>(garbled).etag, Retry::standard())));
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 2u);
+    EXPECT_EQ(slotMovedCount() - moved_before, 0u) << "a failed read is not a moved slot";
+}
+
+namespace
+{
+
+/// A local object storage whose reads of one key fail with a transport exception that is not a
+/// `DB::Exception`, as an S3 client timeout does.
+class TimingOutReadObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::atomic<bool> armed{false};
+    String failing_key_suffix;
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        std::optional<size_t> read_hint,
+        bool use_external_buffer,
+        bool restrict_seek) const override
+    {
+        if (armed.load() && object.remote_path.ends_with(failing_key_suffix))
+            throw Poco::TimeoutException("injected slot read timeout");
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+};
+
+}
+
+/// The exchange contract says the confirm never throws. A transport exception on the slot read is a
+/// `Poco::Exception`, not a `DB::Exception`; the storage still answers `Unknown`, and the pool counts it.
+TEST(CASConfirmExactRef, StorageAnswersUnknownWhenTheSlotReadThrowsATransportException)
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path()
+        / ("ca_confirm_timeout_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    SCOPE_EXIT({ std::filesystem::remove_all(root); });
+    auto object_storage = std::make_shared<TimingOutReadObjectStorage>(
+        DB::LocalObjectStorageSettings("test", root.string(), /*read_only_=*/false));
+    auto settings = tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_confirm_exchange_scratch");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    commitExchangePart(*storage);
+    const DB::CasRelinkSourceToken token = readSourceToken(*storage);
+    ASSERT_EQ(storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text),
+              DB::CasConfirmAnswer::Yes);
+
+    object_storage->failing_key_suffix = storage->poolForTest()->layout().mountKey("test");
+    object_storage->armed = true;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    std::optional<DB::CasConfirmAnswer> answer;
+    try
+    {
+        answer = storage->confirmExactRef(token.root_namespace, kExchangePartName, token.manifest_ref_text);
+    }
+    catch (...)
+    {
+        ADD_FAILURE() << "the confirm threw: " << DB::getCurrentExceptionMessage(false);
+    }
+    object_storage->armed = false;
+
+    EXPECT_EQ(answer, DB::CasConfirmAnswer::Unknown);
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+    storage->shutdown();
+}
+
+/// The fence is lost after the ledger's `Yes`: the read is refused at admission, so nothing is sent.
+TEST(CASConfirmExactRef, FenceLostAfterTheSnapshotThrowsAndIsCounted)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_fence_lost_late"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        store->tripMountLost();
+    });
+    backend->resetCounts();
+    const uint64_t unreadable_before = slotUnreadableCount();
+    const uint64_t moved_before = slotMovedCount();
+    tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)store->confirmExactRef(ns, "x", id.ref);
+    });
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+
+    EXPECT_EQ(backend->getCount(mountSlotKey(store)), 0u) << "a refused admission must not send the GET";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+    EXPECT_EQ(slotMovedCount() - moved_before, 0u);
+}
+
+/// The lease runs out after the ledger's `Yes`: no budget is left for a read, so nothing is sent.
+TEST(CASConfirmExactRef, LeaseBudgetSpentAfterTheSnapshotThrowsAndIsCounted)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(1000);
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = [boot_ms]
+    {
+        return boot_ms->load();
+    };
+    auto store = openPoolWithConfig(backend, std::move(config));
+    const RootNamespace ns{"srv1/confirm_slot_budget_spent"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        boot_ms->fetch_add(10 * 60 * 1000);
+    });
+    backend->resetCounts();
+    const uint64_t unreadable_before = slotUnreadableCount();
+    tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)store->confirmExactRef(ns, "x", id.ref);
+    });
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+
+    EXPECT_EQ(backend->getCount(mountSlotKey(store)), 0u) << "no lease budget left means no GET";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+}
+
+/// Our farewell lands between the snapshot and the read: the body carries our pair but releases the slot.
+TEST(CASConfirmExactRef, FarewellAfterTheSnapshotAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_farewell"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    const String key = mountSlotKey(store);
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        rewriteMountSlot(*backend, key, [](MountLease & lease)
+        {
+            lease.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+            lease.seq += 1;
+        });
+    });
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+}
+
+/// A read-only pool installs no renewer and recovers the refs a writable mount wrote. Its ledger says
+/// `Yes`, but no slot proof exists, so the answer is `Unknown` and nothing is read.
+TEST(CASConfirmExactRef, NoRenewerAnswersUnknownWithoutARead)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto writer = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_no_renewer"};
+    const ManifestId id = publishEmptyPart(writer, ns, "x");
+
+    PoolConfig read_only_config{.pool_prefix = "p", .server_root_id = "test"};
+    read_only_config.read_only = true;
+    auto reader = openPoolWithConfig(backend, std::move(read_only_config));
+    ASSERT_TRUE(reader->resolveRef(ns, "x").has_value()) << "the read-only pool must have the table warm";
+
+    backend->resetCounts();
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(reader->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(backendRequests(*backend), 0u);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u) << "the ledger said Yes and the missing proof refused it";
+}
+
+/// A renewal commits after the `GET` is served and before `holds` runs: the body read carries the old
+/// ETag, so the confirm refuses a healthy mount. The refusal is safe; this pins that it happens.
+TEST(CASConfirmExactRef, RenewalCommittedBetweenGetAndCheckAnswersUnknown)
+{
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_slot_renewal_after_get"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
+
+    backend->watched_key = mountSlotKey(store);
+    bool renewed = false;
+    backend->after_read = [&]
+    {
+        store->renewWatermarkOnce();
+        renewed = true;
+    };
+    const uint64_t moved_before = slotMovedCount();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    ASSERT_TRUE(renewed);
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u);
+
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "the next confirm reads the new body";
+}
+
+namespace
+{
+
+/// Fails the next `failures_left` reads of `watched_key` with a transport timeout, as an S3 client does, and
+/// records the clock at every read of it, failed or served.
+class TimingOutSlotReadBackend : public CountingBackend
+{
+public:
+    String watched_key;
+    std::atomic<uint64_t> failures_left{0};
+    std::function<uint64_t()> now_ms;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == watched_key)
+        {
+            {
+                std::lock_guard lock(times_mutex);
+                read_times.push_back(now_ms());
+            }
+            if (failures_left.load() > 0)
+            {
+                failures_left.fetch_sub(1);
+                throw Poco::TimeoutException("injected slot read timeout");
+            }
+        }
+        return CountingBackend::read(key, access);
+    }
+
+    std::vector<uint64_t> slotReadTimes() const
+    {
+        std::lock_guard lock(times_mutex);
+        return read_times;
+    }
+
+private:
+    mutable std::mutex times_mutex;
+    std::vector<uint64_t> read_times;
+};
+
+constexpr uint64_t kSlotReadFailsForever = std::numeric_limits<uint64_t>::max();
+
+PoolPtr openPoolOnClock(const std::shared_ptr<TimingOutSlotReadBackend> & backend, tests::FakeClock & clock,
+                        std::chrono::milliseconds lease_ttl = std::chrono::milliseconds(30000))
+{
+    backend->now_ms = clock.nowFn();
+    PoolConfig config;
+    config.boot_ms_fn = clock.nowFn();
+    config.retry_sleep_fn = clock.sleepFn();
+    config.mount_lease_ttl_ms = lease_ttl;
+    return openPoolWithConfig(backend, std::move(config));
+}
+
+struct ConfirmOutcome
+{
+    std::optional<ConfirmAnswer> answer;
+    /// Empty when the confirm answered; -1 for an exception that is not a `DB::Exception`.
+    std::optional<int> error_code;
+    String error_message;
+};
+
+ConfirmOutcome confirmPinned(const PoolPtr & store, const CasRefLedger::PinnedResolution & pinned, const RootNamespace & ns,
+                             const ManifestId & id)
+{
+    ConfirmOutcome outcome;
+    try
+    {
+        outcome.answer = store->confirmPinnedRef(pinned.table, ns, "x", id.ref);
+    }
+    catch (const DB::Exception & e)
+    {
+        outcome.error_code = e.code();
+        outcome.error_message = e.message();
+    }
+    catch (...)
+    {
+        outcome.error_code = -1;
+        outcome.error_message = DB::getCurrentExceptionMessage(false);
+    }
+    return outcome;
+}
+
+}
+
+/// A copy confirms inside the user's statement, which has no retry of its own: one transport timeout on the
+/// slot read is reissued with a fresh read, not turned into the statement's failure.
+TEST(CASConfirmExactRef, CopyConfirmRetriesATransientSlotReadTimeout)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_copy_slot_transient"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = 1;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    EXPECT_EQ(backend->slotReadTimes().size(), 2u) << "one failed read, then one fresh read";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 0u);
+}
+
+/// A slot that stays unreadable proves nothing: after the retries the error propagates, counted once.
+TEST(CASConfirmExactRef, CopyConfirmPropagatesAPersistentSlotReadFailureCountedOnce)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_copy_slot_persistent"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    const uint64_t moved_before = slotMovedCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    backend->failures_left = 0;
+
+    EXPECT_FALSE(outcome.answer.has_value()) << "a confirm whose slot read failed must not answer";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::NETWORK_ERROR)) << outcome.error_message;
+    EXPECT_GT(backend->slotReadTimes().size(), 1u) << "the failure was retried before it propagated";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+    EXPECT_EQ(slotMovedCount() - moved_before, 0u) << "a failed read is not a moved slot";
+}
+
+/// The retries end at the deadline the confirm took at its start, not at a fresh window from the read: half the
+/// window is spent before the read, so a fresh window would keep reading past the caller's deadline.
+TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadAtTheCallersDeadline)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    /// A lease far longer than the window, so the policy deadline and not the lease ends the retries.
+    auto store = openPoolOnClock(backend, clock, std::chrono::minutes(10));
+    const RootNamespace ns{"srv1/confirm_copy_slot_deadline"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    const uint64_t window_ms = PoolConfig{}.cas_request_budget.request_window_ms;
+    const uint64_t deadline_ms = clock.now.load() + window_ms;
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        clock.now.fetch_add(window_ms / 2);
+    });
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    backend->failures_left = 0;
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+
+    EXPECT_FALSE(outcome.answer.has_value());
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::NETWORK_ERROR)) << outcome.error_message;
+    EXPECT_NE(outcome.error_message.find("policy deadline"), String::npos) << outcome.error_message;
+    const std::vector<uint64_t> times = backend->slotReadTimes();
+    ASSERT_GT(times.size(), 1u) << "the failure was retried";
+    EXPECT_LT(times.back(), deadline_ms) << "a read was sent at or after the caller's deadline";
+    /// The loop stops only when the next pause plus attempt no longer fits; a pause is at most 5000 ms.
+    EXPECT_GE(clock.now.load() + 5000 + backend->attemptEnvelopeMs(), deadline_ms) << "the retries stopped short of the deadline";
+}
+
+/// The confirm a peer asks for makes one attempt at the slot read: the peer times out and retries from its own queue.
+TEST(CASConfirmExactRef, PeerConfirmMakesOneAttemptAtTheSlotRead)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_peer_single_attempt"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    /// One attempt leaves the transport timeout as it came; a retrying policy would end in `NETWORK_ERROR`.
+    EXPECT_THROW((void)store->confirmExactRef(ns, "x", id.ref), Poco::TimeoutException);
+    backend->failures_left = 0;
+
+    EXPECT_EQ(backend->slotReadTimes().size(), 1u) << "the peer's confirm reissued the slot read";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+}
+
+namespace
+{
+
+/// A pool on `clock` whose mount-plane pauses advance it and then run `*on_pause`, so a test can change the store
+/// between two passes of a confirm. The pool has no background workers, so only the calling thread pauses.
+PoolPtr openPoolOnFakeClock(const BackendPtr & backend, tests::FakeClock & clock,
+                            const std::shared_ptr<std::function<void()>> & on_pause,
+                            std::chrono::milliseconds lease_ttl = std::chrono::minutes(10))
+{
+    PoolConfig config;
+    config.boot_ms_fn = clock.nowFn();
+    config.retry_sleep_fn = [advance = clock.sleepFn(), on_pause](uint64_t ms)
+    {
+        advance(ms);
+        if (*on_pause)
+            (*on_pause)();
+    };
+    config.mount_lease_ttl_ms = lease_ttl;
+    return openPoolWithConfig(backend, std::move(config));
+}
+
+/// A mutation scoped to `ref` that leaves its committed binding as it was: one precommit added and removed.
+void appendPrecommitPairNaming(const PoolPtr & store, const RootNamespace & ns, const String & ref)
+{
+    store->appendRefOps(ns, MutationScope::ref(ref),
+                        [ops = precommitAddRemovePairs(ref, 1, 900000101)](const RefTableState &) { return ops; },
+                        RootMutationOrigin::Writer, RootMutationKind::Publish);
+}
+
+uint64_t inFlightRefusals()
+{
+    return refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+}
+
+}
+
+/// Our own renewal lands after the store served the slot and before the ownership check: that pass answers `Unknown`.
+/// The copy's statement has no retry of its own, so the confirm asks again and the fresh pass reads the new body.
+TEST(CASConfirmExactRef, CopyConfirmReconfirmsWhenOwnRenewalLandsDuringTheSlotRead)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_renewal_during_read"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    backend->watched_key = mountSlotKey(store);
+    bool renewed = false;
+    backend->after_read = [&]
+    {
+        store->renewWatermarkOnce();
+        renewed = true;
+    };
+    const uint64_t moved_before = slotMovedCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    ASSERT_TRUE(renewed) << "positive control: the renewal landed inside the slot read";
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u) << "the first pass refused on the moved slot";
+    EXPECT_EQ(passes, 2u);
+}
+
+/// A mutation naming the source is queued: each pass refuses for it, and once it completes without changing the
+/// source's binding, the next pass confirms.
+TEST(CASConfirmExactRef, CopyConfirmReconfirmsOnceAMutationNamingTheSourceCompletes)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const RootNamespace ns{"srv1/confirm_copy_mutation_clears"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread appender([&] { appendPrecommitPairNaming(store, ns, "x"); });
+    SCOPE_EXIT({
+        *on_pause = nullptr;
+        latch.release();
+        if (appender.joinable())
+            appender.join();
+        store->setRefPreCarveHookForTest(nullptr);
+    });
+    latch.awaitEntered();
+
+    size_t pauses = 0;
+    *on_pause = [&]
+    {
+        if (++pauses != 2)
+            return;
+        latch.release();
+        appender.join();
+    };
+    const uint64_t in_flight_before = inFlightRefusals();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    EXPECT_EQ(inFlightRefusals() - in_flight_before, 2u) << "both passes before the mutation completed refused for it";
+    EXPECT_EQ(pauses, 2u);
+}
+
+/// The mutation stays queued: the confirm keeps asking until the deadline it took at its start and then refuses. It
+/// neither gives up while a pass still fits nor starts one that could not finish by the deadline.
+TEST(CASConfirmExactRef, CopyConfirmRefusesAtItsDeadlineWhileAMutationNamingTheSourceStaysQueued)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_mutation_stays"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread appender([&] { appendPrecommitPairNaming(store, ns, "x"); });
+    SCOPE_EXIT({
+        latch.release();
+        appender.join();
+        store->setRefPreCarveHookForTest(nullptr);
+    });
+    latch.awaitEntered();
+
+    std::vector<uint64_t> pass_times;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { pass_times.push_back(clock.now.load()); });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const uint64_t deadline_ms = clock.now.load() + store->poolConfig().cas_request_budget.request_window_ms;
+    const uint64_t in_flight_before = inFlightRefusals();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    const uint64_t answered_at = clock.now.load();
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    ASSERT_GT(pass_times.size(), 1u) << "the confirm did not ask again";
+    EXPECT_EQ(inFlightRefusals() - in_flight_before, pass_times.size()) << "every pass refused for the queued mutation";
+    EXPECT_LE(answered_at, deadline_ms) << "the confirm answered after its deadline";
+    EXPECT_GE(answered_at + backend->attemptEnvelopeMs(), deadline_ms) << "the confirm gave up while a pass still fit";
+    EXPECT_LT(pass_times.back() + backend->attemptEnvelopeMs(), deadline_ms) << "a pass started that could not finish";
+}
+
+/// `No` says the source is no longer the binding the copy read; no later pass can change that, so it is answered at once.
+TEST(CASConfirmExactRef, CopyConfirmAnswersNoAfterOnePass)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_no"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+    publishEmptyPart(store, ns, "x", /*replace=*/true);
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const uint64_t started_at = clock.now.load();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::No));
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(clock.now.load(), started_at) << "the confirm paused before answering No";
+}
+
+/// A lost mount fence retires the runtime the source was resolved on: its writes resume only under the generation it
+/// was admitted with, and every re-arm follows a remount that supersedes it. No later pass can confirm, so the copy
+/// confirm refuses after one.
+TEST(CASConfirmExactRef, CopyConfirmRefusesAfterOnePassOnceTheMountFenceIsLost)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_fence_lost"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+    store->tripMountLost();
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const uint64_t started_at = clock.now.load();
+    const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 1u);
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(clock.now.load(), started_at) << "the confirm waited on a runtime that can never confirm";
+}
+
+/// A source resolved before a remount is pinned to a runtime the remount replaced. No later pass can confirm on it,
+/// so the copy confirm refuses after one.
+TEST(CASConfirmExactRef, CopyConfirmRefusesAfterOnePassOnASourceResolvedBeforeARemount)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_remounted"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+    rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease)
+    {
+        lease.gc_fenced = true;
+        lease.seq += 1;
+    });
+    ASSERT_TRUE(store->tryRemountOnce());
+    const auto repinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(repinned.has_value());
+    ASSERT_EQ(confirmPinned(store, *repinned, ns, id).answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes))
+        << "positive control: the source itself is confirmable after the remount";
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const uint64_t started_at = clock.now.load();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(clock.now.load(), started_at) << "the confirm waited on a replaced runtime";
+}
+
+namespace
+{
+
+/// The first pass of a copy confirm reads the slot while this server's renewal lands, so the ledger's `Yes` turns into
+/// `Unknown`; `change_source` runs during the pause that follows. Returns the final outcome; `ledger_yes` counts the
+/// passes whose ledger snapshot said `Yes`.
+ConfirmOutcome confirmWhileTheSourceChangesDuringThePause(const RootNamespace & ns,
+                                                          const std::function<void(const PoolPtr &)> & change_source,
+                                                          size_t & passes, size_t & ledger_yes)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    EXPECT_TRUE(pinned.has_value());
+    if (!pinned)
+        return {};
+
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    store->setConfirmAfterLedgerSnapshotHookForTest([&] { ++ledger_yes; });
+    backend->watched_key = mountSlotKey(store);
+    bool renewed = false;
+    backend->after_read = [&]
+    {
+        if (renewed)
+            return;
+        renewed = true;
+        store->renewWatermarkOnce();
+    };
+    bool changed = false;
+    *on_pause = [&]
+    {
+        if (changed)
+            return;
+        changed = true;
+        change_source(store);
+    };
+    SCOPE_EXIT({
+        backend->after_read = nullptr;
+        *on_pause = nullptr;
+        store->setConfirmAfterOwnershipCaptureHookForTest(nullptr);
+        store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+    });
+    const uint64_t moved_before = slotMovedCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_TRUE(renewed) << "positive control: the renewal landed inside the first slot read";
+    EXPECT_TRUE(changed) << "positive control: the source changed during a pause";
+    EXPECT_EQ(slotMovedCount() - moved_before, 1u) << "the first pass refused on the moved slot";
+    return outcome;
+}
+
+/// A successor's tombstone takes the slot of the namespace's next ref-log record, so the next append closes the lane.
+void closeLaneBySuccessorTombstone(const PoolPtr & store, CountingBackend & backend, const RootNamespace & ns)
+{
+    const auto life = store->refTableLifeForTest(ns);
+    ASSERT_TRUE(life.has_value());
+    const uint64_t epoch = store->liveWriterEpoch();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    RefTxnId next{epoch, 1};
+    while (op.read(store->layout().refLogKey(*life, next), Retry::standard()))
+        ++next.ref_sequence;
+    const RefLogTxn tombstone = DB::Cas::tests::tombstoneTxn(ns.string(), next, epoch + 1);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+        store->layout().refLogKey(*life, next), sealObject(FormatId::RefLog, encodeRefLogTxn(tombstone)), Retry::once())));
+    EXPECT_THROW(publishEmptyPart(store, ns, "y"), DB::Exception);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
+}
+
+}
+
+/// The ledger said `Yes` and only the slot read refused; the source is dropped during the pause. The next pass must
+/// take a new ledger snapshot, which no longer has the row.
+TEST(CASConfirmExactRef, CopyConfirmAnswersNoWhenTheSourceIsDroppedAfterASlotRefusal)
+{
+    size_t passes = 0;
+    size_t ledger_yes = 0;
+    const RootNamespace ns{"srv1/confirm_copy_dropped_during_pause"};
+    const ConfirmOutcome outcome = confirmWhileTheSourceChangesDuringThePause(
+        ns, [&](const PoolPtr & store) { store->dropRef(ns, "x"); }, passes, ledger_yes);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::No));
+    EXPECT_EQ(passes, 2u);
+    EXPECT_EQ(ledger_yes, 1u) << "only the pass before the drop may see the source in the ledger";
+}
+
+/// As above, with the source re-pointed to another manifest during the pause.
+TEST(CASConfirmExactRef, CopyConfirmAnswersNoWhenTheSourceIsRepointedAfterASlotRefusal)
+{
+    size_t passes = 0;
+    size_t ledger_yes = 0;
+    const RootNamespace ns{"srv1/confirm_copy_repointed_during_pause"};
+    const ConfirmOutcome outcome = confirmWhileTheSourceChangesDuringThePause(
+        ns, [&](const PoolPtr & store) { publishEmptyPart(store, ns, "x", /*replace=*/true); }, passes, ledger_yes);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::No));
+    EXPECT_EQ(passes, 2u);
+    EXPECT_EQ(ledger_yes, 1u) << "only the pass before the re-point may see the source's manifest in the ledger";
+}
+
+/// Teardown begins while the confirm pauses between two passes: it fails with the teardown error before another pass.
+TEST(CASConfirmExactRef, CopyConfirmEndsWhenTeardownBeginsDuringThePause)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const RootNamespace ns{"srv1/confirm_copy_teardown_in_pause"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    const String slot_key = mountSlotKey(store);
+    backend->watched_key = slot_key;
+    bool renewed = false;
+    backend->after_read = [&]
+    {
+        if (renewed)
+            return;
+        renewed = true;
+        store->renewWatermarkOnce();
+    };
+    size_t pauses = 0;
+    uint64_t requests_at_teardown = 0;
+    uint64_t teardown_at = 0;
+    *on_pause = [&]
+    {
+        if (++pauses != 1)
+            return;
+        store->beginTeardown();
+        requests_at_teardown = backendRequests(*backend);
+        teardown_at = clock.now.load();
+    };
+    SCOPE_EXIT({
+        backend->after_read = nullptr;
+        *on_pause = nullptr;
+        store->setConfirmAfterOwnershipCaptureHookForTest(nullptr);
+    });
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    ASSERT_TRUE(renewed) << "positive control: the first pass refused on the moved slot and paused";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::ABORTED)) << outcome.error_message;
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(pauses, 1u);
+    EXPECT_EQ(backendRequests(*backend), requests_at_teardown) << "the confirm sent a request after teardown began";
+    EXPECT_EQ(clock.now.load(), teardown_at) << "the confirm waited after teardown began";
+}
+
+/// Teardown begins inside a pass whose ledger snapshot answers `Unknown` for a queued mutation: the confirm fails with
+/// the teardown error instead of pausing.
+TEST(CASConfirmExactRef, CopyConfirmEndsWithoutPausingWhenTeardownBeginsDuringAPass)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const RootNamespace ns{"srv1/confirm_copy_teardown_in_pass"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread appender([&] { appendPrecommitPairNaming(store, ns, "x"); });
+    SCOPE_EXIT({
+        latch.release();
+        if (appender.joinable())
+            appender.join();
+        store->setRefPreCarveHookForTest(nullptr);
+    });
+    latch.awaitEntered();
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&]
+    {
+        if (++passes == 1)
+            store->beginTeardown();
+    });
+    size_t pauses = 0;
+    *on_pause = [&] { ++pauses; };
+    SCOPE_EXIT({
+        *on_pause = nullptr;
+        store->setConfirmAfterOwnershipCaptureHookForTest(nullptr);
+    });
+    const uint64_t in_flight_before = inFlightRefusals();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    ASSERT_EQ(inFlightRefusals() - in_flight_before, 1u) << "positive control: the pass refused for the queued mutation";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::ABORTED)) << outcome.error_message;
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(pauses, 0u);
+}
+
+/// Teardown begins while the slot read is in flight and the read then serves a body this mount holds: a read
+/// finished after teardown began does not turn the ledger's `Yes` into the confirm's answer.
+TEST(CASConfirmExactRef, CopyConfirmEndsWhenTeardownBeginsDuringASlotReadThatHolds)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_teardown_in_slot_read"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    size_t ledger_yes = 0;
+    store->setConfirmAfterLedgerSnapshotHookForTest([&] { ++ledger_yes; });
+    backend->watched_key = mountSlotKey(store);
+    bool torn_down = false;
+    backend->after_read = [&]
+    {
+        store->beginTeardown();
+        torn_down = true;
+    };
+    SCOPE_EXIT({
+        backend->after_read = nullptr;
+        store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+    });
+    const uint64_t moved_before = slotMovedCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    ASSERT_TRUE(torn_down) << "positive control: teardown began inside the slot read";
+    EXPECT_EQ(ledger_yes, 1u) << "positive control: the ledger said Yes";
+    EXPECT_EQ(slotMovedCount() - moved_before, 0u) << "positive control: the slot still held this mount's body";
+    EXPECT_FALSE(outcome.answer.has_value()) << "the confirm answered after teardown began";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::ABORTED)) << outcome.error_message;
+}
+
+/// Teardown begins inside a slot read that times out: the read is not reissued, and the confirm fails with the
+/// teardown error.
+TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadOnceTeardownBegins)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<MountSlotProbeBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_teardown_in_slot_retry"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    backend->watched_key = mountSlotKey(store);
+    bool torn_down = false;
+    uint64_t requests_at_teardown = 0;
+    backend->before_read = [&]
+    {
+        store->beginTeardown();
+        torn_down = true;
+        requests_at_teardown = backendRequests(*backend);
+        throw Poco::TimeoutException("injected slot read timeout");
+    };
+    SCOPE_EXIT({ backend->before_read = nullptr; });
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    ASSERT_TRUE(torn_down) << "positive control: teardown began inside the slot read";
+    EXPECT_FALSE(outcome.answer.has_value()) << "the confirm answered after teardown began";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::ABORTED)) << outcome.error_message;
+    EXPECT_EQ(backendRequests(*backend), requests_at_teardown) << "the slot read was reissued after teardown began";
+}
+
+/// A lane closed by a successor's tombstone never reopens on this runtime, so the copy confirm refuses after one pass.
+TEST(CASConfirmExactRef, CopyConfirmRefusesAfterOnePassOnAClosedLane)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolOnFakeClock(backend, clock, std::make_shared<std::function<void()>>());
+    const RootNamespace ns{"srv1/confirm_copy_closed_lane"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+    closeLaneBySuccessorTombstone(store, *backend, ns);
+    if (HasFatalFailure())
+        return;
+
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const uint64_t started_at = clock.now.load();
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 1u);
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(clock.now.load(), started_at) << "the confirm waited on a closed lane";
+}
+
+/// A lane that needs recovery is recovered by the next reader of the table, on the same runtime: the copy confirm asks
+/// again and confirms.
+TEST(CASConfirmExactRef, CopyConfirmReconfirmsOnceALaneNeedingRecoveryRecovers)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const RootNamespace ns{"srv1/confirm_copy_needs_recovery"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+    armOneShotInstallFailure(store);
+    EXPECT_THROW(publishEmptyPart(store, ns, "other"), DB::Exception);
+    store->setInstallRegionProbeForTest(nullptr);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+
+    size_t pauses = 0;
+    *on_pause = [&]
+    {
+        if (++pauses == 1)
+            ASSERT_TRUE(store->resolveRef(ns, "x").has_value());
+    };
+    SCOPE_EXIT({ *on_pause = nullptr; });
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 1u);
+    EXPECT_EQ(pauses, 1u);
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 }

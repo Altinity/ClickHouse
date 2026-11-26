@@ -247,6 +247,10 @@ void IDisk::checkAccess()
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Server UUID is not initialized");
     const String path = fmt::format("clickhouse_access_check_{}", toString(server_uuid));
 
+    /// Disks created in parallel (`Context::getOrCreateDisk`) can share a backing store, and every
+    /// probe writes, reads and removes this one name: overlapping probes see each other's file.
+    static std::mutex probe_mutex;
+    std::lock_guard lock(probe_mutex);
     checkAccessImpl(path);
 }
 

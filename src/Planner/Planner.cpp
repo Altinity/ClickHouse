@@ -90,6 +90,8 @@
 #include <Planner/CollectSets.h>
 #include <Planner/CollectTableExpressionData.h>
 #include <Planner/findQueryForParallelReplicas.h>
+#include <Planner/findDistributedObjectStorageCandidate.h>
+#include <Planner/buildDistributedObjectStorageQueryPlan.h>
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/PlannerContext.h>
 #include <Planner/PlannerCorrelatedSubqueries.h>
@@ -115,6 +117,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsMap additional_table_filters;
+    extern const SettingsBool use_query_cache;
     extern const SettingsUInt64 aggregation_in_order_max_block_bytes;
     extern const SettingsUInt64 aggregation_memory_efficient_merge_threads;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
@@ -2313,7 +2316,8 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
             findQueryForParallelReplicas(query_tree, select_query_options),
             findTableForParallelReplicas(query_tree, select_query_options),
             findTableUnionForParallelReplicas(query_tree, select_query_options),
-            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
+            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_),
+            findDistributedObjectStorageCandidate(query_tree, select_query_options))))
 {
 }
 
@@ -2502,7 +2506,8 @@ static bool shouldUseQueryCacheForSubquery(
         for (const auto & change : query_node.getSettingsChanges())
         {
             if (change.name == "use_query_cache")
-                return change.value.safeGet<bool>();
+                /// The node's context holds the clause as clamped and applied; the literal may be a string such as `'true'`.
+                return query_node.getContext()->getSettingsRef()[Setting::use_query_cache];
         }
     }
 
@@ -2703,13 +2708,24 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
+    /// Repeated driver references can still prevent dispatch after CTE expansion.
+    std::optional<JoinTreeQueryPlan> dispatched_query_plan;
+    const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
+    if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)
+        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(
+            query_tree, *distributed_object_storage_candidate, select_query_info, select_query_options, planner_context);
+
+    if (dispatched_query_plan)
+    {
+        join_tree_query_plan = std::move(*dispatched_query_plan);
+    }
     /// With plan-based parallel replicas the planner builds a plain, normal local plan; distribution is
     /// applied later as a plan transformation (QueryPlanOptimizations::applyParallelReplicas). So skip the
     /// old parallel-replicas planning path here (it would emit ReadFromLocalReplica /
     /// ReadFromRemoteParallelReplicas, e.g. inside a view/union inner query) and use the normal plan.
     /// Same for a plan that is shipped to a shard: those steps are local to the server that planned
     /// them and have no serialized form, and the shard decides on parallel replicas on its own.
-    if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
+    else if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node
         && !settings[Setting::parallel_replicas_plan_based]
         && !select_query_options.build_logical_plan)

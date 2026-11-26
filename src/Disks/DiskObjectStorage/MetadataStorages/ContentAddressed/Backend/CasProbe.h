@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <base/types.h>
 
+#include <cstdint>
+
 namespace DB::Cas
 {
 
@@ -32,5 +34,19 @@ namespace DB::Cas
 /// the failure path immediately before the check-failing exception is rethrown. Cleanup itself suppresses
 /// exceptions so that it cannot hide the capability-check failure.
 void runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+
+class Layout;
+
+/// What the protocol needs under `blob-intents/`. A writer and `cas-fsck` need an exact `GET` of an absent key that
+/// answers absent, and a `LIST`; GC also creates with `If-None-Match` and deletes.
+enum class IntentPrefixRights : uint8_t
+{
+    Read,
+    ReadWrite,
+};
+
+/// Exercises `rights` under `Layout::blobIntentsProbePrefix`, which no intent key can name, and throws with a message
+/// that names the missing right. `Read` writes nothing. Its probe object is removed on every exit path.
+void runIntentPrefixProbe(CasOperation & op, const Layout & layout, IntentPrefixRights rights);
 
 }

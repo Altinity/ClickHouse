@@ -12,10 +12,12 @@
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <fmt/ranges.h>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -44,6 +46,8 @@ bool headExists(Backend & backend, const String & key)
 void seedConsumedSealCursor(InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns)
 {
     seedFoldCursorForTest(backend, layout, ns, RefTxnId{kWriterEpoch + 1, 1});
+    /// A fold cursor names a record GC read; without a snapshot above it, that record is still there.
+    fixture::writeRefLogRaw(backend, layout, RefLogTxn{ns.string(), RefTxnId{kWriterEpoch + 1, 1}, {}, std::nullopt});
 }
 
 /// The catalog cut and `_ckpt` are recovery's sole authority. A fixture that expects a catalog-named
@@ -58,11 +62,11 @@ void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
     ASSERT_NE(entry, catalog.catalog.entries.end());
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{kWriterEpoch},
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}), Retry::standard())));
+        .last_epoch_seal = std::nullopt}, 1), Retry::standard())));
 }
 
 /// Replaces the catalog row immediately before its second read after arming. The legacy orphan path
@@ -179,6 +183,72 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
+/// The decommission drain runs this on its admin pool: once that pool lost its mount, nothing is deleted.
+TEST(CASOrphanManifestSweep, LostMountDeletesNothing)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+    const ManifestRef r = ref(5, 0xAB);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
+    store->tripMountLost();
+
+    std::vector<String> warnings;
+    EXPECT_THROW(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings),
+                 DB::Exception);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+namespace
+{
+/// Runs `on_first_manifest_remove` once, inside the first delete of a manifest, after it applied.
+class HookOnFirstManifestRemoveBackend : public InMemoryBackend
+{
+public:
+    std::function<void()> on_first_manifest_remove;
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        const RawRemoval removed = InMemoryBackend::remove(key, expected_value, access);
+        if (on_first_manifest_remove && key.starts_with("p/cas/manifests/"))
+            std::exchange(on_first_manifest_remove, {})();
+        return removed;
+    }
+};
+}
+
+/// The mount is lost after the first delete: the walk stops at the first refused key instead of adding one
+/// warning per remaining key.
+TEST(CASOrphanManifestSweep, LostMountStopsTheWalkAtTheFirstRefusal)
+{
+    auto backend = std::make_shared<HookOnFirstManifestRemoveBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+    std::vector<String> keys;
+    for (const uint64_t ordinal : {0xABu, 0xACu, 0xADu, 0xAEu})
+    {
+        const ManifestRef r = ref(5, ordinal);
+        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+        keys.push_back(store->layout().manifestKey(ManifestId{ns, r}));
+    }
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
+    backend->on_first_manifest_remove = [&] { store->tripMountLost(); };
+
+    std::vector<String> warnings;
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings);
+
+    EXPECT_EQ(warnings.size(), 1u) << fmt::format("{}", fmt::join(warnings, "; "));
+    const auto kept = std::count_if(keys.begin(), keys.end(), [&](const String & key) { return headExists(*backend, key); });
+    EXPECT_GE(kept, 2);
+}
+
 /// The orphan sweep must not turn a forged same-id snapshot at an OLDER `EpochSeal` into an empty owner
 /// view. The base differs from `last_epoch_seal`, so metadata equality cannot catch it; the candidate
 /// remains retained until the checkpoint is repaired.
@@ -212,11 +282,11 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     applyRefLogTxn(through_seal, birth);
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1), Retry::standard())));
 
     const ManifestRef candidate = ref(5, 0xAC);
     const String candidate_key = layout.manifestKey(ManifestId{ns, candidate});
@@ -366,9 +436,15 @@ TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);
+    EXPECT_FALSE(result.wrapped);
+    ASSERT_FALSE(result.next_cursor.empty());
     const bool first_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r1}));
     const bool second_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r2}));
     EXPECT_NE(first_exists, second_exists);
+    const ManifestSweepResult continued = sweepManifestCursorPageForTest(*store, result.next_cursor, /*list_budget*/100, /*delete_budget*/1);
+    EXPECT_TRUE(continued.wrapped);
+    EXPECT_TRUE(continued.next_cursor.empty());
+    EXPECT_EQ(continued.deleted, 1u);
 }
 
 TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWithoutMountLease)
@@ -724,11 +800,11 @@ TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
         RefTxnId{6, 1});
     writeSealAt(*backend, store->layout(), ns, RefTxnId{7, 2});
     writeManifestRaw(*backend, store->layout(), ns, unowned, {blobEntryFor("unowned", DB::UInt128(0xA2))});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 2},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{7, 2}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{7, 2}}, 1), Retry::standard())));
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
     seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{2, 2});
 
@@ -781,11 +857,11 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
         .snapshot_id = RefTxnId{7, 1},
         .committed = {committedRow("phantom", phantom)},
         .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 1},
         .checkpoint_snapshot_id = RefTxnId{7, 1},
-        .last_epoch_seal = RefTxnId{6, 1}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{6, 1}}, 1), Retry::standard())));
 
     const ManifestRef victim{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, victim, {blobEntryFor("victim", DB::UInt128(0xC1))});
@@ -827,11 +903,11 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "absent-anchor", absent_anchor}, std::nullopt)});
     writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
         .ns = ns.string(), .snapshot_id = RefTxnId{3, 2}, .committed = {}, .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{3, 2},
         .checkpoint_snapshot_id = RefTxnId{3, 2},
-        .last_epoch_seal = cursor}), Retry::standard())));
+        .last_epoch_seal = cursor}, 1), Retry::standard())));
 
     const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, removed, {blobEntryFor("removed", DB::UInt128(0xC2))});
@@ -870,10 +946,10 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
 
-    EXPECT_FALSE(backend->didSwitch())
-        << "the sweep must not resolve a second catalog cut after it starts using the frozen entry";
+    EXPECT_TRUE(backend->didSwitch())
+        << "the catalog read after the walk confirms the frozen life and is the one that sees the new row";
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
-        << "the committed predecessor manifest must remain protected by the same frozen authority cut";
+        << "a replaced row is a removed life: the sweep deletes nothing for it";
 }
 
 /// The LIST-based late-log detector that lived here is RETIRED with the sentinel seal, and it is worth
@@ -892,3 +968,320 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
 /// injection and FLIPS its assertion: from "the detection fired" to "the fence held" -- the late PUT's
 /// conditional create must LOSE to the occupied slot, with zero data loss and the namespace folding
 /// normally.
+
+namespace
+{
+
+/// Writes chain records by exact key at a chosen header generation, since a forward-linked chain
+/// carries headers a plain encode would not stamp.
+struct ChainSweepFixture
+{
+    Backend & backend;
+    const Layout & layout;
+    RootNamespace ns;
+    NamespaceLifeId life = fixture::fixtureLife(ns);
+
+    ChainSweepFixture(Backend & backend_, const Layout & layout_, RootNamespace ns_)
+        : backend(backend_), layout(layout_), ns(std::move(ns_))
+    {
+        fixture::admitLive(backend, layout, ns);
+        OperationForTest op(backend);
+        life = *CasRefCatalog::lifeIfCataloged(*op, layout, ns);
+    }
+
+    void put(RefTxnId id, std::vector<RefOp> ops, std::optional<RefTxnId> backlink = std::nullopt,
+             std::optional<uint64_t> next_epoch = std::nullopt)
+    {
+        RefLogTxn txn{ns.string(), id, std::move(ops), backlink};
+        txn.next_epoch = next_epoch;
+        OperationForTest op(backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.refLogKey(life, id),
+            sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, G_REF_CHAIN)), Retry::once())));
+    }
+
+    void tombstone(RefTxnId id, uint64_t next_epoch) { put(id, {epochSealOp()}, std::nullopt, next_epoch); }
+
+    void ckpt(uint64_t life_epoch, std::optional<RefTxnId> snapshot = std::nullopt)
+    {
+        OperationForTest op(backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.refCkptKey(life),
+            encodeRefCkptAtGeneration(refCkptOf(life_epoch, std::nullopt, snapshot), G_REF_CHAIN), Retry::once())));
+    }
+
+    void snapshot(const RefTableState & state) { writeRefSnapshotRaw(backend, layout, snapshotOf(state, ns.string())); }
+
+    String logKey(RefTxnId id) const { return layout.refLogKey(life, id); }
+    String manifestKey(const ManifestRef & m) const { return layout.manifestKey(ManifestId{ns, m}); }
+
+    void eraseCatalogRow()
+    {
+        OperationForTest op(backend);
+        CasRefCatalog::Snapshot current = CasRefCatalog::read(*op, layout);
+        std::erase_if(current.catalog.entries, [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        ASSERT_TRUE(current.etag.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(current.catalog), *current.etag, Retry::standard())));
+    }
+
+    void removeKey(const String & key)
+    {
+        OperationForTest op(backend);
+        const auto head = (*op).head(key, Retry::once());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+    }
+};
+
+/// Built in epoch 1 and published in a later epoch, so a cursor in epoch 2 satisfies the premise's
+/// epoch rule and only the tail protection can keep these bodies.
+const ManifestRef kChainM1{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
+const ManifestRef kChainM2{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 2};
+const BuildPrefix kChainPrefix{.writer_epoch = 1, .build_sequence = 5};
+
+std::vector<RefOp> birthPublishing(const String & ref_name, const ManifestRef & m)
+{
+    std::vector<RefOp> ops{namespaceBirthOp()};
+    for (const RefOp & op : publishCommittedOps(ref_name, m))
+        ops.push_back(op);
+    return ops;
+}
+
+RefOp removing(const String & ref_name, const ManifestRef & m)
+{
+    return ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, ref_name, m}, std::nullopt);
+}
+
+}
+
+TEST(CASOrphanManifestSweep, RemovalAboveTheCursorAcrossASkippedEpochStaysProtected)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-skipped-epoch@cas@"});
+    f.put({2, 1}, birthPublishing("a", kChainM1));
+    f.tombstone({2, 2}, 5);
+    f.put({5, 1}, {removing("a", kChainM1)}, RefTxnId{2, 2});
+    f.ckpt(2);
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM1, {blobEntryFor("a", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 1});
+
+    EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 0u);
+    EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM1)));
+
+    /// Control: an unowned body of another build of the same epoch is deleted under the same cursor.
+    const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 4, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, f.layout, f.ns, unowned, {blobEntryFor("u", DB::UInt128(2))});
+    EXPECT_EQ(sweepNamespace(*store, f.ns, BuildPrefix{.writer_epoch = 1, .build_sequence = 4}), 1u);
+}
+
+TEST(CASOrphanManifestSweep, RemovalWalkDoesNotTrustAReclaimedCursorKey)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-reclaimed-cursor@cas@"});
+    /// Cleanup removed `{2,1}` and the tombstone `{2,2}` below the snapshot `{5,2}`; a stray that
+    /// removes nothing landed in the tombstone's slot.
+    f.put({2, 2}, {});
+    f.put({5, 1}, {removing("a", kChainM1)}, RefTxnId{2, 2});
+    f.put({5, 2}, {});
+    RefTableState state;
+    applyRefLogTxn(state, RefLogTxn{f.ns.string(), RefTxnId{2, 1}, birthPublishing("a", kChainM1), std::nullopt});
+    applyRefLogTxn(state, tombstoneTxn(f.ns.string(), RefTxnId{2, 2}, 5));
+    applyRefLogTxn(state, RefLogTxn{f.ns.string(), RefTxnId{5, 1}, {removing("a", kChainM1)}, RefTxnId{2, 2}});
+    applyRefLogTxn(state, RefLogTxn{f.ns.string(), RefTxnId{5, 2}, {}, std::nullopt});
+    f.snapshot(state);
+    f.ckpt(2, RefTxnId{5, 2});
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM2, {blobEntryFor("u", DB::UInt128(2))});
+    setWatermarkMinActive(*backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 2});
+    backend->resetCounts();
+
+    EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 1u) << "the unowned m2 proves the namespace was scanned";
+    EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM1)));
+    EXPECT_FALSE(headExists(*backend, f.manifestKey(kChainM2)));
+    EXPECT_EQ(backend->getCount(f.logKey({2, 2})), 0u);
+}
+
+namespace
+{
+
+/// `{2,1}` publishes `a` -> m1; `{2,2}` publishes `b`; `{2,3}` removes `a`; `{2,4}` publishes `c` and is
+/// the snapshot base. m2 is an unowned body of the same build. The fold cursor starts at `{2,1}`.
+void seedLaggingSweep(Backend & backend, ChainSweepFixture & f)
+{
+    const ManifestRef mb{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
+    const ManifestRef mc{.writer_epoch = 2, .build_sequence = 2, .manifest_ordinal = 1};
+    const std::vector<RefLogTxn> chain{
+        RefLogTxn{f.ns.string(), RefTxnId{2, 1}, birthPublishing("a", kChainM1), std::nullopt},
+        RefLogTxn{f.ns.string(), RefTxnId{2, 2}, publishCommittedOps("b", mb), std::nullopt},
+        RefLogTxn{f.ns.string(), RefTxnId{2, 3}, {removing("a", kChainM1)}, std::nullopt},
+        RefLogTxn{f.ns.string(), RefTxnId{2, 4}, publishCommittedOps("c", mc), std::nullopt}};
+    RefTableState state;
+    for (const RefLogTxn & txn : chain)
+    {
+        f.put(txn.txn_id, txn.ops);
+        applyRefLogTxn(state, txn);
+    }
+    f.snapshot(state);
+    f.ckpt(2, RefTxnId{2, 4});
+    writeManifestRaw(backend, f.layout, f.ns, kChainM1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(backend, f.layout, f.ns, kChainM2, {blobEntryFor("u", DB::UInt128(2))});
+    setWatermarkMinActive(backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(backend, f.layout, f.ns, RefTxnId{2, 1});
+}
+
+}
+
+TEST(CASOrphanManifestSweep, LaggingSweepRestartsOnceWhenItsCursorMoved)
+{
+    {
+        auto backend = std::make_shared<SweepReadHookBackend>();
+        auto store = openPoolForTest(backend);
+        ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-lagging-once@cas@"});
+        seedLaggingSweep(*backend, f);
+        backend->arm(f.logKey({2, 3}), 1, [&] { seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 2}, std::nullopt, 2); });
+        backend->resetCounts();
+
+        EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 1u);
+        EXPECT_TRUE(backend->didFire());
+        EXPECT_EQ(backend->getCount(f.logKey({2, 3})), 2u) << "one walk before the cursor moved and one after";
+        EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM1)));
+        EXPECT_FALSE(headExists(*backend, f.manifestKey(kChainM2)));
+    }
+    {
+        auto backend = std::make_shared<SweepReadHookBackend>();
+        auto store = openPoolForTest(backend);
+        ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-lagging-twice@cas@"});
+        seedLaggingSweep(*backend, f);
+        backend->arm(f.logKey({2, 3}), 1, [&]
+        {
+            seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 2}, std::nullopt, 2);
+            backend->arm(f.logKey({2, 3}), 1, [&] { seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 3}, std::nullopt, 3); });
+        });
+        backend->resetCounts();
+
+        EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 0u);
+        EXPECT_EQ(backend->getCount(f.logKey({2, 3})), 2u) << "a second move keeps every candidate, with no third walk";
+        EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM2)));
+    }
+}
+
+TEST(CASOrphanManifestSweep, SweepNamespaceSkipsALifeErasedUnderItsWalk)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-erased-life@cas@"});
+    f.put({2, 1}, birthPublishing("a", kChainM1));
+    f.put({2, 2}, publishCommittedOps("b", kChainM2));
+    f.ckpt(2);
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM2, {blobEntryFor("b", DB::UInt128(2))});
+    setWatermarkMinActive(*backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 1});
+    backend->arm(f.logKey({2, 1}), 1, [&]
+    {
+        f.eraseCatalogRow();
+        f.removeKey(f.logKey({2, 2}));
+    });
+    backend->resetCounts();
+
+    EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 0u);
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM2)));
+    EXPECT_EQ(backend->deleteTotal(), 1u) << "only the hook's own log delete";
+}
+
+namespace
+{
+
+RefOp removeNamespaceOpForSweep()
+{
+    RefOp op;
+    op.kind = RefOpKind::RemoveNamespace;
+    return op;
+}
+
+/// Replaces `_ckpt` with its own bytes (a new token) after every read of `watched_key`.
+class CkptChurnBackend : public CountingBackend
+{
+public:
+    String watched_key;
+    String ckpt_key;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::optional<Raw> result = CountingBackend::read(key, access);
+        if (!watched_key.empty() && key == watched_key)
+        {
+            const auto current = InMemoryBackend::read(ckpt_key, access);
+            if (!current || !InMemoryBackend::write(ckpt_key, current->bytes, current->value, access).has_value())
+                throw std::runtime_error("test checkpoint churn failed");
+        }
+        return result;
+    }
+};
+
+}
+
+/// The cursor is at or above the sweep's sampled snapshot, so the cursor key is read for its kind. A
+/// snapshot published after that sample lets cleanup empty the key and a late `RemoveNamespace` fill it:
+/// a terminal record read there proves the end only while `_ckpt` has not moved.
+TEST(CASOrphanManifestSweep, TerminalAtTheCursorUnderAMovedBaseKeepsEveryCandidate)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-terminal-cursor@cas@"});
+    const ManifestRef mb{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
+    f.put({2, 1}, birthPublishing("a", kChainM1));
+    f.put({2, 2}, publishCommittedOps("b", mb));
+    f.put({2, 3}, {});
+    f.put({2, 4}, {removing("a", kChainM1)});
+    f.ckpt(2);
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM1, {blobEntryFor("a", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 3});
+    /// The owner walk reads the cursor key first; the removal walk's read of it is the second.
+    backend->arm(f.logKey({2, 3}), 2, [&]
+    {
+        OperationForTest op(*backend);
+        const auto ckpt = (*op).read(f.layout.refCkptKey(f.life), Retry::once());
+        ASSERT_TRUE(ckpt.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(f.layout.refCkptKey(f.life),
+            encodeRefCkptAtGeneration(refCkptOf(2, std::nullopt, RefTxnId{2, 4}), G_REF_CHAIN), ckpt->etag, Retry::once())));
+        const auto cursor = (*op).read(f.logKey({2, 3}), Retry::once());
+        ASSERT_TRUE(cursor.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(f.logKey({2, 3}),
+            sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(
+                RefLogTxn{f.ns.string(), RefTxnId{2, 3}, {removeNamespaceOpForSweep()}, std::nullopt}, G_REF_CHAIN)),
+            cursor->etag, Retry::once())));
+    });
+
+    EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix), 0u);
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM1)))
+        << "the removal at {2,4} is above the cursor and unfolded";
+}
+
+TEST(CASOrphanManifestSweep, CheckpointMovingOnEveryWalkExhaustsTheRestartsAndKeepsEveryCandidate)
+{
+    auto backend = std::make_shared<CkptChurnBackend>();
+    auto store = openPoolForTest(backend);
+    ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-ckpt-churn@cas@"});
+    f.put({2, 1}, birthPublishing("a", kChainM1));
+    f.ckpt(2);
+    writeManifestRaw(*backend, f.layout, f.ns, kChainM2, {blobEntryFor("u", DB::UInt128(2))});
+    setWatermarkMinActive(*backend, f.layout, kServerRoot, kWriterEpoch, 6);
+    seedFoldCursorForTest(*backend, f.layout, f.ns, RefTxnId{2, 1});
+    backend->ckpt_key = f.layout.refCkptKey(f.life);
+    backend->watched_key = f.logKey({2, 1});
+    backend->resetCounts();
+
+    std::vector<String> warnings;
+    EXPECT_EQ(sweepNamespace(*store, f.ns, kChainPrefix, &warnings), 0u);
+    EXPECT_TRUE(headExists(*backend, f.manifestKey(kChainM2)));
+    EXPECT_EQ(backend->getCount(f.logKey({2, 1})), kRefReadOnlyRecoveryMaxRestarts + 1)
+        << "the first walk and one per restart, then the sweep gives up";
+    EXPECT_EQ(warnings.size(), 1u);
+}

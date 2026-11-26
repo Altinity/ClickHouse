@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
+#include <Common/ErrorCodes.h>
+#include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
 #include <Common/LoggingHelpers.h>
@@ -19,6 +21,7 @@
 #include <fmt/format.h>
 
 #include <array>
+#include <cerrno>
 #include <ctime>
 #include <limits>
 #include <utility>
@@ -42,8 +45,10 @@ namespace DB::ErrorCodes
     extern const int CAS_DELETE_MARKER;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int READONLY;
 }
 
 namespace DB::Cas
@@ -95,6 +100,13 @@ void logCasWriteRetryLater(const String & why)
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
 }
 
+[[noreturn]] void throwCasRequestRetryLater(const String & why)
+{
+    LogSeriesLimiter log(getLogger("CasRequestRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
+    LOG_WARNING(log, "CAS request did not complete ({}); retrying later", why);
+    throw Exception(ErrorCodes::NETWORK_ERROR, "CAS request did not complete ({}); retrying later", why);
+}
+
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
 {
     logCasWriteRetryLater(why);
@@ -123,7 +135,12 @@ namespace
 /// rather than shared because `Backend/` does not depend on the mount plane.
 uint64_t bootClockMs()
 {
-    return clock_gettime_ns(CLOCK_BOOTTIME) / 1000000;
+#if defined(OS_DARWIN)
+    constexpr clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+    constexpr clockid_t clock_id = CLOCK_BOOTTIME;
+#endif
+    return clock_gettime_ns(clock_id) / 1000000;
 }
 
 uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs)
@@ -195,8 +212,8 @@ bool preconditionStillSatisfiable(const Observation & seen, const std::optional<
         /// be alive. Reporting a conflict on it would name an occupant nobody observed.
         [](const NotObserved &) { return true; },
         [&](const ProvenAbsent &) { return !expected.has_value(); },
-        [&](const Meta & m) { return expected.has_value() && m.etag == *expected; },
-        [&](const Object & o) { return expected.has_value() && o.etag == *expected; }},
+        [&](const Meta & m) { return expected.has_value() && sameVersion(m.etag, *expected); },
+        [&](const Object & o) { return expected.has_value() && sameVersion(o.etag, *expected); }},
         seen);
 }
 
@@ -223,6 +240,12 @@ WriteResult withoutBody(WriteResult result)
 
 }
 
+bool isMemoryLimitExceeded(const std::exception & e)
+{
+    const auto * db = dynamic_cast<const Exception *>(&e);
+    return db && db->code() == ErrorCodes::MEMORY_LIMIT_EXCEEDED;
+}
+
 bool isDeterministicLocalFailure(int code)
 {
     return code == ErrorCodes::LOGICAL_ERROR || code == ErrorCodes::NOT_IMPLEMENTED
@@ -231,6 +254,16 @@ bool isDeterministicLocalFailure(int code)
 
 bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 {
+    /// A read-only object storage and a file the process may not create both refuse before anything is
+    /// written, and say so the same way on every reissue.
+    if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && db_e->code() == ErrorCodes::READONLY)
+        return true;
+    if (const auto * errno_e = dynamic_cast<const ErrnoException *>(&e))
+    {
+        const int error = errno_e->getErrno();
+        if (error == EACCES || error == EPERM || error == EROFS)
+            return true;
+    }
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
         /// The refresh class is included rather than left to overlap: the two name lists agree, but
@@ -278,14 +311,36 @@ bool isFirstAttemptFuseTimeout([[maybe_unused]] const std::exception & e, [[mayb
 #endif
 }
 
+bool isStoreAnswer(const std::exception & e)
+{
+    const auto * db = dynamic_cast<const Exception *>(&e);
+    return dynamic_cast<const Poco::Exception *>(&e) && !(db && isDeterministicLocalFailure(db->code()));
+}
+
+String describeRequestFailure(std::string_view verb, const String & key, const std::exception & e)
+{
+    const auto & poco = dynamic_cast<const Poco::Exception &>(e);
+    String code;
+#if USE_AWS_S3
+    if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
+        code = s3->getExceptionName();
+#endif
+    if (const auto * db = dynamic_cast<const Exception *>(&e); code.empty() && db)
+        code = String(ErrorCodes::getName(db->code()));
+    if (code.empty())
+        code = poco.name();
+    return fmt::format("{} {}: {} {} {}", verb, key, isDefinitelyRefusedWrite(e) ? "refused" : "transport", code, poco.message());
+}
+
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
                          std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
-                         CasHotKeys * hot_keys_)
+                         CasHotKeys * hot_keys_, uint64_t default_window_ms_)
     : backend(std::move(backend_))
     , fence(std::move(fence_))
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
     , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
     , attempt_reservation_ms(backend->attemptEnvelopeMs())
+    , default_window_ms(default_window_ms_)
     , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
     , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
@@ -306,9 +361,14 @@ CasOperation CasRequests::admit(Liveness liveness)
     return CasOperation(*this, fence.generation(), std::move(liveness));
 }
 
-CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness)
+CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness, std::function<void(uint64_t)> sleep_ms_)
 {
-    return CasOperation(*this, admitted_generation, std::move(liveness));
+    return CasOperation(*this, admitted_generation, std::move(liveness), std::move(sleep_ms_));
+}
+
+Dialect CasOperation::backendDialect() const
+{
+    return owner.backend->dialect();
 }
 
 std::optional<Etag> CasRequests::tryMint(const String & key, String value) const
@@ -346,7 +406,7 @@ namespace
                                    std::string_view when)
 {
     if (admit == Fence::Admit::NoBudget)
-        throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
+        throwCasRequestRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
     throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
                                  fmt::format("mount fence tripped {}", when));
 }
@@ -438,8 +498,25 @@ Retry CasOperation::freeze(const Retry & policy) const
     if (policy.policy_deadline_ms)
         return policy;
     Retry frozen = policy;
-    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms);
+    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms.value_or(owner.default_window_ms));
     return frozen;
+}
+
+bool CasOperation::oneAttemptFitsBefore(uint64_t deadline_ms) const
+{
+    return fits(reservedFor(0, 1), Retry::Bound{.deadline_ms = deadline_ms, .lease_bound = false});
+}
+
+std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
+{
+    WriteState state;
+    state.attempts_sent = unresolved.attempts_sent;
+    state.sent_any = unresolved.sent_any;
+    state.last_seen = unresolved.last_seen;
+    /// Room for the next decision's two requests: its catalog read and its write.
+    constexpr uint32_t envelopes_for_next_decision = 2;
+    return gatedPause(ms, envelopes_for_next_decision, state, owner.bindPolicy(policy), detail::recordReissue,
+                      /*should_sleep=*/true);
 }
 
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
@@ -496,11 +573,12 @@ void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subj
                                       const Retry::Bound & bound, uint32_t attempts_made)
 {
     last_read_stop = ReadStop::PolicyExhausted;
-    throwCasWriteRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
-                                        verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
+    throwCasRequestRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
+                                          verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
 }
 
-std::optional<Object> CasOperation::readUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
+std::optional<Object> CasOperation::readUnder(
+    const String & key, const Retry & policy, const Retry::Bound & bound, OnMemoryLimit on_memory_limit)
 {
     return readLoop("read", key, policy, bound, [&](auto & access) -> std::optional<Object>
     {
@@ -508,7 +586,7 @@ std::optional<Object> CasOperation::readUnder(const String & key, const Retry & 
         if (!raw)
             return std::nullopt;
         return Object{std::move(raw->bytes), owner.mint(key, std::move(raw->value))};
-    });
+    }, on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
@@ -563,19 +641,19 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
         "the bucket has object versioning enabled", key);
 }
 
-std::optional<Object> CasOperation::read(const String & key, const Retry & policy)
+std::optional<Object> CasOperation::read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit)
 {
-    return readUnder(key, policy, policy.bind(owner.now_ms()));
+    return readUnder(key, policy, owner.bindPolicy(policy), on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)
 {
-    return headUnder(key, policy, policy.bind(owner.now_ms()));
+    return headUnder(key, policy, owner.bindPolicy(policy));
 }
 
 ListPage CasOperation::list(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
 {
-    return listUnder(prefix, cursor, limit, policy, policy.bind(owner.now_ms()));
+    return listUnder(prefix, cursor, limit, policy, owner.bindPolicy(policy));
 }
 
 void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
@@ -604,7 +682,7 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
             keys.size(), kBulkDeleteMaxKeys);
     if (keys.empty())
         return;
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
     readLoop("removeManyWriteOnce", subject, policy, bound, [&](auto & access)
     {
@@ -615,12 +693,12 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
 
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
-    return removeUnder(key, owner.valueFor(key, seen), policy, policy.bind(owner.now_ms()));
+    return removeUnder(key, owner.valueFor(key, seen), policy, owner.bindPolicy(policy));
 }
 
 Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     for (uint32_t attempt = 1;; ++attempt)
     {
         const std::optional<Meta> seen = headUnder(key, policy, bound);
@@ -634,7 +712,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         /// verb has to honour `once` itself, and its contract is that it never hands a `Mismatch` back.
         /// The message says what actually stopped it, which is the policy and not the deadline.
         if (policy.single_attempt)
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "removeCurrent of '{}': the observed incarnation was replaced and the policy allows no reissue", key));
 
         /// Another incarnation became current between the observation and the delete. Re-observe, paced
@@ -650,13 +728,13 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         if (!fits(needed, bound))
             giveUpReadDeadline("removeCurrent", key, bound, attempt);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
 SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     bool refresh_attempted = false;
     std::optional<SentinelProbeResult> last_probe;
     for (uint32_t attempt = 1;; ++attempt)
@@ -719,13 +797,13 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             return result;
         last_probe = std::move(result);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
 std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     std::unique_ptr<ReadBuffer> body = readLoop("stream", key, policy, bound, [&](auto & access)
     {
         return owner.backend->stream(key, access);
@@ -739,7 +817,7 @@ std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry
 
 void CasOperation::publish(const BlobPublishRequest & request, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     readLoop("publish", request.destination_key, policy, bound, [&](auto & access)
     {
         owner.backend->publish(request, access);
@@ -867,18 +945,27 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     /// `Retry::backoff`'s full jitter includes zero -- so their call to `sleep_ms(0)` is kept
     /// unconditional here to leave their observable behaviour exactly as it was before this collapse.
     if (should_sleep)
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     return std::nullopt;
+}
+
+uint64_t CasOperation::reissuePause(const WriteState & state, uint64_t unspaced_ms) const
+{
+    if (!state.spacing)
+        return unspaced_ms;
+    return Retry::pauseAfterAttempt(state.spacing->spacing_ms, state.spacing->attempt_started_ms, owner.now_ms());
 }
 
 std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::backoff(++state.reissues), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    const uint64_t pause_ms = reissuePause(state, Retry::backoff(++state.reissues));
+    return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::conflictBackoff(), 2, state, bound, detail::recordConflictPause, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, Retry::conflictBackoff()), 2, state, bound, detail::recordConflictPause,
+                      /*should_sleep=*/true);
 }
 
 /// A flat pause before reissuing an attempt whose failure text named a failed connection.
@@ -886,7 +973,7 @@ static constexpr uint64_t kConnectHintPauseMs = 50;
 
 std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(kConnectHintPauseMs, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, kConnectHintPauseMs), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
@@ -921,9 +1008,13 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (!fits(reservation, bound))
             return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
 
+        if (policy.attempt_spacing_ms)
+            state.spacing = WriteState::Spacing{*policy.attempt_spacing_ms, owner.now_ms()};
         detail::recordAttempt();
         ++state.attempts_sent;
         state.sent_any = true;
+        if (observer.on_write_attempt)
+            observer.on_write_attempt(state.attempts_sent);
 
         /// Disengaged means the attempt threw: its fate is unproven, and nothing may be read out of it.
         std::optional<std::expected<String, Backend::RawConflict>> outcome;
@@ -943,7 +1034,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         bool fuse = false;
         try
         {
-            outcome = owner.withTransportAccess(state.attempts_sent, [&](auto & access)
+            outcome = owner.withTransportAccess(state.attempts_sent + policy.attempts_already_sent, [&](auto & access)
             {
                 return owner.backend->write(key, bytes, expected_value, access);
             });
@@ -952,6 +1043,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
+            if (observer.on_failure)
+                observer.on_failure("PUT", key, e);
             /// ONE refresh per call, only for the class a credential could explain, and only when a
             /// reissue could sign with what it installs. So an oversized entity never triggers a
             /// re-acquisition, a denial fresh credentials do not fix is refused on the second look
@@ -995,7 +1088,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
                 ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
             /// Checked AFTER the hint, so a hinted attempt stays hinted (reissued before its read); a
             /// fuse timeout is reissued after the settle read runs below.
-            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent);
+            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent + policy.attempts_already_sent);
             if (fuse && !refresh_owns_reissue)
                 ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
         }
@@ -1008,6 +1101,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             /// still have landed, so `outcome` stays disengaged and the read below settles it.
             if (!dynamic_cast<const Poco::Exception *>(&e))
                 throw;
+            if (observer.on_failure)
+                observer.on_failure("PUT", key, e);
         }
 
         if (outcome && outcome->has_value())
@@ -1035,7 +1130,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// would meet the same broken condition, so the reissue itself is the cheaper probe: the attempt
         /// stays ambiguous (`any_ambiguous` is set above), and if the reissue meets a refused precondition
         /// the read below settles it.
-        if (connect_hint && !policy.single_attempt)
+        if (connect_hint && !policy.single_attempt && policy.resend_unresolved)
         {
             if (auto given_up = pauseFlat(state, bound))
                 return *given_up;
@@ -1045,8 +1140,9 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// Every refused precondition, and every ambiguous attempt that was not reissued on a
         /// connect-failure hint, is settled by ONE exact read, under every policy: a refused
         /// precondition does not say WHO holds the key, and a 404 and a 412 reach here as the same
-        /// answer. A hinted attempt reaches this read only when its reissue meets a refused
-        /// precondition. A refused precondition needs only to know WHAT is there, so a presence-only
+        /// answer. A hinted attempt reaches this read after a reissue that met a refused
+        /// precondition, or at once under a policy that never resends it (`single_attempt`,
+        /// `resend_unresolved = false`). A refused precondition needs only to know WHAT is there, so a presence-only
         /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
         /// the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
@@ -1081,7 +1177,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
         /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
         /// the store's own answer. A policy with no reissue has to say it settled nothing.
-        if (policy.single_attempt)
+        if (policy.single_attempt || !policy.resend_unresolved)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
         /// The first attempt met the adaptive first-attempt timeout: a connection-quality answer, not a
         /// store fault. The read above settled nothing new about it, so re-send at once as attempt 2
@@ -1101,18 +1197,18 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 WriteResult CasOperation::create(const String & key, const String & bytes, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, std::nullopt, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
+    return writeLoop(key, bytes, std::nullopt, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, seen, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
+    return writeLoop(key, bytes, seen, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
     Resolved resolved = observe(key, policy, bound);
@@ -1170,7 +1266,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
 
 WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
     Resolved resolved = observePresence(key, policy, bound);

@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <ICommand.h>
+#include <Utils.h>
 
 #include <iostream>
 
@@ -37,14 +38,7 @@ public:
         const String key = getValueFromCommandLineOptionsThrow<String>(options, "key");
 
         auto disk = client.getCurrentDiskWithPath().getDisk();
-
-        auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
-        if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: '{}' is not an object-storage disk", disk->getName());
-
-        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
-        if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: disk '{}' is not content-addressed", disk->getName());
+        auto * ca = &contentAddressedStorageOf(*disk, "cas-inspect");
 
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: open the CA disk read-only");
@@ -62,7 +56,8 @@ public:
         const Cas::Layout & layout = pool->layout();
         std::optional<Cas::NamespaceLifeId> resolved_life;
         std::optional<Cas::NamespaceLifePhysicalId> life_id;
-        if (const auto parsed = layout.parseRefObjectKey(key))
+        const auto parsed = layout.parseRefObjectKey(key);
+        if (parsed)
             life_id = parsed->life_id;
         else if (const auto parsed_ckpt = layout.parseRefCkptKey(key))
             life_id = *parsed_ckpt;
@@ -72,7 +67,12 @@ public:
             resolved_life = cut.life_index.resolve(*life_id);
         }
 
-        std::cout << Cas::caInspectToJson(layout, key, got->bytes, resolved_life) << "\n";
+        /// A log below the life's snapshot base may be a stray, so the base is read for the label.
+        std::optional<Cas::RefTxnId> base_snapshot_id;
+        if (parsed && parsed->kind == Cas::RefObjectKind::Log && resolved_life)
+            base_snapshot_id = Cas::readInspectBaseSnapshotId(op, layout, *resolved_life, std::cerr);
+
+        std::cout << Cas::caInspectToJson(layout, key, got->bytes, resolved_life, base_snapshot_id) << "\n";
     }
 };
 

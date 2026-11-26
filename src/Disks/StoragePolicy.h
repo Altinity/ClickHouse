@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Names.h>
 #include <Disks/IStoragePolicy.h>
 #include <Disks/IDisk.h>
 
@@ -49,6 +50,9 @@ public:
 
     /// Get free space from most free disk
     UInt64 getMaxUnreservedFreeSpace() const override;
+
+    /// Throws if the policy is marked `backup_metadata_only` but one of its volumes is not read-only.
+    bool isBackupMetadataOnly() const override;
 
     const String & getName() const override{ return name; }
 
@@ -101,7 +105,10 @@ private:
     /// filled more than total_size * move_factor
     double move_factor = 0.1; /// by default move factor is 10%
 
+    bool backup_metadata_only = false;
+
     void buildVolumeIndices();
+    void checkVolumesAreReadOnly() const;
 
     LoggerPtr log;
 };
@@ -118,9 +125,20 @@ class StoragePolicySelector
 public:
     static constexpr auto TMP_STORAGE_POLICY_PREFIX = "__";
 
-    StoragePolicySelector(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, DiskSelectorPtr disks);
+    /// Policies that name a disk of `disks_to_skip` are left out: that disk is not available yet.
+    StoragePolicySelector(
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        DiskSelectorPtr disks,
+        const NameSet & disks_to_skip = {});
 
-    StoragePolicySelectorPtr updateFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, DiskSelectorPtr disks, Strings & new_disks) const;
+    /// An existing policy that names a disk of `disks_to_skip` in the new configuration keeps its previous definition.
+    StoragePolicySelectorPtr updateFromConfig(
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        DiskSelectorPtr disks,
+        Strings & new_disks,
+        const NameSet & disks_to_skip = {}) const;
 
     /// Policy by name
     StoragePolicyPtr get(const String & name) const;

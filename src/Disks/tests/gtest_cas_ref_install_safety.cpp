@@ -306,8 +306,10 @@ TEST(CASRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     /// backend's `putIfAbsent`, so the request reached it), the single-attempt budget is then spent, and
     /// the lane wedges. The message must say so -- and must NOT say "no attempt was sent", which is the
     /// only shape allowed to skip the wedge.
-    EXPECT_NE(message.find("is UNCERTAIN"), String::npos)
+    EXPECT_NE(message.find("outcome is unknown"), String::npos)
         << "the reason must reach the wedge message rather than defaulting: " << message;
+    EXPECT_NE(message.find("a retry may duplicate it"), String::npos) << message;
+    EXPECT_EQ(message.find("nothing is durable"), String::npos) << message;
     EXPECT_EQ(message.find("BEFORE any request was sent"), String::npos)
         << "an ambiguous PUT is not a pre-attempt refusal: " << message;
 }
@@ -350,6 +352,7 @@ TEST(CASRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
 
     EXPECT_NE(message.find("refused BEFORE any request was sent"), String::npos)
         << "the caller must be told WHY, and this is the reason the no-wedge decision rests on: " << message;
+    EXPECT_NE(message.find("nothing is durable, so a retry cannot duplicate this transaction"), String::npos) << message;
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
         << "nothing was sent, so nothing can be durable: there is no ambiguity for a wedge to resolve";
     EXPECT_TRUE(store->wedgedKeyForTest(ns).empty());
@@ -495,7 +498,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
     /// Row 1: the caller's own facts refuse before the attempt. Nothing reaches the store.
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit([] { return false; });
         const WriteResult result = op.create("k", "v", Retry::standard());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -510,7 +513,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         uint64_t clock = 0;
         CasRequests requests(backend, Fence::open(),
-                             [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; });
+                             [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; }, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::within(500));
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -524,7 +527,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         backend->injectAmbiguousWrite("k");
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::once());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -539,7 +542,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         bool live = true;
         backend->onWriteCommitted("k", [&live] { live = false; });
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit([&live] { return live; });
         const WriteResult result = op.create("k", "v", Retry::standard());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -556,7 +559,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         uint64_t clock = 0;
         backend->onBeforeWrite("k", [&clock] { clock = 100'000; });
         backend->injectAmbiguousWrite("k");
-        CasRequests requests(backend, Fence::open(), [&clock]() -> uint64_t { return clock; });
+        CasRequests requests(backend, Fence::open(), [&clock]() -> uint64_t { return clock; }, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::within(1000));
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -637,7 +640,7 @@ TEST(CASRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 #if defined(MEMORY_TRACKER_DEBUG_CHECKS)
 TEST(CASRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
 {
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DENY_ALLOCATIONS_IN_SCOPE;
             volatile auto * p = new char[64];

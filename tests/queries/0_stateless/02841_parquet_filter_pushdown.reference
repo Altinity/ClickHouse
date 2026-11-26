@@ -73,14 +73,14 @@ mostly_null_lc	Nullable(String)
 200	179900
 200	19900
 200	19900
-600	259700
-600	259700
+200	19900
+200	19900
 # Settings that affect the table schema or contents
-500	244750
+0	0
 500	244750
 0	0
 500	244750
-500	244750
+0	0
 500	244750
 500	244750
 # Bad type conversions

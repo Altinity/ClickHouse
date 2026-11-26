@@ -4,6 +4,9 @@
 
 #include <IO/S3/ReadBufferFromGetObjectResult.h>
 #include <Common/HistogramMetrics.h>
+#include <Common/typeid_cast.h>
+
+#include <Poco/Net/HTTPFixedLengthStream.h>
 
 namespace HistogramMetrics
 {
@@ -41,6 +44,12 @@ void ReadBufferFromGetObjectResult::releaseResult()
     observeMetrics();
     detachStream();
     result.reset();
+}
+
+bool ReadBufferFromGetObjectResult::isFixedLengthBodyComplete() const
+{
+    const auto * fixed_length = typeid_cast<const Poco::Net::HTTPFixedLengthStreamBuf *>(sourceBuf());
+    return fixed_length && fixed_length->isComplete();
 }
 
 void ReadBufferFromGetObjectResult::observeMetrics()

@@ -23,6 +23,7 @@ set (CLICKHOUSE_DISKS_SOURCES
     CommandCaGcRebuild.cpp
     CommandCaInspect.cpp
     CommandCaDropMember.cpp
+    CommandCaMigratePool.cpp
     CommandGetCurrentDiskAndPath.cpp
     CommandPackedIO.cpp
     CommandDiskUsage.cpp
@@ -41,3 +42,15 @@ set (CLICKHOUSE_DISKS_LINK
         )
 
 clickhouse_program_add(disks)
+
+# The CAS gtests drive `DisksClient` and the `cas-*` commands in-process, as the binary does. These headers include one
+# another by bare name, so they are linked into one directory that is the test's only include path into this one.
+if (TARGET unit_tests_dbms)
+    set (DISKS_HEADERS_FOR_TESTS_DIR ${CMAKE_CURRENT_BINARY_DIR}/headers_for_tests)
+    file (MAKE_DIRECTORY ${DISKS_HEADERS_FOR_TESTS_DIR})
+    foreach (header DisksApp.h DisksClient.h ICommand.h ICommand_fwd.h Utils.h)
+        file (CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/${header} ${DISKS_HEADERS_FOR_TESTS_DIR}/${header} SYMBOLIC)
+    endforeach ()
+    target_link_libraries(unit_tests_dbms PRIVATE clickhouse-disks-lib)
+    target_include_directories(unit_tests_dbms PRIVATE ${DISKS_HEADERS_FOR_TESTS_DIR})
+endif()

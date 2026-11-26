@@ -2,7 +2,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <base/hex.h>
+#include <algorithm>
 #include <charconv>
+
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
 
 namespace DB::Cas
 {
@@ -28,6 +35,32 @@ std::optional<uint64_t> parseCanonicalU64(std::string_view s)
     return v;
 }
 
+/// `<algoName>` -> `BlobHashAlgo` through the wire table itself, whose coverage is proven against
+/// the enum at compile time. A hand-written candidate list here would be a second enumeration that
+/// a new algorithm could silently outgrow: the parser would reject a segment the writer emits.
+/// Key parsing answers "is this key ours?", so an unknown segment is `nullopt` -- debris, not
+/// corruption -- which is why it scans rather than calling the throwing `fromWord`.
+std::optional<BlobHashAlgo> algoFromPathSegment(std::string_view algo_name)
+{
+    for (const auto & entry : kBlobHashAlgoWords.entries)
+        if (algo_name == entry.word)
+            return entry.value;
+    return std::nullopt;
+}
+
+/// The `<algo>/<shard>/<hex>` segments of a blob, marker or intent key. Accepts every spelling `fromHex`
+/// accepts; a caller that needs the writer's own spelling checks it.
+std::optional<BlobRef> parseBlobSegments(std::string_view algo_name, std::string_view shard, std::string_view hex)
+{
+    const std::optional<BlobHashAlgo> algo = algoFromPathSegment(algo_name);
+    if (!algo || hex.size() != 2 * blobHashLenFor(*algo) || shard != hex.substr(0, 2))
+        return std::nullopt;
+    /// Syntax is checked here so that no exception is read as "not a blob key": a memory limit must propagate.
+    if (std::any_of(hex.begin(), hex.end(), [](char c) { return unhex(c) == 0xff; }))
+        return std::nullopt;
+    return BlobRef{*algo, codecFor(*algo).fromHex(hex)};
+}
+
 }
 
 /// Blob-key operations are kept together with their parsing inverse. `CasTypes.h` supplies the
@@ -39,15 +72,14 @@ String Layout::blobKey(const BlobRef & ref) const
 
 String Layout::blobMetaKey(const BlobRef & ref) const
 {
-    return blobKey(ref) + ".meta";
+    return blobKey(ref) + String(kLegacyMarkerSuffix);
 }
 
 std::optional<BlobRef> Layout::parseBlobKey(std::string_view key) const
 {
     std::string_view rest = key;
-    static constexpr std::string_view kMetaSuffix = ".meta";
-    if (rest.size() >= kMetaSuffix.size() && rest.substr(rest.size() - kMetaSuffix.size()) == kMetaSuffix)
-        rest.remove_suffix(kMetaSuffix.size());
+    if (hasLegacyMarkerSuffix(rest))
+        rest.remove_suffix(kLegacyMarkerSuffix.size());
 
     const String blobs_root = blobsPrefix();   /// "<prefix>/blobs/"
     if (rest.size() <= blobs_root.size() || !rest.starts_with(blobs_root))
@@ -63,37 +95,66 @@ std::optional<BlobRef> Layout::parseBlobKey(std::string_view key) const
     const size_t shard_sep = rest.find('/');
     if (shard_sep == std::string_view::npos)
         return std::nullopt;
-    const std::string_view shard = rest.substr(0, shard_sep);
-    const std::string_view hex = rest.substr(shard_sep + 1);
-    if (shard.size() != 2 || hex.size() < 2 || shard != hex.substr(0, 2))
-        return std::nullopt;   /// malformed shard/hex shape -- not ours
+    return parseBlobSegments(algo_name, rest.substr(0, shard_sep), rest.substr(shard_sep + 1));
+}
 
-    /// `<algoName>` -> `BlobHashAlgo` through the wire table itself, whose coverage is proven against
-    /// the enum at compile time. A hand-written candidate list here would be a second enumeration that
-    /// a new algorithm could silently outgrow: the parser would reject a segment the writer emits.
-    /// This path answers "is this key ours?", so an unknown segment is `nullopt` -- debris, not
-    /// corruption -- which is why it scans rather than calling the throwing `fromWord`.
-    std::optional<BlobHashAlgo> algo;
-    for (const auto & entry : kBlobHashAlgoWords.entries)
-        if (algo_name == entry.word)
-        {
-            algo = entry.value;
-            break;
-        }
-    if (!algo)
-        return std::nullopt;   /// unknown/foreign algo segment -- debris, not ours
+std::optional<BlobRef> Layout::parseLegacyMarkerKey(std::string_view key) const
+{
+    if (!hasLegacyMarkerSuffix(key))
+        return std::nullopt;
+    const std::optional<BlobRef> ref = parseBlobKey(key);
+    if (!ref || blobMetaKey(*ref) != key)
+        return std::nullopt;   /// `fromHex` takes spellings the writer never emits; only the exact key is a marker
+    return ref;
+}
 
-    if (hex.size() != 2 * blobHashLenFor(*algo))
-        return std::nullopt;   /// a KNOWN algo but the wrong-width hex -- not ours either
+String Layout::blobIntentKey(const BlobRef & ref, const CanonicalIdentity & identity) const
+{
+    /// `CanonicalIdentity` is a plain aggregate; a key the parser rejects would never be met by the orphan sweep.
+    if (!opaqueTagFromHex(identity.dialect, identity.tag_hex))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CasLayout: '{}' is not a canonical {} tag for a blob intent key",
+            identity.tag_hex, dialectWord(identity.dialect));
+    const String hex = blobHexOf(ref);
+    String key = blobIntentsPrefix() + String(blobHashAlgoName(ref.algo)) + "/" + hex.substr(0, 2) + "/" + hex + "/"
+        + String(dialectWord(identity.dialect)) + "/" + identity.tag_hex;
+    if (key.size() > kBlobIntentKeyMaxBytes)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CasLayout: a blob intent key of {} bytes is over the {} byte limit; the pool prefix is {} bytes",
+            key.size(), kBlobIntentKeyMaxBytes, prefix.size());
+    return key;
+}
 
-    try
+std::optional<Layout::ParsedBlobIntentKey> Layout::parseBlobIntentKey(std::string_view key) const
+{
+    const String root = blobIntentsPrefix();
+    if (!key.starts_with(root) || isBlobIntentProbeKey(key))
+        return std::nullopt;
+    std::string_view rest = key.substr(root.size());
+
+    /// <algo>/<shard>/<hex>/<dialect>/<tag_hex>: exactly five segments.
+    std::string_view segments[5];
+    for (size_t i = 0; i < 4; ++i)
     {
-        return BlobRef{*algo, codecFor(*algo).fromHex(String(hex))};
+        const size_t sep = rest.find('/');
+        if (sep == std::string_view::npos)
+            return std::nullopt;
+        segments[i] = rest.substr(0, sep);
+        rest.remove_prefix(sep + 1);
     }
-    catch (const Exception &)
-    {
-        return std::nullopt;   /// non-hex characters -- malformed, not ours
-    }
+    if (rest.find('/') != std::string_view::npos)
+        return std::nullopt;
+    segments[4] = rest;
+    const std::string_view hex = segments[2];
+    const std::string_view tag_hex = segments[4];
+
+    const std::optional<BlobRef> ref = parseBlobSegments(segments[0], segments[1], hex);
+    if (!ref || blobHexOf(*ref) != hex)
+        return std::nullopt;   /// `fromHex` also takes uppercase; the writer never emits it
+
+    const std::optional<Dialect> dialect = dialectFromWord(segments[3]);
+    if (!dialect || !opaqueTagFromHex(*dialect, tag_hex))
+        return std::nullopt;
+    return ParsedBlobIntentKey{*ref, CanonicalIdentity{*dialect, String(tag_hex)}};
 }
 
 std::optional<ParsedRefObjectKey> Layout::parseRefObjectKey(std::string_view key) const
@@ -343,6 +404,22 @@ void Layout::checkNamespace(const RootNamespace & ns) const
             break;
         start = end + 1;
     }
+}
+
+std::optional<uint64_t> Layout::stagedEpochOf(std::string_view rest)
+{
+    const size_t slash = rest.find('/');
+    if (slash == std::string_view::npos)
+        return rest.empty() ? std::nullopt : std::optional<uint64_t>(0);
+    const std::string_view dir = rest.substr(0, slash);
+    const std::string_view leaf = rest.substr(slash + 1);
+    if (dir.empty() || leaf.empty() || leaf.find('/') != std::string_view::npos)
+        return std::nullopt;
+    uint64_t epoch = 0;
+    const auto [end, ec] = std::from_chars(dir.data(), dir.data() + dir.size(), epoch);
+    if (ec != std::errc{} || end != dir.data() + dir.size())
+        return std::nullopt;
+    return epoch;
 }
 
 }

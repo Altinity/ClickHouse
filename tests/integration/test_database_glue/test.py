@@ -382,7 +382,7 @@ def started_cluster():
             name="sts.us-east-1.amazonaws.com",
             hostname="sts.us-east-1.amazonaws.com",
             image="altinityinfra/python-bottle",
-            tag="latest",
+            tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
             stay_alive=True,
         )
         sts.stop_clickhouse(kill=True)
@@ -1050,7 +1050,6 @@ def test_create_table_engine_backend_mismatch_rejected(started_cluster):
         "IcebergAzure('http://acc.blob.core.windows.net/cont/tbl/', 'acc', 'key')",
         "IcebergLocal('/var/lib/clickhouse/user_files/tbl/')",
         "IcebergHDFS('hdfs://namenode:9000/tbl/')",
-        "Iceberg('/var/lib/clickhouse/user_files/tbl/') SETTINGS disk = 'local_blob_disk'",
     ]:
         error = node.query_and_get_error(
             f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.mismatch` (x String) ENGINE = {engine}",
@@ -1063,6 +1062,21 @@ def test_create_table_engine_backend_mismatch_rejected(started_cluster):
             "would be reopened with the catalog's storage backend and become unreadable" in error
         ), error
         assert "stores tables on S3" in error, error
+
+    # A table-level `disk` setting that differs from the catalog's value is rejected
+    # earlier, by the per-setting validation in DatabaseDataLake::validateCreateTableEngine,
+    # before the storage backend mismatch is checked.
+    error = node.query_and_get_error(
+        f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.mismatch` (x String) ENGINE = Iceberg('/var/lib/clickhouse/user_files/tbl/') SETTINGS disk = 'local_blob_disk'",
+        settings={
+            "allow_experimental_database_glue_catalog": 1,
+            "allow_database_glue_catalog": 1,
+        },
+    )
+    assert (
+        "Table setting `disk` differs from its value in this DataLakeCatalog" in error
+    ), error
+    assert "would be lost" in error, error
 
 
 def test_schema_evolution(started_cluster):
@@ -2237,3 +2251,245 @@ def test_catalog_schema_with_empty_column_name_is_rejected(started_cluster):
     assert node.query("SELECT 1") == "1\n"
 
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
+
+
+def test_optimize_manifest_glue_update_fails(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must recover when Glue rejects the update of the table pointer.
+
+    For Glue the compacted metadata file is written to storage before the catalog pointer is updated.
+    When Glue then rejects the update (`CONCURRENT_MODIFICATION` or `VERSION_MISMATCH`), the files of that
+    attempt stay in place, and the retry builds on the metadata Glue names, with a version above the
+    rejected file, so it does not collide with it. Glue then points to the newest metadata file.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    import gzip
+    import io
+    import re
+
+    import avro.datafile
+    import avro.io
+
+    node = started_cluster.instances["node1"]
+    minio_client = started_cluster.minio_client
+    bucket = "warehouse-glue"
+
+    test_ref = f"test_optimize_manifest_glue_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    write_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_glue_table(started_cluster, node, root_namespace, table_name, "(x String)")
+
+    num_inserts = 5
+    for i in range(num_inserts):
+        node.query(f"INSERT INTO {table_ref} VALUES ('row{i}');", settings=write_settings)
+    rows_before = node.query(f"SELECT x FROM {table_ref} ORDER BY x")
+
+    def object_key(path):
+        if path.startswith("s3://"):
+            path_bucket, key = path[len("s3://"):].split("/", 1)
+        else:
+            match = re.match(r"^https?://[^/]+/([^/]+)/(.+)$", path)
+            assert match, f"unexpected object path {path}"
+            path_bucket, key = match.group(1), match.group(2)
+        assert path_bucket == bucket, path
+        return key
+
+    def metadata_versions():
+        versions = {}
+        for o in minio_client.list_objects(bucket, prefix=f"{table_name}/metadata/", recursive=True):
+            match = re.search(r"/v(\d+)[^/]*\.metadata\.json$", o.object_name)
+            if match:
+                versions[int(match.group(1))] = o.object_name
+        assert versions, f"no metadata files for {table_name}"
+        return versions
+
+    def read_metadata(key):
+        data = minio_client.get_object(bucket, key).read()
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
+        return json.loads(data)
+
+    def read_avro(path):
+        data = minio_client.get_object(bucket, object_key(path)).read()
+        with avro.datafile.DataFileReader(io.BytesIO(data), avro.io.DatumReader()) as reader:
+            return list(reader)
+
+    glue_client = boto3.client(
+        "glue", region_name="us-east-1", endpoint_url=get_glue_local_url(started_cluster)
+    )
+
+    def glue_metadata_location():
+        table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+        return table_info["Parameters"]["metadata_location"]
+
+    max_version_before = max(metadata_versions())
+    snapshot_id_before = read_metadata(object_key(glue_metadata_location()))["current-snapshot-id"]
+
+    optimize_settings = {
+        "allow_experimental_iceberg_compaction": 1,
+        "iceberg_manifest_min_count_to_compact": 2,
+        **write_settings,
+    }
+    failpoint = "iceberg_glue_update_table_fail"
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        node.query(f"OPTIMIZE TABLE {table_ref} MANIFEST", settings=optimize_settings)
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+
+    # The rejected attempt left its metadata file, and the retry wrote the next version, which Glue names.
+    versions = metadata_versions()
+    assert max(versions) >= max_version_before + 2, sorted(versions)
+    glue_location = glue_metadata_location()
+    assert object_key(glue_location) == versions[max(versions)], (glue_location, sorted(versions))
+
+    metadata = read_metadata(object_key(glue_location))
+    current_snapshot_id = metadata["current-snapshot-id"]
+    current_snapshot = next(s for s in metadata["snapshots"] if s["snapshot-id"] == current_snapshot_id)
+    assert current_snapshot["summary"]["operation"] == "replace"
+    assert current_snapshot["parent-snapshot-id"] == snapshot_id_before
+
+    manifests = [record["manifest_path"] for record in read_avro(current_snapshot["manifest-list"])]
+    assert 0 < len(manifests) < num_inserts, f"expected consolidated manifests, got {manifests}"
+    for manifest in manifests:
+        minio_client.stat_object(bucket, object_key(manifest))
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+
+    assert node.query(f"SELECT x FROM {table_ref} ORDER BY x") == rows_before
+    storage_rows = node.query(
+        f"SELECT x FROM icebergS3('http://minio1:9001/{bucket}/{table_name}/', '{minio_access_key}', '{minio_secret_key}') ORDER BY x"
+    )
+    assert storage_rows == rows_before
+
+    # A later OPTIMIZE must not get stuck on the rejected file.
+    node.query(f"OPTIMIZE TABLE {table_ref} MANIFEST", settings=optimize_settings)
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT x FROM {table_ref} ORDER BY x") == rows_before
+
+
+def test_optimize_bin_pack_concurrent_commit(started_cluster):
+    """Regression test for https://github.com/Altinity/ClickHouse/issues/2733.
+
+    Bin-pack OPTIMIZE on a Glue-catalog table pauses right before it publishes its metadata. While it is
+    paused, pyiceberg lands another commit. pyiceberg names its metadata files differently from ClickHouse,
+    so the commit does not collide with OPTIMIZE's metadata file in storage and only the catalog can notice
+    it. When OPTIMIZE resumes, Glue must refuse its update, because the table no longer points at the
+    metadata OPTIMIZE was based on, and OPTIMIZE must retry on the new snapshot. No row may be lost."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_optimize_race_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    table = create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER, table_name)
+
+    # Two separate appends produce two small data files, so bin-pack has work.
+    table.append(generate_arrow_data(2))
+    table.append(generate_arrow_data(3))
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        # 1. Wait for the compaction to pause at the failpoint.
+        wait_future = executor.submit(
+            lambda: node.query(
+                "SYSTEM WAIT FAILPOINT iceberg_compaction_pause_before_metadata_commit PAUSE",
+                timeout=120,
+            )
+        )
+
+        # 2. Start OPTIMIZE; it rewrites the two small files, then pauses before it publishes.
+        optimize_future = executor.submit(
+            lambda: node.query(
+                f"OPTIMIZE TABLE {table_ref}",
+                settings={
+                    "allow_experimental_iceberg_compaction": 1,
+                    "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+                    "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+                },
+                timeout=180,
+            )
+        )
+
+        # Wait for the pause to actually trigger before the concurrent commit.
+        wait_future.result(timeout=120)
+
+        # 3. Another writer commits in the publish window.
+        catalog.load_table(f"{root_namespace}.{table_name}").append(generate_arrow_data(4))
+
+        # 4. Release the failpoint; OPTIMIZE's publish must be rejected and retried on the new snapshot.
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+        optimize_future.result(timeout=180)
+    finally:
+        # Always disable the failpoint, otherwise a failure above leaves it enabled for later tests
+        # on the same instance. The disable is idempotent, so no exception needs to be swallowed.
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+        executor.shutdown(wait=False)
+
+    # 5. The rows committed during the publish window must remain in the current snapshot.
+    assert catalog.load_table(f"{root_namespace}.{table_name}").scan().to_arrow().num_rows == 9
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "9"
+
+
+def test_optimize_bin_pack_table_without_metadata_location(started_cluster):
+    """A table registered in Glue by `Location` only has no `metadata_location` parameter, and ClickHouse
+    reads its current metadata from storage. `OPTIMIZE` must still be able to compact it and register the pointer."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_optimize_no_metadata_location_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    table = create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER, table_name)
+
+    # Two separate appends produce two small data files, so bin-pack has work.
+    table.append(generate_arrow_data(2))
+    table.append(generate_arrow_data(3))
+
+    glue_client = boto3.client(
+        "glue", region_name="us-east-1", endpoint_url=get_glue_local_url(started_cluster)
+    )
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert "metadata_location" in table_info["Parameters"], "Test setup failed: metadata_location should exist initially"
+    glue_client.update_table(
+        DatabaseName=root_namespace,
+        TableInput={
+            "Name": table_name,
+            "StorageDescriptor": table_info["StorageDescriptor"],
+            "Parameters": {k: v for k, v in table_info["Parameters"].items() if k != "metadata_location"},
+            "TableType": table_info.get("TableType", "EXTERNAL_TABLE"),
+        },
+    )
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert "metadata_location" not in table_info["Parameters"], "Failed to remove metadata_location"
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"
+
+    node.query(
+        f"OPTIMIZE TABLE {table_ref}",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+            "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+        },
+    )
+
+    # The update registered the pointer, and no row was lost.
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert table_info["Parameters"].get("metadata_location"), table_info["Parameters"]
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"
