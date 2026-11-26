@@ -29,9 +29,10 @@ struct ObjectStorageIdentity
     /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
     /// Not part of the object's identity.
     UInt64 fetch_seq = 0;
-    /// SipHash of the access key, secret, and session token that signed the HEAD. Not a secret.
+    /// SipHash of the access key, secret, session token and extra request headers that authenticated the HEAD. Not a secret.
     /// A hit is only valid for the same principal: the STS mock used in tests returns one access key
-    /// with a different secret per role session, so the access key alone does not separate them.
+    /// with a different secret per role session, so the access key alone does not separate them,
+    /// and per-query `headers(...)` carry credentials that are not part of the AWS credentials at all.
     UInt64 credential_hash = 0;
 
     size_t memoryUsage() const

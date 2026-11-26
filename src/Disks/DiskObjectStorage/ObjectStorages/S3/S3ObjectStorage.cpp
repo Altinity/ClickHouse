@@ -73,10 +73,16 @@ namespace DB::FailPoints
 namespace DB
 {
 
-/// Distinguishes principals that sign with the same access key and a different secret or session token.
+/// Distinguishes principals that authenticate differently towards the same endpoint:
+/// - a different access key, secret or session token;
+/// - different request headers. Per-query `headers(...)` of the `s3` table function, `Authorization`, SSE-C key headers and the like
+///   are sent as extra headers after signing, so with the same (or empty) credentials the headers alone decide which principal is
+///   allowed to see the object.
+/// Headers configured on the server are the same for every user, so they do not split the cache.
 static UInt64 s3CredentialHash(const S3::Client & client)
 {
     const auto credentials = client.getCredentials();
+    const auto & extra_headers = client.getClientConfiguration().extra_headers;
     SipHash hash;
     const auto update_field = [&](const auto & field)
     {
@@ -86,6 +92,14 @@ static UInt64 s3CredentialHash(const S3::Client & client)
     update_field(credentials.GetAWSAccessKeyId());
     update_field(credentials.GetAWSSecretKey());
     update_field(credentials.GetSessionToken());
+    /// The count separates the credential fields from the header fields, and each name and value ends with a NUL byte,
+    /// which an HTTP header cannot contain.
+    hash.update(extra_headers.size());
+    for (const auto & header : extra_headers)
+    {
+        update_field(header.name);
+        update_field(header.value);
+    }
     return hash.get64();
 }
 
