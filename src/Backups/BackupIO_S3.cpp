@@ -22,8 +22,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
-#include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
-
 #include <Poco/Util/AbstractConfiguration.h>
 
 #include <aws/core/auth/AWSCredentials.h>
@@ -502,12 +500,9 @@ void BackupReaderS3::copyToDiskImpl(const String & path_in_backup, size_t offset
 
             /// The restored object replaces `blob_path[0]` in `blob_path[1]`, which may hold an identity cached by an
             /// earlier read. Key the entry by the destination endpoint, as `S3ObjectStorage` does for its own writes.
-            /// Fail before copying if the destination is not an S3 storage: the disk claims the S3 data source kind.
-            auto dest_object_storage = destination_disk->getObjectStorage();
-            auto * dest_s3 = dynamic_cast<S3ObjectStorage *>(dest_object_storage.get());
-            if (!dest_s3)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Destination disk {} does not use S3 object storage", destination_disk->getName());
-            const String dest_endpoint = dest_s3->getURI().endpoint;
+            /// `getDescription` returns that endpoint and forwards through a cache layer, so a cached S3 disk works too.
+            /// The native copy is only taken when the destination has the S3 data source kind.
+            const String dest_endpoint = destination_disk->getObjectStorage()->getDescription();
             const String dest_bucket = blob_path[1];
             const String dest_key = blob_path[0];
             /// Runs when the copy throws after an object-creating request was sent. The success path below runs it too.
