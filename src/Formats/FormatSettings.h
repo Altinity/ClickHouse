@@ -402,6 +402,8 @@ struct FormatSettings
         /// read-ahead vs decode, and ColumnData's share of the parsing thread pool.
         double prefetch_memory_fraction = 0.6;
         double decode_thread_fraction = 0.375;
+        /// Anti-amplification guard for read coalescing in the Parquet v3 reader, 0 = off.
+        double read_min_fill_ratio = 0;
 
         /// Write.
         UInt64 row_group_rows = 1000000;

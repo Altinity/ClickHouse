@@ -227,6 +227,9 @@ Advanced tuning knob for the Parquet reader scheduler. Of the memory budget rese
     DECLARE(Double, input_format_parquet_decode_thread_fraction, 0.375, R"(
 Advanced tuning knob for the Parquet reader scheduler. The fraction of the Parquet parsing thread pool dedicated to column decoding (the `ColumnData` stage); the remaining stages, which only issue asynchronous reads, share the rest. Raise it to give decoding (the only CPU-bound stage) more parallelism on fast/local storage; the default suits latency-bound remote reads where memory, not threads, limits concurrency. Must be in [0, 1].
 )", 0) \
+    DECLARE(Double, input_format_parquet_read_min_fill_ratio, 0, R"(
+Experimental. Anti-amplification guard for read coalescing in the Parquet reader. To save requests, the reader coalesces reads through gaps shorter than the seek threshold (for local files, `input_format_parquet_local_file_min_bytes_for_seek`), but many such gaps can accumulate into a read task that is almost entirely unwanted filler - e.g. reading a tiny, scattered (RLE / near-constant) column drags in the neighbouring columns, so far more bytes are read than the query needs. When set above 0, the reader stops extending a read task once less than this fraction of it would be wanted bytes (wanted bytes / total span). A task whose filler is below 64 KiB or twice the seek threshold, whichever is smaller, is never limited. Trades more, smaller requests for fewer bytes read on sparse reads. Must be in [0, 1]; `0` (default) disables.
+)", EXPERIMENTAL) \
     DECLARE(Bool, input_format_parquet_page_filter_push_down, true, R"(
 Skip pages using min/max values from column index.
 )", 0) \

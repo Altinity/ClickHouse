@@ -22,6 +22,7 @@ namespace ProfileEvents
     extern const Event ParquetPrefetcherReadRandomRead;
     extern const Event ParquetPrefetcherReadSeekAndRead;
     extern const Event ParquetPrefetcherReadEntireFile;
+    extern const Event ParquetPrefetcherFillRatioLimitedTasks;
 }
 
 namespace DB::Parquet
@@ -31,6 +32,8 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
+    /// Range-checked in ReadManager::init, before any read is scheduled.
+    read_min_fill_ratio = options.format.parquet.read_min_fill_ratio;
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);
@@ -93,6 +96,27 @@ void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOp
         read_mode = ReadMode::EntireFileIsInMemory;
         file_size = entire_file.size();
     }
+}
+
+bool Prefetcher::fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, size_t end_offset, const RangeState & r) const
+{
+    if (read_min_fill_ratio <= 0)
+        return false;
+
+    const size_t new_span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
+    const size_t new_wanted = wanted_bytes + r.length();
+    if (static_cast<double>(new_wanted) >= read_min_fill_ratio * static_cast<double>(new_span))
+        return false;
+
+    /// Tasks with little filler in absolute terms are always fine: an extra request costs more than
+    /// reading that much filler, and dense reads must never be split. (`new_wanted < new_span`
+    /// here because the ratio is at most 1, so the subtraction doesn't underflow.)
+    const size_t filler_floor = std::min(max_filler_floor_for_fill_ratio, bytes_per_read_task / 2);
+    if (new_span - new_wanted < filler_floor)
+        return false;
+
+    ProfileEvents::increment(ProfileEvents::ParquetPrefetcherFillRatioLimitedTasks);
+    return true;
 }
 
 void Prefetcher::readSync(char * to, size_t n, size_t offset)
@@ -336,6 +360,10 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            /// Limit the filler in the task, see `fillRatioWouldBreak`.
+            if (fillRatioWouldBreak(total_length_of_covered_ranges, start_offset, end_offset, r))
+                break;
+
             /// Include this range in the task.
             start_idx = idx - 1;
             total_length_of_covered_ranges += r.length();
@@ -371,6 +399,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            if (fillRatioWouldBreak(total_length_of_covered_ranges, start_offset, end_offset, r))
+                break;
+
             end_idx = idx + 1;
             total_length_of_covered_ranges += r.length();
             end_offset = std::max(end_offset, r.end);

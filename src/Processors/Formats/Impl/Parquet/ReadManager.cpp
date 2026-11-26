@@ -90,6 +90,13 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "input_format_parquet_decode_thread_fraction must be in [0, 1], got {}", decode_thread_fraction);
 
+    /// Used by Prefetcher read coalescing; validated here, together with the other scheduler knobs,
+    /// and not in Prefetcher::init, which also serves schema inference and metadata-only reads.
+    const double read_min_fill_ratio = reader.options.format.parquet.read_min_fill_ratio;
+    if (!(read_min_fill_ratio >= 0 && read_min_fill_ratio <= 1))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "input_format_parquet_read_min_fill_ratio must be in [0, 1], got {}", read_min_fill_ratio);
+
     auto set_fractions = [&](ReadStage s, double memory_fraction, double thread_fraction)
     {
         stages[size_t(s)].memory_target_fraction = memory_fraction;
