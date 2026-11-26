@@ -1472,7 +1472,7 @@ def test_export_part_aggregate_function_states(cluster):
     states = {"allow_aggregate_function_states_in_open_formats": 1}
 
     columns = (
-        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(max, UInt32)"
     )
 
     make_mt(node, mt, columns, "k", order_by="k")
@@ -1480,7 +1480,7 @@ def test_export_part_aggregate_function_states(cluster):
 
     node.query(
         f"INSERT INTO {mt} "
-        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), maxSimpleState(toUInt32(number)) "
         f"FROM numbers(200) GROUP BY number % 2"
     )
 

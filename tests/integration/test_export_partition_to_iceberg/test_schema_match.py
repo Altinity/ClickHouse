@@ -923,7 +923,7 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
     iceberg_table = f"iceberg_agg_states_{uid}"
 
     columns = (
-        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(max, UInt32)"
     )
     # The destination enables the setting in its own `SETTINGS`, which decide over the profile and the query.
     states = {"allow_aggregate_function_states_in_open_formats": 1}
@@ -939,7 +939,7 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
 
     node.query(
         f"INSERT INTO {mt_table} "
-        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), maxSimpleState(toUInt32(number)) "
         f"FROM numbers(200) GROUP BY number % 2"
     )
 
