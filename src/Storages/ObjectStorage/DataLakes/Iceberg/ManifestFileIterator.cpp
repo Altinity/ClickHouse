@@ -238,8 +238,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     std::optional<UInt64> inherited_first_row_id_,
     DB::ContextPtr context_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
-    Int32 table_snapshot_schema_id_,
-    const std::atomic<bool> * stop_flag_)
+    Int32 table_snapshot_schema_id_)
 {
     auto dump_metadata = [&]()->String { return manifest_file_deserializer_->getMetadataContent(); };
     insertRowToLogTable(
@@ -336,8 +335,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         partition_key.partition_spec_fields_count,
         total_rows,
         std::move(filter_dag_),
-        table_snapshot_schema_id_,
-        stop_flag_));
+        table_snapshot_schema_id_));
 }
 
 ManifestFileIterator::ManifestFileIterator(
@@ -357,8 +355,7 @@ ManifestFileIterator::ManifestFileIterator(
     size_t partition_spec_fields_count_,
     size_t total_rows_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
-    Int32 table_snapshot_schema_id_,
-    const std::atomic<bool> * stop_flag_)
+    Int32 table_snapshot_schema_id_)
     : manifest_file_deserializer(std::move(manifest_file_deserializer_))
     , path_to_manifest_file(path_to_manifest_file_)
     , format_version(format_version_)
@@ -373,7 +370,6 @@ ManifestFileIterator::ManifestFileIterator(
     , partition_spec_fields_count(partition_spec_fields_count_)
     , table_snapshot_schema_id(table_snapshot_schema_id_)
     , total_rows(total_rows_)
-    , stop_flag(stop_flag_)
     , data_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
     , position_deletes_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
     , equality_deletes_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
@@ -661,11 +657,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::next()
             fully_initialized.store(true);
             return nullptr;
         }
-        /// The data manifest decode tasks pass the stream's stopped flag here, so a cancelled
-        /// query stops decoding mid-manifest. Checked between rows rather than by the caller,
-        /// because a long stretch of pruned rows yields nothing the caller could check on.
-        if (stop_flag && stop_flag->load(std::memory_order_relaxed))
-            return nullptr;
         auto entry = processRow(row_index);
         if (entry)
             return entry;

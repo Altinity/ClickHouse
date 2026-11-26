@@ -71,7 +71,6 @@ private:
     M(MergeTreePrefixesDeserialization, "MergeTreePrefixesDeserializationThreadPool", MergeTreeSubcolumnsReader) \
     M(DropDistributedCache, "DropDistributedCacheThreadPool", DropDistributedCache) \
     M(FormatParsing, "FormatParsingThreadPool", FormatParsing) \
-    M(IcebergManifestDecode, "IcebergManifestDecodeThreadPool", IcebergManifestDecode) \
     M(ParquetEncoder, "ParquetEncoderThreadPool", ParquetEncoder) \
     M(AIRequest, "AIRequestThreadPool", AIRequest)
 

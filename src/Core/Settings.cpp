@@ -6110,22 +6110,6 @@ Possible values:
     DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
 If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
 )", 0) \
-    DECLARE_WITH_ALIAS(NonZeroUInt64, iceberg_manifest_decode_concurrency, 4, R"(
-Maximum number of Iceberg manifest files decoded concurrently while reading a table.
-
-Delete manifests are all decoded before any data file is read; data manifests are decoded while the list of data files for the query is produced, and new ones are decoded only as the query consumes already decoded entries. Decoding several manifests at a time overlaps the object storage round-trips and the per-entry pruning work.
-
-Higher values raise peak memory when the Iceberg metadata files cache is disabled or full, since each in-flight manifest then holds its own decoded contents.
-
-Must be greater than zero; `1` decodes the manifests one at a time.
-)", 0, iceberg_delete_manifest_decode_concurrency) \
-    DECLARE(NonZeroUInt64, iceberg_file_entries_queue_size, 100, R"(
-Capacity of the queue between the Iceberg data manifest decode tasks and the query, in data file entries.
-
-The decode tasks pause once the queue is full and the query is not consuming, so this also bounds the read-ahead.
-
-Must be greater than zero.
-)", 0) \
     DECLARE(Bool, use_parquet_metadata_cache, true, R"(
 If turned on, parquet format may utilize the parquet metadata cache.
 
@@ -9657,7 +9641,10 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true) \
     MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1) \
     MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
-    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true)
+    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_manifest_decode_concurrency, 4) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_delete_manifest_decode_concurrency, 4) \
+    MAKE_OBSOLETE(M, NonZeroUInt64, iceberg_file_entries_queue_size, 100)
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 
