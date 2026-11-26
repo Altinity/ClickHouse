@@ -49,7 +49,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"entries_condemned", std::make_shared<DataTypeUInt64>(), "Retired entries newly condemned this round (retired-cursor pipeline stage 1)."},
         {"entries_intent_confirmed", std::make_shared<DataTypeUInt64>(), "Rows committed `pending` this round: blobs whose deletion intent this round created or found and confirmed. A later round whose cut shows in-degree 0 deletes the body."},
         {"entries_bodies_deleted", std::make_shared<DataTypeUInt64>(), "Exact-token deletes of blob bodies of `pending` rows answered this round."},
-        {"entries_body_delete_failed", std::make_shared<DataTypeUInt64>(), "Pending blob deletes whose HEAD or exact-token DELETE failed this round. Each such row stays `pending` and is retried in the next round; a non-zero value fails the round."},
+        {"entries_body_delete_failed", std::make_shared<DataTypeUInt64>(), "Counts each pending row with a failed `HEAD` or body-delete job, plus one per refused job enqueue. A failure leaves the round uncommitted."},
         {"fence_outs", std::make_shared<DataTypeUInt64>(), "Expired mounts fenced out by this round's heartbeat floor."},
         {"anomalies", std::make_shared<DataTypeUInt64>(), "Fold clamps surfaced (and survived) this round; steady >0 warrants a look at the round log details."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},

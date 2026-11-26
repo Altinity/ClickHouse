@@ -45,8 +45,7 @@ struct ContentAddressedGarbageCollectionLogElement
     UInt64 entries_condemned = 0;   /// retired-cursor pipeline: entries newly condemned this round
     UInt64 entries_intent_confirmed = 0;   /// rows committed `pending` this round (intent created or found, and confirmed)
     UInt64 entries_bodies_deleted = 0;   /// exact-token deletes of blob bodies of `pending` rows answered this round
-    /// Counts one failed `HEAD`, conditional `DELETE`, or refused body-delete enqueue
-    /// per affected `pending` row.
+    /// Counts each pending row with a failed `HEAD` or body-delete job, plus one per refused job enqueue.
     UInt64 entries_body_delete_failed = 0;
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
     UInt64 anomalies = 0;           /// fold clamps surfaced this round

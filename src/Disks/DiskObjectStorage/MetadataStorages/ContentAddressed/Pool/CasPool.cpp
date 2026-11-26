@@ -582,9 +582,11 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             /// namespace only (never the content planes) — acceptable.
             const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
             CasOperation probe_op = bootstrap_requests.admit();
-            runCapabilityProbe(probe_op, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+            const CapabilityProbeResult probe_result = runCapabilityProbe(
+                probe_op, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
             /// A writable mount may run GC, which creates and deletes intents; its writers read them.
             runIntentPrefixProbe(probe_op, layout, IntentPrefixRights::ReadWrite);
+            probe_backend.pinConditionalBatchDeleteSupport(probe_result.conditional_batch_delete_supported);
         }
         else
         {

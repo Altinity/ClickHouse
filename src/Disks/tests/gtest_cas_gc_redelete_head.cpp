@@ -34,6 +34,9 @@ const DB::UInt128 kGc = hexToU128("00000000000000000000000000000001");
 class RedeleteHeadBackend : public CountingBackend
 {
 public:
+    /// Set before the round to return a different wire spelling of the same body token.
+    std::optional<String> quoted_head_key;
+
     void armHeadFault(const String & key)
     {
         std::lock_guard lock(mutex);
@@ -111,7 +114,11 @@ public:
         if (latched)
             --in_flight;
         if (meta)
+        {
+            if (key == quoted_head_key)
+                meta->value = '"' + meta->value + '"';
             head_values[key] = meta->value;
+        }
         if (std::this_thread::get_id() == owner_thread)
             inline_head_keys.push_back(key);
         return meta;
@@ -131,13 +138,15 @@ public:
         return raw;
     }
 
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         {
             std::lock_guard lock(mutex);
-            remove_calls.emplace_back(key, expected_value);
+            for (const auto & removal : removals)
+                remove_calls.emplace_back(removal.key, removal.expected_token);
         }
-        return CountingBackend::remove(key, expected_value, access);
+        return CountingBackend::removeManyByConditional(removals, access);
     }
 
 private:
@@ -682,6 +691,13 @@ TEST(CASGcRedeleteHead, BodyReplacedAfterTheDeleteHeadIsKeptByTheTokenCondition)
     auto store = openPool(backend, 4);
     Gc gc(store, kGc);
     ASSERT_NO_FATAL_FAILURE(makeAllPending(*backend, store, gc, blobs));
+    const auto preview = gc.previewDeletes();
+    const auto row = std::find_if(preview.deletes.begin(), preview.deletes.end(), [&](const auto & entry)
+    {
+        return entry.reason == "pending" && entry.ref == blobRefOf(replaced);
+    });
+    ASSERT_NE(row, preview.deletes.end());
+    backend->quoted_head_key = blobKeyOf(*store, replaced);
     backend->clearRecords();
     ReplaceAtPhase replace(*backend, *store, "fold_reduce", replaced);
     gc.setPhaseSink(replace.sink());
@@ -689,6 +705,7 @@ TEST(CASGcRedeleteHead, BodyReplacedAfterTheDeleteHeadIsKeptByTheTokenCondition)
     const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(replace.fired);
     ASSERT_TRUE(replace.token_before.has_value()) << "the delete HEAD was not sent in the fold";
+    EXPECT_NE(*replace.token_before, row->token.value) << "the fold must supply the wire token of its own HEAD";
     EXPECT_EQ(rep.deleted, blobs - 1);
     EXPECT_EQ(rep.replaced, 1u);
 

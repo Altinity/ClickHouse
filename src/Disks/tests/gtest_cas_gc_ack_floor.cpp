@@ -88,29 +88,6 @@ std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & la
     return std::nullopt;
 }
 
-/// Counts every conditional removal sent against `watched_key` while that key is ALREADY absent.
-/// A store may answer such a removal with a precondition failure rather than a clean miss (rustfs does,
-/// observed 2026-07-11), so a caller that sends one cannot tell "somebody replaced it" from "it is
-/// gone". The GC redelete site is not allowed to send one: it observes the blob first and compares the
-/// condemned incarnation against what it saw.
-class AbsentRemovalWatchBackend : public InMemoryBackend
-{
-public:
-    void watch(const String & key) { watched_key = key; }
-    size_t removalsAgainstAbsent() const { return removals_against_absent; }
-
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
-    {
-        if (key == watched_key && !InMemoryBackend::head(key, access))
-            ++removals_against_absent;
-        return InMemoryBackend::remove(key, expected_value, access);
-    }
-
-private:
-    String watched_key;
-    size_t removals_against_absent = 0;
-};
-
 class CkptReplacementConflictBackend : public InMemoryBackend
 {
 public:
@@ -1227,7 +1204,7 @@ TEST(CASGCAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 /// round observes first, so it never has to tell the two apart.
 TEST(CASGCAckFloor, AbsentBlobGoesStandingWithoutASpeculativeConditionalRemoval)
 {
-    auto backend = std::make_shared<AbsentRemovalWatchBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
@@ -1258,14 +1235,14 @@ TEST(CASGCAckFloor, AbsentBlobGoesStandingWithoutASpeculativeConditionalRemoval)
     ASSERT_TRUE(pending_entry->token.matches(doomed->etag));
     ASSERT_EQ(op.remove(blob_key, doomed->etag, Retry::once()), Removal::Removed);
     ASSERT_FALSE(op.head(blob_key, Retry::once()));
-    backend->watch(blob_key);
+    const auto deletes_before = backend->deleteCount(blob_key);
 
     // The deleting pass observes the absent key and records `standing` without a request the store could
     // answer ambiguously; the intent stays for the next zero cut.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.replaced, 0u);
-    EXPECT_EQ(backend->removalsAgainstAbsent(), 0u)
+    EXPECT_EQ(backend->deleteCount(blob_key), deletes_before)
         << "the delete HEAD observed the key first, so it sent no conditional removal against an absent object";
     const auto standing = currentEntryFor(*backend, store->layout(), blob);
     ASSERT_TRUE(standing.has_value());

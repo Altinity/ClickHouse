@@ -234,9 +234,8 @@ void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAcces
     store_[request.destination_key] = std::move(object);
 }
 
-Backend::RawRemoval InMemoryBackend::applyDelete(const String & key, const String & expected_value)
+Backend::RawRemoval InMemoryBackend::removeUnderLock(const String & key, const String & expected_value, bool hold)
 {
-    // Caller holds the mutex.
     auto it = store_.find(key);
     if (it == store_.end())
         return RawRemoval::Gone;
@@ -244,7 +243,10 @@ Backend::RawRemoval InMemoryBackend::applyDelete(const String & key, const Strin
     if (enforce_tokens_ && it->second.value != expected_value)
         return RawRemoval::Mismatch;
 
-    store_.erase(it);
+    if (hold)
+        pending_deletes_.push_back({key, expected_value});
+    else
+        store_.erase(it);
     return simulate_delete_markers_ ? RawRemoval::DeleteMarker : RawRemoval::Removed;
 }
 
@@ -256,24 +258,7 @@ Backend::RawRemoval InMemoryBackend::remove(const String & key, const String & e
     checkExpectedValue(key, expected_value);
 
     std::lock_guard lock(mutex_);
-
-    if (hold_deletes_)
-    {
-        // Validate the key exists (and the value matches if enforcing) before queuing,
-        // but don't remove yet — just enqueue.
-        auto it = store_.find(key);
-        if (it == store_.end())
-            return RawRemoval::Gone;
-        if (enforce_tokens_ && it->second.value != expected_value)
-            return RawRemoval::Mismatch;
-        PendingDelete pd;
-        pd.key = key;
-        pd.value = expected_value;
-        pending_deletes_.push_back(std::move(pd));
-        return simulate_delete_markers_ ? RawRemoval::DeleteMarker : RawRemoval::Removed;
-    }
-
-    return applyDelete(key, expected_value);
+    return removeUnderLock(key, expected_value, hold_deletes_);
 }
 
 void InMemoryBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &)
@@ -311,6 +296,23 @@ void InMemoryBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys
         }
         store_.erase(it);
     }
+}
+
+std::vector<Backend::RawBatchRemoveResult> InMemoryBackend::removeManyByConditional(
+    const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
+{
+    if (removals.size() <= 1)
+        return Backend::removeManyByConditional(removals, access);
+
+    for (const RawConditionalRemove & removal : removals)
+        checkExpectedValue(removal.key, removal.expected_token);
+
+    std::lock_guard lock(mutex_);
+    std::vector<RawBatchRemoveResult> results;
+    results.reserve(removals.size());
+    for (const RawConditionalRemove & removal : removals)
+        results.push_back(removeUnderLock(removal.key, removal.expected_token, hold_deletes_));
+    return results;
 }
 
 void InMemoryBackend::failNextBulkRemoveWith(std::exception_ptr error)
@@ -429,7 +431,7 @@ Backend::RawRemoval InMemoryBackend::landPendingDelete(size_t i)
     pending_deletes_.erase(pending_deletes_.begin() + static_cast<ptrdiff_t>(i));
 
     // Apply the value check at LAND time — the object may have been modified since the delete was enqueued.
-    return applyDelete(pd.key, pd.value);
+    return removeUnderLock(pd.key, pd.value, /*hold=*/false);
 }
 
 void InMemoryBackend::refuseNextWrite(const String & key)

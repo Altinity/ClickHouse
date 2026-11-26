@@ -2186,6 +2186,24 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    /// A conditional delete has the same per-key verb for a single key and for a batch. Keep the
+    /// request boundary in the journal, and let single-key fixtures intercept their usual remove.
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, DB::Cas::TransportAccess & access) override
+    {
+        if (removals.size() <= 1)
+            return Backend::removeManyByConditional(removals, access);
+
+        std::vector<String> keys;
+        keys.reserve(removals.size());
+        for (const auto & removal : removals)
+            keys.push_back(removal.key);
+        append(JournalVerb::Remove, std::move(keys), {});
+        for (const auto & removal : removals)
+            tick(delete_counts, delete_total, removal.key);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
     /// One `removeManyWriteOnce` call is one bulk-delete request that names every key it carried; the
     /// per-key `delete_counts` grow by one for each key named, exactly as a single-key `remove` would,
     /// so `deleteCount(key)` reads the same whichever verb deleted it.

@@ -48,7 +48,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `entries_condemned` ([UInt64](/sql-reference/data-types/int-uint)) — Retired entries newly condemned this round (retired-cursor pipeline stage 1).
 - `entries_intent_confirmed` ([UInt64](/sql-reference/data-types/int-uint)) — Rows committed `pending` this round: blobs whose deletion intent this round created or found and confirmed. A later round whose cut shows in-degree `0` deletes the body.
 - `entries_bodies_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Exact-token blob body deletes answered this round.
-- `entries_body_delete_failed` ([UInt64](/sql-reference/data-types/int-uint)) — Pending blob deletes whose `HEAD` or exact-token `DELETE` failed this round. Each such row stays `pending` and is retried in the next round; a non-zero value fails the round.
+- `entries_body_delete_failed` ([UInt64](/sql-reference/data-types/int-uint)) — Counts each pending row with a failed `HEAD` or body-delete job, plus one per refused job enqueue. A failure leaves the round uncommitted.
 - `fence_outs` ([UInt64](/sql-reference/data-types/int-uint)) — Expired mounts fenced out by this round's heartbeat floor.
 - `anomalies` ([UInt64](/sql-reference/data-types/int-uint)) — Fold clamps surfaced (and survived) this round. A steady non-zero value warrants a look at the round log details.
 - `duration_ms` ([UInt64](/sql-reference/data-types/int-uint)) — The round wall-clock duration (on a `Finish` row).
@@ -94,7 +94,7 @@ The phases, in execution order:
 | `intent_sweep_list` | List one page of `blob-intents/` from the stored cursor to find deletion intents that have no row. Absent from a round whose destruction is suppressed. `phase_metrics` carries `listed`, `nominated`, `unparsed`, `wrapped` (`1` when the listing reached its end) and `list_budget_keys`. | one `LIST` page |
 | `fold_reduce` | The per-shard in-degree merge: condemn and create intents, spare, decide deletes, adopt orphan intents. `phase_metrics` carries `condemned`, `intents_confirmed` (rows committed `pending`), `spared`, `body_deletes_decided` (body deletes decided), `adopted`, `nominations_waiting` (nominated intents left for a later fold: see [orphan intents](/antalya/cas/architecture/garbage-collection#orphan-intents)), `read_ahead_blobs` (blobs the fold holds in memory to read the `HEAD`s of `pending` and `standing` rows ahead; 0 when no parent row is `pending` or `standing`), `suppress_destructive` (`1` when the round deleted no body or intent: an anomaly, a held namespace, an incomplete reference frontier, a stop request seen before the end of the ref intake, or `parent_unconfirmed`), `frontier_complete` (`0` when the round could not prove its reference frontier complete, which suppresses deletes), `parent_unconfirmed` (`1` when the `HEAD` of `gc/state` after the intake did not show the leased version, so the round deleted nothing), `condemned_rows` (rows the round leaves on file: `candidate`, `pending` and `standing`) and `pending_rows` (the `pending` and `standing` rows among them). | prior-run streaming `GET`s, one `HEAD` per blob that needs a decision, one intent `PUT` per intent created, run `PUT`s |
 | `fold_seal_write` | Publish the new fold seal. | one `PUT` |
-| `pending_deletes` | The single content-delete site: exact-token deletes of bodies whose rows were `pending` in the adopted state, then the deletion-intent deletes, plus the outcome logs. `phase_metrics` carries `bodies_deleted` (body deletes answered this round), `jobs_scheduled` (bodies sent to the GC I/O pool; `0` for no candidates, sequential execution, singleton batches, or refusal before the first submission), `jobs_failed` and `intents_deleted`. | one `DELETE` per body, intent deletes in batch requests, one outcome-log `PUT` per shard with rows |
+| `pending_deletes` | Delete blobs whose rows were `pending` in the adopted state, using the token for each key observed in `fold_reduce`. After all body deletes have answered, remove the eligible deletion intents. | conditional blob-delete chunks, separate write-once intent deletes, one outcome-log `PUT` per shard with rows |
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
 | `manifest_deletes` | Exact-token deletes of owner-removed manifest bodies, after their decrements were adopted. | one `DELETE` per body |
@@ -153,12 +153,28 @@ WHERE round_id = '...' AND event_type = 'Phase'
 ORDER BY event_time_microseconds;
 ```
 
+The `pending_deletes` phase reports body work separately from intent cleanup.
+
+| `phase_metrics` key | Unit |
+|---|---|
+| `bodies_deleted` | Blob keys whose conditional delete answered `Removed`, `Gone` or `Mismatch`. `deleted` counts the `Deleted` outcomes. |
+| `delete_chunks` | Logical body-delete chunks executed inline or submitted to the I/O pool, including those that fail. A retry belongs to the same chunk. |
+| `jobs_scheduled`, `delete_chunk_jobs_scheduled` | Body-delete chunks successfully enqueued on the I/O pool. Both are zero for inline execution, including a shard with a single chunk. |
+| `jobs_failed` | One per blob in a failed chunk, plus one per enqueue refusal regardless of the number of unsent blobs. |
+| `delete_chunk_jobs_failed` | One per chunk that finishes with an exception, including inline execution. |
+| `delete_chunk_job_schedule_failures` | One per refusal to enqueue a chunk. |
+| `intents_deleted` | Intent keys removed by the separate write-once deletes. |
+
+The scheduling and failure counters are recorded even when the phase throws.
+
 Two caveats when reading these rows:
 
 - Requests issued by GC I/O pool workers — the `pending_deletes` fan-out, the intent creates of `fold_reduce` and the fold read-ahead of
   `fold_ref_intake` and `fold_reduce` — also run on other threads and are missing from those phase
-  rows' `ProfileEvents`. They still count in `system.events`. On `pending_deletes`, read
-  `phase_metrics` `jobs_scheduled` / `jobs_failed` next to `bodies_deleted`.
+  rows' `ProfileEvents`. They still count in `system.events`. With `cas_gc_io_concurrency = 1`,
+  the `pending_deletes` row's `DiskS3DeleteObjects` includes S3 requests for both blob deletes and
+  intent cleanup, including retries. On that row, `CASBulkDeleteRequests` counts successful
+  write-once requests for intent cleanup, including singletons.
 - Phase durations do not sum to the round's `duration_ms`. The round also performs untimed
   bookkeeping between phases, and the `Finish` row's `duration_ms` remains the authority on total
   round time.

@@ -51,6 +51,8 @@ public:
     /// `hold_deletes_` exactly as `remove` does: a held delete is queued and lands only on
     /// `landPendingDelete`.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
     /// The next `removeManyWriteOnce` throws `error` instead of deleting anything; one-shot, like
     /// `failNextWriteWith`.
     void failNextBulkRemoveWith(std::exception_ptr error);
@@ -62,6 +64,8 @@ public:
 
     /// The emulation deletes keys one by one under its lock, so the CAS maximum is the only bound.
     size_t bulkDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
+    size_t conditionalBatchDeleteKeyLimit() const override { return conditional_batch_delete_supported ? kBulkDeleteMaxKeys : 1; }
+    void pinConditionalBatchDeleteSupport(const bool supported) override { conditional_batch_delete_supported = supported; }
 
     /// Creates the key when `expected_value` is empty, or replaces the incarnation it names. A
     /// refused precondition leaves the store unchanged. Value enforcement can be disabled with
@@ -95,17 +99,15 @@ public:
 
     // ---- Fault-injection controls ----
 
-    /// When true, `remove` validates and enqueues deletes rather than applying them immediately.
-    /// The caller sees `Removed` (the send was accepted), but the object remains until
-    /// `landPendingDelete`, where the expected value is checked again.
+    /// When enabled, single-key and batched conditional deletes queue each accepted key with the
+    /// expected value from the request. The object remains until `landPendingDelete` checks that value again.
     void setHoldDeletes(bool hold);
 
     /// Returns the number of currently held deletes.
     size_t pendingDeletes() const;
 
-    /// Applies and removes the held delete at index `i`. The expected value is evaluated against the
-    /// current object at land time; the queue entry is removed whether the result is `Mismatch` or
-    /// `Removed`. An invalid index returns `NotFound`.
+    /// Consumes the held delete at index `i` and checks its expected value against the current object.
+    /// An invalid index returns `Gone`.
     RawRemoval landPendingDelete(size_t i);
 
     /// Refuses the next write of `key` once, as a clean precondition failure that leaves the store
@@ -180,9 +182,8 @@ private:
     /// backend instance, which also makes value equality a safe content-cache identity check in tests.
     String mintValue();
 
-    /// Applies an exact-value delete while `mutex_` is already held. Used by immediate deletes and by
-    /// `landPendingDelete` after its queue entry has been removed.
-    RawRemoval applyDelete(const String & key, const String & expected_value);
+    /// Caller holds `mutex_`. A held delete records the supplied value even when token checks are disabled.
+    RawRemoval removeUnderLock(const String & key, const String & expected_value, bool hold);
 
     using ArmedFailures = std::map<String, std::vector<std::exception_ptr>>;
     using Hooks = std::map<String, std::function<void()>>;
@@ -227,6 +228,7 @@ private:
     std::vector<std::exception_ptr> armed_bulk_remove_failures_;
     std::function<void()> before_bulk_remove_hook_;
     size_t bulk_remove_calls_ = 0;
+    std::atomic_bool conditional_batch_delete_supported = false;
 };
 
 }

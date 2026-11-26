@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
+#include <base/scope_guard.h>
 
 namespace DB
 {
@@ -19,11 +20,7 @@ namespace DB::Cas
 namespace
 {
 
-/// `op.remove`'s own delete-marker signal (`CAS_DELETE_MARKER`, thrown outside the attempt loop because
-/// a versioned bucket answers this way every time) is re-signalled here as the operator-facing message
-/// the probe has always thrown for it — everything else propagates unchanged. Every `remove` the battery
-/// issues against a live incarnation goes through this: a store that ignores the delete precondition AND
-/// mints delete markers must still be reported with this message, not the engine's terse one.
+/// Report the bucket requirement even if a store creates a marker on a stale-token probe delete.
 Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const Etag & seen)
 {
     try
@@ -35,13 +32,9 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
         if (e.code() != DB::ErrorCodes::CAS_DELETE_MARKER)
             throw;
         throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
-            "CasProbe: remove succeeded but created a versioning delete marker — the bucket has "
-            "object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket: "
-            "every GC delete would archive a noncurrent version instead of reclaiming storage (the bucket "
-            "grows forever), and the constantly-rewritten ref objects would pile up versions on every "
-            "commit. Use a bucket where versioning was NEVER enabled; skip_access_check skips this probe "
-            "but does not make a versioned bucket usable — note that merely SUSPENDING versioning is not enough (deletes on a "
-            "versioning-suspended bucket still mint delete markers, so this probe will refuse again)");
+            "CasProbe: removing '{}' created a delete marker. CAS requires a bucket where versioning has never been enabled. "
+            "A bucket with suspended versioning can still create delete markers. "
+            "Setting skip_access_check bypasses this probe but does not make a versioned bucket usable.", key);
     }
 }
 
@@ -51,6 +44,14 @@ void throwIfRefused(const WriteResult & result, std::string_view what, const Str
 {
     if (const auto * refused = std::get_if<Refused>(&result))
         throw DB::Exception(refused->store_error, "CasProbe: the store refused the {} of '{}': {}", what, key, refused->message);
+}
+
+Etag requireProbeCommit(const WriteResult & result, std::string_view what, const String & key)
+{
+    throwIfRefused(result, what, key);
+    if (const auto * committed = std::get_if<Committed>(&result))
+        return committed->etag;
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CasProbe: the {} of '{}' did not commit", what, key);
 }
 
 /// Rethrows the request's failure with the right it needs; keeps the store's code where it has one.
@@ -96,12 +97,64 @@ void removeIfPresent(CasOperation & op, const String & key) noexcept
 
 }
 
-void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
+bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key)
+{
+    /// The optional batch probe sends S3-compatible XML `DeleteObjects`. GCS rejects per-object `ETag` conditions.
+    /// https://docs.cloud.google.com/storage/docs/object-deletion-overview
+    /// GCS JSON API batch can group separate `DELETE` requests, each with its own `ifGenerationMatch`.
+    /// https://docs.cloud.google.com/storage/docs/batch
+    /// https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters
+    if (absent_key.expected_token.dialect() == Dialect::Generation)
+        return false;
+
+    const String first_matching_key = probe_prefix + "/batch-first";
+    const String replaced_key = probe_prefix + "/batch-second";
+    const String second_matching_key = probe_prefix + "/batch-third";
+    SCOPE_EXIT({
+        removeIfPresent(op, first_matching_key);
+        removeIfPresent(op, replaced_key);
+        removeIfPresent(op, second_matching_key);
+    });
+
+    const Etag first_matching_token = requireProbeCommit(
+        op.create(first_matching_key, "probe-batch-first", Retry::standard()), "create", first_matching_key);
+    const Etag stale_token = requireProbeCommit(
+        op.create(replaced_key, "probe-batch-second-v1", Retry::standard()), "create", replaced_key);
+    const String replacement_bytes = "probe-batch-second-v2";
+    requireProbeCommit(op.replace(replaced_key, replacement_bytes, stale_token, Retry::standard()), "replace", replaced_key);
+    const Etag second_matching_token = requireProbeCommit(
+        op.create(second_matching_key, "probe-batch-third", Retry::standard()), "create", second_matching_key);
+    try
+    {
+        const auto removals = op.removeManyByConditional(
+            {{first_matching_key, first_matching_token}, {replaced_key, stale_token},
+             {second_matching_key, second_matching_token}, absent_key},
+            Retry::standard(), CasOperation::ConditionalDeletePurpose::Probe);
+        if (removals.size() != 4 || removals[0] != Removal::Removed || removals[1] != Removal::Mismatch
+            || removals[2] != Removal::Removed || removals[3] != Removal::Gone)
+            return false;
+
+        /// Check before cleanup, which would otherwise hide a successful response without deletion.
+        const auto first = op.head(first_matching_key, Retry::standard());
+        const auto replacement = op.read(replaced_key, Retry::standard());
+        const auto second = op.head(second_matching_key, Retry::standard());
+        return !first && !second && replacement && replacement->bytes == replacement_bytes;
+    }
+    catch (const DB::Exception & e)
+    {
+        if (e.code() != DB::ErrorCodes::NOT_IMPLEMENTED)
+            throw;
+        return false;
+    }
+}
+
+CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix)
 {
     // Sub-directory style ("probe_prefix/token") ensures that list(probe_prefix, …) works for both the
     // in-memory backend (prefix match) and the LocalObjectStorage backend (directory listing).
     const String key = probe_prefix + "/token";
 
+    CapabilityProbeResult result;
     try
     {
         // ---- Step 1: create fresh -> Committed; read-after-write returns the bytes. ----
@@ -231,6 +284,9 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                     "CasProbe: list-after-delete failed — the deleted probe key '{}' is still visible in the listing under prefix '{}'",
                     key, probe_prefix);
         }
+
+        /// The single-object delete verified that `key` was gone, so reuse its token for the absent entry.
+        result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
     }
     catch (...)
     {
@@ -240,6 +296,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
 
     // The key was already deleted in step 7; the HEAD finds it gone.
     removeIfPresent(op, key);
+    return result;
 }
 
 void runIntentPrefixProbe(CasOperation & op, const Layout & layout, IntentPrefixRights rights)

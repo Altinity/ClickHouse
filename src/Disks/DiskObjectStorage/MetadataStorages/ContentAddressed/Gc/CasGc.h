@@ -160,7 +160,7 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t intent_confirmed = 0;  /// rows committed `pending` this round: intent creates confirmed in this round
     size_t bodies_deleted = 0;    /// body deletes answered this round
-    /// Counts one failed `HEAD`, conditional `DELETE`, or refused delete enqueue per affected `pending` row.
+    /// Counts each pending row with a failed `HEAD` or body-delete job, plus one per refused job enqueue.
     size_t body_delete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
@@ -546,6 +546,7 @@ public:
     /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
     size_t bulkDeleteChunkKeys() const;
+    size_t conditionalDeleteKeysPerChunk() const;
 
     /// Deletes intent keys in requests of `bulkDeleteChunkKeys` keys, one by one on a store without batch
     /// delete. An absent key is success; a refused or unanswered request throws naming a key of its chunk.
@@ -850,16 +851,18 @@ private:
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget, bool run_orphan_manifest_sweep);
 
-    struct RedeleteIo
-    {
-        String blob_key;
-        Removal del = Removal::Gone;
-    };
-
     struct IndexedException
     {
         size_t index;
         std::exception_ptr exception;
+    };
+
+    struct IoJobsResult
+    {
+        bool on_pool = false;
+        size_t scheduled = 0;
+        std::vector<std::exception_ptr> scheduled_job_errors;
+        std::optional<IndexedException> job_schedule_error;
     };
 
     /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
@@ -884,13 +887,20 @@ private:
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
         std::map<uint64_t, OutcomeTally> & outcome_tallies;
-        uint64_t & jobs_scheduled;
+        uint64_t & delete_chunk_jobs_scheduled;
+        uint64_t & delete_chunk_jobs_failed;
+        uint64_t & delete_chunk_job_schedule_failures;
+        uint64_t & delete_chunks;
     };
 
-    /// Sends the exact-token delete when the fold's `HEAD` showed the row's own incarnation; no request otherwise.
-    static RedeleteIo performRedeleteIo(const BodyDelete & body_delete, const Layout & layout, CasOperation & op);
+    IoJobsResult runRedeleteIoJobs(
+        ThreadPool & pool,
+        size_t concurrency,
+        size_t job_count,
+        CasOperation & op,
+        const std::function<void(size_t, CasOperation &)> & job);
 
-    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
+    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const Layout & layout, Removal removal);
 
     void reportRedeleteFailure(
         RedeleteRoundContext & ctx,

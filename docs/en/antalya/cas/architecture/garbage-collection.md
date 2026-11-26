@@ -53,7 +53,7 @@ follower or a deferred round execution returns before that commit.
 | 9 | `intent_sweep_list` | fold; absent from a round whose destruction is suppressed | One `LIST` page of `blob-intents/` from the stored cursor, nominating [deletion intents](#orphan-intents) that have no row |
 | 10 | `fold_reduce` | fold | Merge prior edges, new deltas, the parent's rows and the nominated intents: create an intent for each blob that reached zero, spare referenced blobs, decide body and intent deletes, adopt orphan intents |
 | 11 | `fold_seal_write` | fold | Write the new fold seal once, write-once deterministic, adopting a byte-identical replay instead of rewriting it |
-| 12 | `pending_deletes` | fold | The single blob-body delete site: exact-token delete of bodies whose rows were `pending` in the adopted state, then the deletion-intent deletes, plus the outcome-log writes |
+| 12 | `pending_deletes` | fold | Delete blobs from previously committed `pending` rows in conditional chunks using the tokens from phase 10, then remove eligible deletion intents and write the outcome logs |
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
@@ -96,7 +96,7 @@ exact-token deletes and prune that earlier phases justified from *previously* pu
 already have run; they are idempotent): unapplied transactions and a cursor/apply mismatch (both
 `CORRUPTED_DATA`, checked between phases 10 and 11), a missing adopted seal, a table with a snapshot
 but no surviving log and no cursor, a non-total condemned summary (all `CORRUPTED_DATA`), and an
-observed delete marker (`CAS_DELETE_MARKER`: bucket versioning is on). The per-phase "fails the round
+observed delete marker (`CAS_DELETE_MARKER`). The per-phase "fails the round
 if" lists below name the protocol checks; an uncaught backend or decode exception fails the round
 execution too.
 
@@ -559,32 +559,68 @@ memory* here and made durable only by phase 13's commit `CAS`.
 
 ## Phase 12 — pending deletes {#phase-12-pending-deletes}
 
-The round's single blob-body delete site, before the commit `CAS`: sends the exact-token body
-deletes the fold decided for `pending` rows, then the deletion-intent deletes, and writes the
-forensic outcome logs. Body deletes, and the phase 10 `HEAD`s that decide them, are bounded by
-`cas_gc_round_redelete_budget` (the excess is carried unchanged; see [condemnation and deletion](#condemn-delete)).
+Phase 12 is the round's single blob-body delete site and runs before the commit `CAS`.
+A previously committed `pending` row records an intent confirmed in an earlier round. If the
+current fold still finds zero references, phase 10 checks which incarnation is at the blob key.
+An absent blob needs no delete. For a matching incarnation the fold passes its observation to
+phase 12 in `BodyDelete::observed`. On S3, GC takes the blob's `ETag` directly from that
+phase 10 `HEAD` response. If a writer has since republished the blob, the precondition
+preserves the replacement. The [redelete budget](#condemn-delete) bounds this work.
 
-- **Runs on:** fold path only
-- **Reads:** none here. The `HEAD` that names the body's current token was sent in phase 10, after the
-  round's reference cut; it also settles the absent case without spending a conditional delete
-- **Writes / deletes:** a `DELETE` conditional on the token that `HEAD` observed, for each body the fold
-  found still at the row's token; then the intent deletes of the round (one batch request for up to
-  `cas_gc_bulk_delete_chunk_keys` keys, or one `DELETE` per key on a store without batch delete),
-  sent only after every body delete answered; one write-once outcome log per shard with settled
-  entries
-- **Safety:** a body is deletable only because an earlier committed fold recorded its row `pending`,
-  which means its intent was confirmed in an earlier round, and because this round's cut still shows no
-  reference. Exact token means a stale leader cannot delete a fresh incarnation; `Removed`, `Gone` and
-  `Mismatch` each show that the incarnation the row names is no longer at the key. An intent delete
-  never shares a job with the delete of its body. A delete without a usable answer fails the round
-  before its commit and the row keeps its state
-- **Fails the round if:** a body or intent delete is refused or unanswered (the affected rows stay as
-  they were); a backend delete marker appears in a response — object versioning on a mis-provisioned
-  pool (`CAS_DELETE_MARKER`). A store that refuses the intent deletes, for example a credential without `DELETE` on
-  `blob-intents/`, fails every round that must delete an intent
-- **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `bodies_deleted`,
-  `intents_confirmed`, `replaced`, `spared`, `intents_deleted`, `jobs_scheduled`, `jobs_failed`,
-  `outcome_logs_written`, `outcome_rows_dropped`
+Within each GC shard, one delete job handles a chunk of up to `cas_gc_bulk_delete_chunk_keys`
+blobs, capped by the backend's conditional-delete limit and 1000 keys. S3 receives one
+`DeleteObjects` request with an `ETag` per key for a multi-key chunk, or one conditional
+`DeleteObject` for a singleton. A mount without a successful conditional-batch probe uses
+one-key chunks. Multiple chunks can run concurrently up to `cas_gc_io_concurrency`.
+
+After every body delete has answered, GC removes the deletion intents selected by the fold.
+It groups their keys across all shards and sends ordinary write-once deletes in separate
+requests, bounded by `cas_gc_bulk_delete_chunk_keys` and the backend's ordinary batch limit.
+GC then writes one outcome log per shard with budget-admitted outcomes.
+
+`Removed`, `Gone` and `Mismatch` all settle a body delete. A failed chunk can have partially
+deleted its blobs. GC waits for the submitted jobs in that shard and records the successful
+chunks' outcomes in memory before propagating a job or enqueue error. A body or intent delete
+that fails leaves the previous state committed, so the next round rechecks those rows.
+For example, missing permission to delete from `blob-intents/` fails every round that needs to remove an intent.
+If S3 reports a delete marker for any key, GC raises `CAS_DELETE_MARKER` with that key,
+even if the same response reports `SlowDown` for another key. With versioning enabled, S3
+retains the previous version. With versioning suspended, S3 can create a marker and remove
+the version whose `VersionId` is `null` in the same operation.
+
+The phase row reports `bodies_deleted` (body deletes answered), `intents_deleted` (intent keys
+removed) and `delete_chunks` (logical body-delete chunks executed inline or submitted to the
+pool). The job counters `jobs_scheduled`, `jobs_failed`, `delete_chunk_jobs_scheduled`,
+`delete_chunk_jobs_failed` and `delete_chunk_job_schedule_failures` are defined in
+[`system.cas_gc_log`](/operations/system-tables/cas_gc_log#per-phase-rows). The other phase
+metrics are `deleted`, `absent`, `intents_confirmed`, `replaced`, `spared`, `outcome_logs_written`
+and `outcome_rows_dropped`.
+
+Ordinary S3 batch deletion and conditional batch deletion have independent capability flags. Only
+the latter requires the store to enforce a separate `ETag` for each key in `DeleteObjects`. Both
+paths use `objects_chunk_size_to_delete` as a size limit. A request-level `NotImplemented` from
+the optional batch check leaves GC using one-key chunks. A request-level `InvalidRequest` or
+`InvalidArgument` propagates and fails the mount. After a successful probe, a batch request error
+follows the normal request retry policy and does not change the pinned capability.
+
+When S3 returns an outcome for every key, CAS keeps completed outcomes and retries only keys
+with retryable errors. Each retry uses the original `ETag`. If a response is lost, CAS retries
+the keys from that attempt because their outcomes are unknown. A single remaining key uses
+conditional `DeleteObject`. The mount probe retries its full four-key batch so that one
+`DeleteObjects` response demonstrates all four expected outcomes.
+
+CAS skips the optional conditional batch delete check on Google Cloud Storage in generation-token
+mode. The [S3-compatible XML `DeleteObjects` API](https://docs.cloud.google.com/storage/docs/object-deletion-overview)
+rejects per-object `ETag` conditions. The [GCS JSON batch API](https://docs.cloud.google.com/storage/docs/batch)
+can group individual `DELETE` requests, each with its own
+[`ifGenerationMatch` condition](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters).
+CAS uses the XML API. The mount verifies single-object conditional deletion and GC sends a separate
+`DELETE` for each blob body with
+[`x-goog-if-generation-match`](https://docs.cloud.google.com/storage/docs/xml-api/delete-object#request-headers).
+
+The RustFS integration test mounts two disks with GC chunk limits of one and two. It counts
+conditional body-delete requests separately from intent cleanup in each round and lists the
+bucket to verify that the blobs actually disappeared.
 
 Under `suppress_destructive` no body delete and no intent delete is decided, so nothing is deleted;
 sparing and moving a row to a replaced body still happen. An outcome log is written only for a shard
@@ -1062,7 +1098,7 @@ logs:
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per blob that reached zero, per `pending` row at zero, per transition, per adopted orphan, and per `pending` or `standing` row of a blob referenced again |
 | Intent `PUT` (`If-None-Match`) | 1 per blob condemned, per `candidate` retried and per transition, up to `cas_gc_round_intent_create_budget`; plus 1 `GET` when the intent already exists |
-| Blob body `DELETE` | 1 per `pending` row whose `HEAD` still shows its token; the `HEAD`s of untouched `pending` rows are bounded by `cas_gc_round_redelete_budget` |
+| Blob body `DELETE` | 1 request per conditional chunk in each GC shard before retries. Each key comes from a `pending` row whose `HEAD` still shows its token |
 | Intent `DELETE` | 1 per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` shows another token, in batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | `LIST blob-intents/` | 1 page per round whose destruction is not suppressed |
 | `HEAD gc/state` | 1 when the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction; 1 more when the adopted seal is missing or the merge reports `CORRUPTED_DATA` |
@@ -1109,8 +1145,8 @@ disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without
 | `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep candidate budget per page; `0` lists without nominations (phases 10, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 10) |
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 10) |
-| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
-| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 10), the orphan-sweep planning reads (phase 10), the rebuild read-ahead and the `pending_deletes` conditional `DELETE` fan-out (phase 12); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
+| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per conditional blob-delete chunk or ordinary delete of write-once keys, including intents (phases 12, 15–17). Range `1` to `1000`, capped by the backend limit for that operation |
+| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 10), intent creates and orphan-sweep planning reads (phase 10), rebuild read-ahead, conditional blob-delete chunks (phase 12) and namespace janitor batch deletes (phase 16). `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 
 The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
 and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk
@@ -1236,7 +1272,7 @@ No `CAS`.
 
 | Key | Operation | Requests |
 |---|---|---:|
-| blob body | conditional `DELETE` | one per `pending` row whose `HEAD` in phase 10 still showed its token (≤ `cas_gc_round_redelete_budget`) |
+| blob body | conditional `DELETE` | one per conditional chunk per shard before retries, using each blob's token from the phase 10 `HEAD` |
 | `<pool_prefix>/blob-intents/...` | `DELETE` | one key per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` in phase 10 showed another token; batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | per-shard outcome log | `PUT` | one per shard with at least one budget-admitted delete or spare outcome; a replay adds one byte-compare `GET` |
 
@@ -1345,7 +1381,7 @@ that a `GC` round refuses as corrupt).
 |---|---|
 | `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
-| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Rebuilds the `GC` baseline from raw owner state. It runs when `gc/state` is absent or its lease was never held. A present `gc/state` whose lease was held is refused with `another GC leader holds the lease`; one that names a missing fold seal is refused before the lease is tried, with a message that says the pool must be recreated. No repair for such a pool is available in this build (see [GC refuses its bookkeeping](/antalya/cas/operations/debugging#gc-bookkeeping-corrupt)). It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's intent, body-delete, exact-token path. It resets `intent_sweep_cursor`, so the intent sweep then re-adopts every intent of the pool. The disk is required |
+| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Rebuilds the `GC` baseline from raw owner state. It runs when `gc/state` is absent or its lease was never held. A present `gc/state` whose lease was held is refused with `another GC leader holds the lease`; one that names a missing fold seal is refused before the lease is tried, with a message that says the pool must be recreated. No repair for such a pool is available in this build (see [GC refuses its bookkeeping](/antalya/cas/operations/debugging#gc-bookkeeping-corrupt)). It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's intent, body-delete, exact-token path. An `ABORTED` commit conflict or `CAS_DELETE_MARKER` from a delete request is not a reason to rebuild. It resets `intent_sweep_cursor`, so the intent sweep then re-adopts every intent of the pool. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references, and leaves out a GC shard a round refuses as corrupt, naming it instead. Prints `snapshot=none` or `snapshot=adopted` after `preview_deletes=`, and fails with `CORRUPTED_DATA` when `gc/state` names a fold seal that is absent. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead

@@ -974,7 +974,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCRetiredSparedByReref, "Number of CAS GC pending or standing rows dropped because the blob was referenced again (an ordinary race, not a fail-closed abort). Subset of CASGCRetiredSpared.", ValueType::Number) \
     M(CASGCRetiredIntentConfirmed, "Number of CAS GC rows committed pending after their deletion intent was confirmed. Growth indicates cleanup progress.", ValueType::Number) \
     M(CASGCRetiredBodyDeleted, "Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity.", ValueType::Number) \
-    M(CASGCRetiredBodyDeleteFailed, "Number of CAS GC pending blob deletes whose HEAD or exact-token DELETE failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round.", ValueType::Number) \
+    M(CASGCRetiredBodyDeleteFailed, "Counts each CAS GC pending row with a failed HEAD or body-delete job, plus one per refused job enqueue. A failure leaves the round uncommitted.", ValueType::Number) \
     M(CASGCRetiredGraduated, "The earlier name of CASGCRetiredIntentConfirmed, incremented together with it.", ValueType::Number) \
     M(CASGCRetiredRedeleted, "The earlier name of CASGCRetiredBodyDeleted, incremented together with it.", ValueType::Number) \
     M(CASGCRetiredRedeleteFailed, "The earlier name of CASGCRetiredBodyDeleteFailed, incremented together with it.", ValueType::Number) \

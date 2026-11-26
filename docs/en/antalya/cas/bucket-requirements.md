@@ -22,7 +22,7 @@ these conditions is refused rather than trusted.
 | Conditional overwrite (`If-Match: <token>`) | `Backend::putOverwrite`, `Backend::casPut` | The one mutual-exclusion primitive: mount leases, `gc/state` |
 | Unconditional complete-object publication | `Backend::publishBlob` | An absent or condemned content-addressed body is replaced atomically; native stores may use multipart |
 | Native same-store copy when `cas_staging_backend = s3` | `IObjectStorage::copyObject` with `ObjectStorageCopyMode::NativeOnly` | The first absent staged publication may copy its complete object without a client-side fallback |
-| Exact-token delete | `Backend::deleteExact` | GC must delete only the incarnation it condemned, never a replacement |
+| Exact-token delete | `Backend::remove` | GC must delete only the incarnation it condemned, never a replacement |
 | Ranged same-store copy, for backups only | `UploadPartCopy` through `copyS3File` | A `BACKUP` to an `S3(...)` destination on the pool's own endpoint copies a blob's payload without its header. Optional, but only when the lack is recognized: `GCS` lacks it by its current XML API, so `Client::supportsMultiPartCopy` reports `false` there and the copy goes through the ClickHouse server, which is slower but correct. A store that instead refuses `UploadPartCopy` with an error other than `AccessDenied` fails the `BACKUP`; set `s3_allow_multipart_copy = 0` there |
 | Ranged `GET` | `Backend::get` / `Backend::getStream` with a `Range` | Opening one column file of a part costs one bounded read, not a whole-object fetch |
 | `LIST` with a resumable cursor | `Backend::list` | GC discovery and the orphan-manifest sweep page through the pool without a separate index |
@@ -30,6 +30,13 @@ these conditions is refused rather than trusted.
 | `TOKEN ⟹ CONTENT` (a repeated token implies unchanged bytes) | standing requirement on every `Backend` implementation | Not probed — it cannot be tested cheaply. A backend that recycled tokens would serve stale manifests, i.e. wrong query results, not merely an inefficiency |
 | A body token never recurs at a key | standing requirement on the store | Not probed. A deletion intent and an exact-token delete both name one body incarnation; a store that gave a later body an earlier body's token would let a writer adopt a body `GC` is deleting. A token must also canonicalise to the pool's recorded dialect — the probe checks that the token of its own scratch object does and refuses the writable mount, pool creation and `cas-migrate-pool` otherwise |
 | `GET` of an absent key answers `404` | `Backend::get` on `blob-intents/` | Every blob reuse reads the intent of the body it found; `404` means "no intent exists for this incarnation now"; the writer adopts the body because its precommit edge was durable before the `HEAD`. Any other answer, including `403`, fails the part write; see [deletion intents](#deletion-intents) |
+
+A writable S3 mount also probes conditional batch deletion. It sends one `DeleteObjects`
+with four scratch keys and an individual `ETag` for each. The probe checks the per-key results
+for two matches, a stale `ETag` and an absent key, then verifies that both matching objects
+disappeared and the replacement survived. GC uses conditional `DeleteObject` for each blob
+when this capability is unavailable or the probe is skipped. GC can still use ordinary
+`DeleteObjects` requests to clean up `blob-intents/` on stores that support them.
 
 Bucket **versioning is not required** — in fact it must be **disabled** on the generation-token
 dialect (see below), because a token-exact delete on a versioned bucket archives a noncurrent
@@ -216,7 +223,7 @@ establish acceptance of Google's multipart, native-copy, and exact-delete wire b
 | AWS S3 | ✓ | Native `ETag`-based conditional dialect for mutable objects and exact deletion; blob publication is unconditional |
 | Google Cloud Storage | implementation complete; release gate pending | Generation-token dialect for mutable objects/native-token `HEAD`/exact deletion, opted into via `http_client = gcs_hmac` or `gcp_oauth`; blob publication uses ordinary copy/multipart. Real credentialed GCS groups have not run yet |
 | Azure Blob Storage | probably | Azure's REST API documents the equivalent conditional headers, but ClickHouse's Azure object-storage backend does not yet wire up a `CAS` conditional dialect the way the S3 and GCS paths do — untested, not validated by the capability probe |
-| Other S3-compatible stores | only with enforced conditional operations | The capability probe is the actual gate: a store that silently ignores `If-None-Match`/`If-Match` (accepting and applying the write regardless) fails the probe and is refused. `RustFS` passes the full battery and is used as the project's test backend; `Garage` was evaluated and rejected because it silently ignores conditional operations |
+| Other S3-compatible stores | only with enforced conditional operations | A store that silently ignores required `If-None-Match` or `If-Match` conditions fails the mount probe. RustFS 1.0.6 passes both the required single-key checks and the optional per-object `ETag` check for `DeleteObjects`. Garage was evaluated and rejected because it silently ignores conditional operations. |
 
 The full mechanics of the two dialects — how the backend detects which one a given endpoint speaks,
 what the capability probe actually checks, and how exact-token deletes map onto each provider's

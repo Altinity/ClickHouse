@@ -38,6 +38,8 @@ namespace DB::ErrorCodes
 namespace DB::Cas
 {
 
+class CasOperation;
+
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
 /// too large, an access denial, or a credential failure; for a local store, `READONLY` or an `errno` of
 /// `EACCES`, `EPERM` or `EROFS`. Whether a STALE CREDENTIAL explains it is not
@@ -310,6 +312,12 @@ private:
 /// The cap on one `removeManyWriteOnce` chunk -- also the ceiling a batch-delete request can carry.
 inline constexpr size_t kBulkDeleteMaxKeys = 1000;
 
+struct ConditionalRemove
+{
+    String key;
+    Etag expected_token;
+};
+
 /// One admitted operation: the unit a policy, a fence generation and a liveness predicate apply to.
 /// Move-only, and every request it makes re-checks its admission -- before each attempt, before each
 /// sleep, and once more after a proven commit, so a write whose fence was lost while it was in flight
@@ -381,6 +389,7 @@ public:
     /// success. Throws when the policy is exhausted. More keys than the cap is a caller bug: the
     /// consumer chunks, so that every chunk that succeeded is recorded before a later one can fail.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy);
+    std::vector<Removal> removeManyByConditional(const std::vector<ConditionalRemove> & removals, const Retry & policy);
     /// The one primitive that reports failure as a value, so the policy reissues on the OUTCOME:
     /// `Indeterminate` is retried, the four authoritative outcomes return at once, and an
     /// `Indeterminate` that outlives the bound is returned rather than thrown. A lost fence or a spent
@@ -402,6 +411,12 @@ public:
     WriteResult readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy);
 
 private:
+    friend bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key);
+
+    enum class ConditionalDeletePurpose { Remove, Probe };
+    std::vector<Removal> removeManyByConditional(
+        const std::vector<ConditionalRemove> & removals, const Retry & policy, ConditionalDeletePurpose purpose);
+
     friend class CasRequests;
     /// The lane waits on this operation's own admission and reads and writes through its verbs; it
     /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.

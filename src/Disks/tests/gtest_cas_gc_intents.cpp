@@ -174,26 +174,27 @@ public:
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
-        if (!isBody(key))
-            return HeadHookBackend::remove(key, expected_value, access);
-        if (auto hook = takeOnce(before_body_delete))
-            hook(key);
-        if (on_body_delete)
-            on_body_delete(key);
-        if (lose_body_deletes)
-        {
-            CountingBackend::remove(key + ".never", expected_value, access);
-            throw Poco::TimeoutException("the body delete was never answered");
-        }
-        const auto current = InMemoryBackend::read(key, access);
-        if (!current)
-            return HeadHookBackend::remove(key, expected_value, access);
-        String stored_form = expected_value;
-        if (quote_blob_tokens && stored_form.size() >= 2 && stored_form.front() == '"')
-            stored_form = stored_form.substr(1, stored_form.size() - 2);
-        if (content_tokens && stored_form == contentValue(current->bytes))
-            stored_form = current->value;
-        return HeadHookBackend::remove(key, stored_form, access);
+        RawConditionalRemove removal{key, expected_value};
+        bool unanswered = false;
+        prepareBodyDelete(removal, access, unanswered);
+        const auto result = CountingBackend::remove(removal.key, removal.expected_token, access);
+        throwIfUnanswered(unanswered);
+        return result;
+    }
+
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        if (removals.size() <= 1)
+            return CountingBackend::removeManyByConditional(removals, access);
+
+        auto prepared = removals;
+        bool unanswered = false;
+        for (auto & removal : prepared)
+            prepareBodyDelete(removal, access, unanswered);
+        auto results = CountingBackend::removeManyByConditional(prepared, access);
+        throwIfUnanswered(unanswered);
+        return results;
     }
 
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override
@@ -207,6 +208,37 @@ public:
     }
 
 private:
+    void prepareBodyDelete(RawConditionalRemove & removal, TransportAccess & access, bool & unanswered)
+    {
+        if (!isBody(removal.key))
+            return;
+        if (auto hook = takeOnce(before_body_delete))
+            hook(removal.key);
+        if (on_body_delete)
+            on_body_delete(removal.key);
+        if (lose_body_deletes)
+        {
+            /// Journal the attempt without deleting the body, then lose the reply to the whole request.
+            removal.key += ".never";
+            unanswered = true;
+            return;
+        }
+        const auto current = InMemoryBackend::read(removal.key, access);
+        if (!current)
+            return;
+        String & token = removal.expected_token;
+        if (quote_blob_tokens && token.size() >= 2 && token.front() == '"')
+            token = token.substr(1, token.size() - 2);
+        if (content_tokens && token == contentValue(current->bytes))
+            token = current->value;
+    }
+
+    static void throwIfUnanswered(bool unanswered)
+    {
+        if (unanswered)
+            throw Poco::TimeoutException("the body delete was never answered");
+    }
+
     /// Requests of a round arrive on several threads: clearing a once-hook is a write they must not race.
     std::function<void(const String &)> takeOnce(std::function<void(const String &)> & hook)
     {
@@ -226,6 +258,7 @@ struct PoolOptions
     uint64_t create_budget = 0;
     uint64_t redelete_budget = 0;
     uint64_t io_concurrency = 1;
+    uint64_t delete_chunk_keys = PoolConfig{}.gc_bulk_delete_chunk_keys;
     uint64_t intent_sweep_page = PoolConfig{}.intent_sweep_list_budget_keys;
     uint64_t max_defer_rounds = PoolConfig{}.gc_fold_max_defer_rounds;
 };
@@ -248,6 +281,7 @@ struct IntentPool
         config.gc_round_intent_create_budget = options.create_budget;
         config.gc_round_redelete_budget = options.redelete_budget;
         config.gc_io_concurrency = options.io_concurrency;
+        config.gc_bulk_delete_chunk_keys = options.delete_chunk_keys;
         config.intent_sweep_list_budget_keys = options.intent_sweep_page;
         config.gc_fold_max_defer_rounds = options.max_defer_rounds;
         store = Pool::open(backend, std::move(config));
@@ -1663,7 +1697,7 @@ TEST(CASGcIntents, SparedThenRecondemnedBlobIsDeleted)
 TEST(CASGcIntents, ThrowingRoundDrainsItsDeleteJobsBeforeReturning)
 {
     const std::vector<uint64_t> rows = inRunOrder({1, 2, 3});
-    auto pool = makePool({.io_concurrency = 4});
+    auto pool = makePool({.io_concurrency = 4, .delete_chunk_keys = 1});
     ASSERT_NO_FATAL_FAILURE(pool.makePending(rows));
     const uint64_t round_before = committedRound(*pool.backend, pool.layout());
 

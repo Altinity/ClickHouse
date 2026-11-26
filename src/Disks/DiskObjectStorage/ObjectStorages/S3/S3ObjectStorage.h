@@ -130,6 +130,9 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
+    std::vector<ConditionalBatchRemoveResult> removeObjectsIfTokensMatch(
+        const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request) override;
+
     /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
     /// Exactly one object is always a plain `DeleteObject` instead (never gated on `s3_capabilities`: a
     /// single physical request per call, so there is nothing here for that capability to say no to).
@@ -142,6 +145,7 @@ public:
 
     /// `objects_chunk_size_to_delete`, at least 1, while `DeleteObjects` is not known unsupported; 1 after.
     size_t batchDeleteKeyLimit() const override;
+    size_t configuredBatchDeleteKeyLimit() const override;
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 

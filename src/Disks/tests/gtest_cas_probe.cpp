@@ -11,6 +11,20 @@
 #include <Common/ErrnoException.h>
 #include <base/scope_guard.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
+
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
+
+#include <exception>
+
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+extern const int NOT_IMPLEMENTED;
+}
 
 #include <cerrno>
 #include <filesystem>
@@ -48,6 +62,214 @@ TEST(CASProbe, PassesOnEnforcingBackend)
     auto op = requests.admit();
     EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe"));
     EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());   // probe cleans up after itself
+}
+
+namespace
+{
+
+class IgnoresConditionalBatchTokensBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawBatchRemoveResult> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+        {
+            const auto current = InMemoryBackend::head(removal.key, access);
+            results.push_back(current ? InMemoryBackend::remove(removal.key, current->value, access) : RawRemoval::Gone);
+        }
+        return results;
+    }
+};
+
+class NoOpConditionalBatchDeleteBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawBatchRemoveResult> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+        {
+            const auto current = InMemoryBackend::head(removal.key, access);
+            if (!current)
+                results.push_back(RawRemoval::Gone);
+            else if (current->value != removal.expected_token)
+                results.push_back(RawRemoval::Mismatch);
+            else
+                results.push_back(RawRemoval::Removed);
+        }
+        return results;
+    }
+};
+
+class ReportsAbsentKeyAsRemovedBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        auto results = InMemoryBackend::removeManyByConditional(removals, access);
+        EXPECT_EQ(results, (std::vector<RawBatchRemoveResult>{RawRemoval::Removed, RawRemoval::Mismatch, RawRemoval::Removed, RawRemoval::Gone}));
+        for (auto & result : results)
+            if (result == RawRemoval::Gone)
+                result = RawRemoval::Removed;
+        return results;
+    }
+};
+
+class FailingConditionalBatchBackend : public InMemoryBackend
+{
+public:
+    explicit FailingConditionalBatchBackend(const std::exception_ptr & failure_) : failure(failure_)
+    {
+    }
+
+    std::vector<RawBatchRemoveResult> removeManyByConditional(const std::vector<RawConditionalRemove> &, TransportAccess &) override
+    {
+        ++batch_attempts;
+        std::rethrow_exception(failure);
+    }
+
+    size_t batch_attempts = 0;
+
+private:
+    std::exception_ptr failure;
+};
+
+class GenerationConditionalBatchBackend : public FailingConditionalBatchBackend
+{
+public:
+    using FailingConditionalBatchBackend::FailingConditionalBatchBackend;
+
+    Dialect dialect() const override { return Dialect::Generation; }
+};
+
+}
+
+TEST(CASProbe, ReportsConditionalBatchCapability)
+{
+    InMemoryBackend enforcing;
+    auto enforcing_requests = makeRequests(enforcing);
+    auto enforcing_op = enforcing_requests.admit();
+    EXPECT_TRUE(runCapabilityProbe(enforcing_op, "p/.cas_probe").conditional_batch_delete_supported);
+
+    IgnoresConditionalBatchTokensBackend ignores;
+    auto ignores_requests = makeRequests(ignores);
+    auto ignores_op = ignores_requests.admit();
+    EXPECT_FALSE(runCapabilityProbe(ignores_op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, SkipsConditionalBatchDeleteForGenerationTokens)
+{
+    GenerationConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "conditional batch delete unsupported")));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend.batch_attempts, 0u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+TEST(CASProbe, RejectsConditionalBatchSuccessWithoutDeletion)
+{
+    NoOpConditionalBatchDeleteBackend backend;
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+TEST(CASProbe, RequiresGoneForAnAlreadyDeletedKeyInTheBatch)
+{
+    ReportsAbsentKeyAsRemovedBackend backend;
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, SingletonMismatchCannotProveBatchTokenEnforcement)
+{
+    class PartialProbeBackend final : public IgnoresConditionalBatchTokensBackend
+    {
+    public:
+        std::vector<size_t> request_sizes;
+        std::vector<RawBatchRemoveResult> removeManyByConditional(
+            const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+        {
+            request_sizes.push_back(removals.size());
+            if (request_sizes.size() == 1 && removals.size() == 4)
+            {
+                auto reply = InMemoryBackend::removeManyByConditional(removals, access);
+                reply[1] = std::unexpected(std::make_exception_ptr(Poco::TimeoutException("stale key throttled")));
+                return reply;
+            }
+            if (removals.size() == 1)
+                return InMemoryBackend::removeManyByConditional(removals, access);
+            return IgnoresConditionalBatchTokensBackend::removeManyByConditional(removals, access);
+        }
+    };
+
+    auto backend = std::make_shared<PartialProbeBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend->request_sizes, (std::vector<size_t>{4, 4}));
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+TEST(CASProbe, ExplicitlyUnsupportedConditionalBatchReturnsFalseAndCleansUp)
+{
+    FailingConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "conditional batch delete unsupported")));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend.batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+#if USE_AWS_S3
+TEST(CASProbe, ConditionalBatchAccessDeniedPropagatesAndCleansUp)
+{
+    FailingConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::S3Exception("conditional batch delete denied", Aws::S3::S3Errors::ACCESS_DENIED)));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    try
+    {
+        runCapabilityProbe(op, "p/.cas_probe");
+        ADD_FAILURE() << "expected S3 access denial";
+    }
+    catch (const DB::S3Exception & e)
+    {
+        EXPECT_EQ(e.getS3ErrorCode(), Aws::S3::S3Errors::ACCESS_DENIED);
+    }
+    EXPECT_EQ(backend.batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+#endif
+
+TEST(CASProbe, ConditionalBatchTimeoutPropagatesAfterRetriesAndCleansUp)
+{
+    DB::Cas::tests::FakeClock clock;
+    auto backend = std::make_shared<FailingConditionalBatchBackend>(std::make_exception_ptr(Poco::TimeoutException()));
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "removeManyByConditional",
+        [&] { runCapabilityProbe(op, "p/.cas_probe"); });
+    EXPECT_GT(backend->batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
 }
 
 TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
@@ -115,6 +337,20 @@ TEST(CASProbe, ConcurrentMountsDoNotCollide)
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
     EXPECT_TRUE(probe_op.read("p/_probe/token", Retry::once()).has_value());
+}
+
+TEST(CASProbe, PoolPinsConditionalBatchCapabilityOnlyAfterProbe)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    EXPECT_EQ(backend->conditionalBatchDeleteKeyLimit(), 1u);
+
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    EXPECT_EQ(store->poolBackendPtr()->conditionalBatchDeleteKeyLimit(), kBulkDeleteMaxKeys);
+
+    auto skipped_backend = std::make_shared<InMemoryBackend>();
+    auto skipped = Pool::open(skipped_backend, PoolConfig{
+        .pool_prefix = "skip", .server_root_id = "test", .skip_access_check = true});
+    EXPECT_EQ(skipped->poolBackendPtr()->conditionalBatchDeleteKeyLimit(), 1u);
 }
 
 /// RFC cas-s3-timeout-retry-control: a Native-mode mount over an object storage that does not support
@@ -252,8 +488,10 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
         EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty()) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.write_reached, 4) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.remove_reached, 2) << "dialect " << static_cast<int>(dialect);
+        /// The optional batch check adds four writes and one cleanup remove when it runs.
+        const bool runs_batch_probe = dialect != Dialect::Generation;
+        EXPECT_EQ(b.write_reached, runs_batch_probe ? 8 : 4) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.remove_reached, runs_batch_probe ? 3 : 2) << "dialect " << static_cast<int>(dialect);
     }
 }
 
