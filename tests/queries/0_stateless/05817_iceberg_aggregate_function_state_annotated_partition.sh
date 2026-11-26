@@ -19,7 +19,7 @@ cleanup()
 }
 trap cleanup EXIT
 
-CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1 --session_timezone=UTC"
+CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1 --allow_aggregate_function_states_in_open_formats=1 --session_timezone=UTC"
 
 ${CLIENT} --query "
     CREATE TABLE ${TABLE} (k UInt32, x DateTime64(6, 'UTC'))
