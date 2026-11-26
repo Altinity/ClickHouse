@@ -616,12 +616,13 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         }
         else
         {
-            auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
+            /// Catalog destinations must be resolved with the settings persisted by the initiating query.
+            auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
+
+            auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, context);
             if (!destination_storage)
                 throw Exception(ErrorCodes::UNKNOWN_TABLE, "Destination table {} not found for export commit",
                     destination_storage_id.getNameForLogs());
-
-            auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
 
             LOG_INFO(storage.log, "ExportPartition: all parts exported for task {}, committing", transaction_id);
 
