@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
@@ -2432,6 +2433,8 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             catch (...)
             {
                 std::erase(rt->pending, item);
+                /// The queue may now be drained, and a removal waits for that without a timeout.
+                rt->cv.notify_all();
                 throw;
             }
 
@@ -2460,7 +2463,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
         }
         else
         {
-            rt->cv.wait(lk);
+            waitAsFollower(rt, item, lk);
         }
     }
     lk.unlock();
@@ -2468,16 +2471,50 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     ProfileEvents::increment(ProfileEvents::CASRefQueueWaitMicroseconds,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - enqueued_at).count());
+    /// One failure can complete several items, each rethrown on its own caller's thread.
     if (item->error)
-        std::rethrow_exception(item->error);
+        rethrowOwnCopy(item->error);
     return item->committed_id;
 }
 
+
+void CasRefLedger::waitAsFollower(
+    const std::shared_ptr<RefTableRuntime> & rt, const std::shared_ptr<RefMutationItem> & item, std::unique_lock<std::mutex> & lk)
+{
+    try
+    {
+        Cas::waitStoppable(rt->cv, lk, [&]
+        {
+            runRefFollowerWaitHook(FollowerWaitPhase::Queued);
+            return item->done || !rt->leader_active;
+        });
+    }
+    catch (...)
+    {
+        /// A queued item still belongs to its caller and is withdrawn. Otherwise a leader owns it (or it is
+        /// done) and completes it, so the caller leaves only with that result; this wait has no owner check.
+        if (std::erase(rt->pending, item) > 0)
+        {
+            rt->cv.notify_all();
+            throw;
+        }
+        rt->cv.wait(lk, [&]
+        {
+            runRefFollowerWaitHook(FollowerWaitPhase::Carved);
+            return item->done;
+        });
+    }
+}
 
 void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                               const std::shared_ptr<RefMutationItem> & own,
                               std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
+    /// Captured before `shared`, which leaves no owner to ask.
+    const std::function<void()> owner_check = Cas::OwnerScope::effectiveCheck();
+    /// One caller's owner must not decide work done for several callers.
+    const auto shared = Cas::OwnerScope::shared();
+
     /// Fairness baton pass: serve flushes only until the caller's OWN item is done, then hand off to a
     /// woken waiter.
     while (true)
@@ -2487,7 +2524,9 @@ void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared
             if (own->done)
                 return;
         }
-        flushRefBatch(ns, rt, owned_items);
+        if (owner_check)
+            owner_check();
+        flushRefBatch(ns, rt, owned_items, own, owner_check);
     }
 }
 
@@ -3421,7 +3460,8 @@ bool CasRefLedger::ensureEpochOpenForAppend(const RootNamespace & ns, const std:
 }
 
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                                 std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
+                                 std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+                                 const std::shared_ptr<RefMutationItem> & own, const std::function<void()> & owner_check)
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
@@ -3445,12 +3485,18 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         }
         rt->cv.notify_all();
     };
-    auto carve_all_pending = [&]() -> std::vector<std::shared_ptr<RefMutationItem>>
+    /// Takes the error already built and allocates nothing, so no failure can leave a taken item neither queued
+    /// nor completed.
+    auto fail_all_pending = [&](const std::exception_ptr & e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        std::vector<std::shared_ptr<RefMutationItem>> all(rt->pending.begin(), rt->pending.end());
+        for (const auto & it : rt->pending)
+        {
+            it->error = e;
+            it->done = true;
+        }
         rt->pending.clear();
-        return all;
+        rt->cv.notify_all();
     };
 
     RefRecoveryOutcome recovery_outcome = RefRecoveryOutcome::Recovered;
@@ -3460,13 +3506,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     }
     catch (...)
     {
-        complete_error(carve_all_pending(), std::current_exception());
+        fail_all_pending(std::current_exception());
         return;
     }
     if (recovery_outcome == RefRecoveryOutcome::LifeRemoved)
     {
-        complete_error(carve_all_pending(),
-            makeCasWriteRetryLaterExceptionPtr(recoveredLifeRemovedMessage(ns, rt->life)));
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(recoveredLifeRemovedMessage(ns, rt->life)));
         return;
     }
 
@@ -3474,7 +3519,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// Fails the WHOLE queue -- every caller would have gotten the same refusal alone.
     if (!may_mutate())
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS mount lost / lease expired — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id)));
         return;
@@ -3488,7 +3533,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// reaching this AFTER passing `mayMutate` above proves the swap happened.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount — "
             "retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -3517,7 +3562,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             case WedgeResolution::Rejected:
             case WedgeResolution::StillWedged:
             case WedgeResolution::Corrupted:
-                complete_error(carve_all_pending(), resolution.survivor_error);
+                fail_all_pending(resolution.survivor_error);
                 return;
         }
     }
@@ -3557,7 +3602,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// `CORRUPTED_DATA` about a stale premise this lane was never entitled to use.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
             "before its batch was carved — retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -3583,6 +3628,10 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
+        /// Until carved, the leader's own item is still its caller's to withdraw; the leadership exit guard
+        /// removes it from `pending`. Outside the prelude's catch, which would fail the whole queue for one caller's stop.
+        if (owner_check && std::find(rt->pending.begin(), rt->pending.end(), own) != rt->pending.end())
+            owner_check();
         const size_t cap = table_live ? kMaxRefBatch : 1;
 
         /// --- PLAN ---

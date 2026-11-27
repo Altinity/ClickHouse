@@ -36,6 +36,22 @@ namespace DB::Cas
 /// re-validating anything.
 enum class ResolveAudit : uint8_t { Emit, Deferred };
 
+/// Where a queued ref-log follower evaluates its wait condition: `Queued` while it waits stoppably, `Carved` once
+/// its owner stopped and a leader owns its item, a wait it must not leave before the item is done.
+enum class FollowerWaitPhase : uint8_t { Queued, Carved };
+
+/// Thrown when a namespace's positive ref-mutation admission is closed for a removal: the call was refused
+/// before its mutation was queued, so it wrote nothing and bound nothing. Catch sites match by type; the code
+/// and text are those of `throwCasWriteRetryLater`.
+class RefAdmissionRefusedException : public Exception
+{
+public:
+    explicit RefAdmissionRefusedException(const Exception & retry_later) : Exception(retry_later) {}
+
+    RefAdmissionRefusedException * clone() const override { return new RefAdmissionRefusedException(*this); }
+    void rethrow() const override { throw *this; } // NOLINT
+};
+
 /// The complete state of one table's append lane. It is guarded by `RefTableRuntime::state_mutex`;
 /// there is no independent apply marker or durable-id floor whose combinations form a second,
 /// implicit state machine.
@@ -529,6 +545,10 @@ public:
 
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
+
+    /// Runs on a queued follower each time it evaluates its wait condition, under the queue mutex. It must not
+    /// lock anything, and it runs as `noexcept`: a throw terminates rather than unwinding out of the `Carved` wait.
+    void setRefFollowerWaitHookForTest(std::function<void(FollowerWaitPhase)> hook) { ref_follower_wait_hook_for_test = std::move(hook); }
 
     /// Pauses an ordinary append after it captured an exact runtime but before recovery or enqueue.
     void setAppendAfterRuntimeCaptureHookForTest(std::function<void()> hook)
@@ -1139,6 +1159,12 @@ private:
     /// idle (baton un-taken, the caller's item un-enqueued), never a permanently non-idle namespace with
     /// no live leader. Null in production. See `appendRefOps`.
     std::function<void()> ref_pre_tenure_hook_for_test;
+    std::function<void(FollowerWaitPhase)> ref_follower_wait_hook_for_test;
+    void runRefFollowerWaitHook(FollowerWaitPhase phase) const noexcept
+    {
+        if (ref_follower_wait_hook_for_test)
+            ref_follower_wait_hook_for_test(phase);
+    }
 
     /// Test-only hook fired at each carve/validation phase point (see `CarvePhaseForTest`); null in
     /// production.
@@ -1333,9 +1359,16 @@ private:
     /// Every item this leader becomes responsible for -- its own `own` plus each item a flush removes
     /// from `pending` to form a batch -- is recorded into `owned_items`, so the caller's leadership guard
     /// can complete + de-pend any that a flush leaves unfinished on an exceptional exit.
+    /// Every leader flushes in its caller's thread group under `OwnerScope::shared`. Its own item stays withdrawable by
+    /// its background owner until carved.
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                            const std::shared_ptr<RefMutationItem> & own,
                            std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// Waits, with `lk` held on return and on throw, until `item` is done or the lane needs a leader.
+    /// A stopped follower withdraws its queued item or waits for its carved result.
+    void waitAsFollower(const std::shared_ptr<RefTableRuntime> & rt, const std::shared_ptr<RefMutationItem> & item,
+                        std::unique_lock<std::mutex> & lk);
 
     /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
     /// and apply-after-commit ordering -- the LIVE state is still only ever advanced once the object is
@@ -1346,7 +1379,8 @@ private:
     /// `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one tenure via
     /// `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                       std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+                       std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+                       const std::shared_ptr<RefMutationItem> & own, const std::function<void()> & owner_check);
 
     /// The lane's tombstone step, run by `flushRefBatch` before the batch copies its working state.
     /// True: the chain epoch equals the live epoch, or the stream is terminal, and the batch may proceed.

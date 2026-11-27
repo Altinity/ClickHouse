@@ -296,7 +296,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
             {
                 /// The leader ran out of its own query's memory, which says nothing about this query's budget.
                 if (!isMemoryLimitExceeded(e))
-                    throw;
+                    rethrowOwnCopy(std::current_exception());
                 continue;
             }
         }
@@ -316,8 +316,9 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
         catch (...)
         {
             retire();
-            promise.set_exception(std::current_exception());
-            throw;
+            /// The followers copy the published failure, so the leader leaves it untouched and throws its own copy.
+            promise.set_exception(ownerStopRequested() ? std::make_exception_ptr(LeaderStopped{}) : std::current_exception());
+            rethrowOwnCopy(std::current_exception());
         }
         promise.set_value(view);
         retire();

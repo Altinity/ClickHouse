@@ -1091,6 +1091,9 @@ public:
     /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_ledger.setRefPreCarveHookForTest(std::move(hook)); }
 
+    /// Test-only: fires on a queued ref-log follower at each evaluation of its wait condition.
+    void setRefFollowerWaitHookForTest(std::function<void(FollowerWaitPhase)> hook) { ref_ledger.setRefFollowerWaitHookForTest(std::move(hook)); }
+
     /// Test-only: pre-tenure fault seam for the append-lane leadership acquisition; forwards to
     /// `CasRefLedger::setRefPreTenureHookForTest` (see it for the baton-safety contract).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_ledger.setRefPreTenureHookForTest(std::move(hook)); }
