@@ -469,7 +469,7 @@ public:
     void beginTeardown() noexcept;
     bool teardownBegun() const noexcept;
     /// The GC scheduler's per-tick cleanup of this mount's own idle `Creating` catalog rows; stops at teardown
-    /// or once `stop_requested` returns true.
+    /// or once `stop_requested` returns true, with `ABORTED` when that happens inside a cancel.
     void cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requested = {});
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;

@@ -33,7 +33,9 @@ struct GcRoundLogRecord
     /// nothing durable is wrong. `Stopped`: the same transient class, observed after the pool's
     /// teardown began -- a correlation, not a cause: the engine reports a refused teardown fence
     /// exactly like a lost mount fence, so the flag is the only witness, and the row says so honestly
-    /// rather than reading a clean restart as a backend incident. `Failed` is reserved for everything
+    /// rather than reading a clean restart as a backend incident. `Stopped` also names a round that ended
+    /// at a scheduler stop it observed itself (`Gc::roundStopObserved`), and a manual round that ended with
+    /// `QUERY_WAS_CANCELLED` or with a transient code while its query was stopped. `Failed` is reserved for everything
     /// else (a logic error, corrupted data, an unclassified code): fail-closed, an unrecognised
     /// failure reads as real -- during a teardown too.
     enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred, Aborted, Stopped };
@@ -181,6 +183,10 @@ public:
     /// Set it before `start`.
     void setBeforeTickLockHookForTest(std::function<void()> hook) { before_tick_lock_hook_for_test = std::move(hook); }
 
+    /// Runs `hook` on the round worker when a tick fails, after the round mutex is released and before the
+    /// failure is logged. Set it before `start`.
+    void setTickFailureHookForTest(std::function<void()> hook) { tick_failure_hook_for_test = std::move(hook); }
+
 private:
     enum class SchedulerState
     {
@@ -259,6 +265,8 @@ private:
     std::condition_variable terminal_exit_cv;
     /// See `setBeforeTickLockHookForTest`. Empty in production.
     std::function<void()> before_tick_lock_hook_for_test;
+    /// See `setTickFailureHookForTest`. Empty in production.
+    std::function<void()> tick_failure_hook_for_test;
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.

@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -636,6 +637,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     }
     catch (const Exception & e)
     {
+        /// Skipped with a warning, a stopped owner's failure would let the drain go on after the stop.
+        rethrowIfStoppedOwnersFailure();
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                     "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping its deletions",
                     ns.string(), e.message());
@@ -653,6 +656,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     uint64_t deleted = 0;
     op.forEachListedKey(prefix_key, [&](const ListedKey & listed)
     {
+        throwIfQueryStopped();
+        throwIfBackgroundStopped();
         if (protection.active.contains(listed.key))
             return true;   /// owned by a committed or precommit owner — never sweep
 
@@ -676,7 +681,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         /// already reclaimed it" race, not a failure. A THROWN exception (a transient backend hiccup)
         /// is the one thing `warnings` changes: opted-in (non-null), it is recorded and the sweep moves
         /// to the next key; opted-out (nullptr, every pre-existing caller), it propagates exactly as
-        /// before (fail-close).
+        /// before (fail-close). A failure after an owner stopped propagates either way.
         try
         {
             const std::optional<Meta> head = op.head(listed.key, Retry::standard());
@@ -687,6 +692,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         }
         catch (...)
         {
+            rethrowIfStoppedOwnersFailure();
             if (!warnings)
                 throw;
             warnings->push_back("CAS orphan sweep: " + listed.key + " delete failed: "

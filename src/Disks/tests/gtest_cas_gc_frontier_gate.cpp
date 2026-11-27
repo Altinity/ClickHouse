@@ -1,18 +1,25 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
+#include "cas_killable_query.h"
 #include "cas_test_helpers.h"
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <base/scope_guard.h>
 
 #include <Poco/Exception.h>
 #include <Poco/StreamChannel.h>
@@ -35,8 +42,19 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int ABORTED;
     extern const int NETWORK_ERROR;
+    extern const int NOT_IMPLEMENTED;
+    extern const int TIMEOUT_EXCEEDED;
     extern const int CORRUPTED_DATA;
+    extern const int QUERY_WAS_CANCELLED;
+    extern const int READONLY;
+    extern const int CANNOT_SCHEDULE_TASK;
+}
+
+namespace DB::FailPoints
+{
+    extern const char thread_group_switcher_post_attach_failure[];
 }
 
 /// THE DESTRUCTIVE-ROUND FRONTIER PROOF (spec 2026-07-27 "ref chain complete cut" §5).
@@ -5833,4 +5851,1251 @@ TEST(CASGCFrontierGate, ACreatingOnlyCatalogRegainsAProvenFrontier)
     EXPECT_TRUE(after.catalog_proved_empty);
     EXPECT_TRUE(after.frontier_complete);
     EXPECT_FALSE(after.suppress_destructive);
+}
+
+namespace
+{
+
+/// Kills `kill` once a conditional write moves `gc/state` to `generation` or beyond: the round has just
+/// committed, and the post-commit tail has not started.
+class KillAtRoundCommitBackend final : public CountingBackend
+{
+public:
+    String gc_state_key;
+    uint64_t generation = 0;
+    std::function<void()> kill;
+    std::atomic<bool> fired{false};
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
+    {
+        std::expected<String, RawConflict> result = CountingBackend::write(key, bytes, expected_value, access);
+        if (kill && result.has_value() && expected_value && key == gc_state_key
+            && decodeGcState(bytes).snap_generation >= generation && !fired.exchange(true))
+            kill();
+        return result;
+    }
+};
+
+}
+
+/// A manual round whose query is killed right after the round commit still reclaims the hand-off
+/// prefix: the hand-off is one-shot, so the stop must not cost it.
+TEST(CASGCFrontierGate, StoppedManualRoundStillReclaimsHandoffPrefix)
+{
+    auto backend = std::make_shared<KillAtRoundCommitBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .gc_snapshot_generations_to_keep = 2, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = publish(*backend, layout, ns, "tbl", 1, DB::UInt128(0xa1));
+
+    Gc gc(store, kGc);
+    runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+    OperationForTest raw_op(*backend);
+    const uint64_t old_gen = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes).snap_generation;
+    const String old_prefix = layout.gcGenPrefix(old_gen);
+    for (int i = 0; i < 6; ++i)
+    {
+        runRegularRoundReclaiming(gc);
+        store->renewWatermarkOnce();
+    }
+    const GcState before = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
+    ASSERT_GT(before.snap_pruned_through, old_gen) << "the generation must be behind the retention cursor";
+    ASSERT_FALSE((*raw_op).list(old_prefix, "", 1000, Retry::once()).keys.empty()) << "a live ref still pins it";
+
+    const ManifestRef r2{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, DB::UInt128(0xb2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("data.bin", DB::UInt128(0xb2))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
+
+    backend->gc_state_key = layout.gcStateKey();
+    backend->generation = before.snap_generation + 1;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        backend->kill = [&query] { query.kill(); };
+        try
+        {
+            runRegularRoundReclaiming(gc);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::QUERY_WAS_CANCELLED) << e.message();
+        }
+        backend->kill = {};
+    });
+
+    ASSERT_TRUE(backend->fired) << "the query was not killed at the round commit";
+    EXPECT_TRUE((*raw_op).list(old_prefix, "", 1000, Retry::once()).keys.empty())
+        << "the hand-off prefix is reclaimed by the stopped round";
+}
+
+/// The catalog reconciler of a stopped manual round (driven directly, not through a full round) resolves
+/// its attempted erase of a completed `Removing` row by a complete catalog read, even when its owner stops
+/// during the backoff after that read's first attempt failed. The drain then stops before its next selection.
+TEST(CASGCFrontierGate, StoppedDrainReconcilerStillResolvesAttemptedErase)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    CasRequests seed_requests = openRequestsForTest(backend);
+    CasOperation seed_op = seed_requests.admit();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(seed_op, store, kGc);
+
+    size_t catalog_reads = 0;
+    std::atomic<bool> resolution_read_failed{false};
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (++catalog_reads == 2)
+        {
+            resolution_read_failed = true;
+            throw Poco::TimeoutException("the erase's resolution read is lost");
+        }
+    });
+
+    uint64_t completed_erases = 0;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        CasRequests requests(backend, Fence::open(), {}, [&](uint64_t)
+        {
+            if (resolution_read_failed)
+                query.kill();
+        }, nullptr, kDefaultRequestWindowMs);
+        CasOperation op = requests.admit();
+        const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+        ASSERT_TRUE(parent_object);
+        const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+        CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
+        expectThrowsCode(DB::ErrorCodes::QUERY_WAS_CANCELLED,
+            [&] { reconciler.reconcile(noAuthorityRefresh, noRetirementRecord); });
+        completed_erases = reconciler.completedErases();
+        EXPECT_TRUE(query.status->isKilled()) << "the owner stopped before the reissue";
+    });
+    backend->afterReadOf(layout.refCatalogKey(), {});
+
+    ASSERT_TRUE(resolution_read_failed);
+    EXPECT_EQ(catalog_reads, 3u) << "selection, the failed resolution read and its reissue";
+    EXPECT_EQ(completed_erases, 1u);
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(seed_op, layout, fixture.ns)) << "the erase landed and was observed";
+}
+
+namespace
+{
+
+/// A gate the test opens on every exit, so a failed assertion cannot strand a parked round thread.
+class OpenOnExitGate
+{
+public:
+    ~OpenOnExitGate() { open(); }
+
+    void open()
+    {
+        std::lock_guard lock(mutex);
+        opened = true;
+        cv.notify_all();
+    }
+
+    bool wait()
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(30), [&] { return opened; });
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool opened = false;
+};
+
+/// A lease nobody holds, so a scheduler with its own random identity claims it on its first round.
+void freeGcLease(Backend & backend, const Layout & layout)
+{
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
+    const auto got = op.read(layout.gcStateKey(), Retry::once());
+    ASSERT_TRUE(got);
+    GcState state = decodeGcState(got->bytes);
+    state.lease = GcLease{.owner = UInt128(0), .seq = 0};
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(layout.gcStateKey(), encodeGcState(state), got->etag, Retry::once())));
+}
+
+/// Calls `stop` from another thread, because it joins the round thread that asks for it, and returns once
+/// the stop is visible to the round.
+std::future<void> requestSchedulerStop(CasGcScheduler & scheduler)
+{
+    auto stopping = std::async(std::launch::async, [&scheduler] { scheduler.stop(); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!scheduler.stopRequested() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_TRUE(scheduler.stopRequested());
+    return stopping;
+}
+
+std::vector<String> journalAfter(const std::vector<String> & journal, size_t from, const String & except_key)
+{
+    std::vector<String> tail;
+    for (size_t i = from; i < journal.size(); ++i)
+        if (!journal[i].ends_with(" " + except_key))
+            tail.push_back(journal[i]);
+    return tail;
+}
+
+}
+
+/// A scheduled round stopped between two erases of its pre-fold drain: the first erase and its resolution
+/// read complete, nothing follows them, and the round ends `Stopped` without its listing or commit. The
+/// next activation drains the row left.
+TEST(CASGCFrontierGate, StopBetweenErasesSkipsSecondAndFold)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, /*count=*/2);
+    freeGcLease(*backend, layout);
+    const std::vector<RootNamespace> seeded{
+        RootNamespace{"00/drain-batch-0@cas@"}, RootNamespace{"00/drain-batch-1@cas@"}};
+    const uint64_t catalog_writes_before = backend->putOverwriteCount(layout.refCatalogKey());
+
+    OwnerRoundSink sink;
+    ScopedCasGcLogCapture scheduler_log("test::gc");
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    OpenOnExitGate parked;
+    OpenOnExitGate release;
+    std::atomic<bool> fired = false;
+    size_t journal_at_stop = 0;
+    uint64_t state_writes_at_stop = 0;
+    /// The first catalog read with an erase behind it is that erase's resolution read.
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (backend->putOverwriteCount(layout.refCatalogKey()) == catalog_writes_before || fired.exchange(true))
+            return;
+        journal_at_stop = backend->journalSnapshot().size();
+        state_writes_at_stop = backend->putOverwriteCount(layout.gcStateKey());
+        parked.open();
+        release.wait();
+    });
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    ASSERT_TRUE(parked.wait()) << "the round never resolved its first erase";
+    std::future<void> stopping = requestSchedulerStop(scheduler);
+    release.open();
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+    backend->afterReadOf(layout.refCatalogKey(), {});
+
+    ASSERT_TRUE(finish);
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped) << finish->error;
+    EXPECT_EQ(finish->error_code, DB::ErrorCodes::ABORTED) << finish->error;
+    EXPECT_EQ(scheduler_log.captured().find("round failed"), String::npos) << scheduler_log.captured();
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_writes_before + 1);
+    const std::vector<String> tail = journalAfter(backend->journalSnapshot(), journal_at_stop, layout.gcHbKey());
+    EXPECT_TRUE(tail.empty()) << "first request after the resolution read: " << tail.front();
+    EXPECT_EQ(backend->putOverwriteCount(layout.gcStateKey()), state_writes_at_stop) << "the round committed";
+    size_t still_cataloged = 0;
+    for (const RootNamespace & ns : seeded)
+        if (CasRefCatalog::lifeIfCataloged(op, layout, ns))
+            ++still_cataloged;
+    EXPECT_EQ(still_cataloged, 1u);
+
+    const auto finishes = [&]
+    {
+        std::vector<GcRoundLogRecord> rows;
+        for (const GcRoundLogRecord & r : sink.all())
+            if (r.event_type == GcRoundLogRecord::EventType::Finish)
+                rows.push_back(r);
+        return rows;
+    };
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (finishes().size() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    scheduler.stop();
+    ASSERT_EQ(finishes().size(), 2u) << "the next activation ran no round";
+    EXPECT_EQ(finishes()[1].outcome, GcRoundLogRecord::Outcome::Success) << finishes()[1].error;
+    for (const RootNamespace & ns : seeded)
+        EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(op, layout, ns)) << ns.string();
+}
+
+/// A scheduled round stopped after its erase's reply was lost settles that erase by a read and sends it
+/// once; the drain then stops before anything else.
+TEST(CASGCFrontierGate, StopAfterLostEraseSettlesWithoutResend)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, /*count=*/2);
+    const String catalog_key = layout.refCatalogKey();
+    const uint64_t catalog_writes_before = backend->putOverwriteCount(catalog_key);
+    backend->clearJournal();
+    backend->loseNextCatalogCasResponse(catalog_key);
+
+    Gc gc(store, kGc);
+    gc.setStopSignal([&]
+    {
+        const std::vector<String> journal = backend->journalSnapshot();
+        return std::find(journal.begin(), journal.end(), "cas_response_lost " + catalog_key) != journal.end();
+    });
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+    gc.setStopSignal({});
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + catalog_key), 1) << "the lost erase was resent";
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_response_lost " + catalog_key), 1);
+    EXPECT_EQ(backend->putOverwriteCount(catalog_key), catalog_writes_before + 1);
+    ASSERT_FALSE(journal.empty());
+    EXPECT_EQ(journal.back(), "get " + catalog_key) << "the drain sent more after resolving the lost erase";
+    const auto row_count = CasRefCatalog::read(op, layout).catalog.entries.size();
+    EXPECT_EQ(row_count, 1u) << "the settled erase landed; the second row stays";
+}
+
+/// A drain whose owner stopped during the first of several creator probes probes no other creator. A
+/// failed probe of a stopped owner is not reported as an unreadable creator slot.
+TEST(CASGCFrontierGate, StopAfterFirstOfSeveralCreatorProbesProbesNoMore)
+{
+    for (const bool probe_fails : {false, true})
+    {
+        SCOPED_TRACE(probe_fails ? "the probe fails" : "the probe answers");
+        auto backend = std::make_shared<DrainRaceBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        std::vector<CatalogEntry> rows;
+        for (size_t i = 0; i < 3; ++i)
+            rows.push_back(seedStalledCreating(op, store, fmt::format("00/probe-{}@cas@", i), UInt128{0xc0 + i},
+                CreatorFence{.server_root_id = fmt::format("creator-{}", i), .writer_epoch = 1, .fence_generation = 1}));
+
+        bool stopped = false;
+        size_t probes = 0;
+        const CasFoldSeal parent;
+        CatalogLifecycleReconciler reconciler(op, layout, parent, [&](const CreatorFence &)
+        {
+            ++probes;
+            stopped = true;
+            if (probe_fails)
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected mount slot read failure");
+            return CreatorSlotStatus::Live;
+        });
+        ScopedCasGcLogCapture capture("CatalogLifecycleReconciler");
+        {
+            const auto owner = OwnerScope::background([&]
+            {
+                if (stopped)
+                    throw DB::Exception(DB::ErrorCodes::ABORTED, "test owner stopped");
+            });
+            expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { reconciler.reconcile(noAuthorityRefresh, noRetirementRecord); });
+        }
+
+        EXPECT_EQ(probes, 1u);
+        EXPECT_EQ(capture.captured().find("could not be read"), String::npos) << capture.captured();
+        for (const CatalogEntry & row : rows)
+            EXPECT_EQ(catalogRow(op, layout, row.ns), std::optional<CatalogEntry>{row}) << row.ns.string();
+    }
+}
+
+/// A manual round's drain whose query is killed while the first of several creator probes answers ends at the next
+/// row with the query's own error: nothing failed, so there is no failure to keep, and no other creator is probed.
+TEST(CASGCFrontierGate, KilledQueryEndsTheDrainAtTheNextRow)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    std::vector<CatalogEntry> rows;
+    for (size_t i = 0; i < 3; ++i)
+        rows.push_back(seedStalledCreating(op, store, fmt::format("00/killed-probe-{}@cas@", i), UInt128{0xd0 + i},
+            CreatorFence{.server_root_id = fmt::format("killed-creator-{}", i), .writer_epoch = 1, .fence_generation = 1}));
+
+    size_t probes = 0;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        const CasFoldSeal parent;
+        CatalogLifecycleReconciler reconciler(op, layout, parent, [&](const CreatorFence &)
+        {
+            ++probes;
+            query.kill();
+            return CreatorSlotStatus::Live;
+        });
+        expectThrowsCode(DB::ErrorCodes::QUERY_WAS_CANCELLED,
+            [&] { reconciler.reconcile(noAuthorityRefresh, noRetirementRecord); });
+    });
+
+    EXPECT_EQ(probes, 1u);
+    for (const CatalogEntry & row : rows)
+        EXPECT_EQ(catalogRow(op, layout, row.ns), std::optional<CatalogEntry>{row}) << row.ns.string();
+}
+
+/// A scheduled round deposed inside its drain, with the stop requested only after the drain's last owner
+/// check, ends `Aborted`: the scheduler reports a stop the round observed, never one it samples afterwards.
+TEST(CASGCFrontierGate, DepositionDuringStopIsNotStopped)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(op, store, kGc);
+    freeGcLease(*backend, layout);
+    const String seal_key = layout.foldSealKey(1, 1);
+    const uint64_t seal_reads_before = backend->getCount(seal_key);
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    /// The drain reads its parent seal, then `gc/state` for its authority, then `gc/state` again before the
+    /// erase. The first of these deposes the leader; the second, which reads the deposition, requests the stop.
+    bool in_hook = false;
+    bool deposed = false;
+    std::optional<std::future<void>> stopping;
+    backend->afterReadOf(layout.gcStateKey(), [&]
+    {
+        if (in_hook || stopping || backend->getCount(seal_key) == seal_reads_before)
+            return;
+        in_hook = true;
+        if (!deposed)
+        {
+            transferGcLease(*backend, layout, hexToU128("00000000000000000000000000000099"));
+            deposed = true;
+        }
+        else
+        {
+            stopping = requestSchedulerStop(scheduler);
+        }
+        in_hook = false;
+    });
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!scheduler.stopRequested() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    scheduler.stop();
+    backend->afterReadOf(layout.gcStateKey(), {});
+
+    ASSERT_TRUE(finish);
+    ASSERT_TRUE(stopping) << "the round never reached the erase's authority read";
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Aborted) << finish->error;
+    EXPECT_NE(finish->error_code, DB::ErrorCodes::ABORTED) << finish->error;
+    EXPECT_TRUE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns));
+}
+
+/// A manual round on a stopped scheduler that meets corruption is `Failed`: a stopped scheduler names no
+/// stop of a round it did not run.
+TEST(CASGCFrontierGate, CorruptionOnStoppedSchedulerManualRoundIsFailed)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    GcState state;
+    state.round = 1;
+    state.gc_shards = store->poolConfig().gc_shards;
+    state.snap_generation = 1;
+    state.snap_attempt = 1;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.gcStateKey(), encodeGcState(state), Retry::once())));
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    scheduler.start();
+    scheduler.stop();
+    ASSERT_TRUE(scheduler.stopRequested());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)scheduler.runOneRoundNow(GcRoundLogRecord::Trigger::Manual); });
+
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    ASSERT_TRUE(finish);
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Failed) << finish->error;
+    EXPECT_EQ(finish->error_code, DB::ErrorCodes::CORRUPTED_DATA);
+}
+
+/// A scheduled round whose drain saw no stop still stops before the hot listing: on a fresh pool the drain
+/// reads nothing, and the round lists nothing.
+TEST(CASGCFrontierGate, StopBeforeTheHotListingListsNothing)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    Gc gc(store, kGc);
+    gc.setStopSignal([] { return true; });
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { gc.runRegularRound(); });
+    gc.setStopSignal({});
+    EXPECT_EQ(backend->listCount(store->layout().casRefsPrefix()), 0u);
+}
+
+namespace
+{
+
+/// Runs `fail` once, in place of the answer to the first read or listing whose name `matches` accepts.
+class FailOneRequestBackend final : public CountingBackend
+{
+public:
+    using CountingBackend::list;
+
+    void failFirst(std::function<bool(const String &)> matches_, std::function<void()> fail_)
+    {
+        std::lock_guard lock(mutex);
+        matches = std::move(matches_);
+        fail = std::move(fail_);
+    }
+
+    bool fired() const
+    {
+        std::lock_guard lock(mutex);
+        return did_fire;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        failIfArmed(key);
+        return CountingBackend::read(key, access);
+    }
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        failIfArmed(prefix);
+        return CountingBackend::list(prefix, cursor, limit, access);
+    }
+
+private:
+    void failIfArmed(const String & name)
+    {
+        std::function<void()> now;
+        {
+            std::lock_guard lock(mutex);
+            if (fail && matches(name))
+            {
+                now = std::move(fail);
+                fail = {};
+                did_fire = true;
+            }
+        }
+        if (now)
+            now();
+    }
+
+    mutable std::mutex mutex;
+    std::function<bool(const String &)> matches;
+    std::function<void()> fail;
+    bool did_fire = false;
+};
+
+}
+
+/// A killed manual round whose authority read fails reports that failure, not a lost lease.
+TEST(CASGCFrontierGate, StoppedOwnersFailedAuthorityReadIsNotALostLease)
+{
+    auto backend = std::make_shared<FailOneRequestBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(op, store, kGc);
+    const String seal_key = layout.foldSealKey(1, 1);
+    const uint64_t seal_reads_before = backend->getCount(seal_key);
+
+    ScopedCasGcLogCapture capture;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        /// The drain reads its parent seal, then `gc/state` for its authority.
+        backend->failFirst(
+            [&](const String & name) { return name == layout.gcStateKey() && backend->getCount(seal_key) > seal_reads_before; },
+            [&]
+            {
+                query.kill();
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected gc/state read failure");
+            });
+        Gc gc(store, kGc);
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "injected gc/state read failure", [&] { gc.runRegularRound(); });
+    });
+
+    ASSERT_TRUE(backend->fired());
+    EXPECT_EQ(capture.captured().find("leader-authority probe failed"), String::npos) << capture.captured();
+}
+
+/// A manual round killed while the namespace janitor lists fails with the listing's failure; the janitor does not
+/// report it as a stopped page of a successful round.
+TEST(CASGCFrontierGate, KilledManualRoundIsNotSwallowedByTheJanitor)
+{
+    auto backend = std::make_shared<FailOneRequestBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(op, store, kGc);
+
+    ScopedCasGcLogCapture capture;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        backend->failFirst(
+            [&](const String & name) { return name == layout.namespaceRootPrefix(); },
+            [&]
+            {
+                query.kill();
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected janitor listing failure");
+            });
+        Gc gc(store, kGc);
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "injected janitor listing failure", [&] { gc.runRegularRound(); });
+    });
+
+    ASSERT_TRUE(backend->fired()) << "the round never ran its janitor";
+    EXPECT_EQ(capture.captured().find("janitor stopped this round"), String::npos) << capture.captured();
+}
+
+/// The deferral decision reads the adopted fold seal. A read that fails for a killed manual round ends the round with
+/// its failure, reading the seal no more; under a live query the same failure forces a fold instead of a deferral.
+TEST(CASGCFrontierGate, KilledRoundsFailedDeferralSealReadEndsTheRound)
+{
+    struct Run
+    {
+        int code = 0;
+        String message;
+        std::optional<RoundReport> report;
+        uint64_t seal_reads_at_decision = 0;
+        uint64_t seal_reads = 0;
+    };
+    enum class Arm { Control, Live, Killed };
+    const auto run = [](Arm arm, uint64_t fail_after_reads)
+    {
+        Run out;
+        auto backend = std::make_shared<FailOneRequestBackend>();
+        auto store = openPoolForTest(backend);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        seedCompletedRemoving(op, store, kGc);
+        const String seal_key = layout.foldSealKey(1, 1);
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            Gc gc(store, kGc);
+            /// The decision's read is the last seal read before the hot scan's catalog read.
+            gc.setRoundPointHookForTest([&](const Gc::RoundPointSiteForTest & site)
+            {
+                if (site.point == Gc::RoundPointForTest::AfterCatalogRead && out.seal_reads_at_decision == 0)
+                    out.seal_reads_at_decision = backend->getCount(seal_key);
+            });
+            if (arm != Arm::Control)
+                backend->failFirst(
+                    [&](const String & name) { return name == seal_key && backend->getCount(seal_key) == fail_after_reads; },
+                    [&, arm]
+                    {
+                        if (arm == Arm::Killed)
+                            query.kill();
+                        throw DB::Exception(DB::ErrorCodes::READONLY, "injected seal read refusal");
+                    });
+            try
+            {
+                out.report = gc.runRegularRound();
+            }
+            catch (const DB::Exception & e)
+            {
+                out.code = e.code();
+                out.message = e.message();
+            }
+        });
+        out.seal_reads = backend->getCount(seal_key);
+        return out;
+    };
+
+    const Run control = run(Arm::Control, 0);
+    ASSERT_TRUE(control.report) << control.message;
+    ASSERT_TRUE(control.report->deferred) << "the fixture's round must be eligible for deferral";
+    ASSERT_GE(control.seal_reads_at_decision, 1u);
+    const uint64_t reads_before_decision = control.seal_reads_at_decision - 1;
+
+    const Run live = run(Arm::Live, reads_before_decision);
+    ASSERT_TRUE(live.report) << live.message;
+    EXPECT_FALSE(live.report->deferred) << "a live query's failed seal read forces the fold";
+
+    const Run killed = run(Arm::Killed, reads_before_decision);
+    EXPECT_FALSE(killed.report.has_value());
+    EXPECT_EQ(killed.code, DB::ErrorCodes::READONLY) << killed.message;
+    EXPECT_NE(killed.message.find("injected seal read refusal"), String::npos) << killed.message;
+    EXPECT_EQ(killed.seal_reads, reads_before_decision) << "the killed round read the seal again";
+}
+
+/// A killed manual round whose janitor batch delete fails ends with that failure and leaves the janitor's cursor
+/// where it was; under a live query the same failure is a recorded leak and the round succeeds.
+TEST(CASGCFrontierGate, KilledRoundsFailedJanitorBatchDeletePublishesNoPage)
+{
+    for (const bool killed : {false, true})
+    {
+        SCOPED_TRACE(killed ? "killed query" : "live query");
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        /// An authoritative universe must not be empty for the destructive gate to open.
+        const RootNamespace live_namespace{"live/janitor-kill@cas@"};
+        fixture::admitLive(*backend, layout, live_namespace);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+            layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+            encodeRefCkptAtGeneration(RefCkpt{
+                .life_epoch = std::optional<uint64_t>{1},
+                .checkpoint_snapshot_id = std::nullopt,
+                .last_epoch_seal = std::nullopt}, 1),
+            Retry::once())));
+        const String dead_log = layout.refLogKey(
+            NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/janitor-kill"}, UInt128{0xDB}), RefTxnId{1, 1});
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(dead_log, "dead residue", Retry::once())));
+        const GcMaintenanceReadResult progress_before = readGcMaintenanceState(op, layout);
+
+        std::map<String, UInt64> namespace_cleanup;
+        int code = 0;
+        String message;
+        std::atomic<bool> fired{false};
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            backend->onBeforeBulkRemove([&]
+            {
+                if (fired.exchange(true))
+                    return;
+                if (killed)
+                    query.kill();
+                throw DB::Exception(DB::ErrorCodes::READONLY, "injected batch delete refusal");
+            });
+            Gc gc(store, kGc);
+            gc.setPhaseSink([&](const GcPhaseRecord & record)
+            {
+                if (record.phase == "namespace_cleanup")
+                    namespace_cleanup = record.metrics;
+            });
+            try
+            {
+                ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+            backend->onBeforeBulkRemove({});
+        });
+
+        ASSERT_TRUE(fired.load()) << "the round sent no janitor batch delete";
+        EXPECT_TRUE(op.head(dead_log, Retry::once()).has_value());
+        if (killed)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::READONLY) << message;
+            EXPECT_NE(message.find("injected batch delete refusal"), String::npos) << message;
+            const GcMaintenanceReadResult progress_after = readGcMaintenanceState(op, layout);
+            EXPECT_EQ(progress_after.etag.has_value(), progress_before.etag.has_value());
+            if (progress_after.etag && progress_before.etag)
+                EXPECT_TRUE(sameVersion(*progress_after.etag, *progress_before.etag)) << "the janitor published the page";
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << message;
+            ASSERT_FALSE(namespace_cleanup.empty());
+            EXPECT_EQ(namespace_cleanup["leaked"], 1u);
+        }
+    }
+}
+
+/// A store without batch delete makes the janitor delete one key at a time. A killed manual round whose first such
+/// delete fails sends no further delete and leaves the janitor's cursor where it was; under a live query the failure is
+/// a recorded leak and the next key is still deleted.
+TEST(CASGCFrontierGate, KilledRoundsFailedJanitorSingleKeyFallbackPublishesNoPage)
+{
+    for (const bool killed : {false, true})
+    {
+        SCOPED_TRACE(killed ? "killed query" : "live query");
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        /// An authoritative universe must not be empty for the destructive gate to open.
+        const RootNamespace live_namespace{"live/janitor-fallback-kill@cas@"};
+        fixture::admitLive(*backend, layout, live_namespace);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+            layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+            encodeRefCkptAtGeneration(RefCkpt{
+                .life_epoch = std::optional<uint64_t>{1},
+                .checkpoint_snapshot_id = std::nullopt,
+                .last_epoch_seal = std::nullopt}, 1),
+            Retry::once())));
+        const NamespaceLifeId dead_life
+            = NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/janitor-fallback-kill"}, UInt128{0xDD});
+        const std::vector<String> dead_logs{layout.refLogKey(dead_life, RefTxnId{1, 1}), layout.refLogKey(dead_life, RefTxnId{1, 2})};
+        for (const String & key : dead_logs)
+            ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "dead residue", Retry::once())));
+        const GcMaintenanceReadResult progress_before = readGcMaintenanceState(op, layout);
+
+        std::map<String, UInt64> namespace_cleanup;
+        int code = 0;
+        String message;
+        std::atomic<int> janitor_deletes{0};
+        std::atomic<size_t> calls_at_failure{0};
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            backend->onBeforeBulkRemove([&]
+            {
+                const int n = ++janitor_deletes;
+                if (n == 1)
+                    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected: no batch delete");
+                if (n != 2)
+                    return;
+                calls_at_failure = backend->bulkRemoveCalls();
+                if (killed)
+                    query.kill();
+                throw DB::Exception(DB::ErrorCodes::READONLY, "injected single-key delete refusal");
+            });
+            Gc gc(store, kGc);
+            gc.setPhaseSink([&](const GcPhaseRecord & record)
+            {
+                if (record.phase == "namespace_cleanup")
+                    namespace_cleanup = record.metrics;
+            });
+            try
+            {
+                ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+            backend->onBeforeBulkRemove({});
+        });
+
+        ASSERT_GE(janitor_deletes.load(), 2) << "the round never fell back to single-key deletes";
+        size_t remaining = 0;
+        for (const String & key : dead_logs)
+            remaining += op.head(key, Retry::once()).has_value() ? 1 : 0;
+        if (killed)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::READONLY) << message;
+            EXPECT_NE(message.find("injected single-key delete refusal"), String::npos) << message;
+            EXPECT_EQ(backend->bulkRemoveCalls(), calls_at_failure.load()) << "a delete was sent after the failed one";
+            EXPECT_EQ(remaining, 2u);
+            const GcMaintenanceReadResult progress_after = readGcMaintenanceState(op, layout);
+            EXPECT_EQ(progress_after.etag.has_value(), progress_before.etag.has_value()) << "the janitor published the page";
+            if (progress_after.etag && progress_before.etag)
+                EXPECT_TRUE(sameVersion(*progress_after.etag, *progress_before.etag)) << "the janitor published the page";
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << message;
+            EXPECT_EQ(remaining, 1u) << "the key after the failed one is still deleted";
+            ASSERT_FALSE(namespace_cleanup.empty());
+            EXPECT_EQ(namespace_cleanup["leaked"], 1u);
+        }
+    }
+}
+
+/// A janitor delete worker that fails to join the manual round's query sends nothing: outside the query its request
+/// would not see the query's stop. The janitor stops with that failure and its cursor stays where it was; a janitor
+/// failure under a live query does not fail the round.
+TEST(CASGCFrontierGate, JanitorWorkerOutsideTheRoundsQueryDeletesNothing)
+{
+    CAS_SKIP_WITHOUT_FAILPOINTS();
+    for (const bool attach_fails : {false, true})
+    {
+        SCOPED_TRACE(attach_fails ? "worker attach fails" : "control");
+        auto backend = std::make_shared<FailOneRequestBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        /// An authoritative universe must not be empty for the destructive gate to open.
+        const RootNamespace live_namespace{"live/janitor-group@cas@"};
+        fixture::admitLive(*backend, layout, live_namespace);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+            layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+            encodeRefCkptAtGeneration(RefCkpt{
+                .life_epoch = std::optional<uint64_t>{1},
+                .checkpoint_snapshot_id = std::nullopt,
+                .last_epoch_seal = std::nullopt}, 1),
+            Retry::once())));
+        const String dead_log = layout.refLogKey(
+            NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/janitor-group"}, UInt128{0xDE}), RefTxnId{1, 1});
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(dead_log, "dead residue", Retry::once())));
+        const GcMaintenanceReadResult progress_before = readGcMaintenanceState(op, layout);
+
+        int code = 0;
+        String message;
+        std::optional<size_t> deletes_at_arming;
+        ScopedCasGcLogCapture capture;
+        onKillableQueryThread([&](CasKillableQuery &)
+        {
+            /// Armed at the janitor's listing, after the round's own attach, so a janitor worker's switch fails.
+            backend->failFirst(
+                [&](const String & name) { return attach_fails && name == layout.namespaceRootPrefix(); },
+                [&]
+                {
+                    deletes_at_arming = backend->bulkRemoveCalls();
+                    DB::FailPointInjection::enableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+                });
+            SCOPE_EXIT({ DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure); });
+            Gc gc(store, kGc);
+            try
+            {
+                ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+
+        if (!attach_fails)
+        {
+            EXPECT_EQ(code, 0) << message;
+            EXPECT_FALSE(op.head(dead_log, Retry::once()).has_value()) << "positive control: the janitor deletes the residue";
+            continue;
+        }
+        ASSERT_TRUE(deletes_at_arming.has_value()) << "the round never listed the namespace roots";
+        EXPECT_EQ(code, 0) << message;
+        EXPECT_NE(capture.captured().find("janitor delete worker could not join"), String::npos) << capture.captured();
+        EXPECT_EQ(backend->bulkRemoveCalls(), *deletes_at_arming) << "a janitor worker outside the query sent a delete";
+        EXPECT_TRUE(op.head(dead_log, Retry::once()).has_value());
+        const GcMaintenanceReadResult progress_after = readGcMaintenanceState(op, layout);
+        EXPECT_EQ(progress_after.etag.has_value(), progress_before.etag.has_value()) << "the janitor published the page";
+        if (progress_after.etag && progress_before.etag)
+            EXPECT_TRUE(sameVersion(*progress_after.etag, *progress_before.etag)) << "the janitor published the page";
+    }
+}
+
+namespace
+{
+
+/// Runs `on_remove` once, before the first `DELETE` of `target` reaches the store.
+class RemoveHookBackend final : public CountingBackend
+{
+public:
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        std::function<void()> hook;
+        if (key == target)
+            hook = std::exchange(on_remove, {});
+        if (hook)
+            hook();
+        return CountingBackend::remove(key, expected_value, access);
+    }
+
+    String target;
+    std::function<void()> on_remove;
+};
+
+}
+
+/// A killed manual round whose janitor exact delete of one key fails ends with that failure and leaves the janitor's
+/// cursor where it was; under a live query the same failure is a recorded leak and the round succeeds.
+TEST(CASGCFrontierGate, KilledRoundsFailedJanitorExactDeletePublishesNoPage)
+{
+    for (const bool killed : {false, true})
+    {
+        SCOPED_TRACE(killed ? "killed query" : "live query");
+        auto backend = std::make_shared<RemoveHookBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        /// An authoritative universe must not be empty for the destructive gate to open.
+        const RootNamespace live_namespace{"live/janitor-exact-kill@cas@"};
+        fixture::admitLive(*backend, layout, live_namespace);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+            layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+            encodeRefCkptAtGeneration(RefCkpt{
+                .life_epoch = std::optional<uint64_t>{1},
+                .checkpoint_snapshot_id = std::nullopt,
+                .last_epoch_seal = std::nullopt}, 1),
+            Retry::once())));
+        /// A dead life's checkpoint is mutable, so the janitor deletes it exactly, one key at a time.
+        const String dead_ckpt = layout.refCkptKey(
+            NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/janitor-exact-kill"}, UInt128{0xDC}));
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(dead_ckpt, "dead checkpoint", Retry::once())));
+        const GcMaintenanceReadResult progress_before = readGcMaintenanceState(op, layout);
+
+        std::map<String, UInt64> namespace_cleanup;
+        int code = 0;
+        String message;
+        bool fired = false;
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            backend->target = dead_ckpt;
+            backend->on_remove = [&]
+            {
+                fired = true;
+                if (killed)
+                    query.kill();
+                throw DB::Exception(DB::ErrorCodes::READONLY, "injected exact delete refusal");
+            };
+            Gc gc(store, kGc);
+            gc.setPhaseSink([&](const GcPhaseRecord & record)
+            {
+                if (record.phase == "namespace_cleanup")
+                    namespace_cleanup = record.metrics;
+            });
+            try
+            {
+                ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+
+        ASSERT_TRUE(fired) << "the round sent no janitor delete of the dead checkpoint";
+        EXPECT_TRUE(op.head(dead_ckpt, Retry::once()).has_value());
+        if (killed)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::READONLY) << message;
+            EXPECT_NE(message.find("injected exact delete refusal"), String::npos) << message;
+            const GcMaintenanceReadResult progress_after = readGcMaintenanceState(op, layout);
+            EXPECT_EQ(progress_after.etag.has_value(), progress_before.etag.has_value()) << "the janitor published the page";
+            if (progress_after.etag && progress_before.etag)
+                EXPECT_TRUE(sameVersion(*progress_after.etag, *progress_before.etag)) << "the janitor published the page";
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << message;
+            ASSERT_FALSE(namespace_cleanup.empty());
+            EXPECT_EQ(namespace_cleanup["leaked"], 1u);
+        }
+    }
+}
+
+/// A manual round stopped by its query is `Stopped`, for a kill and for `max_execution_time`, and ends with the
+/// failure that observed the stop. A 159 while the query is live is not a query stop, so that round stays `Aborted`.
+TEST(CASGCFrontierGate, QueryStopOfAManualRoundIsStopped)
+{
+    enum class Stop { Kill, QueryTimeout, LiveQueryTimeout };
+    for (const Stop how : {Stop::Kill, Stop::QueryTimeout, Stop::LiveQueryTimeout})
+    {
+        SCOPED_TRACE(how == Stop::Kill ? "kill" : how == Stop::QueryTimeout ? "query timeout" : "159 under a live query");
+        auto backend = std::make_shared<FailOneRequestBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        seedCompletedRemoving(op, store, kGc);
+        freeGcLease(*backend, layout);
+
+        OwnerRoundSink sink;
+        CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+        int code = 0;
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            /// A 159 that is not the query's: the query stays live while another owner reports a timeout.
+            std::atomic<bool> timed_out{false};
+            const auto other_owner = OwnerScope::background([&]
+            {
+                if (timed_out)
+                    throw DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "Timeout exceeded");
+            });
+            backend->failFirst(
+                [&](const String & name) { return name == layout.foldSealKey(1, 1); },
+                [&]
+                {
+                    if (how == Stop::LiveQueryTimeout)
+                        timed_out = true;
+                    else if (how == Stop::QueryTimeout)
+                        query.kill(std::make_exception_ptr(DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "Timeout exceeded")));
+                    else
+                        query.kill();
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected seal read failure");
+                });
+            try
+            {
+                (void)scheduler.runOneRoundNow(GcRoundLogRecord::Trigger::Manual);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+            }
+        });
+
+        ASSERT_TRUE(backend->fired());
+        EXPECT_EQ(code, how == Stop::LiveQueryTimeout ? DB::ErrorCodes::TIMEOUT_EXCEEDED : DB::ErrorCodes::NETWORK_ERROR);
+        const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+        ASSERT_TRUE(finish);
+        EXPECT_EQ(finish->error_code, code) << finish->error;
+        EXPECT_EQ(finish->outcome, how == Stop::LiveQueryTimeout ? GcRoundLogRecord::Outcome::Aborted : GcRoundLogRecord::Outcome::Stopped)
+            << finish->error;
+    }
+}
+
+/// A manual round that runs after a scheduled round ended at `SYSTEM CAS GC STOP`, but before the scheduler
+/// classified that failure, does not turn the stop into a failed round in the log.
+TEST(CASGCFrontierGate, ManualRoundBeforeTheStopIsClassifiedKeepsTheStop)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+
+    OwnerRoundSink sink;
+    ScopedCasGcLogCapture scheduler_log("test::gc", "information");
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    std::future<void> stopping;
+    std::promise<void> stop_issued;
+    std::atomic<bool> tick_seen = false;
+    /// The stop is visible before the round starts, so the round's pre-listing poll ends it.
+    scheduler.setBeforeTickLockHookForTest([&]
+    {
+        if (tick_seen.exchange(true))
+            return;
+        stopping = requestSchedulerStop(scheduler);
+        stop_issued.set_value();
+    });
+    std::atomic<bool> manual_ran = false;
+    scheduler.setTickFailureHookForTest([&]
+    {
+        if (manual_ran.exchange(true))
+            return;
+        try
+        {
+            (void)scheduler.runOneRoundNow(GcRoundLogRecord::Trigger::Manual);
+        }
+        catch (...)
+        {
+            ADD_FAILURE() << "the manual round failed: " << DB::getCurrentExceptionMessage(false);
+        }
+    });
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    ASSERT_EQ(stop_issued.get_future().wait_for(std::chrono::seconds(60)), std::future_status::ready) << "no tick ran";
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(60)), std::future_status::ready);
+
+    ASSERT_TRUE(manual_ran) << "the scheduled round did not fail";
+    std::vector<GcRoundLogRecord> finishes;
+    for (const GcRoundLogRecord & r : sink.all())
+        if (r.event_type == GcRoundLogRecord::EventType::Finish)
+            finishes.push_back(r);
+    ASSERT_EQ(finishes.size(), 2u);
+    EXPECT_EQ(finishes[0].trigger, GcRoundLogRecord::Trigger::Scheduled);
+    EXPECT_EQ(finishes[0].outcome, GcRoundLogRecord::Outcome::Stopped) << finishes[0].error;
+    EXPECT_EQ(finishes[1].trigger, GcRoundLogRecord::Trigger::Manual);
+    EXPECT_NE(finishes[1].outcome, GcRoundLogRecord::Outcome::Stopped) << finishes[1].error;
+    const String captured = scheduler_log.captured();
+    EXPECT_NE(captured.find("stopped by the scheduler's stop"), String::npos) << captured;
+    EXPECT_EQ(captured.find("round failed"), String::npos) << captured;
+}
+
+namespace
+{
+
+/// Fails the round's `gc/state` commit on a killable query thread: the query is killed inside the commit's
+/// write, which then either loses to a competing `gc/state` write or loses its reply with a failed settling read.
+class KilledCommitBackend final : public CountingBackend
+{
+public:
+    enum class Fault : uint8_t { CompetingWrite, LostReplyUnreadable };
+
+    void arm(const Layout & layout_, uint64_t round_before_, Fault fault_, std::function<void()> kill_)
+    {
+        layout.emplace(layout_);
+        round_before = round_before_;
+        fault = fault_;
+        kill = std::move(kill_);
+    }
+
+    bool fired() const { return did_fire; }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (fail_state_reads && layout && key == layout->gcStateKey())
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected gc/state read failure");
+        return CountingBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
+    {
+        if (!kill || in_hook || !layout || key != layout->gcStateKey() || !expected_value
+            || decodeGcState(bytes).round <= round_before)
+            return CountingBackend::write(key, bytes, expected_value, access);
+        did_fire = true;
+        const std::function<void()> kill_now = std::exchange(kill, {});
+        if (fault == Fault::CompetingWrite)
+            moveLeaseAway();
+        kill_now();
+        if (fault == Fault::CompetingWrite)
+            return CountingBackend::write(key, bytes, expected_value, access);
+        fail_state_reads = true;
+        throw Poco::TimeoutException("injected lost gc/state commit reply");
+    }
+
+private:
+    /// Through this backend, so the commit write that follows is conditioned on a moved incarnation.
+    void moveLeaseAway()
+    {
+        in_hook = true;
+        SCOPE_EXIT({ in_hook = false; });
+        auto requests = openRequestsForTest(*this);
+        auto op = requests.admit();
+        const auto got = op.read(layout->gcStateKey(), Retry::once());
+        ASSERT_TRUE(got);
+        GcState state = decodeGcState(got->bytes);
+        state.lease.owner = hexToU128("00000000000000000000000000000099");
+        ++state.lease.seq;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout->gcStateKey(), encodeGcState(state), got->etag, Retry::once())));
+    }
+
+    std::optional<Layout> layout;
+    uint64_t round_before = 0;
+    Fault fault = Fault::CompetingWrite;
+    std::function<void()> kill;
+    bool in_hook = false;
+    bool did_fire = false;
+    bool fail_state_reads = false;
+};
+
+}
+
+/// A manual round whose query is stopped is `Stopped` also when the stop surfaces as another transient code:
+/// `ABORTED` from a commit that lost to a competing write after the kill, or the unresolved commit's 210.
+TEST(CASGCFrontierGate, KilledManualRoundIsStoppedWhateverTransientCodeEndsIt)
+{
+    using Fault = KilledCommitBackend::Fault;
+    for (const Fault fault : {Fault::CompetingWrite, Fault::LostReplyUnreadable})
+    {
+        SCOPED_TRACE(fault == Fault::CompetingWrite ? "competing write" : "lost reply, unreadable settlement");
+        auto backend = std::make_shared<KilledCommitBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const Layout & layout = store->layout();
+        seedCompletedRemoving(op, store, kGc);
+        freeGcLease(*backend, layout);
+        const auto state = op.read(layout.gcStateKey(), Retry::once());
+        ASSERT_TRUE(state);
+
+        OwnerRoundSink sink;
+        CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+        int code = 0;
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            backend->arm(layout, decodeGcState(state->bytes).round, fault, [&query] { query.kill(); });
+            try
+            {
+                (void)scheduler.runOneRoundNow(GcRoundLogRecord::Trigger::Manual);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+            }
+        });
+
+        ASSERT_TRUE(backend->fired()) << "the round never sent its commit";
+        EXPECT_EQ(code, fault == Fault::CompetingWrite ? DB::ErrorCodes::ABORTED : DB::ErrorCodes::NETWORK_ERROR);
+        const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+        ASSERT_TRUE(finish);
+        EXPECT_EQ(finish->error_code, code) << finish->error;
+        EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped) << finish->error;
+    }
 }

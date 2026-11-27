@@ -10,9 +10,11 @@
 #if USE_AWS_S3
 #include <IO/S3Common.h>
 #endif
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/defines.h>
+#include <Common/CurrentThread.h>
 #include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
 #include <Poco/Exception.h>
@@ -1142,6 +1144,96 @@ TEST(CASSourceEdgeRun, OnlyAnAbsentRunReachesTheHook)
             EXPECT_NE(*code, DB::ErrorCodes::CORRUPTED_DATA);
         }
         EXPECT_EQ(calls, 0u);
+    }
+}
+
+namespace
+{
+
+/// Serves the run's header line, then on the next refill calls `on_refill` and throws the query's stored
+/// exception, as an S3 body whose next `GET` fails after a kill does.
+class HeaderThenStoppedReadBuffer : public DB::ReadBuffer
+{
+public:
+    HeaderThenStoppedReadBuffer(String header_, std::function<void()> on_refill_)
+        : DB::ReadBuffer(nullptr, 0), header(std::move(header_)), on_refill(std::move(on_refill_))
+    {
+    }
+
+private:
+    bool nextImpl() override
+    {
+        if (!served)
+        {
+            served = true;
+            BufferBase::set(header.data(), header.size(), 0);
+            return true;
+        }
+        on_refill();
+        DB::CurrentThread::checkIfNotCancelled();
+        return false;
+    }
+
+    String header;
+    std::function<void()> on_refill;
+    bool served = false;
+};
+
+class HeaderThenStoppedBackend : public InMemoryBackend
+{
+public:
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override
+    {
+        auto raw = InMemoryBackend::read(key, access);
+        if (!raw)
+            return nullptr;
+        return std::make_unique<HeaderThenStoppedReadBuffer>(raw->bytes.substr(0, raw->bytes.find('\n') + 1), on_refill);
+    }
+
+    std::function<void()> on_refill;
+};
+
+}
+
+/// A run row read whose stream refill fails with the query's stored exception must not annotate it: the query
+/// rethrows that one object to every thread it stops. The stored code is `CORRUPTED_DATA`, the code the row catch
+/// annotates.
+TEST(CASSourceEdgeRun, RowReadLeavesTheStoredQueryExceptionUnchanged)
+{
+    const String stored_text = "the query's stored corruption";
+    for (const auto mode : {AdoptedRunReader::OnRefusal::Throw, AdoptedRunReader::OnRefusal::Report})
+    {
+        SCOPED_TRACE(mode == AdoptedRunReader::OnRefusal::Report ? "Report" : "Throw");
+        HeaderThenStoppedBackend backend;
+        const Layout layout{"pool"};
+        const RunRef run = writeSourceEdgeRun(backend, layout, 1, 0, 0, {}, {{b(1), s(1)}});
+        const auto cause = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "{}", stored_text));
+        int code = 0;
+        DB::Cas::tests::onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            backend.on_refill = [&] { query.kill(cause); };
+            DB::Cas::tests::OperationForTest op(backend);
+            const std::vector<RunRef> runs{run};
+            AdoptedRunReader reader(*op, runs, 0, AdoptedRunContext{.gc_shards = 1, .parent_round = 1, .summary = {}}, mode);
+            SourceEdgeRecord rec;
+            try
+            {
+                reader.next(rec);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+            }
+        });
+        EXPECT_EQ(code, DB::ErrorCodes::CORRUPTED_DATA) << "the refill failure did not reach the caller";
+        try
+        {
+            std::rethrow_exception(cause);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.message(), stored_text) << "the row read annotated the query's stored exception";
+        }
     }
 }
 

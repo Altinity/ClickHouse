@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
@@ -76,9 +77,16 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     }
     catch (...)
     {
-        if (first_page_of_pass)
-            (void)casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::once());
-        throw;
+        /// A stopped query's failed `LIST` keeps the scan's progress: the reset is optional, and the stop vetoed
+        /// every further request.
+        if (!first_page_of_pass || queryStopRequested())
+            throw;
+        const std::exception_ptr list_failure = std::current_exception();
+        WriteResult reset = casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::once());
+        /// A reset that may still land outranks the listing error.
+        if (const auto * gave_up = std::get_if<GaveUp>(&reset); gave_up && gave_up->why == GaveUp::Why::Unresolved && gave_up->sent_any)
+            (void)orThrow(std::move(reset), "CAS GC janitor cursor reset after a failed LIST");
+        std::rethrow_exception(list_failure);
     }
     result.pages = 1;
     result.keys = page.keys.size();
@@ -105,6 +113,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     /// themselves prevent progress.
     bool page_decided = !ambiguous && !suppress_deletes;
     std::vector<WriteOnceKey> dead_stream_keys;
+    /// A request that failed for a stopped query ends the page with that failure, unpublished.
+    std::exception_ptr stopped_query_failure;
 
     for (const ListedKey & listed : page.keys)
     {
@@ -164,6 +174,11 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
                 ++result.leaked;
                 result.anomalies.push_back(
                     "leaked dead-life object '" + listed.key + "': exact HEAD failed: " + e.what());
+                if (queryStopRequested())
+                {
+                    stopped_query_failure = std::current_exception();
+                    break;
+                }
                 continue;
             }
         }
@@ -183,8 +198,15 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
             ++result.leaked;
             result.anomalies.push_back(
                 "leaked dead-life object '" + listed.key + "': exact delete failed: " + e.what());
+            if (queryStopRequested())
+            {
+                stopped_query_failure = std::current_exception();
+                break;
+            }
         }
     }
+    if (stopped_query_failure)
+        std::rethrow_exception(stopped_query_failure);
 
     if (page_decided && !dead_stream_keys.empty() && op.admitted())
         remove_write_once_keys(op, dead_stream_keys, result);
@@ -199,20 +221,29 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     if (page_decided)
     {
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
+        std::optional<WriteResult> outcome;
         try
         {
-            const WriteResult outcome = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
-            if (std::holds_alternative<Refused>(outcome) || std::holds_alternative<GaveUp>(outcome))
-                result.anomalies.push_back("cursor publication did not commit");
-            else if (std::holds_alternative<Committed>(outcome))
-            {
-                published = true;
-                result.more = result.deleted > 0 && !(cursor.empty() && page.next_cursor.empty());
-            }
+            outcome = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
         }
         catch (const std::exception & e)
         {
+            if (queryStopRequested())
+                throw;
             result.anomalies.push_back("cursor publication failed: " + String(e.what()));
+        }
+        /// A stopped query's caller must learn that the cursor write may still land, or that the store refused it.
+        const auto * gave_up = outcome ? std::get_if<GaveUp>(&*outcome) : nullptr;
+        const bool unresolved = gave_up && gave_up->why == GaveUp::Why::Unresolved && gave_up->sent_any;
+        const bool refused = outcome && std::holds_alternative<Refused>(*outcome);
+        if ((unresolved || refused) && queryStopRequested())
+            (void)orThrow(std::move(*outcome), "CAS GC janitor cursor publication");
+        if (outcome && (std::holds_alternative<Refused>(*outcome) || std::holds_alternative<GaveUp>(*outcome)))
+            result.anomalies.push_back("cursor publication did not commit");
+        else if (outcome && std::holds_alternative<Committed>(*outcome))
+        {
+            published = true;
+            result.more = result.deleted > 0 && !(cursor.empty() && page.next_cursor.empty());
         }
     }
     /// An unpublished page is listed again, so its failed keys are not leaked yet.

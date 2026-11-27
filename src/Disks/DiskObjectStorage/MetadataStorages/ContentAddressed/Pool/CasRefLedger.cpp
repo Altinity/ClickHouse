@@ -772,6 +772,14 @@ void CasRefLedger::cancelIdleOwnCreatingRows(
     const auto stopped = [&] { return stop_requested && stop_requested(); };
     if (stopped())
         return;
+    /// The stop also ends a cancel that keeps losing the catalog, at its next submission.
+    std::optional<Cas::OwnerScope> stop_owner;
+    if (stop_requested)
+        stop_owner.emplace(Cas::OwnerScope::background([&]
+        {
+            if (stopped())
+                throw Exception(ErrorCodes::ABORTED, "CAS cleanup of this mount's own `Creating` rows stopped by its scheduler");
+        }));
     /// The order `Pool::captureMountIncarnation` uses: a generation that holds across the epoch read dates it.
     const uint64_t generation = fence_generation_fn();
     const uint64_t epoch = live_epoch_fn();

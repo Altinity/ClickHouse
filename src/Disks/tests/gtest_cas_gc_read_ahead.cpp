@@ -11,10 +11,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <Common/CurrentMetrics.h>
+#include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <Poco/Exception.h>
+#include <fmt/format.h>
 #include <base/getThreadId.h>
 #include <base/scope_guard.h>
 
@@ -27,10 +34,16 @@
 #include <functional>
 #include <mutex>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+namespace DB::FailPoints
+{
+    extern const char thread_group_switcher_post_attach_failure[];
+}
 
 namespace DB::ErrorCodes
 {
@@ -197,6 +210,145 @@ TEST(CASGCReadAhead, WindowIsFourTimesConcurrency)
     ReadAheadRig rig;
     GcReadAhead reads(rig.op, rig.requests, rig.pool, 8);
     EXPECT_EQ(reads.window(), 32u);
+}
+
+/// A manual round's workers run in its query: a worker whose first request fails after the kill sends no second
+/// one, and the take gets that request's own failure. Under a live query the same worker retries and answers.
+TEST(CASGCReadAhead, KilledRoundsWorkerDoesNotReissueAFailedRequest)
+{
+    enum class Worker : uint8_t { Read, Head, Create };
+    for (const Worker worker : {Worker::Read, Worker::Head, Worker::Create})
+    {
+        for (const bool killed : {true, false})
+        {
+            SCOPED_TRACE(fmt::format("worker {}, {}", static_cast<int>(worker), killed ? "killed query" : "live query"));
+            ReadAheadRig rig;
+            rig.put("k", "v");
+            rig.backend->resetCounts();
+            bool answered = false;
+            String failure;
+            std::thread round([&]
+            {
+                std::optional<DB::ThreadStatus> thread_status;
+                thread_status.emplace();
+                CasKillableQuery query(getContext().context);
+                if (killed)
+                    query.kill();
+                const auto timeout = std::make_exception_ptr(Poco::TimeoutException("injected request timeout"));
+                if (worker == Worker::Head)
+                    rig.backend->failNextHeadWith("k", timeout);
+                else
+                    rig.backend->failNextReadWith("k", timeout);
+                GcReadAhead reads(rig.op, rig.requests, rig.pool, 4);
+                try
+                {
+                    switch (worker)
+                    {
+                        case Worker::Read:
+                            reads.hintRead("k");
+                            answered = reads.takeRead("k").has_value();
+                            break;
+                        case Worker::Head:
+                            reads.hintHead("k");
+                            answered = reads.takeHead("k").has_value();
+                            break;
+                        case Worker::Create:
+                        {
+                            auto take = reads.startCreate([](CasOperation & op)
+                            {
+                                EXPECT_TRUE(op.read("k", Retry::standard()).has_value());
+                                return IntentCreateResult{};
+                            });
+                            (void)take();
+                            answered = true;
+                            break;
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    failure = DB::getCurrentExceptionMessage(/*with_stacktrace=*/false);
+                }
+            });
+            round.join();
+
+            const size_t requests = worker == Worker::Head ? rig.backend->headCount("k") : rig.backend->getCount("k");
+            if (killed)
+            {
+                EXPECT_FALSE(answered);
+                EXPECT_NE(failure.find("injected request timeout"), String::npos) << failure;
+                EXPECT_EQ(requests, 1u) << "the failed request was reissued after the kill";
+            }
+            else
+            {
+                EXPECT_TRUE(answered) << failure;
+                EXPECT_EQ(requests, 2u) << "positive control: a live query's worker retries";
+            }
+        }
+    }
+}
+
+/// A manual round's worker that fails to join the round's query sends nothing: outside the query its request would
+/// not see the query's stop. The take gets the worker's failure.
+TEST(CASGCReadAhead, WorkerOutsideTheRoundsQuerySendsNothing)
+{
+    CAS_SKIP_WITHOUT_FAILPOINTS();
+    enum class Worker : uint8_t { Read, Head, Create };
+    for (const Worker worker : {Worker::Read, Worker::Head, Worker::Create})
+    {
+        SCOPED_TRACE(fmt::format("worker {}", static_cast<int>(worker)));
+        ReadAheadRig rig;
+        rig.put("k", "v");
+        rig.backend->resetCounts();
+        bool answered = false;
+        int code = 0;
+        String failure;
+        std::thread round([&]
+        {
+            DB::ThreadStatus thread_status;
+            CasKillableQuery query(getContext().context);
+            GcReadAhead reads(rig.op, rig.requests, rig.pool, 4);
+            /// Armed after the round's own attach, so the worker's switch is the one that fails.
+            DB::FailPointInjection::enableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+            SCOPE_EXIT({ DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure); });
+            try
+            {
+                switch (worker)
+                {
+                    case Worker::Read:
+                        reads.hintRead("k");
+                        answered = reads.takeRead("k").has_value();
+                        break;
+                    case Worker::Head:
+                        reads.hintHead("k");
+                        answered = reads.takeHead("k").has_value();
+                        break;
+                    case Worker::Create:
+                    {
+                        auto take = reads.startCreate([](CasOperation & op)
+                        {
+                            EXPECT_TRUE(op.read("k", Retry::standard()).has_value());
+                            return IntentCreateResult{};
+                        });
+                        (void)take();
+                        answered = true;
+                        break;
+                    }
+                }
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                failure = e.message();
+            }
+        });
+        round.join();
+
+        EXPECT_FALSE(answered);
+        EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK) << failure;
+        const size_t requests = worker == Worker::Head ? rig.backend->headCount("k") : rig.backend->getCount("k");
+        EXPECT_EQ(requests, 0u) << "a worker outside the round's query sent a request";
+    }
 }
 
 /// A create's state is released when its answer is taken, so a site that keeps a window of creates in flight holds
