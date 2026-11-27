@@ -285,22 +285,34 @@ CasRefLedger::CasRefLedger(
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
     , recovery_pre_first_request_hook_for_test(std::move(recovery_pre_first_request_hook_for_test_))
 {
-    /// Default backoff sleep for the recovery retry loop (`ensureRefTableRecovered`): sleep in short
-    /// slices and stop early if the mount fence drops (shutdown / lease loss), so teardown never waits
-    /// out a full 30s backoff. This is deliberate, bounded backoff against external object-store I/O
-    /// failure -- NOT masking a race -- exactly like the request engine's own inter-attempt sleep; the
-    /// slice loop additionally makes it interruptible, which that one is not.
-    recovery_retry_sleep_fn = [this](uint64_t total_ms, const std::optional<DetachedStopToken> & token)
+    recovery_retry_slice_sleep_fn = [](uint64_t ms) { sleepForMilliseconds(ms); };
+}
+
+void CasRefLedger::pauseBeforeRecoveryRetry(uint64_t total_ms, const std::optional<DetachedStopToken> & token)
+{
+    /// A test's whole-pause sleep is one slice, so the checks below run before it as before every slice.
+    const uint64_t slice_ms = recovery_retry_pause_sleep_for_test ? total_ms : static_cast<uint64_t>(Cas::kOwnerStopSlice.count());
+    uint64_t slept = 0;
+    do
     {
-        constexpr uint64_t slice_ms = 200;
-        uint64_t slept = 0;
-        while (slept < total_ms && fence_ok_fn() && !(token && token->stopping()))
+        if (!fence_ok_fn() || (token && token->stopping()))
+            return;
+        /// A stopped owner ends the pause before a new walk, as it ends the pause before an S3 reissue: a
+        /// background owner with its verdict, a query by returning early to the caller's veto.
+        Cas::throwIfBackgroundStopped();
+        if (!Cas::insideOwed() && Cas::queryStopRequested())
+            return;
+        if (recovery_retry_pause_sleep_for_test)
         {
-            const uint64_t chunk = std::min(slice_ms, total_ms - slept);
-            sleepForMilliseconds(chunk);
-            slept += chunk;
+            recovery_retry_pause_sleep_for_test(total_ms, token);
+            return;
         }
-    };
+        if (total_ms == 0)
+            return;
+        const uint64_t chunk = std::min(slice_ms, total_ms - slept);
+        recovery_retry_slice_sleep_fn(chunk);
+        slept += chunk;
+    } while (slept < total_ms);
 }
 
 WriteResult CasRefLedger::stagingPutIfAbsent(const String & key, const String & bytes)
@@ -330,7 +342,7 @@ void CasRefLedger::throwNotAdmitted(std::string_view what) const
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     mount_requests.setSleepFnForTest(sleep_fn);
-    recovery_retry_sleep_fn = [recovery_sleep_fn = std::move(sleep_fn)](
+    recovery_retry_pause_sleep_for_test = [recovery_sleep_fn = std::move(sleep_fn)](
         uint64_t total_ms, const std::optional<DetachedStopToken> &)
     {
         recovery_sleep_fn(total_ms);
@@ -340,7 +352,12 @@ void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_f
 void CasRefLedger::setRefRecoveryRetrySleepForTest(
     std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn)
 {
-    recovery_retry_sleep_fn = std::move(sleep_fn);
+    recovery_retry_pause_sleep_for_test = std::move(sleep_fn);
+}
+
+void CasRefLedger::setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn)
+{
+    recovery_retry_slice_sleep_fn = std::move(sleep_fn);
 }
 
 
@@ -1163,7 +1180,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
 std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
     const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
-    bool & cancelled, const std::optional<DetachedStopToken> & token)
+    bool & cancelled, bool & unresolved_sent, const std::optional<DetachedStopToken> & token)
 {
     /// One attempt. Runs with NO lock held: everything below is either read-only I/O or a conditional
     /// write at a key this namespace owns, and the replayed candidate is PRIVATE until the caller
@@ -1182,13 +1199,15 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// is the fence's. The predicate is a bool where the poll throws, so the poll still runs at the
     /// boundaries: it turns each of these facts into the right exception and LATCHES a cancellation for
     /// the caller's retry classification.
-    CasOperation op = mount_requests.resume(admitted_generation, [&rt, &token]
+    /// An admission check, not an owner: its terms hold inside an owed walk too.
+    const auto recovery_request_still_admitted = [&rt, &token]
     {
         return !(token && token->stopping())
             && !rt.recovery_cancel_requested.load(std::memory_order_acquire)
             && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt.superseded_by_remount.load(std::memory_order_acquire);
-    });
+    };
+    CasOperation op = mount_requests.resume(admitted_generation, recovery_request_still_admitted);
 
     /// ---- The checkpoint and the base ----
     /// The runtime was admitted for this exact life before entering recovery, so this walk takes no
@@ -1225,7 +1244,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
         catch (const Exception & e)
         {
-            if (!failureJudgedAgainstCkpt(e.code()))
+            /// A query's stored cause says nothing about the checkpoint, whatever its code.
+            if (!failureJudgedAgainstCkpt(e.code()) || Cas::isQueryStoredCause(std::current_exception()))
                 throw;
 
             /// A newer checkpoint may have re-anchored recovery while cleanup retired this old anchor's
@@ -1302,6 +1322,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         return true;
     };
 
+    /// Marks the error of a sent write that may still land, so a later owner stop does not replace it.
+    const auto throwUnresolved = [&unresolved_sent](bool sent_any, const String & message)
+    {
+        unresolved_sent = sent_any;
+        throwCasRequestRetryLater(message);
+    };
+
     /// The walk never re-reads `_ckpt` itself: the re-read after the last read or write of this attempt
     /// covers its end and every tombstone create.
     RefChainOrigin origin{
@@ -1360,10 +1387,15 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
             CkptStampResult stamp = stampCkptGeneration3(op, layout, life, accepted);
+            /// The 412 proves the stamp did not land; the stop ends this walk rather than starting another.
+            if (stamp.outcome == CkptStampOutcome::TokenMismatch && stamp.observed_stop)
+                throwCasRequestRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the query stopped after its refused generation 3 stamp "
+                    "of `_ckpt`; nothing is installed", ns.string()));
             if (stamp.outcome == CkptStampOutcome::TokenMismatch)
                 return std::nullopt;
             if (stamp.outcome == CkptStampOutcome::Unresolved)
-                throwCasRequestRetryLater(fmt::format(
+                throwUnresolved(stamp.sent_any, fmt::format(
                     "CAS ref-table recovery for namespace '{}': the generation 3 stamp of its `_ckpt` is "
                     "unresolved; nothing is installed", ns.string()));
             accepted = std::move(*stamp.stamped);
@@ -1437,7 +1469,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
 
         if (const auto * gave_up = std::get_if<GaveUp>(&created))
-            throwCasRequestRetryLater(fmt::format(
+            throwUnresolved(gave_up->sent_any, fmt::format(
                 "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} is UNRESOLVED ({}); the "
                 "table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence,
                 gave_up->sent_any ? "the outcome of the attempt is unknown" : "nothing was sent"));
@@ -1625,14 +1657,15 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
         return RefRecoveryOutcome::Recovered;
 
     /// A concurrent second caller waits here rather than racing an independent walk against the first
-    /// caller's unlocked I/O.
+    /// caller's unlocked I/O. The walk belongs to another caller, so this caller's query does not end the wait.
     while (rt.recovery_in_progress)
     {
         if (token && token->stopping())
             throw Exception(ErrorCodes::ABORTED,
                 "CAS ref recovery: teardown began while waiting for a concurrent recovery");
+        Cas::throwIfBackgroundStopped();
         ++rt.recovery_waiters_for_test;
-        rt.recovery_cv.wait_for(lock, std::chrono::milliseconds(200));
+        rt.recovery_cv.wait_for(lock, Cas::kOwnerStopSlice);
         --rt.recovery_waiters_for_test;
     }
     if (rt.recovered && !needs_rerecovery())
@@ -1682,6 +1715,60 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     uint32_t walks_started = 0;
     bool vanish_brake_tripped = false;
     bool cancelled = false;
+    /// Only a walk that threw lets a stopped owner end recovery: a restart after a successful walk and the
+    /// structural exits keep their answers.
+    bool walk_failed = false;
+    std::exception_ptr unresolved_error;
+    /// After a failed walk a stopped background owner ends recovery with its verdict, an unresolved write's error first.
+    const auto rethrowIfBackgroundStoppedAfterFailedWalk = [&]
+    {
+        if (!walk_failed)
+            return;
+        if (std::exception_ptr stop = Cas::backgroundStopRequested())
+            std::rethrow_exception(unresolved_error ? unresolved_error : stop);
+    };
+    /// The same, then a stopped query ends recovery with `failure`, the error recovery already has.
+    const auto rethrowIfOwnerStoppedAfterFailedWalk = [&](const std::exception_ptr & failure)
+    {
+        rethrowIfBackgroundStoppedAfterFailedWalk();
+        if (walk_failed && Cas::queryStopRequested())
+            std::rethrow_exception(unresolved_error ? unresolved_error : failure);
+    };
+    /// Whether the catalog still names the recovering life. A failed catalog read is a third answer.
+    struct LifeCheck
+    {
+        enum class Answer : uint8_t { Exists, Removed, Unknown };
+        Answer answer;
+        std::exception_ptr failure;
+    };
+    const auto checkLifeStillCataloged = [&]() -> LifeCheck
+    {
+        try
+        {
+            if (confirmRecoveredLifeOrDetach(rt, admitted_generation))
+                return {LifeCheck::Answer::Exists, nullptr};
+            return {LifeCheck::Answer::Removed, nullptr};
+        }
+        catch (...)
+        {
+            return {LifeCheck::Answer::Unknown, std::current_exception()};
+        }
+    };
+    const auto throwIfTeardown = [&token]
+    {
+        if (token && token->stopping())
+            throw Exception(ErrorCodes::ABORTED, "CAS ref recovery: teardown began during recovery");
+    };
+    /// Throws `ABORTED` on teardown. False when the mount fence is lost, this runtime is retired or superseded by a
+    /// self-remount, or the admitting generation has moved: retrying under a stale generation can only be refused at the install.
+    const auto mayRetry = [&]
+    {
+        throwIfTeardown();
+        return fence_ok_fn()
+            && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt.superseded_by_remount.load(std::memory_order_acquire)
+            && fence_generation_fn() == admitted_generation;
+    };
     for (;;)
     {
         try
@@ -1715,6 +1802,10 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 /// selected-base vanish after the next attempt takes a different path.
                 hole_detail.reset();
 
+                if (walk_failed)
+                    Cas::throwIfBackgroundStopped();
+                walk_failed = false;
+
                 /// The whole walk runs UNLOCKED. Nothing it touches is shared: the candidate is private
                 /// and `rt` is read only through atomics the poll consults. Unlocking is what keeps a
                 /// recovery's full I/O envelope from stalling every reader of this table -- and what lets
@@ -1722,10 +1813,14 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 ++walks_started;
                 lock.unlock();
                 std::optional<RecoveryResult> walked;
+                bool unresolved_sent = false;
                 try
                 {
+                    /// Owed so that CAS's own checks do not cut a started walk. On S3 a stopped query's walk still
+                    /// fails at its first error answer, the `404` that ends every walk included.
+                    const auto owed = Cas::OwnerScope::owed();
                     walked = runRecoveryWalkOnce(
-                        ns, rt, admitted_generation, live, retained_attempt, hole_detail, cancelled, token);
+                        ns, rt, admitted_generation, live, retained_attempt, hole_detail, cancelled, unresolved_sent, token);
                     /// The admission's catalog read precedes the walk, and another server's GC may have
                     /// erased the life and deleted its objects under it.
                     if (walked)
@@ -1733,6 +1828,9 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 }
                 catch (...)
                 {
+                    walk_failed = true;
+                    if (unresolved_sent)
+                        unresolved_error = std::current_exception();
                     /// Re-acquire BEFORE letting anything propagate: the SCOPE_EXIT above mutates
                     /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with
                     /// `state_mutex` held -- unwinding through it unlocked would be a data race on the
@@ -1800,34 +1898,37 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             /// a `catch (const Exception &)` would not even see. `getCurrentExceptionCode()` normalises
             /// every exception (DB, Poco, std) to a code so the transient classifier can decide.
             const int code = getCurrentExceptionCode();
-            /// Corruption of a life the catalog no longer names is the janitor's work, not damage.
-            if (code == ErrorCodes::CORRUPTED_DATA)
+            /// Corruption of a life the catalog no longer names is the janitor's work, not damage. The confirmation
+            /// is no retry, so a stopped query reaches it as a live one does; a query's stored cause is no corruption.
+            const bool confirm_corruption
+                = code == ErrorCodes::CORRUPTED_DATA && !Cas::isQueryStoredCause(std::current_exception());
+            if (!confirm_corruption)
+                rethrowIfOwnerStoppedAfterFailedWalk(std::current_exception());
+            else
             {
+                rethrowIfBackgroundStoppedAfterFailedWalk();
                 lock.unlock();
-                bool confirmed = true;
-                try
-                {
-                    confirmed = confirmRecoveredLifeOrDetach(rt, admitted_generation);
-                }
-                catch (...)  // NOLINT(bugprone-empty-catch)
-                {
-                    /// Without a confirmation the walk's own error is the answer.
-                }
+                const LifeCheck life = checkLifeStillCataloged();
                 lock.lock();
-                if (!confirmed)
+                if (life.answer == LifeCheck::Answer::Removed)
                 {
                     life_removed = true;
                     break;
                 }
+                /// A stop during the confirmation must not surface as corruption.
+                rethrowIfOwnerStoppedAfterFailedWalk(life.failure ? life.failure : std::current_exception());
+                /// Nor may a failed confirmation: it did not establish that the catalog still names the life.
+                if (life.answer == LifeCheck::Answer::Unknown)
+                    std::rethrow_exception(unresolved_error ? unresolved_error : life.failure);
             }
             /// `cancelled` is latched by the poll itself: a self-remount's cancellation uses the
             /// retry-later class (the caller should retry, against the FRESH incarnation), so without the
             /// latch this loop would read it as a transient blip and re-drive the very work the remount
             /// just stopped. Detached teardown is independently terminal even when the in-flight
             /// exception happened to carry a transient transport code.
-            if (vanish_brake_tripped || cancelled || (token && token->stopping())
-                || !isTransientRecoveryError(code))
+            if (vanish_brake_tripped || cancelled || !isTransientRecoveryError(code))
                 throw;   /// a latched terminal case, or a non-transient failure -- fail fast
+            throwIfTeardown();
 
             /// A cancellation now ends the walk through the operation's liveness, which refuses
             /// silently -- so the exception that arrives here carries a transport code and `cancelled`
@@ -1866,11 +1967,17 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             /// `state_mutex`) never runs unlocked -- same obligation as the walk's window above.
             try
             {
-                recovery_retry_sleep_fn(backoff_ms, token);
+                /// Only a walk that threw makes the next walk a reissue the owner may stop.
+                std::optional<Cas::OwnerScope> pause_owed;
+                if (!walk_failed)
+                    pause_owed.emplace(Cas::OwnerScope::owed());
+                pauseBeforeRecoveryRetry(backoff_ms, token);
             }
             catch (...)
             {
                 lock.lock();
+                if (unresolved_error)
+                    std::rethrow_exception(unresolved_error);
                 throw;
             }
             lock.lock();
@@ -5618,6 +5725,9 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
                     return rt->life;
                 }
                 invalidateRemovedCatalogLife(rt->life);
+                /// A stopped caller starts no work on a successor life.
+                if (recovery_error && Cas::ownerStopRequested())
+                    std::rethrow_exception(recovery_error);
             }
         }
     }

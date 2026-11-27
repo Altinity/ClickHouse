@@ -2202,6 +2202,11 @@ void Pool::setRefRecoveryRetrySleepForTest(
     ref_ledger.setRefRecoveryRetrySleepForTest(std::move(sleep_fn));
 }
 
+void Pool::setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn)
+{
+    ref_ledger.setRefRecoveryRetrySliceSleepForTest(std::move(sleep_fn));
+}
+
 std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale, ResolveAudit audit)
 {
     return ref_ledger.resolveRef(ns, ref_name, allow_stale, audit);

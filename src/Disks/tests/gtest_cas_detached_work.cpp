@@ -17,12 +17,18 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace DB::Cas;
 
 namespace ProfileEvents
 {
 extern const Event CASDetachedWorkDrainTimeouts;
+}
+
+namespace DB::ErrorCodes
+{
+extern const int ABORTED;
 }
 
 namespace
@@ -1028,4 +1034,90 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     EXPECT_EQ(fixture.ledger.recoveryInstallCountForTest(), installs_before)
         << "recovery installed a materialized result after detached stop was latched";
     EXPECT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
+}
+
+namespace
+{
+
+/// Parks the first read of the armed key, then loses its reply, so the read's reissue meets whatever
+/// was latched while it was parked.
+class ParkThenLoseReadBackend : public DB::Cas::tests::OrderedFaultBackend
+{
+public:
+    void arm(String key_, std::shared_ptr<Gate> parked_, std::shared_ptr<Gate> release_)
+    {
+        key = std::move(key_);
+        parked = std::move(parked_);
+        release = std::move(release_);
+        armed.store(true);
+    }
+
+    std::optional<Raw> read(const String & read_key, TransportAccess & access) override
+    {
+        if (read_key == key && armed.exchange(false))
+        {
+            parked->open();
+            release->wait("release_parked_read");
+            throw Poco::TimeoutException("test: the read's reply is lost");
+        }
+        return DB::Cas::tests::OrderedFaultBackend::read(read_key, access);
+    }
+
+private:
+    String key;
+    std::shared_ptr<Gate> parked;
+    std::shared_ptr<Gate> release;
+    std::atomic<bool> armed{false};
+};
+
+struct PublishErrorCodes
+{
+    std::mutex mutex;
+    std::vector<int> codes;
+};
+
+}
+
+/// Teardown during a detached recovery walk ends the recovery with `ABORTED`, not with the error of the
+/// request that teardown refused.
+TEST(CASRefWriterRecoveryRetry, TeardownDuringWalkThrowsAborted)
+{
+    auto backend = std::make_shared<ParkThenLoseReadBackend>();
+    auto errors = std::make_shared<PublishErrorCodes>();
+    PoolConfig config;
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    config.publish_error_hook_for_test = [errors]
+    {
+        std::lock_guard lock(errors->mutex);
+        errors->codes.push_back(DB::getCurrentExceptionCode());
+    };
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/teardown_during_walk"};
+
+    auto first_publisher_captured = std::make_shared<Gate>();
+    auto release_first_publisher = std::make_shared<Gate>();
+    String ckpt_key;
+    preparePendingRecoveryPublisher(
+        store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
+
+    auto read_parked = std::make_shared<Gate>();
+    auto release_read = std::make_shared<Gate>();
+    backend->arm(ckpt_key, read_parked, release_read);
+    {
+        std::lock_guard lock(errors->mutex);
+        errors->codes.clear();
+    }
+    release_first_publisher->open();
+    GateOpenedOnExit read_released{*release_read};
+    read_parked->wait("read_parked");
+
+    auto drain = std::async(std::launch::async, [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/5000); });
+    awaitStopLatched(store);
+    release_read->open();
+    EXPECT_TRUE(drain.get());
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    std::lock_guard lock(errors->mutex);
+    EXPECT_EQ(errors->codes, std::vector<int>{DB::ErrorCodes::ABORTED});
 }

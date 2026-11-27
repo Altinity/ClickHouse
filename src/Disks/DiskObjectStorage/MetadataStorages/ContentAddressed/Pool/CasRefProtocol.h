@@ -78,8 +78,9 @@ bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLif
 /// Whether a failure with this code is judged against `_ckpt` at all: only `CORRUPTED_DATA` is.
 bool failureJudgedAgainstCkpt(int error_code);
 
-/// For a failure caught while reading a chain grounded on `_ckpt` `token`: true asks the reader to restart,
-/// false to rethrow. Only `CORRUPTED_DATA` restarts, and only when `_ckpt` moved or is absent, because
+/// For a failure caught while reading a chain grounded on `_ckpt` `token`, called inside its handler: true asks the
+/// reader to restart, false to rethrow. Only `CORRUPTED_DATA` restarts, never a query's stored cause, and only when
+/// `_ckpt` moved or is absent, because
 /// cleanup may then have emptied keys the reader relied on; any other code returns false without a
 /// request. When the `_ckpt` re-read itself throws, its store error replaces the caught exception: the
 /// caller fails closed as retry-later and this attempt reports no corruption verdict.

@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -14,8 +15,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 
@@ -57,9 +61,12 @@
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
+extern const int QUERY_WAS_CANCELLED;
+extern const int READONLY;
 }
 
 namespace ProfileEvents
@@ -72,10 +79,12 @@ extern const Event CASRefRecoveryCancelled;
 extern const Event CASRefCheckpointPublished;
 extern const Event CASRefCheckpointStamped;
 extern const Event CASRefAppendTombstoneWritten;
+extern const Event CASRefRecoveryRetries;
 }
 
 using namespace DB::Cas;
 using DB::Cas::tests::VirtualRetryClock;
+using DB::Cas::tests::onKillableQueryThread;
 using DB::Cas::tests::committedRow;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::expectThrowsCode;
@@ -1138,7 +1147,6 @@ TEST(CASRefRecoveryCasWalk, UnresolvedRecoveryStampWritesNoTombstoneAndInstallsN
     auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config = walkTestConfig();
     config.boot_ms_fn = [fake_now] { return fake_now->load(); };
-    config.cas_request_budget.recovery_retry_budget_ms = 1;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
     auto store = openWalkPool(backend, config);
@@ -1160,6 +1168,119 @@ TEST(CASRefRecoveryCasWalk, UnresolvedRecoveryStampWritesNoTombstoneAndInstallsN
     ASSERT_TRUE(sniffHeaderLine(ckpt->bytes).has_value());
     EXPECT_EQ(sniffHeaderLine(ckpt->bytes)->v, 1u) << "the ambiguous stamp did not land";
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "nothing is installed";
+}
+
+namespace
+{
+
+/// Runs `on_settle` once, in the first read of `watched_key` after a write of it was refused.
+class SettleHookBackend : public HidingListBackend
+{
+public:
+    String watched_key;
+    uint64_t writes_at_arm = 0;
+    std::function<void()> on_settle;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == watched_key && on_settle && writeCount(key) > writes_at_arm)
+            std::exchange(on_settle, nullptr)();
+        return HidingListBackend::read(key, access);
+    }
+};
+
+struct StoppedConflictRun
+{
+    int code = 0;
+    String message;
+    uint64_t stamp_writes = 0;
+    uint64_t tombstone_writes = 0;
+};
+
+/// A recovery that seals dead epoch 1, run by a query; the write of `refused` (the stamp or the tombstone) is refused
+/// with 412, and with `kill` the query is killed in the read that settles that refusal, which then fails.
+StoppedConflictRun runRecoveryWithARefusedWrite(bool refuse_stamp, bool kill)
+{
+    auto backend = std::make_shared<SettleHookBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{refuse_stamp ? "srv1/stamp_conflict" : "srv1/tombstone_conflict"};
+    burnEpochsUpTo(backend, layout, 2);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 1}));
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String ckpt_key = layout.refCkptKey(life);
+    const String tombstone_key = layout.refLogKey(life, RefTxnId{1, 2});
+    auto store = openWalkPool(backend);
+    store->setCasRetrySleepForTest([](uint64_t) {});
+
+    backend->watched_key = refuse_stamp ? ckpt_key : tombstone_key;
+    backend->writes_at_arm = backend->writeCount(backend->watched_key);
+    backend->refuseNextWrite(backend->watched_key);
+    const uint64_t stamp_writes_before = backend->writeCount(ckpt_key);
+    const uint64_t tombstone_writes_before = backend->writeCount(tombstone_key);
+
+    StoppedConflictRun run;
+    std::thread caller([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        if (kill)
+            backend->on_settle = [&query]
+            {
+                query.kill();
+                throw Poco::TimeoutException("SettleHookBackend: the settling read timed out");
+            };
+        try
+        {
+            (void)store->listRefs(ns);
+        }
+        catch (const DB::Exception & e)
+        {
+            run.code = e.code();
+            run.message = e.message();
+        }
+        backend->on_settle = nullptr;
+    });
+    caller.join();
+    run.stamp_writes = backend->writeCount(ckpt_key) - stamp_writes_before;
+    run.tombstone_writes = backend->writeCount(tombstone_key) - tombstone_writes_before;
+    return run;
+}
+
+}
+
+/// A refused stamp whose settling read the query's stop cut short ends that walk: the 412 proves the stamp did not
+/// land, so the error is a retry-later naming the stop, and no second walk sends a second stamp. A clean refusal
+/// restarts the walk, whose second stamp lands.
+TEST(CASRefRecoveryCasWalk, RefusedStampSettledUnderAStoppedQueryEndsTheWalk)
+{
+    {
+        SCOPED_TRACE("killed in the settling read");
+        const auto run = runRecoveryWithARefusedWrite(/*refuse_stamp=*/true, /*kill=*/true);
+        EXPECT_EQ(run.code, DB::ErrorCodes::NETWORK_ERROR) << run.message;
+        EXPECT_NE(run.message.find("stopped after its refused generation 3 stamp"), String::npos) << run.message;
+        EXPECT_EQ(run.stamp_writes, 1u) << "one walk, one stamp";
+        EXPECT_EQ(run.tombstone_writes, 0u);
+    }
+    {
+        SCOPED_TRACE("live");
+        const auto run = runRecoveryWithARefusedWrite(/*refuse_stamp=*/true, /*kill=*/false);
+        EXPECT_EQ(run.code, 0) << run.message;
+        EXPECT_EQ(run.stamp_writes, 2u) << "the refused stamp, then the restarted walk's stamp";
+        EXPECT_EQ(run.tombstone_writes, 1u);
+    }
+}
+
+/// The same for the tombstone: its settling read observed nothing, so the walk ends with a retry-later and chases no
+/// successor.
+TEST(CASRefRecoveryCasWalk, RefusedTombstoneSettledUnderAStoppedQueryEndsTheWalk)
+{
+    const auto run = runRecoveryWithARefusedWrite(/*refuse_stamp=*/false, /*kill=*/true);
+    EXPECT_EQ(run.code, DB::ErrorCodes::NETWORK_ERROR) << run.message;
+    EXPECT_NE(run.message.find("could not observe"), String::npos) << run.message;
+    EXPECT_EQ(run.stamp_writes, 1u);
+    EXPECT_EQ(run.tombstone_writes, 1u) << "one walk, one tombstone";
 }
 
 /// GENESIS. A namespace born at epoch 5 has no epochs 1-4 of its own: they are not "empty epochs it
@@ -1990,6 +2111,43 @@ TEST(CASRefRecoveryCasWalk, RecoveryRequestSequenceStampsThenWritesOneTombstone)
     };
     EXPECT_EQ(requests, expected);
     EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+}
+
+/// A cold read by a stopped query still recovers the table: the one recovery walk, its stamp and its
+/// tombstone included, is owed, so a healthy store answers with every committed ref.
+TEST(CASRefRecoveryCasWalk, KilledColdReaderStillRecoversWithStampOrTombstone)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/killed_cold_reader"};
+
+    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/4);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
+
+    auto store = openWalkPool(backend);
+    ASSERT_TRUE(store);
+    const uint64_t stamped_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped];
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
+
+    size_t refs = 0;
+    std::thread reader([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        query.kill();
+        EXPECT_NO_THROW(refs = store->listRefs(ns).size());
+    });
+    reader.join();
+
+    EXPECT_EQ(refs, 3u) << "every committed ref stays visible";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped] - stamped_before, 1u)
+        << "the walk stamped the checkpoint";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed] - sealed_before, 1u)
+        << "the walk sealed the dead epoch with a tombstone";
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -3407,4 +3565,260 @@ TEST(CASRefWriterTombstone, TombstoneInstallRefusedAfterItsCreateNeedsRecoveryAn
     EXPECT_EQ(ids, (std::vector<RefTxnId>{RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 3}, RefTxnId{3, 1}}))
         << "no second tombstone";
     EXPECT_TRUE(store->listRefs(ns).contains("c"));
+}
+
+/// ---------------------------------------------------------------------------------------------
+/// A stopped owner and the stamp and tombstone writes of recovery
+/// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+/// Loses the reply of the next `lost_replies` writes of `watched_key` before they apply, after `on_lost`
+/// runs, so the settling read finds the old state, which proves neither way. `refused_writes` refuses
+/// the next writes of the key instead. Counts every write of the key.
+class LostWriteReplyBackend : public JournalingBackend
+{
+public:
+    String watched_key;
+    std::atomic<int> lost_replies{0};
+    std::atomic<int> refused_writes{0};
+    std::atomic<int> writes_of_watched_key{0};
+    std::function<void()> on_lost;
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        DB::Cas::TransportAccess & access) override
+    {
+        if (key == watched_key)
+        {
+            ++writes_of_watched_key;
+            if (refused_writes.fetch_sub(1) > 0)
+                throw DB::Exception(DB::ErrorCodes::READONLY, "test: the store refuses the write");
+            if (lost_replies.fetch_sub(1) > 0)
+            {
+                if (on_lost)
+                    on_lost();
+                throw Poco::TimeoutException("test: the write's reply is lost");
+            }
+        }
+        return JournalingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+struct ResidentStampRecovery
+{
+    std::shared_ptr<LostWriteReplyBackend> backend;
+    PoolPtr store;
+    RootNamespace ns;
+    NamespaceLifeId life;
+    String ckpt_key;
+    String tombstone_key;
+};
+
+/// A namespace whose recovery stamps its generation 1 `_ckpt`, then closes the dead epoch 1 with a
+/// tombstone at {1,4}. Its runtime is resident and unrecovered: a first recovery failed before its first
+/// request, so the next `namespaceLife` recovers it in place.
+ResidentStampRecovery openResidentStampRecovery(const String & name, uint64_t backoff_ms = 1)
+{
+    auto backend = std::make_shared<LostWriteReplyBackend>();
+    const RootNamespace ns{"srv1/" + name};
+    const Layout layout("p");
+    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/4);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
+
+    auto fail_first = std::make_shared<std::atomic<bool>>(true);
+    PoolConfig config = walkTestConfig();
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = backoff_ms;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = backoff_ms;
+    config.recovery_pre_first_request_hook_for_test = [fail_first]
+    {
+        if (fail_first->exchange(false))
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "test: the first recovery fails before its first request");
+    };
+    PoolPtr store = openWalkPool(backend, config);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { (void)store->namespaceLife(ns); });
+    EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), 0u) << "the runtime stays resident";
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+    return ResidentStampRecovery{
+        .backend = backend,
+        .store = store,
+        .ns = ns,
+        .life = life,
+        .ckpt_key = layout.refCkptKey(life),
+        .tombstone_key = layout.refLogKey(life, RefTxnId{1, 4})};
+}
+
+/// The owner stops while the reply of the recovery's write at `key` is lost: the caller of `namespaceLife`
+/// sees the unresolved 210 after one send, nothing is installed and the catalog row is unchanged. Control:
+/// a live owner retries and recovers.
+void expectStoppedOwnerKeepsUnresolvedRecoveryWrite(bool tombstone)
+{
+    const String unresolved_message = tombstone
+        ? "the tombstone at 1-4 is UNRESOLVED"
+        : "the generation 3 stamp of its `_ckpt` is unresolved";
+    for (const bool stop : {true, false})
+    {
+        SCOPED_TRACE(stop ? "stopped owner" : "control: live owner");
+        auto fx = openResidentStampRecovery(fmt::format("unresolved_{}_{}", tombstone ? "tombstone" : "stamp", stop ? "stopped" : "live"));
+        const uint64_t installs_before = fx.store->recoveryInstallCountForTest();
+        fx.backend->watched_key = tombstone ? fx.tombstone_key : fx.ckpt_key;
+        fx.backend->lost_replies = 1;
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            if (stop)
+            {
+                fx.backend->on_lost = [&query] { query.kill(); };
+                DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, unresolved_message,
+                    [&] { (void)fx.store->namespaceLife(fx.ns); });
+            }
+            else
+            {
+                EXPECT_NO_THROW((void)fx.store->namespaceLife(fx.ns));
+            }
+            fx.backend->on_lost = {};
+        });
+        if (stop)
+        {
+            EXPECT_EQ(fx.backend->writes_of_watched_key.load(), 1) << "the lost write is not sent again";
+            EXPECT_EQ(fx.store->recoveryInstallCountForTest(), installs_before);
+            EXPECT_FALSE(fx.store->refTableRecoveredForTest(fx.ns));
+            EXPECT_EQ(catalogLife(fx.backend, Layout("p"), fx.ns), fx.life) << "the catalog row is unchanged";
+        }
+        else
+        {
+            EXPECT_EQ(fx.backend->writes_of_watched_key.load(), 2);
+            EXPECT_EQ(fx.store->recoveryInstallCountForTest(), installs_before + 1);
+        }
+    }
+}
+
+}
+
+TEST(CASRefWriterRecoveryRetry, UnresolvedStampThenStopKeepsUnresolvedExitThroughNamespaceLife)
+{
+    expectStoppedOwnerKeepsUnresolvedRecoveryWrite(/*tombstone=*/false);
+}
+
+TEST(CASRefWriterRecoveryRetry, UnresolvedTombstoneThenStopKeepsUnresolvedExitThroughNamespaceLife)
+{
+    expectStoppedOwnerKeepsUnresolvedRecoveryWrite(/*tombstone=*/true);
+}
+
+/// The catalog row is removed and replaced while the stamp's reply is lost: the stopped caller sees the
+/// unresolved 210 and starts no work on the successor life.
+TEST(CASRefWriterRecoveryRetry, UnresolvedStampThenStopThroughNamespaceLifeWithRowGone)
+{
+    auto fx = openResidentStampRecovery("unresolved_stamp_row_gone");
+    const Layout layout("p");
+    const CatalogEntry predecessor{.ns = fx.life.ns, .state = NsState::Live, .incarnation = fx.life.incarnation, .creator = std::nullopt};
+    std::optional<CatalogEntry> successor;
+    size_t journal_at_loss = 0;
+    fx.backend->watched_key = fx.ckpt_key;
+    fx.backend->lost_replies = 1;
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        fx.backend->on_lost = [&]
+        {
+            successor = replaceCatalogLifeForTest(fx.backend, layout, predecessor, DB::UInt128(0x5eed));
+            query.kill();
+            journal_at_loss = fx.backend->journal().size();
+        };
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+            "the generation 3 stamp of its `_ckpt` is unresolved", [&] { (void)fx.store->namespaceLife(fx.ns); });
+        fx.backend->on_lost = {};
+    });
+    ASSERT_TRUE(successor);
+    EXPECT_EQ(fx.backend->writes_of_watched_key.load(), 1);
+    const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(successor->ns, successor->incarnation);
+    const auto journal = fx.backend->journal();
+    for (size_t i = journal_at_loss; i < journal.size(); ++i)
+    {
+        const auto & [method, key] = journal[i];
+        EXPECT_TRUE(method == "GET" || method == "HEAD") << method << " " << key << ": no write after the stop";
+        EXPECT_FALSE(key.starts_with(layout.namespaceStreamPrefix(successor_life))
+                     || key.starts_with(layout.namespaceStatePrefix(successor_life)))
+            << method << " " << key << ": no request for the successor life";
+    }
+    EXPECT_EQ(fx.store->refTableLifeForTest(fx.ns), std::nullopt) << "the removed life is detached";
+}
+
+/// The owner stops during the pool's own backoff after a walk whose stamp stayed unresolved: the
+/// unresolved 210, not the owner's verdict.
+TEST(CASRefWriterRecoveryRetry, StopInBackoffAfterUnresolvedStampKeeps210)
+{
+    auto fx = openResidentStampRecovery("unresolved_stamp_stop_in_backoff", /*backoff_ms=*/10'000);
+    fx.backend->watched_key = fx.ckpt_key;
+    fx.backend->lost_replies = 1;
+    const uint64_t retries_before = counterOf(ProfileEvents::CASRefRecoveryRetries);
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        /// The counter moves right before the backoff starts.
+        std::thread killer([&]
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (counterOf(ProfileEvents::CASRefRecoveryRetries) == retries_before && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            query.kill();
+        });
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+            "the generation 3 stamp of its `_ckpt` is unresolved", [&] { (void)fx.store->namespaceLife(fx.ns); });
+        killer.join();
+    });
+    EXPECT_GT(counterOf(ProfileEvents::CASRefRecoveryRetries), retries_before) << "the backoff started";
+    EXPECT_EQ(fx.backend->writes_of_watched_key.load(), 1);
+    EXPECT_FALSE(fx.store->refTableRecoveredForTest(fx.ns));
+}
+
+namespace
+{
+
+/// Runs `namespaceLife` under a background owner that the recovery's backoff stops, so the gate before the next walk
+/// is the first check to observe the stop, and expects `code` with `message` after one write of the watched key.
+void expectBackgroundStopInBackoff(ResidentStampRecovery & fx, int code, const String & message)
+{
+    std::atomic<bool> stopped{false};
+    fx.store->setRefRecoveryRetrySleepForTest([&stopped](uint64_t, const auto &) { stopped = true; });
+    {
+        const auto owner = DB::Cas::OwnerScope::background([&stopped]
+        {
+            if (stopped.load())
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "test: the background owner stopped");
+        });
+        DB::Cas::tests::expectThrowsCodeWithMessage(code, message, [&] { (void)fx.store->namespaceLife(fx.ns); });
+    }
+    fx.store->setRefRecoveryRetrySleepForTest([](uint64_t, const auto &) {});
+    EXPECT_TRUE(stopped.load()) << "the recovery paused after its failed walk";
+    EXPECT_EQ(fx.backend->writes_of_watched_key.load(), 1) << "no walk after the stop";
+    EXPECT_FALSE(fx.store->refTableRecoveredForTest(fx.ns));
+}
+
+}
+
+/// A background owner stopped after a walk whose stamp or tombstone stayed unresolved gets the unresolved 210,
+/// not its own verdict: the write may still land.
+TEST(CASRefWriterRecoveryRetry, BackgroundStopAfterUnresolvedWriteKeeps210)
+{
+    for (const bool tombstone : {false, true})
+    {
+        SCOPED_TRACE(tombstone ? "tombstone" : "stamp");
+        auto fx = openResidentStampRecovery(tombstone ? "background_unresolved_tombstone" : "background_unresolved_stamp");
+        fx.backend->watched_key = tombstone ? fx.tombstone_key : fx.ckpt_key;
+        fx.backend->lost_replies = 1;
+        expectBackgroundStopInBackoff(fx, DB::ErrorCodes::NETWORK_ERROR,
+            tombstone ? "the tombstone at 1-4 is UNRESOLVED" : "the generation 3 stamp of its `_ckpt` is unresolved");
+    }
+}
+
+/// A refused stamp sent nothing that may land, so a background owner stopped after it gets its own verdict.
+TEST(CASRefWriterRecoveryRetry, StampRefusalIsNotUnresolved)
+{
+    auto fx = openResidentStampRecovery("stamp_refusal");
+    fx.backend->watched_key = fx.ckpt_key;
+    fx.backend->refused_writes = 1;
+    expectBackgroundStopInBackoff(fx, DB::ErrorCodes::ABORTED, "the background owner stopped");
 }

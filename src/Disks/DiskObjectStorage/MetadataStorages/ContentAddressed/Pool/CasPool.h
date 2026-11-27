@@ -1194,6 +1194,9 @@ public:
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
 
+    /// Test-only: replace the single-slice sleep inside the default recovery retry delay. Same rule.
+    void setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn);
+
     /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
     /// `appendRefOps` callers are enqueued for `ns` right now.
     size_t refQueuePendingForTest(const RootNamespace & ns) { return ref_ledger.refQueuePendingForTest(ns); }

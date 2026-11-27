@@ -6,6 +6,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include "cas_test_helpers.h"
+#include "cas_killable_query.h"
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 
 #include <Common/Exception.h>
 #include <Common/scope_guard_safe.h>
@@ -18,6 +20,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int S3_ERROR;
 }
@@ -397,6 +400,106 @@ TEST(CASRecoveryStreaming, CorruptObjectFailsFast)
     /// The exact checkpoint frontier determines this GET. A corrupt committed object fails fast without
     /// asking a stream enumeration to reinterpret the durable recovery boundary.
     EXPECT_EQ(backend->refs_list_count.load(), 0) << "durable corruption must not trigger recovery LIST";
+}
+
+/// A removal under a background owner, parked behind another caller's recovery, leaves at its owner's stop while that
+/// recovery is still running; a killed query parked beside it keeps waiting and then reads the recovered table.
+TEST(CASRecoveryStreaming, AStoppedBackgroundOwnerLeavesTheWaitForAnotherRecovery)
+{
+    auto backend = std::make_shared<BlockingFirstLogGetBackend>();
+    seedPoolMetaForRestart(*backend);
+    const Layout layout("p");
+    const RootNamespace ns{"00/aa@cas@"};
+    publishCommittedTransition(*backend, layout, ns, "x", std::nullopt, mref(1));
+
+    auto store = openPoolForTest(backend);
+    backend->refs_prefix = layout.namespaceStreamPrefix(fixture::fixtureLife(ns));
+    std::promise<void> entered_promise;
+    std::atomic<bool> get_entered{false};
+    std::promise<void> release_promise;
+    std::shared_future<void> release_future = release_promise.get_future().share();
+    backend->target_log_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 1});
+    backend->on_first_target_get = [&]
+    {
+        if (!get_entered.exchange(true))
+            entered_promise.set_value();
+        release_future.wait();
+    };
+    backend->armed = true;
+
+    std::exception_ptr recovering_error;
+    std::thread recovering([&]
+    {
+        try
+        {
+            store->listRefs(ns);
+        }
+        catch (...)
+        {
+            recovering_error = std::current_exception();
+        }
+    });
+    entered_promise.get_future().wait();
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> removal_code{-1};
+    std::thread removal([&]
+    {
+        const auto owner = OwnerScope::background([&]
+        {
+            if (stop.load())
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "server shutdown");
+        });
+        try
+        {
+            (void)store->dropNamespace(ns);
+            removal_code = 0;
+        }
+        catch (const DB::Exception & e)
+        {
+            removal_code = e.code();
+        }
+    });
+    const bool removal_parked = pollUntil([&] { return store->refRecoveryWaitersForTest(ns) >= 1; });
+
+    std::atomic<bool> query_done{false};
+    std::atomic<int> query_code{-1};
+    std::thread query_reader([&]
+    {
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            query.kill();
+            try
+            {
+                store->listRefs(ns);
+                query_code = 0;
+            }
+            catch (const DB::Exception & e)
+            {
+                query_code = e.code();
+            }
+        });
+        query_done = true;
+    });
+    const bool query_parked = pollUntil([&] { return store->refRecoveryWaitersForTest(ns) >= 2; });
+
+    stop = true;
+    const bool removal_left = pollUntil([&] { return removal_code.load() != -1; });
+    const bool query_still_waiting = !query_done.load();
+
+    release_promise.set_value();
+    recovering.join();
+    removal.join();
+    query_reader.join();
+
+    ASSERT_TRUE(removal_parked) << "the removal never reached the wait";
+    ASSERT_TRUE(query_parked) << "the killed query never reached the wait";
+    EXPECT_TRUE(removal_left) << "the stopped removal waited for the other recovery";
+    EXPECT_EQ(removal_code.load(), DB::ErrorCodes::ABORTED);
+    EXPECT_TRUE(query_still_waiting) << "a killed query is not a stop for this wait";
+    EXPECT_EQ(query_code.load(), 0);
+    EXPECT_FALSE(recovering_error);
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value());
 }
 
 /// Test 14 (concurrent-waiter leg): while one caller is blocked in recovery's unlocked exact-log GET,

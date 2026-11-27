@@ -417,9 +417,12 @@ public:
     /// leave it untouched.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
-    /// Replaces only ref-table recovery's token-aware retry delay seam for deterministic tests.
+    /// Replaces the sleep of a whole recovery retry pause; the pause's stop checks still run before it.
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
+
+    /// Replaces the sleep of one slice of a recovery retry pause, keeping its slicing and stop checks.
+    void setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
     /// The counters expose recovery and publication progress; wedge methods create and inspect the
@@ -860,10 +863,14 @@ private:
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
     std::function<void()> recovery_pre_first_request_hook_for_test;
 
-    /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
-    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops or detached teardown starts);
-    /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
-    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_sleep_fn;
+    /// The sleep of one slice of `pauseBeforeRecoveryRetry`.
+    std::function<void(uint64_t)> recovery_retry_slice_sleep_fn;
+    /// When set, `pauseBeforeRecoveryRetry` sleeps the whole pause through it, after the same checks.
+    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_pause_sleep_for_test;
+
+    /// The backoff of `ensureRefTableRecovered`'s retry loop, in `kOwnerStopSlice` slices. Returns early on fence
+    /// loss, teardown, or a stopped query outside `owed`; throws a stopped background owner's verdict.
+    void pauseBeforeRecoveryRetry(uint64_t total_ms, const std::optional<DetachedStopToken> & token);
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
     /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
@@ -1322,10 +1329,12 @@ private:
     /// reported through the retry-later class (the caller should retry, against the FRESH incarnation),
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
+    /// `unresolved_sent` is set when the walk throws because its stamp or tombstone was sent and stays
+    /// unresolved, so the caller can keep that exit after its owner stops.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
         const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
-        bool & cancelled, const std::optional<DetachedStopToken> & token = std::nullopt);
+        bool & cancelled, bool & unresolved_sent, const std::optional<DetachedStopToken> & token = std::nullopt);
 
     /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Detached
     /// teardown, self-remount cancellation, and a runtime already detached by self-remount each
