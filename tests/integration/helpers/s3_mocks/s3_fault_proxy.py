@@ -22,6 +22,23 @@ Focused tests can additionally restrict S22 faults to a `path_substring` and an 
 `remaining_faults` budget. The `drop_after_forward` mode records the upstream result and request
 body digest, then closes the downstream connection so retry recovery can prove response-loss cases.
 
+`slow_then_drop` waits `slow_ms`, forwards, then closes without the response. `trickle` forwards, then
+sends the response in pieces spread over `slow_ms`. `trace: true` records every request at ingress
+(optionally scoped by `trace_path_substring`) and `/stats` returns it as `trace`, with the proxy's
+monotonic clock as `now_mono_ms`. A record names the fault it got; after a trickle, `outcome` is
+`delivered` once the last piece is flushed or `disconnected` when a write fails, and
+`t_last_piece_mono_ms` is when the last piece started to be written. With `trace_bodies: true` a record
+also carries the request body as Latin-1 text when it is at most `TRACE_BODY_MAX_BYTES`, else None.
+
+`rules` is an ordered script of `{method, path_substring, action, count}` with an optional
+`body_substring`. Only the first rule with `count > 0` is consulted: a request it matches consumes one
+count and gets its action, any other request gets the random decision above. `path_substring`,
+`trace_path_substring` and `body_substring` are each a string or a list of strings that must all occur.
+Actions: `forward`; `412`, an S3 `PreconditionFailed` without forwarding; `503`, a `SlowDown` without
+forwarding; `hold`, which parks the request until `POST /release {id, respond: forward|503}`. A traced
+parked request gets `t_release_mono_ms` when it is released. `GET /parked` lists the parked requests;
+`/stats` returns the rules with their remaining counts.
+
 Control plane (separate port): POST /config {json}, GET /stats, GET /healthz. Deterministic: fault
 decisions are driven by a seeded PRNG keyed per-request-index, so a given (seed, rate) is reproducible.
 """
@@ -29,6 +46,7 @@ decisions are driven by a seeded PRNG keyed per-request-index, so a given (seed,
 import hashlib
 import http.client
 import http.server
+import io
 import json
 import os
 import random
@@ -41,20 +59,29 @@ import time
 UPSTREAM = os.environ.get("RUSTFS_UPSTREAM", "rustfs1:11121")  # host:port of the real store
 S3_PORT = int(os.environ.get("S3_PROXY_PORT", "11121"))
 CTL_PORT = int(os.environ.get("S3_PROXY_CTL_PORT", "8474"))
+TRICKLE_INTERVAL_MS = 250
+TRACE_BODY_MAX_BYTES = 64 * 1024
 
 # Runtime-mutable fault config (guarded by _cfg_lock). rate=0 => pure pass-through.
 _cfg_lock = threading.Lock()
 _DEFAULT_CFG = {
     "rate": 0.0,                       # fraction of matched requests that get a fault
-    "modes": ["503"],                  # subset of {503,429,slow,reset,drop_after_forward}
+    # subset of {503,429,slow,reset,drop_after_forward,slow_then_drop,trickle}:
+    # slow_then_drop waits slow_ms, forwards, then closes without the response;
+    # trickle forwards, then sends the response in pieces spread over slow_ms.
+    "modes": ["503"],
     "methods": ["GET", "PUT", "HEAD", "POST"],  # HTTP methods eligible for S22 faults
     "slow_ms": 1500,                   # latency for the "slow" mode
     "seed": 1,
     "path_substring": None,            # optional request-path scope
+    "trace": False,                    # record every request at ingress; returned by /stats
+    "trace_path_substring": None,      # optional scope of the trace
+    "trace_bodies": False,             # record small request bodies in the trace
     "remaining_faults": None,          # optional exact finite fault budget; None = legacy unlimited
     # S27 list-anomaly config (independent of the S22 fault rate):
     "list_anomaly": None,              # None | "duplicate" | "drop_token"
     "list_prefix": "roots/",           # only LIST calls whose prefix contains this are perturbed
+    "rules": [],                       # ordered script; see the module docstring
 }
 _DEFAULT_STATS = {
     "forwarded": 0,
@@ -62,13 +89,18 @@ _DEFAULT_STATS = {
     "list_perturbed": 0,
     "by_mode": {},
     "drop_after_forward": [],
+    "trace": [],
 }
 _cfg = dict(_DEFAULT_CFG)
 _stats = dict(_DEFAULT_STATS)
 _stats["by_mode"] = {}
 _stats["drop_after_forward"] = []
+_stats["trace"] = []
 _req_index = [0]
 _idx_lock = threading.Lock()
+# id -> {"id", "method", "path", "t_mono_ms", "event", "respond", "trace"}; guarded by _cfg_lock.
+_parked = {}
+_parked_ids = [0]
 
 
 def _get_cfg():
@@ -104,14 +136,26 @@ def _record_drop_after_forward(method, path, body, upstream_status, upstream_eta
         del records[:-64]
 
 
+def _release(record, respond):
+    record["respond"] = respond
+    if record["trace"] is not None:
+        record["trace"]["t_release_mono_ms"] = time.monotonic() * 1000.0
+    record["event"].set()
+
+
 def _reset():
     with _cfg_lock:
+        # A parked handler thread must not outlive the test that parked it.
+        for record in _parked.values():
+            _release(record, "503")
+        _parked.clear()
         _cfg.clear()
         _cfg.update(_DEFAULT_CFG)
         _stats.clear()
         _stats.update(_DEFAULT_STATS)
         _stats["by_mode"] = {}
         _stats["drop_after_forward"] = []
+        _stats["trace"] = []
         with _idx_lock:
             _req_index[0] = 0
 
@@ -119,6 +163,21 @@ def _reset():
 _SLOWDOWN_BODY = (b'<?xml version="1.0" encoding="UTF-8"?>'
                   b'<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message>'
                   b'<Resource>/</Resource><RequestId>fault-proxy</RequestId></Error>')
+_PRECONDITION_FAILED_BODY = (b'<?xml version="1.0" encoding="UTF-8"?>'
+                             b'<Error><Code>PreconditionFailed</Code>'
+                             b'<Message>At least one of the pre-conditions you specified did not hold</Message>'
+                             b'<Resource>/</Resource><RequestId>fault-proxy</RequestId></Error>')
+
+
+def _path_matches(path, substring):
+    if substring is None:
+        return True
+    substrings = [substring] if isinstance(substring, str) else substring
+    return all(s in (path or "") for s in substrings)
+
+
+def _body_matches(body, substring):
+    return _path_matches(body.decode("latin-1"), substring)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -128,6 +187,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # quiet
 
     # --- fault decision -----------------------------------------------------
+    def _admit(self, ingress_mono_ms):
+        """Consumes the head rule, publishes the trace record and parks a held request in one critical section, so
+        a concurrent `/config` reset or `/release` sees all three or none of them. Returns the rule's action and the
+        parked record."""
+        with _cfg_lock:
+            action = None
+            head = next((r for r in _cfg["rules"] if r["count"] > 0), None)
+            if (head is not None and head["method"] == self.command and _path_matches(self.path, head["path_substring"])
+                    and _body_matches(self._cached_body, head.get("body_substring"))):
+                head["count"] -= 1
+                action = head["action"]
+            if _cfg["trace"] and _path_matches(self.path, _cfg.get("trace_path_substring")):
+                body = None
+                if _cfg.get("trace_bodies") and len(self._cached_body) <= TRACE_BODY_MAX_BYTES:
+                    body = self._cached_body.decode("latin-1")
+                # Every key exists before the record is published; later fields start as None.
+                self._trace_record = {"t_mono_ms": ingress_mono_ms, "method": self.command, "path": self.path,
+                                      "fault": None, "rule": action, "status": None, "outcome": None,
+                                      "t_last_piece_mono_ms": None, "t_release_mono_ms": None, "body": body}
+                _stats["trace"].append(self._trace_record)
+            parked = None
+            if action == "hold":
+                _parked_ids[0] += 1
+                parked = {"id": _parked_ids[0], "method": self.command, "path": self.path, "t_mono_ms": ingress_mono_ms,
+                          "event": threading.Event(), "respond": None, "trace": self._trace_record}
+                _parked[parked["id"]] = parked
+            return action, parked
+
     def _should_fault(self, cfg):
         # Keep the original unscoped decision path byte-for-byte: existing scenario configs omit
         # both new fields and therefore retain their request-index/seed behavior.
@@ -146,8 +233,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             current = _cfg
             if current["rate"] <= 0 or self.command not in current["methods"]:
                 return None
-            path_substring = current.get("path_substring")
-            if path_substring is not None and path_substring not in (self.path or ""):
+            if not _path_matches(self.path, current.get("path_substring")):
                 return None
             remaining = current.get("remaining_faults")
             if remaining is not None and remaining <= 0:
@@ -161,17 +247,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 current["remaining_faults"] = remaining - 1
             return mode
 
+    def _send_error(self, code, body):
+        self._trace_status(code)
+        self.send_response(code)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _hold(self, parked):
+        parked["event"].wait()
+        if parked["respond"] == "forward":
+            self._forward()
+        else:
+            self._send_error(503, _SLOWDOWN_BODY)
+
+    def _apply_rule(self, action, parked):
+        _bump("by_mode", "rule_" + action)
+        if action == "forward":
+            self._forward()
+        elif action == "412":
+            self._send_error(412, _PRECONDITION_FAILED_BODY)
+        elif action == "503":
+            self._send_error(503, _SLOWDOWN_BODY)
+        elif action == "hold":
+            self._hold(parked)
+        else:
+            raise ValueError(f"unknown rule action {action}")
+
     def _emit_fault(self, mode):
         _bump("faults")
         _bump("by_mode", mode)
         if mode in ("503", "429"):
-            code = 503 if mode == "503" else 429
-            self.send_response(code)
-            self.send_header("Content-Type", "application/xml")
-            self.send_header("Content-Length", str(len(_SLOWDOWN_BODY)))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(_SLOWDOWN_BODY)
+            self._send_error(503 if mode == "503" else 429, _SLOWDOWN_BODY)
         elif mode == "slow":
             time.sleep(_get_cfg()["slow_ms"] / 1000.0)
             self._forward()  # after the delay, serve the real response
@@ -184,6 +293,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         elif mode == "drop_after_forward":
             self._forward(drop_after_forward=True)
+        elif mode == "slow_then_drop":
+            time.sleep(_get_cfg()["slow_ms"] / 1000.0)
+            self._forward(drop_after_forward=True)
+        elif mode == "trickle":
+            self._forward(trickle=True)
 
     # --- request body -------------------------------------------------------
     def _read_body(self):
@@ -207,7 +321,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return b""
 
     # --- forward to upstream ------------------------------------------------
-    def _forward(self, drop_after_forward=False):
+    def _forward(self, drop_after_forward=False, trickle=False):
         body = getattr(self, "_cached_body", None)
         if body is None:
             body = self._read_body()
@@ -265,6 +379,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             self.connection.close()
             return
+        self._trace_status(resp.status)
+        real_wfile = self.wfile
+        if trickle:
+            self.wfile = io.BytesIO()
         self.send_response(resp.status)
         is_head = (self.command == "HEAD")
         for k, v in resp.getheaders():
@@ -281,10 +399,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if not is_head:
             self.wfile.write(data)
+        if trickle:
+            # Keeps the socket active, so only a total-time bound ends the attempt.
+            raw = self.wfile.getvalue()
+            self.wfile = real_wfile
+            pieces = max(1, int(cfg["slow_ms"] // TRICKLE_INTERVAL_MS))
+            step = max(1, -(-len(raw) // pieces))
+            outcome = "disconnected"
+            try:
+                for i in range(0, len(raw), step):
+                    time.sleep(TRICKLE_INTERVAL_MS / 1000.0)
+                    if i + step >= len(raw) and self._trace_record is not None:
+                        self._trace_record["t_last_piece_mono_ms"] = time.monotonic() * 1000.0
+                    self.wfile.write(raw[i:i + step])
+                    self.wfile.flush()
+                outcome = "delivered"
+            finally:
+                if self._trace_record is not None:
+                    self._trace_record["outcome"] = outcome
         conn.close()
+
+    def _trace_status(self, status):
+        if self._trace_record is not None:
+            self._trace_record["status"] = status
 
     def _handle(self):
         cfg = _get_cfg()
+        self._trace_record = None
+        ingress_mono_ms = time.monotonic() * 1000.0
         # Cache body once (fault paths + forward both may need it).
         try:
             self._cached_body = self._read_body()
@@ -294,8 +436,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"[dbg] {self.command} {self.path[:60]} CL={self.headers.get('Content-Length')} "
                   f"TE={self.headers.get('Transfer-Encoding')} CE={self.headers.get('Content-Encoding')} "
                   f"Expect={self.headers.get('Expect')} read={len(self._cached_body)}", flush=True)
-        mode = self._should_fault(cfg)
-        if mode is None:
+        action, parked = self._admit(ingress_mono_ms)
+        mode = self._should_fault(cfg) if action is None else None
+        if self._trace_record is not None:
+            self._trace_record["fault"] = mode
+        if action is not None:
+            self._apply_rule(action, parked)
+        elif mode is None:
             self._forward()
         else:
             self._emit_fault(mode)
@@ -365,21 +512,41 @@ class CtlHandler(http.server.BaseHTTPRequestHandler):
                 snapshot = dict(_stats)
                 snapshot["by_mode"] = dict(_stats["by_mode"])
                 snapshot["drop_after_forward"] = list(_stats["drop_after_forward"])
+                snapshot["trace"] = [dict(r) for r in _stats["trace"]]
+                snapshot["rules"] = [dict(r) for r in _cfg["rules"]]
+                snapshot["now_mono_ms"] = time.monotonic() * 1000.0
             return self._json(200, snapshot)
+        if self.path.startswith("/parked"):
+            with _cfg_lock:
+                parked = [{k: r[k] for k in ("id", "method", "path", "t_mono_ms")}
+                          for r in _parked.values() if r["respond"] is None]
+            return self._json(200, {"parked": parked})
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self.path.startswith("/config"):
-            return self._json(404, {"error": "not found"})
         length = int(self.headers.get("Content-Length", "0"))
         try:
             patch = json.loads(self.rfile.read(length) or b"{}")
         except Exception as e:
             return self._json(400, {"error": f"bad json: {e}"})
+        if self.path.startswith("/release"):
+            respond = patch.get("respond", "forward")
+            if respond not in ("forward", "503"):
+                return self._json(400, {"error": f"bad respond {respond}"})
+            with _cfg_lock:
+                record = _parked.pop(patch.get("id"), None)
+                if record is None:
+                    return self._json(404, {"error": "not parked"})
+                _release(record, respond)
+            return self._json(200, {"ok": True})
+        if not self.path.startswith("/config"):
+            return self._json(404, {"error": "not found"})
         reset = bool(patch.pop("reset", False))
         if reset:
             _reset()
         with _cfg_lock:
+            if "rules" in patch:
+                patch["rules"] = [dict(r) for r in patch["rules"]]
             _cfg.update(patch)
             snap = dict(_cfg)
         self._json(200, {"ok": True, "config": snap})

@@ -1,0 +1,5 @@
+<clickhouse>
+    <!-- A failed table removal is requeued only after this long, so a removal attempt that
+         fails cannot be retried, with a different outcome, while a test is still checking it. -->
+    <database_catalog_drop_error_cooldown_sec>600</database_catalog_drop_error_cooldown_sec>
+</clickhouse>

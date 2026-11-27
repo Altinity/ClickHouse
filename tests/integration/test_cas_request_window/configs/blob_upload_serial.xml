@@ -1,0 +1,4 @@
+<clickhouse>
+    <!-- One upload thread publishes a part's blobs one after another, so a held blob decides which blobs follow it. -->
+    <cas_blob_upload_pool_size>1</cas_blob_upload_pool_size>
+</clickhouse>
