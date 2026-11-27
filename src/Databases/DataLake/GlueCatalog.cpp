@@ -26,7 +26,6 @@
 #include <base/unit.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
-#include <Formats/FormatFactory.h>
 
 #include <DataTypes/IDataType.h>
 #include <DataTypes/DataTypeArray.h>
@@ -88,6 +87,7 @@ namespace DB::FailPoints
 namespace DB::Setting
 {
     extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
     extern const SettingsUInt64 s3_max_connections;
     extern const SettingsUInt64 s3_max_redirects;
     extern const SettingsUInt64 s3_retry_attempts;
@@ -726,7 +726,9 @@ bool GlueCatalog::tryGetTableMetadata(
                     const bool allow_geo_parser
                         = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
                     auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(
-                        context_, allow_geo_parser, DB::allowAggregateFunctionStates(/*table_allow=*/ std::nullopt, context_));
+                        context_,
+                        allow_geo_parser,
+                        context_->getSettingsRef()[DB::Setting::allow_aggregate_function_states_in_open_formats].value);
                     auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
                     auto parsed_schema = schema_processor.getClickHouseTableSchemaById(id);
                     if (parsed_schema)

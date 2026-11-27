@@ -1,7 +1,7 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/transformTypesRecursively.h>
-#include <Formats/FormatFactory.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Context.h>
@@ -229,7 +229,7 @@ void addCurrentSchema(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Objec
             const auto field = fields_by_id.find(static_cast<Int32>(field_id));
             if (field == fields_by_id.end()
                 || Iceberg::clickHouseTypeAnnotationFitsField(
-                    resolveClickHouseTypeAnnotation(it->second.type_name, /*allow_aggregate_function_states=*/ true),
+                    getAnnotatedDataType(it->second.type_name),
                     field->second->get(Iceberg::f_type),
                     field->second->getValue<bool>(Iceberg::f_required)))
                 annotation = it->second.type_name;
@@ -321,7 +321,7 @@ static bool clickHouseTypeAnnotationMatches(
     const auto annotations
         = Iceberg::getClickHouseTypeAnnotations(metadata_object, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
     const auto it = annotations.find(field->getValue<Int32>(Iceberg::f_id));
-    return (it == annotations.end() ? String{} : it->second.type_name) == getClickHouseTypeAnnotation(type);
+    return (it == annotations.end() ? String{} : it->second.type_name) == getAggregateFunctionTypeAnnotation(type);
 }
 
 /// The state versions of the aggregate functions nested in `type`, in traversal order.
@@ -935,7 +935,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     }
 
     addCurrentSchema(metadata_object, current_schema, next_schema_id);
-    Iceberg::setClickHouseTypeAnnotation(metadata_object, new_field_id, next_schema_id, getClickHouseTypeAnnotation(type));
+    Iceberg::setClickHouseTypeAnnotation(metadata_object, new_field_id, next_schema_id, getAggregateFunctionTypeAnnotation(type));
 }
 
 bool MetadataGenerator::generateModifyColumnMetadata(
@@ -944,7 +944,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
     ContextPtr context,
     bool first,
     const String & after_column,
-    std::optional<bool> table_allow_aggregate_function_states)
+    bool allow_aggregate_function_states)
 {
     if (type)
         Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
@@ -978,7 +978,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
                 Iceberg::IcebergSchemaProcessor schema_processor(
                     context,
                     context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
-                    allowAggregateFunctionStates(table_allow_aggregate_function_states, context));
+                    allow_aggregate_function_states);
                 const auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, annotations, context);
 
                 if (!current_ch_type->equals(*type))
@@ -1045,7 +1045,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
             metadata_object,
             target_field_id,
             metadata_object->getValue<Int32>(Iceberg::f_current_schema_id),
-            getClickHouseTypeAnnotation(type));
+            getAggregateFunctionTypeAnnotation(type));
         return true;
     }
 
@@ -1095,7 +1095,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
 
     addCurrentSchema(metadata_object, current_schema, next_schema_id);
     if (type_changed || annotation_changed)
-        Iceberg::setClickHouseTypeAnnotation(metadata_object, target_field_id, next_schema_id, getClickHouseTypeAnnotation(type));
+        Iceberg::setClickHouseTypeAnnotation(metadata_object, target_field_id, next_schema_id, getAggregateFunctionTypeAnnotation(type));
     return true;
 }
 

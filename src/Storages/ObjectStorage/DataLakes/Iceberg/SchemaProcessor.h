@@ -121,6 +121,8 @@ public:
     {
     }
 
+    bool useClickHouseTypeAnnotations() const { return use_clickhouse_type_annotations; }
+
     /// `clickhouse_type_annotations` are the ones in effect for the schema in the table metadata it belongs to.
     void addIcebergTableSchema(
         Poco::JSON::Object::Ptr schema_ptr,

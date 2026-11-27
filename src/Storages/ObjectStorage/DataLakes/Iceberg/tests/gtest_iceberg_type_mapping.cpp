@@ -14,6 +14,7 @@
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 using namespace DB;
@@ -192,15 +193,15 @@ TEST(IcebergTypeMapping, AnnotationKeepsAggregateStateVersion)
     /// The name of a version 0 state has no version, which reads back as version 0, not as the default version.
     auto v0 = DataTypeFactory::instance().get("AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8))");
     EXPECT_EQ(v0->getName(), "AggregateFunction(sumMap, Array(UInt8), Array(UInt8))");
-    EXPECT_EQ(version_of(resolveClickHouseTypeAnnotation(v0->getName(), true)), 0u);
+    EXPECT_EQ(version_of(getAnnotatedDataType(v0->getName())), 0u);
 
     auto array_v0 = DataTypeFactory::instance().get("Array(AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8)))");
     EXPECT_EQ(
-        version_of(assert_cast<const DataTypeArray &>(*resolveClickHouseTypeAnnotation(array_v0->getName(), true)).getNestedType()),
+        version_of(assert_cast<const DataTypeArray &>(*getAnnotatedDataType(array_v0->getName())).getNestedType()),
         0u);
 
     auto latest = DataTypeFactory::instance().get("AggregateFunction(sumMap, Array(UInt8), Array(UInt8))");
-    EXPECT_EQ(version_of(resolveClickHouseTypeAnnotation(latest->getName(), true)), version_of(latest));
+    EXPECT_EQ(version_of(getAnnotatedDataType(latest->getName())), version_of(latest));
 }
 
 #endif

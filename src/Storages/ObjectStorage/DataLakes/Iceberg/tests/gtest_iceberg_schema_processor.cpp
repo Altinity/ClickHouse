@@ -600,11 +600,11 @@ TEST(IcebergSchemaProcessor, AnnotationMustDescribeTheFieldType)
     tryRegisterAggregateFunctions();
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
 
-    /// ClickHouse writes both `Int64` and `UInt64` as `long`.
+    /// ClickHouse writes both `Int64` and `UInt32` as `long`.
     auto context = getContext().context;
     IcebergSchemaProcessor processor(context, /*allow_geo_parser_=*/ false, /*use_clickhouse_type_annotations_=*/ true);
-    processor.addIcebergTableSchema(schema, context, {{1, {"SimpleAggregateFunction(sum, UInt64)"}}});
-    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, UInt64)");
+    processor.addIcebergTableSchema(schema, context, {{1, {"SimpleAggregateFunction(max, UInt32)"}}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(max, UInt32)");
 
     /// An annotation recorded for the schema itself must describe its field.
     expectAnnotatedSchemaRejected(schema, {{1, {"AggregateFunction(uniq, UInt64)"}}});

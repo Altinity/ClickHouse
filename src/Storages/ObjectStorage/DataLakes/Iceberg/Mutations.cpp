@@ -981,7 +981,7 @@ void alter(
                         context,
                         params[0].first,
                         params[0].after_column,
-                        getTableAllowAggregateFunctionStates(data_lake_settings)))
+                        persistent_table_components.schema_processor->useClickHouseTypeAnnotations()))
                 {
                     succeeded = true;
                 }

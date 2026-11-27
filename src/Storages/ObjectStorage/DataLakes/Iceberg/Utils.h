@@ -184,8 +184,9 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
     UInt64 format_version = 2,
     bool is_catalog_table = false);
 
-/// The table's `allow_aggregate_function_states_in_open_formats`. A table function has none, and the query decides.
-std::optional<bool> getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings);
+/// The table's `allow_aggregate_function_states_in_open_formats`. A table function or a `DataLakeCatalog` table has none
+/// and takes the query's (`context`).
+bool getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings, const ContextPtr & context);
 
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,

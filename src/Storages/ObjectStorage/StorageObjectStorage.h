@@ -65,8 +65,7 @@ public:
         bool is_table_function_ = false,
         bool lazy_init = false,
         bool updated_configuration = false, // avoid double update configuration from cluster and local versions
-        std::optional<std::string> sample_path_ = std::nullopt,
-        std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt);
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -303,8 +302,6 @@ protected:
     /// `object_storage` to allow direct access to data storage.
     const ObjectStoragePtr object_storage;
     const std::optional<FormatSettings> format_settings;
-    /// The table's `allow_aggregate_function_states_in_open_formats`. A table function has none, and the query decides.
-    const std::optional<bool> table_allow_aggregate_function_states;
     /// Whether this engine is a part of according Cluster engine implementation.
     /// (One of the reading replicas, not the initiator).
     const bool distributed_processing;

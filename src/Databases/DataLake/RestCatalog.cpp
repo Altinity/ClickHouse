@@ -87,6 +87,7 @@ namespace DB::ErrorCodes
 namespace DB::Setting
 {
     extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace DB::FailPoints
@@ -2564,7 +2565,7 @@ bool RestCatalog::getTableMetadataImpl(
         const bool allow_geo_parser
             = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
         auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(
-            context_, allow_geo_parser, DB::allowAggregateFunctionStates(/*table_allow=*/ std::nullopt, context_));
+            context_, allow_geo_parser, context_->getSettingsRef()[DB::Setting::allow_aggregate_function_states_in_open_formats].value);
         auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
         auto schema = schema_processor.getClickHouseTableSchemaById(id);
         result.setSchema(*schema);

@@ -23,7 +23,6 @@
 #include <base/scope_guard.h>
 #include <Core/Settings.h>
 
-#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeDate.h>
@@ -39,6 +38,7 @@
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <Formats/FormatFactory.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/Context.h>
@@ -842,7 +842,7 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
 
     const auto & annotation = annotation_it->second;
     const String & annotated_name = annotation.type_name;
-    auto annotated_type = resolveClickHouseTypeAnnotation(annotated_name, /*allow_aggregate_function_states=*/ true);
+    auto annotated_type = getAnnotatedDataType(annotated_name);
 
     if (!clickHouseTypeAnnotationFitsField(annotated_type, field->get(type_key), required))
     {
@@ -1214,7 +1214,7 @@ IcebergSchemaProcessor::getAppliedClickHouseTypeAnnotations(const ClickHouseType
 
     for (const auto & [field_id, annotation] : clickhouse_type_annotations)
     {
-        if (!resolveClickHouseTypeAnnotation(annotation.type_name, /*allow_aggregate_function_states=*/ false))
+        if (typeNameHasAggregateFunction(annotation.type_name))
             throw Exception(
                 ErrorCodes::SUPPORT_IS_DISABLED,
                 "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`, which has aggregate "

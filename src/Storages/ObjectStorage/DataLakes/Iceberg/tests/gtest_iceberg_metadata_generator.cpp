@@ -611,14 +611,14 @@ void expectModifyRejected(
     const DataTypePtr & requested_type,
     bool first = false,
     const String & after_column = {},
-    std::optional<bool> table_allow_aggregate_function_states = std::nullopt)
+    bool allow_aggregate_function_states = false)
 {
     const auto before = readSchemaState(metadata);
     MetadataGenerator gen(metadata);
     try
     {
         gen.generateModifyColumnMetadata(
-            column, requested_type, getContext().context, first, after_column, table_allow_aggregate_function_states);
+            column, requested_type, getContext().context, first, after_column, allow_aggregate_function_states);
         FAIL() << "MODIFY COLUMN " << column << " " << requested_type->getName()
                << " cannot be recorded in Iceberg and must be rejected";
     }
@@ -1292,10 +1292,10 @@ TEST(IcebergMetadataGenerator, ModifyColumnComparesWithTheAnnotatedTypeOfAState)
         = makeMetadataWithAnnotatedField("u", f_binary, /* required */ true, "AggregateFunction(uniq, UInt64)");
     EXPECT_FALSE(MetadataGenerator(metadata).generateModifyColumnMetadata(
         "u", DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)"), getContext().context,
-        /* first */ false, /* after_column */ {}, /* table_allow_aggregate_function_states */ true));
+        /* first */ false, /* after_column */ {}, /* allow_aggregate_function_states */ true));
     expectModifyRejected(
         metadata, "u", DataTypeFactory::instance().get("AggregateFunction(sum, UInt64)"),
-        /* first */ false, /* after_column */ {}, /* table_allow_aggregate_function_states */ true);
+        /* first */ false, /* after_column */ {}, /* allow_aggregate_function_states */ true);
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "u"), "AggregateFunction(uniq, UInt64)");
 }
 

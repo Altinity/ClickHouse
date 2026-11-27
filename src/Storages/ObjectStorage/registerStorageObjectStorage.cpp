@@ -82,7 +82,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         format_settings = getFormatSettings(context);
     }
 
-    const auto table_allow_aggregate_function_states = extractTableAllowAggregateFunctionStates(
+    setTableAllowAggregateFunctionStates(
         *format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr, args.getContext());
 
     ASTPtr partition_by;
@@ -139,8 +139,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         args.query.if_not_exists,
         /* is_datalake_query */ false,
         /* is_table_function */ false,
-        /* lazy_init */ false,
-        table_allow_aggregate_function_states);
+        /* lazy_init */ false);
 }
 
 #endif

@@ -1,7 +1,7 @@
 #include <Processors/Formats/Impl/ClickHouseColumnTypesMetadata.h>
 
-#include <DataTypes/DataTypeAggregateFunction.h>
 #include <Common/Exception.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
@@ -31,7 +31,7 @@ String serializeClickHouseColumnTypesMetadata(const NamesAndTypesList & columns)
     Poco::JSON::Object::Ptr column_types = new Poco::JSON::Object;
     for (const auto & [column_name, type] : columns)
     {
-        if (auto annotation = getClickHouseTypeAnnotation(type); !annotation.empty())
+        if (auto annotation = getAggregateFunctionTypeAnnotation(type); !annotation.empty())
             column_types->set(column_name, annotation);
     }
 

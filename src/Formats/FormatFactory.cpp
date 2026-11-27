@@ -105,7 +105,7 @@ FormatSettings getFormatSettings(const ContextPtr & context)
     return getFormatSettings(context, settings);
 }
 
-bool extractTableAllowAggregateFunctionStates(
+void setTableAllowAggregateFunctionStates(
     FormatSettings & table_format_settings, const SettingsChanges * table_settings, const ContextPtr & global_context)
 {
     bool table_allow = global_context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats];
@@ -115,12 +115,6 @@ bool extractTableAllowAggregateFunctionStates(
             table_allow = SettingFieldBool(*value).value;
     }
     table_format_settings.parquet.allow_aggregate_function_states = table_allow;
-    return table_allow;
-}
-
-bool allowAggregateFunctionStates(std::optional<bool> table_allow, const ContextPtr & context)
-{
-    return table_allow.value_or(context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats]);
 }
 
 FormatSettings getFormatSettings(const ContextPtr & context, const Settings & settings)

@@ -27,8 +27,7 @@ public:
         bool if_not_exists,
         bool is_datalake_query,
         bool is_table_function_ = false,
-        bool lazy_init = false,
-        std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt);
+        bool lazy_init = false);
 
     std::string getName() const override;
 

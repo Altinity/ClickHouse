@@ -157,13 +157,11 @@ StorageObjectStorage::StorageObjectStorage(
     bool is_table_function_,
     bool lazy_init,
     bool updated_configuration,
-    std::optional<std::string> sample_path_,
-    std::optional<bool> table_allow_aggregate_function_states_)
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
     , format_settings(format_settings_)
-    , table_allow_aggregate_function_states(table_allow_aggregate_function_states_)
     , distributed_processing(distributed_processing_)
     , is_table_function(is_table_function_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
@@ -915,8 +913,8 @@ IStorage::ImportResult StorageObjectStorage::import(
 {
     /// The export brings its own format settings, but the table's own `allow_aggregate_function_states_in_open_formats` decides over them.
     auto import_format_settings = format_settings_ ? format_settings_ : format_settings;
-    if (format_settings_ && table_allow_aggregate_function_states)
-        import_format_settings->parquet.allow_aggregate_function_states = *table_allow_aggregate_function_states;
+    if (format_settings_ && format_settings)
+        import_format_settings->parquet.allow_aggregate_function_states = format_settings->parquet.allow_aggregate_function_states;
 
     if (isDataLake())
     {

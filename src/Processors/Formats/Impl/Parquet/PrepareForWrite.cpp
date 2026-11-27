@@ -1149,7 +1149,9 @@ bool isDateTime64WithScale(const DataTypePtr & type, UInt32 scale)
     return date_time64 && date_time64->getScale() == scale;
 }
 
-/// Mirrors the non-injective mappings in `preparePrimitiveColumn`.
+/// The parquet writer stores some ClickHouse types as parquet types that the reader maps to a different
+/// ClickHouse type, e.g. `Date` is read back as `Date32`. Lists those pairs, so the type from
+/// `clickhouse.column_types` metadata can be checked against the parquet schema of a file we wrote.
 bool parquetWriterCouldProduce(const DataTypePtr & annotated, const DataTypePtr & derived)
 {
     if (annotated->equals(*derived))

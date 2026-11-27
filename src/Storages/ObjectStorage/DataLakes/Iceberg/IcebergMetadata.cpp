@@ -308,7 +308,7 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
         .schema_processor = std::make_shared<IcebergSchemaProcessor>(
             context_,
             context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
-            allowAggregateFunctionStates(getTableAllowAggregateFunctionStates(configuration->getDataLakeSettings()), context_)),
+            getTableAllowAggregateFunctionStates(configuration->getDataLakeSettings(), context_)),
         .metadata_cache = cache_ptr,
         .format_version = format_version,
         .table_location = table_location,
@@ -1120,12 +1120,11 @@ void IcebergMetadata::alterPartitionDropImpl(
     executor.run();
 }
 
-static void checkAggregateFunctionStatesAllowed(
-    const String & column_name, const DataTypePtr & type, const DataLakeStorageSettings & data_lake_settings, const ContextPtr & context)
+static void checkAggregateFunctionStatesAllowed(const String & column_name, const DataTypePtr & type, bool allow_aggregate_function_states)
 {
     if (!type || !hasAggregateFunctionType(type))
         return;
-    if (allowAggregateFunctionStates(Iceberg::getTableAllowAggregateFunctionStates(data_lake_settings), context))
+    if (allow_aggregate_function_states)
         return;
 
     throw Exception(
@@ -1153,7 +1152,8 @@ void IcebergMetadata::alter(
     }
 
     for (const auto & command : params)
-        checkAggregateFunctionStatesAllowed(command.column_name, command.data_type, data_lake_settings, context);
+        checkAggregateFunctionStatesAllowed(
+            command.column_name, command.data_type, persistent_components.schema_processor->useClickHouseTypeAnnotations());
 
     Iceberg::alter(params, context, storage_id, object_storage, data_lake_settings, persistent_components, write_format, catalog);
 }
@@ -1299,7 +1299,8 @@ void IcebergMetadata::createInitial(
     }
 
     for (const auto & column : columns->getAll())
-        checkAggregateFunctionStatesAllowed(column.name, column.type, configuration_ptr->getDataLakeSettings(), local_context);
+        checkAggregateFunctionStatesAllowed(
+            column.name, column.type, getTableAllowAggregateFunctionStates(configuration_ptr->getDataLakeSettings(), local_context));
 
     String location_path = configuration_ptr->getRawPath().path;
     if (!location_path.contains("://") && !location_path.starts_with('/'))
@@ -2930,7 +2931,7 @@ IcebergMetadata::getExportDestinationInfo(const std::string & iceberg_metadata_j
     IcebergSchemaProcessor schema_processor(
         context,
         /* allow_geo_parser_ */ true,
-        allowAggregateFunctionStates(Iceberg::getTableAllowAggregateFunctionStates(data_lake_settings), context));
+        persistent_components.schema_processor->useClickHouseTypeAnnotations());
     schema_processor.addIcebergTableSchema(
         lookupSchema(metadata_json, info->schema_id),
         context,

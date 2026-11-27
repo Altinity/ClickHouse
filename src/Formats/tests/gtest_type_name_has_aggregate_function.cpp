@@ -1,22 +1,19 @@
 #include <gtest/gtest.h>
 
-#include <Common/tests/gtest_global_register.h>
-#include <DataTypes/DataTypeAggregateFunction.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 
 using namespace DB;
 
-/// With states disabled, a name with an `AggregateFunction` is not resolved, so its aggregate function is never looked up.
-TEST(ResolveClickHouseTypeAnnotation, SkipsOnlyAggregateFunctionStatesWhenDisabled)
+/// Aggregate functions are not registered: the check must not look up the aggregate function named by the type.
+TEST(TypeNameHasAggregateFunction, DetectsOnlyAggregateFunctionStates)
 {
-    tryRegisterAggregateFunctions();
-
     for (const auto * name : {
              "AggregateFunction(uniq, UInt64)",
              "AggregateFunction(0, sumMap, Array(UInt8), Array(UInt32))",
              "Array(AggregateFunction(no_such_aggregate_function, UInt64))",
              "Map(String, AggregateFunction(uniq, UInt64))",
              "Tuple(a UInt64, b Array(AggregateFunction(uniq, UInt64)))"})
-        EXPECT_EQ(resolveClickHouseTypeAnnotation(name, /*allow_aggregate_function_states=*/ false), nullptr) << name;
+        EXPECT_TRUE(typeNameHasAggregateFunction(name)) << name;
 
     for (const auto * name : {
              "UInt64",
@@ -25,5 +22,5 @@ TEST(ResolveClickHouseTypeAnnotation, SkipsOnlyAggregateFunctionStatesWhenDisabl
              "Tuple(a UInt64, b Array(Nullable(String)))",
              "Enum8('AggregateFunction' = 1)",
              "Tuple(`AggregateFunction` String)"})
-        EXPECT_NE(resolveClickHouseTypeAnnotation(name, /*allow_aggregate_function_states=*/ false), nullptr) << name;
+        EXPECT_FALSE(typeNameHasAggregateFunction(name)) << name;
 }

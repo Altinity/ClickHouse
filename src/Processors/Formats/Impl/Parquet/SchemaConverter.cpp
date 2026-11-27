@@ -17,6 +17,7 @@
 #include <DataTypes/DataTypeVariant.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/NestedUtils.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Functions/DateTimeTransforms.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
@@ -150,7 +151,7 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
     DataTypePtr annotated_type;
     try
     {
-        annotated_type = resolveClickHouseTypeAnnotation(type_name, /*allow_aggregate_function_states=*/ true);
+        annotated_type = getAnnotatedDataType(type_name);
     }
     catch (Exception & e)
     {

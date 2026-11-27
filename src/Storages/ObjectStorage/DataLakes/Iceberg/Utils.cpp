@@ -10,7 +10,6 @@
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
-#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -19,6 +18,7 @@
 #include <DataTypes/DataTypesDecimal.h>
 #include <Common/assert_cast.h>
 #include <DataTypes/DataTypeTuple.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <IO/CompressionMethod.h>
 #include <Interpreters/Context_fwd.h>
 #include <Parsers/ASTExpressionList.h>
@@ -370,6 +370,7 @@ namespace DB::DataLakeStorageSetting
 namespace DB::Setting
 {
 extern const SettingsString iceberg_metadata_compression_method;
+extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 extern const SettingsBool datalake_ignore_unsupported_table_properties;
 }
 
@@ -1553,7 +1554,7 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         auto type = getIcebergType(column.type, iter, format_version);
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
-        if (auto annotation = getClickHouseTypeAnnotation(column.type); !annotation.empty())
+        if (auto annotation = getAggregateFunctionTypeAnnotation(column.type); !annotation.empty())
             setClickHouseTypeAnnotation(new_metadata_file_content, iter_for_initial_columns, /*schema_id=*/ 0, annotation);
         column_name_to_source_id[column.name] = iter_for_initial_columns;
         schema_fields->add(field);
@@ -1817,12 +1818,12 @@ std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr
     return max_version;
 }
 
-std::optional<bool> getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings)
+bool getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings, const ContextPtr & context)
 {
     const auto & setting = data_lake_settings[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
-    if (!setting.changed)
-        return std::nullopt;
-    return setting.value;
+    if (setting.changed)
+        return setting.value;
+    return context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats].value;
 }
 
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
