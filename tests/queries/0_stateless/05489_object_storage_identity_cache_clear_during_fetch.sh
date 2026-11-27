@@ -5,16 +5,16 @@
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
 # A metadata read is paused after its HEAD and before it stores the identity. The object is overwritten
-# and then the whole cache is dropped. The drop advances the cache epoch, so the read must not store
-# looks untouched again. When the read resumes it must still not store the identity it fetched before
-# the overwrite: the next read misses and returns the new rows.
+# and then the whole cache is dropped. The drop stops the stores of the fetches that began before it.
+# When the read resumes it must not store the identity it fetched before the overwrite: the next read
+# misses and returns the new rows.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
 URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}.tsv"
-READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 0, use_object_storage_list_objects_cache = 0"
+READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0"
 FAILPOINT="object_storage_identity_cache_pause_before_store"
 
 fail()
@@ -57,9 +57,11 @@ insert_values "SELECT 1"
 
 ${CLICKHOUSE_CLIENT} -q "SYSTEM ENABLE FAILPOINT ${FAILPOINT}" || fail "enable failpoint failed"
 
-# The read misses, HEADs the current object, and pauses before storing that identity.
+# The read misses, HEADs the current object, and pauses before storing that identity. It does not
+# validate the ETag: once the object is replaced, a validated GET would fail, and this test is about the store.
+READER_SETTINGS="${READ_SETTINGS/s3_validate_etag_on_read = 1/s3_validate_etag_on_read = 0}"
 ${CLICKHOUSE_CLIENT} -q \
-    "SELECT n FROM s3('${URL}', 'test', 'testtest', 'TSV', 'n UInt64') ORDER BY n SETTINGS ${READ_SETTINGS} FORMAT TabSeparated" \
+    "SELECT n FROM s3('${URL}', 'test', 'testtest', 'TSV', 'n UInt64') ORDER BY n SETTINGS ${READER_SETTINGS} FORMAT TabSeparated" \
     >/dev/null &
 reader_pid=$!
 
