@@ -12,6 +12,10 @@ request parked for the kill handshake is not abandoned by its attempt timeout fi
 there is removed at once (configs/drop_delay.xml). It runs with Keeper and transactions enabled
 (configs/transactions.xml), and uploads a part's blobs one at a time (configs/blob_upload_serial.xml).
 
+The upload tests stop a part body that `max_remote_write_network_bandwidth` paces, on `disk_cas_stop` (local
+staging) and `disk_cas_stop_s3` (S3 staging). `node_guard` (configs/guard.xml) paces every body by a server-wide
+limit, pins its mount lease and waits 30 s for connections at shutdown; only the upload guard tests run there.
+
 The GC test runs on `node_gc` (configs/storage_conf_gc.xml): the same timing and a one-hour GC interval.
 A manual round never takes the GC lease from another process, and a restart leaves the lease with the
 previous one, so this server is never restarted.
@@ -21,6 +25,7 @@ passes in any order and when repeated.
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -60,14 +65,16 @@ def _control(url, path, patch=None):
         return json.loads(response.read().decode())
 
 
-def _wait_until(probe, timeout):
+def _wait_until(probe, timeout, describe=None):
+    """Polls `probe` until it returns a true value. On a timeout the error carries `describe()`, when given."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         result = probe()
         if result:
             return result
         time.sleep(0.2)
-    raise AssertionError("condition did not become true within {}s".format(timeout))
+    raise AssertionError("condition did not become true within {}s{}".format(
+        timeout, "" if describe is None else ": " + str(describe())))
 
 
 @pytest.fixture(scope="module")
@@ -82,6 +89,7 @@ def node():
                                                     "configs/transactions.xml", "configs/blob_upload_serial.xml"],
                          with_rustfs=True, with_zookeeper=True, stay_alive=True)
     cluster.add_instance("node_gc", main_configs=["configs/storage_conf_gc.xml"], with_rustfs=True)
+    cluster.add_instance("node_guard", main_configs=["configs/guard.xml"], with_rustfs=True, stay_alive=True)
     cluster.base_cmd.extend(["--file", os.path.join(os.path.dirname(__file__), "docker_compose_proxy.yml")])
     try:
         cluster.start()
@@ -103,6 +111,11 @@ def node_gc(node):
     return cluster.instances["node_gc"]
 
 
+@pytest.fixture(scope="module")
+def node_guard(node):
+    return cluster.instances["node_guard"]
+
+
 def _drop_all_tables(instance):
     for name in instance.query("SELECT table FROM system.detached_tables WHERE database = 'default'").split():
         instance.query("ATTACH TABLE default.`{}`".format(name))
@@ -111,11 +124,11 @@ def _drop_all_tables(instance):
 
 
 @pytest.fixture(autouse=True)
-def clean_state(node, node_stop, node_gc):
+def clean_state(node, node_stop, node_gc, node_guard):
     _control(cluster.proxy_url, "/config", {"reset": True})
     yield
     _control(cluster.proxy_url, "/config", {"reset": True})
-    for instance in (node, node_stop, node_gc):
+    for instance in (node, node_stop, node_gc, node_guard):
         _drop_all_tables(instance)
 
 
@@ -971,3 +984,250 @@ def test_shutdown_hands_atomic_drop_to_restart(node_stop):
     # The retried removal may seal the previous writer epoch first.
     appended = _wait_until(appended_through_terminal, timeout=60)
     assert all(r["status"] == 200 for r in appended), _brief(appended)
+
+
+# A fresh incompressible body per insert, so the store holds no copy to reuse. At `PACED_LIMIT` it needs 120 s.
+BODY_BYTES = 60_000_000
+PACED_LIMIT = 500_000
+PACED_INSERT = "INSERT INTO {} SELECT 1, randomString(60000000)"
+# Above the one-second burst of the throttler and far below half of the body.
+PROGRESS_BYTES = 4_000_000
+STOP_BOUND_S = 20
+# A stop that is not honoured waits for the rest of the body, about 100 s at `PACED_LIMIT`.
+UNSTOPPED_WAIT_S = 300
+GUARD_POLICY = "cas_guard"
+GUARD_DISK = "disk_cas_guard"
+# `configs/guard.xml`.
+SERVER_LIMIT = 1_000_000
+GUARD_LEASE_TTL_S = 10
+GUARD_RENEW_PERIOD_S = 2
+
+
+def _paced(settings=None):
+    return dict({"max_remote_write_network_bandwidth": PACED_LIMIT, "async_insert": 0}, **(settings or {}))
+
+
+def _query_throttled_bytes(node, query_id):
+    """The bytes that the query's own write limit let through so far. None while the query has no row in
+    `system.processes`: before the server registered it and after it ended."""
+    value = node.http_query("SELECT ProfileEvents['QueryRemoteWriteThrottlerBytes'] FROM system.processes "
+                            "WHERE query_id = '{}'".format(query_id)).strip()
+    return int(value) if value else None
+
+
+def _wait_body_going_out(node, request, query_id, baseline, timeout=180):
+    """Waits until the query's limit let `PROGRESS_BYTES` through beyond `baseline`, with most of the body left to
+    send. Returns the byte count then."""
+    end = time.monotonic() + timeout
+    last = None
+    while True:
+        # No row before the server registers the query, and none after it ended.
+        sent = _query_throttled_bytes(node, query_id)
+        if sent is not None:
+            last = sent
+            if sent >= baseline + PROGRESS_BYTES:
+                break
+        assert request.process.poll() is None, \
+            "the query ended before its body went out paced: {} bytes over the limit when last seen".format(last)
+        assert time.monotonic() < end, "{} bytes over the limit after {} s".format(last, timeout)
+        time.sleep(0.2)
+    assert sent - baseline <= BODY_BYTES // 2, (baseline, sent)
+    return sent
+
+
+def _kill_and_time(node, request, query_id):
+    """Kills the query and returns the seconds from before the kill to the query's end."""
+    started = time.monotonic()
+    node.http_query("KILL QUERY WHERE query_id = '{}' SYNC".format(query_id), timeout=UNSTOPPED_WAIT_S)
+    _wait_until(lambda: request.process.poll() is not None, timeout=UNSTOPPED_WAIT_S)
+    return time.monotonic() - started
+
+
+@pytest.mark.parametrize("stop", ["kill", "timeout"])
+@pytest.mark.parametrize("staging", ["local", "s3"])
+def test_upload_is_stopped_in_flight(node_stop, staging, stop):
+    """A query stopped while its part body goes out paced by its write limit ends within `STOP_BOUND_S`: from before
+    `KILL QUERY`, or from the `max_execution_time` deadline. No part is committed, and the same insert without a limit
+    then succeeds. With S3 staging the body goes out while the part file is written."""
+    name = "paced_{}_{}".format(staging, stop)
+    node_stop.query("CREATE TABLE {} (id UInt64, payload String) ENGINE = MergeTree ORDER BY id "
+                    "SETTINGS storage_policy = '{}'".format(name, STOP_POLICY if staging == "local" else "cas_stop_s3"))
+    query_id = name + "_insert"
+    # The gate passes about 8 s after the upload starts. At the deadline at most 30.5 MB went out, so the rest of
+    # the body still needs about 59 s.
+    timeout = {"max_execution_time": 60, "timeout_overflow_mode": "throw"} if stop == "timeout" else {}
+    submitted = time.monotonic()
+    request = node_stop.get_query_request(PACED_INSERT.format(name), query_id=query_id, settings=_paced(timeout),
+                                          timeout=UNSTOPPED_WAIT_S + 60)
+    sent = _wait_body_going_out(node_stop, request, query_id, baseline=0)
+    gated = time.monotonic() - submitted
+    if stop == "kill":
+        elapsed = _kill_and_time(node_stop, request, query_id)
+        code = 394
+    else:
+        deadline = submitted + timeout["max_execution_time"]
+        assert time.monotonic() < deadline, "the gate passed {:.1f} s after submission, past the {} s deadline".format(
+            gated, timeout["max_execution_time"])
+        _wait_until(lambda: request.process.poll() is not None, timeout=UNSTOPPED_WAIT_S)
+        elapsed = time.monotonic() - deadline
+        code = 159
+    logging.info("%s: %d bytes paced at the gate %.1f s after submission, ended %.1f s after the stop",
+                 name, sent, gated, elapsed)
+    assert elapsed <= STOP_BOUND_S, "ended {:.1f} s after the stop".format(elapsed)
+    error = request.get_error()
+    assert re.search(r"Code: {}\b".format(code), error), error
+    assert node_stop.query("SELECT count() FROM {}".format(name)).strip() == "0"
+
+    node_stop.query(PACED_INSERT.format(name), settings={"async_insert": 0}, timeout=120)
+    assert node_stop.query("SELECT count() FROM {}".format(name)).strip() == "1"
+
+
+def _server_throttled_bytes(node):
+    return _events(node, "RemoteWriteThrottlerBytes")
+
+
+def _guard_mount(node):
+    rows = node.query("SELECT writer_epoch, renewal_sequence FROM system.cas_mounts WHERE disk = '{}' "
+                      "AND server_root_id = 'itest-cas-guard'".format(GUARD_DISK)).strip().splitlines()
+    assert len(rows) == 1, rows
+    return tuple(int(v) for v in rows[0].split("\t"))
+
+
+def test_limit_applies_and_the_mount_stays_live(node_guard):
+    """Mount renewals pass no bytes through the server-wide limit. Concurrent inserts of distinct bodies under that
+    limit take at least 90% of the time that their bytes, less one second of burst and one send quantum, need at the
+    limit. While they upload for more than one lease period the mount renews in the same epoch."""
+    bodies, body_bytes = 3, 8_000_000
+    idle_baseline = _server_throttled_bytes(node_guard)
+    idle_mount = _guard_mount(node_guard)
+    # Three renewal periods with no upload: the renewals in them must leave the counter where it was.
+    time.sleep(3 * GUARD_RENEW_PERIOD_S)
+    renewed = _guard_mount(node_guard)
+    assert renewed[0] == idle_mount[0] and renewed[1] > idle_mount[1], (idle_mount, renewed)
+    # Holds while no other test leaves merging tables on `node_guard`.
+    assert _server_throttled_bytes(node_guard) == idle_baseline, (idle_baseline, _server_throttled_bytes(node_guard))
+    node_guard.query("CREATE TABLE server_limit (id UInt64, payload String) ENGINE = MergeTree ORDER BY id "
+                     "SETTINGS storage_policy = '{}'".format(GUARD_POLICY))
+    baseline = _server_throttled_bytes(node_guard)
+    started = time.monotonic()
+    requests = [node_guard.get_query_request(
+        "INSERT INTO server_limit SELECT {}, randomString({})".format(i, body_bytes),
+        settings={"async_insert": 0}, timeout=300) for i in range(bodies)]
+    _wait_until(lambda: _server_throttled_bytes(node_guard) >= baseline + PROGRESS_BYTES // 2, timeout=120,
+                describe=lambda: "{} bytes over the limit".format(_server_throttled_bytes(node_guard) - baseline))
+
+    samples = [(time.monotonic(), _guard_mount(node_guard))]
+    while samples[-1][0] - samples[0][0] <= GUARD_LEASE_TTL_S:
+        # Three renewal periods between samples, so each sample follows at least one renewal even if one is slow.
+        time.sleep(3 * GUARD_RENEW_PERIOD_S)
+        mount = _guard_mount(node_guard)
+        assert any(r.process.poll() is None for r in requests), \
+            "the uploads ended {:.1f} s into the sampling".format(time.monotonic() - samples[0][0])
+        samples.append((time.monotonic(), mount))
+    logging.info("mount samples: %s", samples)
+    epochs = {mount[0] for _, mount in samples}
+    assert len(epochs) == 1, samples
+    sequences = [mount[1] for _, mount in samples]
+    assert all(later > earlier for earlier, later in zip(sequences, sequences[1:])), samples
+
+    for request in requests:
+        request.get_answer()
+    wall = time.monotonic() - started
+    # The burst cap is applied after a call's amount is taken off, so the first call after an idle spell passes one
+    # quantum, at least 32 KiB, free.
+    # 10% slack: a socket charges the larger of the send size and 32 KiB per call, so the free amount varies.
+    bound = 0.9 * (bodies * body_bytes - SERVER_LIMIT - 32 * 1024) / SERVER_LIMIT
+    logging.info("%d bytes under %d B/s: %.1f s, bound %.1f s", bodies * body_bytes, SERVER_LIMIT, wall, bound)
+    assert wall >= bound, (wall, bound)
+    assert node_guard.query("SELECT count() FROM server_limit").strip() == str(bodies)
+
+
+def test_killed_transaction_rolls_back_during_a_paced_upload(node_stop):
+    """An `INSERT` in an implicit transaction writes a tiny first part and a large second one, and is killed while the
+    second part's body goes out paced: it ends within `STOP_BOUND_S`, and the transaction rolls back the first part.
+    A ref-log record that lands after the kill installs that part with the rolled-back creation CSN."""
+    name = "txn_paced_kill"
+    life = _create_with_life(node_stop, name)
+    try:
+        node_stop.query("SYSTEM STOP MERGES")
+        node_stop.query("INSERT INTO {} VALUES (1000, 'first')".format(name))
+        fatal_before = int(node_stop.count_in_log("<Fatal>").strip())
+        query_id = "txn_paced_kill_insert"
+        request = node_stop.get_query_request(
+            "INSERT INTO {} SELECT number, if(number = 0, 'x', randomString({})) FROM numbers(2)".format(name, BODY_BYTES),
+            # One thread, so the tiny part is written and committed before the large one is built.
+            query_id=query_id, settings=_paced(dict(ONE_PART_PER_SECOND, implicit_transaction=1, max_threads=1,
+                                                    max_insert_threads=1)),
+            timeout=UNSTOPPED_WAIT_S + 60)
+        registered = _wait_until(lambda: node_stop.query(
+            "SELECT name FROM system.parts WHERE table = '{}' AND active AND creation_csn = 0 LIMIT 1".format(name)).strip(),
+            timeout=60)
+        baseline = _query_throttled_bytes(node_stop, query_id)
+        assert baseline is not None, "the query ended with its first part"
+        sent = _wait_body_going_out(node_stop, request, query_id, baseline)
+        killed_at = len(_stats()["trace"])
+        elapsed = _kill_and_time(node_stop, request, query_id)
+        ended_at = len(_stats()["trace"])
+        logging.info("%s: %d bytes paced past %d at the gate, ended %.1f s after the kill", name, sent, baseline, elapsed)
+        assert elapsed <= STOP_BOUND_S, "ended {:.1f} s after the kill".format(elapsed)
+        # A merge of transactional parts is not supported on a CAS disk.
+        node_stop.query("SYSTEM STOP MERGES {}".format(name))
+        error = request.get_error()
+        assert re.search(r"Code: 394\b", error), error
+        window = _stats()["trace"][killed_at:ended_at]
+        assert _rolled_back_installs(node_stop, window, life, registered), (registered, _brief(window))
+        # The cleanup may already have removed the rolled-back part.
+        csn = node_stop.query(
+            "SELECT creation_csn FROM system.parts WHERE table = '{}' AND name = '{}'".format(name, registered)).strip()
+        assert csn in ("", str(ROLLED_BACK_CSN)), (registered, csn)
+        assert node_stop.query("SELECT count() FROM {}".format(name)).strip() == "1"
+        assert int(node_stop.count_in_log("<Fatal>").strip()) == fatal_before
+
+        node_stop.query("INSERT INTO {} VALUES (100, 'next')".format(name),
+                        settings={"implicit_transaction": 1, "async_insert": 0})
+        assert node_stop.query("SELECT count() FROM {}".format(name)).strip() == "2"
+    finally:
+        try:
+            node_stop.query("DROP TABLE IF EXISTS {} SYNC".format(name))
+        finally:
+            node_stop.query("SYSTEM START MERGES")
+
+
+def _server_alive(node, pid):
+    state = node.exec_in_container(["bash", "-c", "ps -o stat= -p {} || true".format(pid)], user="root").strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def test_sigterm_during_insert_upload_is_orderly(node_guard):
+    """SIGTERM while a paced body goes out: shutdown kills the query, its upload stops, and the server closes its
+    connections within `shutdown_wait_unfinished` (30 s, well below the body's remaining time), shuts its storages
+    down and exits without the forced exit. One SIGTERM to the exact server PID: a second one, or SIGKILL, would end
+    the process without the orderly shutdown under test."""
+    node_guard.query("CREATE TABLE sigterm_upload (id UInt64, payload String) ENGINE = MergeTree ORDER BY id "
+                     "SETTINGS storage_policy = '{}'".format(GUARD_POLICY))
+    # The success line only: the warning about remaining connections starts with the same words.
+    closed = "Application: Closed connections\\.$"
+    forced = "Will shutdown forcefully"
+    storages = "Shut down storages\\."
+    before = {line: int(node_guard.count_in_log(line).strip()) for line in (closed, forced, storages, "<Fatal>")}
+    pid = node_guard.get_process_pid("clickhouse")
+    assert pid is not None
+    query_id = "sigterm_upload_insert"
+    request = node_guard.get_query_request(PACED_INSERT.format("sigterm_upload"), query_id=query_id,
+                                           settings=_paced(), timeout=UNSTOPPED_WAIT_S)
+    try:
+        sent = _wait_body_going_out(node_guard, request, query_id, baseline=0)
+        signalled = time.monotonic()
+        node_guard.exec_in_container(["bash", "-c", "kill -15 {}".format(pid)], user="root")
+        _wait_until(lambda: not _server_alive(node_guard, pid), timeout=120, describe=lambda: "{} still alive {:.1f} s "
+                    "after the signal".format(pid, time.monotonic() - signalled))
+        logging.info("sigterm: %d bytes paced at the gate, server exited %.1f s after the signal",
+                     sent, time.monotonic() - signalled)
+        _wait_until(lambda: request.process.poll() is not None, timeout=60)
+        delta = {line: int(node_guard.count_in_log(line).strip()) - count for line, count in before.items()}
+        # A forced exit can lose its own log line, so the two success lines carry the check.
+        assert delta == {closed: 1, forced: 0, storages: 1, "<Fatal>": 0}, delta
+    finally:
+        if node_guard.get_process_pid("clickhouse") is None:
+            node_guard.start_clickhouse()
+    assert node_guard.query("SELECT 1").strip() == "1"

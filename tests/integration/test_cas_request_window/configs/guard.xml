@@ -1,0 +1,39 @@
+<clickhouse>
+    <!-- Paces every CAS part body on this server. Other nodes run without it. -->
+    <max_remote_write_network_bandwidth_for_server>1000000</max_remote_write_network_bandwidth_for_server>
+    <!-- Below the remaining time of a paced upload, so only a stopped upload lets the server close its connections. -->
+    <shutdown_wait_unfinished>30</shutdown_wait_unfinished>
+    <storage_configuration>
+        <disks>
+            <disk_cas_guard>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>itest-cas-guard</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/cas_request_guard/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>false</cas_gc_enabled>
+                <!-- The lease the test watches while bodies are paced. Envelope = 1000 + 2 * 500 = 2000 ms;
+                     renew period + two envelopes + margin = 6500 < lease TTL. -->
+                <connect_timeout_ms>500</connect_timeout_ms>
+                <cas_attempt_timeout_ms>1000</cas_attempt_timeout_ms>
+                <cas_request_window_ms>5000</cas_request_window_ms>
+                <cas_mount_lease_ttl_ms>10000</cas_mount_lease_ttl_ms>
+                <cas_mount_renew_period_ms>2000</cas_mount_renew_period_ms>
+                <cas_lease_safety_margin_ms>500</cas_lease_safety_margin_ms>
+            </disk_cas_guard>
+        </disks>
+        <policies>
+            <cas_guard>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_guard</disk>
+                    </main>
+                </volumes>
+            </cas_guard>
+        </policies>
+    </storage_configuration>
+</clickhouse>
