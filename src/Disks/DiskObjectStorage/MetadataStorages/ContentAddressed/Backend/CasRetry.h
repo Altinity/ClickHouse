@@ -109,17 +109,8 @@ struct Retry
         return spacedPause(drawSpacing(attempt_spacing_ms_), attempt_started_ms, now_ms);
     }
 
-    /// This policy, made single-attempt. A frozen loop policy keeps its absolute deadline through it,
-    /// which is what lets a loop send an unrepeatable request under the same bound as the rest.
-    Retry asSingleAttempt() const
-    {
-        Retry copy = *this;
-        copy.single_attempt = true;
-        return copy;
-    }
-
-    /// This policy ending no later than `deadline_ms` on the caller's clock. The deadline replaces `window_ms` as a
-    /// frozen one does; an earlier frozen deadline stays.
+    /// This policy ending no later than `deadline_ms` on the caller's clock; the window and the lease bound
+    /// still apply, and an earlier cap stays.
     Retry cappedAt(uint64_t deadline_ms) const
     {
         Retry copy = *this;

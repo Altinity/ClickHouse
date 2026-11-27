@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasToolDeadline.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
@@ -159,20 +160,31 @@ TEST(CASRetry, PoliciesAreShapedAsSpecified)
 /// A cap later than the request's own window leaves the window.
 TEST(CASRetry, AnOutsideCapLaterThanTheWindowLeavesTheWindow)
 {
-    FakeClock clock;
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto requests = makeRequests(backend, clock);
-    auto op = requests.admit();
+    const uint64_t now = 1'000'000;
+    EXPECT_EQ(Retry::standard().cappedAt(now + 3'600'000).bind(now, kEngineTestWindowMs).deadline_ms, now + 90'000);
+    EXPECT_EQ(Retry::within(5'000).cappedAt(now + 60'000).bind(now, kEngineTestWindowMs).deadline_ms, now + 5'000);
+}
 
-    const uint64_t start = clock.now;
-    const Retry frozen = op.freeze(Retry::standard());
-    ASSERT_TRUE(frozen.policy_deadline_ms.has_value());
-    EXPECT_EQ(frozen.bind(start, kEngineTestWindowMs).deadline_ms, start + 90'000);
-    EXPECT_EQ(frozen.bind(start + 50'000, kEngineTestWindowMs).deadline_ms, start + 90'000);
-    EXPECT_FALSE(frozen.bind(start + 50'000, kEngineTestWindowMs).lease_bound);
-    /// The single-attempt view of a frozen policy keeps the deadline rather than starting a window.
-    EXPECT_EQ(frozen.asSingleAttempt().policy_deadline_ms, frozen.policy_deadline_ms);
-    EXPECT_TRUE(frozen.asSingleAttempt().single_attempt);
+/// An earlier cap or an earlier lease bound wins, and the lease bound still says so when it is the one that won.
+TEST(CASRetry, AnEarlierOutsideCapAndAnEarlierLeaseBothWin)
+{
+    const uint64_t now = 1'000'000;
+    const Retry::Bound capped = Retry::standard().cappedAt(now + 10'000).bind(now, kEngineTestWindowMs);
+    EXPECT_EQ(capped.deadline_ms, now + 10'000);
+    EXPECT_NE(capped.source, Retry::Bound::Source::Lease);
+
+    Retry both = Retry::untilLeaseSafe(now + 10'000, 2'000).cappedAt(now + 20'000);
+    EXPECT_EQ(both.bind(now, kEngineTestWindowMs).deadline_ms, now + 8'000);
+    EXPECT_EQ(both.bind(now, kEngineTestWindowMs).source, Retry::Bound::Source::Lease);
+
+    both = Retry::untilLeaseSafe(now + 10'000, 2'000).cappedAt(now + 3'000);
+    EXPECT_EQ(both.bind(now, kEngineTestWindowMs).deadline_ms, now + 3'000);
+    EXPECT_NE(both.bind(now, kEngineTestWindowMs).source, Retry::Bound::Source::Lease);
+
+    EXPECT_EQ(Retry::standard().cappedAt(now + 20'000).cappedAt(now + 5'000).bind(now, kEngineTestWindowMs).deadline_ms, now + 5'000);
+    EXPECT_EQ(Retry::standard().cappedAt(now + 60'000).bind(now + 50'000, kEngineTestWindowMs).deadline_ms, now + 60'000);
+    EXPECT_EQ(Retry::standard().cappedAt(now + 5'000).cappedAt(now + 20'000).bind(now, kEngineTestWindowMs).deadline_ms, now + 5'000);
+}
 
 /// A bound names the bound that set its deadline; a tie goes to the request window, then to the outside cap.
 TEST(CASRetry, BindNamesTheExactSourceOfItsDeadline)
@@ -183,9 +195,34 @@ TEST(CASRetry, BindNamesTheExactSourceOfItsDeadline)
     EXPECT_EQ(Retry::standard().cappedAt(now + 10'000).bind(now, kEngineTestWindowMs).source, Source::OutsideCap);
     EXPECT_EQ(Retry::untilLeaseSafe(now + 10'000, 2'000).bind(now, kEngineTestWindowMs).source, Source::Lease);
 
-    const Retry::Bound leashed = op.freeze(Retry::untilLeaseSafe(start + 10'000, 2'000)).bind(clock.now, kEngineTestWindowMs);
-    EXPECT_EQ(leashed.deadline_ms, start + 8'000);
-    EXPECT_TRUE(leashed.lease_bound);
+    const Retry::Bound all_equal
+        = Retry::untilLeaseSafe(now + 92'000, 2'000).cappedAt(now + 90'000).bind(now, kEngineTestWindowMs);
+    EXPECT_EQ(all_equal.deadline_ms, now + 90'000);
+    EXPECT_EQ(all_equal.source, Source::RequestWindow);
+
+    const Retry::Bound cap_equals_lease
+        = Retry::untilLeaseSafe(now + 12'000, 2'000).cappedAt(now + 10'000).bind(now, kEngineTestWindowMs);
+    EXPECT_EQ(cap_equals_lease.deadline_ms, now + 10'000);
+    EXPECT_EQ(cap_equals_lease.source, Source::OutsideCap);
+}
+
+TEST(CASRetry, BindSaturatesWhenTheWindowOverflows)
+{
+    const uint64_t now = std::numeric_limits<uint64_t>::max() - 10;
+    EXPECT_EQ(Retry::within(1'000).bind(now, kEngineTestWindowMs).deadline_ms, std::numeric_limits<uint64_t>::max());
+}
+
+/// The tool's preflight checks the bound the engine will apply, so a plane window too short for one attempt
+/// is the tool's timeout even when the tool's own deadline is far away.
+TEST(CASRequests, ToolDeadlinePreflightChecksTheWindowNotOnlyTheCap)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, 1'000);
+    requests.setAttemptReservationForTest(5'000);
+    const ToolDeadline deadline(requests, std::chrono::hours(1), "tool", "raise --timeout");
+    auto op = requests.admit();
+    EXPECT_THROW(deadline.bound(op, "phase"), DB::Exception);
 }
 
 /// A policy that names no window takes the window of the plane it runs on; one that names its own keeps it.

@@ -498,13 +498,9 @@ uint64_t CasOperation::reservedFor(uint64_t sleep_ms, uint32_t envelopes) const
     return total;
 }
 
-Retry CasOperation::freeze(const Retry & policy) const
+bool CasOperation::oneAttemptFits(const Retry & policy) const
 {
-    if (policy.policy_deadline_ms)
-        return policy;
-    Retry frozen = policy;
-    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms.value_or(owner.default_window_ms));
-    return frozen;
+    return fits(reservedFor(0, 1), owner.bindPolicy(policy));
 }
 
 bool CasOperation::oneAttemptFitsBefore(uint64_t deadline_ms) const
