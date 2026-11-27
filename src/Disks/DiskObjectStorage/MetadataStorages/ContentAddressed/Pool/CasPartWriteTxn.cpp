@@ -122,6 +122,22 @@ void recordFailedPublicationAttempt(
         LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
 }
 
+/// The failure that a stopped query's veto of the next publication ends with. A credential refusal becomes retry-later
+/// carrying it, so it does not read as damage.
+[[noreturn]] void rethrowVetoedPublicationFailure(const String & key, const std::exception_ptr & failure)
+{
+    try
+    {
+        std::rethrow_exception(failure);
+    }
+    catch (const std::exception & e)
+    {
+        if (isRefreshableCredentialError(e) && !isQueryStoredCause(failure))
+            detail::throwVetoedCredentialRetry("publish", key, e);
+        throw;
+    }
+}
+
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
 {
     /// A refused write, EXCEPT the class a fresh credential fixes: the engine refreshes once before it

@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 
 #include <Common/ErrorCodes.h>
 #include <Common/ErrnoException.h>
@@ -112,11 +113,15 @@ void logCasWriteRetryLater(const String & why)
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS request did not complete ({}); retrying later", why);
 }
 
-std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
+Exception makeCasWriteRetryLaterException(const String & why)
 {
     logCasWriteRetryLater(why);
-    return std::make_exception_ptr(
-        Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why));
+    return Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
+}
+
+std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
+{
+    return std::make_exception_ptr(makeCasWriteRetryLaterException(why));
 }
 
 [[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition)
@@ -322,6 +327,24 @@ bool isStoreAnswer(const std::exception & e)
     return dynamic_cast<const Poco::Exception *>(&e) && !(db && isDeterministicLocalFailure(db->code()));
 }
 
+bool isLocalFault(const std::exception_ptr & e)
+{
+    if (isQueryStoredCause(e))
+        return false;
+    try
+    {
+        std::rethrow_exception(e);
+    }
+    catch (const std::exception & ex)
+    {
+        return !isStoreAnswer(ex);
+    }
+    catch (...)
+    {
+        return true;
+    }
+}
+
 String describeRequestFailure(std::string_view verb, const String & key, const std::exception & e)
 {
     const auto & poco = dynamic_cast<const Poco::Exception &>(e);
@@ -335,6 +358,12 @@ String describeRequestFailure(std::string_view verb, const String & key, const s
     if (code.empty())
         code = poco.name();
     return fmt::format("{} {}: {} {} {}", verb, key, isDefinitelyRefusedWrite(e) ? "refused" : "transport", code, poco.message());
+}
+
+void detail::throwVetoedCredentialRetry(std::string_view verb, const String & subject, const std::exception & e)
+{
+    throwCasRequestRetryLater(fmt::format("the query stopped before the credential retry; {}",
+                                          describeRequestFailure(verb, subject, e)));
 }
 
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
@@ -483,8 +512,8 @@ CasOperation::Gate CasOperation::gate(uint64_t needed_ms) const
         case Fence::Admit::NoBudget:      return Gate::NoBudget;
         case Fence::Admit::Ok: break;
     }
-    /// The caller's own facts are the second half of admission, and the engine does not need to know
-    /// which of the two refused: a stopping task and a lost lease end the operation the same way.
+    /// The caller's authority facts and pool teardown are the second half of admission, and the engine
+    /// does not need to know which of the two refused. A query's or a background owner's stop never feeds it.
     if (liveness && !liveness())
         return Gate::FenceLost;
     return Gate::Ok;
@@ -508,7 +537,7 @@ bool CasOperation::oneAttemptFitsBefore(uint64_t deadline_ms) const
     return fits(reservedFor(0, 1), Retry::Bound{.deadline_ms = deadline_ms, .source = Retry::Bound::Source::OutsideCap});
 }
 
-std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
+std::optional<GaveUp> CasOperation::pauseAfterUnresolvedWrite(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
 {
     WriteState state;
     state.attempts_sent = unresolved.attempts_sent;
@@ -584,12 +613,9 @@ bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
 
 bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed)
 {
-    if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
-        return true;
     /// A local failure -- a bad allocation, a logic error raised inside the attempt -- is not a
-    /// transport fault, and reissuing it would spend the whole deadline replaying the same bug. Every
-    /// exception the transport raises is a `Poco::Exception`, `DB::Exception` included.
-    if (!dynamic_cast<const Poco::Exception *>(&e))
+    /// transport fault, and reissuing it would spend the whole deadline replaying the same bug.
+    if (!isStoreAnswer(e))
         return true;
     /// A credential failure gets ONE refresh per call -- the storage hands back a fresh client every
     /// time it is asked, so refreshing per attempt would reissue a permanent denial to the deadline.
@@ -733,7 +759,7 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
             keys.size(), kBulkDeleteMaxKeys);
     if (keys.empty())
         return;
-    const Retry::Bound bound = owner.bindPolicy(policy);
+    throwIfBackgroundStopped();
     const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
     readLoop("removeManyWriteOnce", subject, policy, [&](auto & access)
     {
@@ -801,6 +827,9 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
     std::optional<SentinelProbeResult> last_probe;
     for (uint32_t attempt = 1;; ++attempt)
     {
+        /// Not before the first probe: a healthy probe is never refused.
+        if (attempt > 1)
+            throwIfBackgroundStopped();
         const uint64_t reservation = reservedFor(0, 1);
         switch (gate(reservation))
         {
@@ -819,6 +848,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 
         detail::recordAttempt();
         SentinelProbeResult result{ProbeOutcome::Indeterminate, std::nullopt};
+        std::exception_ptr cause;
         try
         {
             result = owner.withTransportAccess(attempt, [&](auto & access)
@@ -828,6 +858,12 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
         }
         catch (const std::exception & e)
         {
+            /// A local fault surfaces unchanged, as in the write loop; a query's stored cause can carry any code.
+            if (!isStoreAnswer(e) && !isQueryStoredCause(std::current_exception()))
+                throw;
+            /// A stopped owner's failure is no store answer: neither reissued nor a credential refresh. A stopped
+            /// query keeps the failure.
+            rethrowIfStoppedOwnersFailure();
             /// The probe never counts a fuse, so whether this fault was a credential reissue is not
             /// interesting here -- only the write and read loops guard a counter with it.
             bool refreshed = false;
@@ -835,6 +871,22 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
                 throw;
             /// The probe reports every transport failure as `Indeterminate` rather than by throwing, so
             /// a decorator that does throw is folded onto the same inconclusive outcome.
+            cause = std::current_exception();
+        }
+
+        /// The native and default backends fold a stopped owner's exception into `Indeterminate`, so the
+        /// background verdict is recovered here. A stopped query gets the inconclusive outcome itself, or its cause,
+        /// and no reissue. An authoritative outcome stays a store answer.
+        if (result.outcome == ProbeOutcome::Indeterminate)
+        {
+            if (auto stop = backgroundStopRequested())
+                std::rethrow_exception(stop);
+            if (queryStopRequested())
+            {
+                if (cause)
+                    std::rethrow_exception(cause);
+                return result;
+            }
         }
 
         /// The reissue is driven by the OUTCOME: this is the one primitive whose failures never reach a
@@ -859,7 +911,12 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             return result;
         last_probe = std::move(result);
         detail::recordReissue();
-        sleep(pause_ms);
+        if (!sleepUnlessQueryStops(pause_ms, [this](uint64_t slice_ms) { sleep(slice_ms); }))
+        {
+            if (cause)
+                std::rethrow_exception(cause);
+            return *last_probe;
+        }
     }
 }
 
@@ -885,60 +942,47 @@ void CasOperation::publish(const BlobPublishRequest & request, const Retry & pol
     });
 }
 
-CasOperation::Resolved CasOperation::observe(const String & key, const Retry & policy, const Retry::Bound & bound)
+CasOperation::Resolved CasOperation::observe(const String & key, const Retry & policy, ResolveWith what)
 {
     last_read_stop.reset();
     try
     {
-        auto got = readUnder(key, policy, bound);
-        if (!got)
-            return {ProvenAbsent{}, std::nullopt};
-        return {std::move(*got), std::nullopt};
+        if (what == ResolveWith::Presence)
+        {
+            if (auto meta = headUnder(key, policy))
+                return {std::move(*meta), std::nullopt};
+        }
+        else if (auto object = readUnder(key, policy))
+            return {std::move(*object), std::nullopt};
+        return {ProvenAbsent{}, std::nullopt};
     }
-    catch (const Exception & e)
+    catch (const std::exception & e)
     {
         /// A local bug replays identically on every reissue, so it is never swallowed into "nothing
-        /// observed". Anything else settled nothing -- and `last_read_stop` says whether a bound
-        /// refused the read or the transport itself failed, which the exception cannot.
-        if (isDeterministicLocalFailure(e.code()))
+        /// observed". A stopped owner's failure is not a store answer: it is reported only when a bound
+        /// refused the read or the read is owed. `last_read_stop` says which bound refused it.
+        bool observed_stop = false;
+        if (!isStoreAnswer(e) && !isQueryStoredCause(std::current_exception()))
             throw;
-        return {NotObserved{}, last_read_stop};
-    }
-    catch (const std::exception & e)
-    {
-        /// A failure that is not the transport's is not an observation: it is the same local bug the
-        /// read loop refuses to reissue, and swallowing it here would hide it just as thoroughly.
-        if (!dynamic_cast<const Poco::Exception *>(&e))
+        if (auto stop = backgroundStopRequested())
+        {
+            /// The verdict, not `e`: the stop can land after the read's own check classified `e`.
+            if (!last_read_stop && !insideOwed())
+                std::rethrow_exception(stop);
+        }
+        else if (queryStopRequested())
+        {
+            observed_stop = true;
+            if (!last_read_stop && !insideOwed())
+                throw;
+        }
+        else if (!isStoreAnswer(e))
             throw;
-        return {NotObserved{}, last_read_stop};
+        return {NotObserved{}, last_read_stop, last_read_source, observed_stop};
     }
 }
 
-CasOperation::Resolved CasOperation::observePresence(const String & key, const Retry & policy, const Retry::Bound & bound)
-{
-    last_read_stop.reset();
-    try
-    {
-        auto got = headUnder(key, policy, bound);
-        if (!got)
-            return {ProvenAbsent{}, std::nullopt};
-        return {std::move(*got), std::nullopt};
-    }
-    catch (const Exception & e)
-    {
-        if (isDeterministicLocalFailure(e.code()))
-            throw;
-        return {NotObserved{}, last_read_stop};
-    }
-    catch (const std::exception & e)
-    {
-        if (!dynamic_cast<const Poco::Exception *>(&e))
-            throw;
-        return {NotObserved{}, last_read_stop};
-    }
-}
-
-WriteResult CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const
+GaveUp CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const
 {
     ProfileEvents::increment(ProfileEvents::CASRequestGaveUp);
     return GaveUp{why, source, state.sent_any, state.last_seen, state.attempts_sent};
@@ -1019,7 +1063,7 @@ WriteResult CasOperation::postCommit(Etag inc, bool resolved_by_read, WriteState
     return Committed{std::move(inc), state.attempts_sent, resolved_by_read};
 }
 
-std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
+CasOperation::PauseOutcome CasOperation::gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
                                                     const Retry::Bound & bound, void (*record)(), bool should_sleep)
 {
     const uint64_t needed = reservedFor(pause_ms, envelopes);
@@ -1034,12 +1078,15 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     record();
     /// `should_sleep` is false ONLY for the fuse's zero-pause reissue: that pause is not "zero
     /// milliseconds", it is NO PAUSE AT ALL, so it must not call `sleep_ms` even with a zero argument.
-    /// The three ordinary callers always sleep, even when a drawn jitter happens to be exactly zero --
-    /// `Retry::backoff`'s full jitter includes zero -- so their call to `sleep_ms(0)` is kept
-    /// unconditional here to leave their observable behaviour exactly as it was before this collapse.
-    if (should_sleep)
-        sleep(pause_ms);
-    return std::nullopt;
+    /// The two ordinary callers always sleep, even when a drawn jitter happens to be exactly zero --
+    /// `Retry::backoff`'s full jitter includes zero.
+    const bool query_stopped = should_sleep
+        ? !sleepUnlessQueryStops(pause_ms, [this](uint64_t slice_ms) { sleep(slice_ms); })
+        : !insideOwed() && queryStopRequested();
+    if (!query_stopped)
+        return ResumeAfterPause{};
+    state.observed_stop = true;
+    return QueryVetoedResend{};
 }
 
 uint64_t CasOperation::reissuePause(const WriteState & state, uint64_t unspaced_ms) const
@@ -1049,29 +1096,163 @@ uint64_t CasOperation::reissuePause(const WriteState & state, uint64_t unspaced_
     return Retry::pauseAfterAttempt(state.spacing->spacing_ms, state.spacing->attempt_started_ms, owner.now_ms());
 }
 
-std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
+CasOperation::PauseOutcome CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
 {
     const uint64_t pause_ms = reissuePause(state, Retry::backoff(++state.reissues));
     return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
-std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
-{
-    return gatedPause(reissuePause(state, Retry::conflictBackoff()), 2, state, bound, detail::recordConflictPause,
-                      /*should_sleep=*/true);
-}
-
 /// A flat pause before reissuing an attempt whose failure text named a failed connection.
 static constexpr uint64_t kConnectHintPauseMs = 50;
 
-std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
+CasOperation::PauseOutcome CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
 {
     return gatedPause(reissuePause(state, kConnectHintPauseMs), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
-std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
+CasOperation::PauseOutcome CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
 {
     return gatedPause(0, 2, state, bound, detail::recordReissue, /*should_sleep=*/false);
+}
+
+CasOperation::Resolved CasOperation::settlingRead(const String & key, const Retry & policy, const WriteState & state,
+                                                  ResolveWith resolve_refusal_with)
+{
+    ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
+    /// Owed to the write: a stopped owner must not lose the proof of what its attempt did.
+    const auto owed = OwnerScope::owed();
+    return observe(key, policy, state.any_ambiguous ? ResolveWith::Body : resolve_refusal_with);
+}
+
+std::optional<WriteResult> CasOperation::adjudicate(const Resolved & resolved, const String & bytes,
+                                                    const std::optional<Etag> & expected, WriteState & state,
+                                                    const Retry::Bound & write_bound)
+{
+    state.last_seen = resolved.seen;
+    state.observed_stop = state.observed_stop || resolved.observed_stop;
+    /// A bound of the resolve read refused it, so say WHICH. Erasing it here is what let a lost
+    /// fence be reported as an ordinary conflict and a lease refusal as a policy deadline.
+    if (resolved.stop)
+        return gaveUpForReadStop(*resolved.stop, resolved.source, state);
+
+    /// No attempt of this inner write is unresolved, so the refused precondition IS the answer.
+    /// Identical bytes here are somebody else's object, and the caller that owns the key's meaning
+    /// decides what that means.
+    if (!state.any_ambiguous)
+        return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous, state.observed_stop};
+
+    if (!preconditionStillSatisfiable(state.last_seen, expected))
+    {
+        /// The precondition has MOVED, and THAT is what makes byte equality a proof: an attempt
+        /// that never applied leaves the key exactly as it found it, so under an incarnation that
+        /// did not move our own bytes cannot be told from the bytes already there. A create reaches
+        /// here for every object it sees -- an occupied key never satisfies its precondition.
+        if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
+            return postCommit(obj->etag, /*resolved_by_read=*/true, state, write_bound);
+        /// Nothing of this inner write's is at the key, and a reissue would be refused too.
+        return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous, state.observed_stop};
+    }
+    return std::nullopt;
+}
+
+namespace
+{
+
+/// What one conditional write attempt proved, from its reply alone.
+enum class AttemptKind : uint8_t
+{
+    Committed,
+    /// The precondition was refused: this attempt wrote nothing.
+    Conflict,
+    /// Refused before anything was written, the same way on every resend.
+    Refused,
+    /// Refused before anything was written; fresh credentials may let a resend through.
+    CredentialRefused,
+    /// No proof either way: the attempt may have landed.
+    Ambiguous,
+    /// The query's stored verdict replaced the store's answer, which may have landed.
+    QueryStoredCause,
+    /// Not a store answer: surfaced unchanged.
+    LocalFault,
+};
+
+struct WriteAttempt
+{
+    explicit WriteAttempt(AttemptKind kind_) : kind(kind_) {}
+
+    AttemptKind kind;
+    /// For `Committed`.
+    std::optional<Etag> landed;
+    /// For every thrown kind.
+    std::exception_ptr error;
+    /// For `Refused` and `CredentialRefused`.
+    int refusal_code = 0;
+    String refusal_message;
+    /// An owner had asked to stop when the attempt failed.
+    bool failed_after_stop = false;
+    /// For a thrown store answer: the text named a failed connection.
+    bool connect_hint = false;
+    /// For `Ambiguous`: the first attempt met the adaptive timeout.
+    bool fuse = false;
+};
+
+/// Only the transport can have landed anything, and every exception it raises is a `Poco::Exception`; a local fault
+/// settled by a read would bury the bug behind an outcome the store never gave.
+WriteAttempt classifyWriteFailure(const std::exception & e, size_t attempt_no)
+{
+    WriteAttempt attempt(AttemptKind::Ambiguous);
+    attempt.error = std::current_exception();
+    attempt.failed_after_stop = ownerStopRequested() != nullptr;
+    if (isQueryStoredCause(attempt.error))
+        attempt.kind = AttemptKind::QueryStoredCause;
+    else if (!isStoreAnswer(e))
+        attempt.kind = AttemptKind::LocalFault;
+    else
+    {
+        attempt.connect_hint = isConnectFailureHint(e);
+        if (isDefinitelyRefusedWrite(e))
+        {
+            attempt.kind = isRefreshableCredentialError(e) ? AttemptKind::CredentialRefused : AttemptKind::Refused;
+            const auto & refusal = dynamic_cast<const Exception &>(e);
+            attempt.refusal_code = refusal.code();
+            attempt.refusal_message = refusal.message();
+        }
+        else
+        {
+            /// False when the text is also a hint: such an attempt stays a hint.
+            attempt.fuse = isFirstAttemptFuseTimeout(e, attempt_no);
+        }
+    }
+    return attempt;
+}
+
+/// `on_failure` takes the exception object, which only a rethrow recovers from an `exception_ptr`.
+void reportWriteFailure(const RequestObserver & observer, const String & key, const std::exception_ptr & error)
+{
+    if (!observer.on_failure)
+        return;
+    try
+    {
+        std::rethrow_exception(error);
+    }
+    catch (const std::exception & e)
+    {
+        observer.on_failure("PUT", key, e);
+    }
+}
+
+[[noreturn]] void throwVetoedCredentialRetryOfWrite(const String & key, const std::exception_ptr & refusal)
+{
+    try
+    {
+        std::rethrow_exception(refusal);
+    }
+    catch (const std::exception & e)
+    {
+        detail::throwVetoedCredentialRetry("PUT", key, e);
+    }
+}
+
 }
 
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
@@ -1086,11 +1267,54 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
     /// write of the same call sent DIFFERENT bytes and ended in a conflict, which proved its attempts
     /// dead -- carrying its ambiguity forward is how a competitor's identical object gets claimed.
     state.any_ambiguous = false;
+    /// False while an ambiguous attempt awaits its settling read: a connect hint resends before reading.
+    bool latest_attempt_settled = true;
+    /// A stopped owner gets its latest attempt settled instead of a reissue.
+    const auto settle_for_stopped_owner = [&]() -> WriteResult
+    {
+        if (!latest_attempt_settled)
+            if (auto settled = adjudicate(settlingRead(key, policy, state, ResolveWith::Body), bytes, expected, state, bound))
+                return *settled;
+        return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
+    };
+
+    const auto send_attempt = [&]() -> WriteAttempt
+    {
+        std::optional<std::expected<String, Backend::RawConflict>> reply;
+        try
+        {
+            reply = owner.withTransportAccess(state.attempts_sent + policy.attempts_already_sent, [&](auto & access)
+            {
+                return owner.backend->write(key, bytes, expected_value, access);
+            });
+        }
+        catch (const std::exception & e)
+        {
+            return classifyWriteFailure(e, state.attempts_sent + policy.attempts_already_sent);
+        }
+        if (!reply->has_value())
+            return WriteAttempt(AttemptKind::Conflict);
+        /// A 2xx carrying a value no grammar accepts may well have landed: an ambiguity, never a corruption verdict.
+        std::optional<Etag> landed = owner.tryMint(key, std::move(**reply));
+        WriteAttempt attempt(landed ? AttemptKind::Committed : AttemptKind::Ambiguous);
+        attempt.landed = std::move(landed);
+        return attempt;
+    };
 
     for (;;)
     {
-        /// A write reserves TWO envelopes: the attempt, and the exact read that settles it. That is
-        /// what keeps "every conflict is settled by one read" true at the deadline edge.
+        /// A query that stopped during a failure pause gets the latest attempt settled instead of a reissue.
+        if (state.observed_stop)
+            return settle_for_stopped_owner();
+        /// Once an attempt may have landed, a stopped background owner gets that attempt settled instead of its
+        /// verdict. A stopped query is consulted only on the failure path below, which records what it saw.
+        if (!state.any_ambiguous)
+            throwIfBackgroundStopped();
+        else if (!insideOwed() && backgroundStopRequested())
+            return settle_for_stopped_owner();
+
+        /// An attempt starts only with room for TWO envelopes: itself and the read that settles it. This
+        /// bounds when the attempt starts, not when it lands or whether its settling read completes.
         const uint64_t reservation = reservedFor(0, 2);
         switch (gate(reservation))
         {
@@ -1109,181 +1333,100 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (observer.on_write_attempt)
             observer.on_write_attempt(state.attempts_sent);
 
-        /// Disengaged means the attempt threw: its fate is unproven, and nothing may be read out of it.
-        std::optional<std::expected<String, Backend::RawConflict>> outcome;
-        /// A credential answer is given BEFORE the store applies anything, so the attempt provably did
-        /// not land. It is the one failure that is neither a commit nor an ambiguity, and keeping it out
-        /// of `any_ambiguous` is what lets a second credential failure of this inner write be refused
-        /// instead of resolved by a read and reissued to the deadline.
-        bool credential_answer = false;
-        bool refreshed = false;
-        /// Set once `refreshed` is known: true only when the credential-owned reissue below (the one
-        /// guarded by this exact expression) is what will actually resend this attempt. An earlier
-        /// ambiguity of this inner write routes the reissue through the ordinary hint/fuse/backoff
-        /// mechanisms instead -- the credential answer never gets to skip their read or their pacing --
-        /// so a hint or fuse counter must still count in that case even though credentials were refreshed.
-        bool refresh_owns_reissue = false;
-        bool connect_hint = false;
-        bool fuse = false;
-        try
+        /// "This attempt did not land" says nothing about an earlier attempt of this write whose reply was lost.
+        const bool earlier_attempt_unanswered = state.any_ambiguous;
+        WriteAttempt attempt = send_attempt();
+        const bool refused = attempt.kind == AttemptKind::Refused || attempt.kind == AttemptKind::CredentialRefused;
+
+        if (attempt.kind == AttemptKind::LocalFault)
+            std::rethrow_exception(attempt.error);
+        if (attempt.kind == AttemptKind::Committed)
+            return postCommit(std::move(*attempt.landed), /*resolved_by_read=*/false, state, bound);
+
+        /// Nothing is resent after the owner stopped: a failure that may have landed, or a refusal that cannot answer
+        /// for an earlier unanswered attempt, is settled and ends the call. A refusal with nothing unanswered is kept.
+        if (attempt.failed_after_stop && !(refused && !earlier_attempt_unanswered))
         {
-            outcome = owner.withTransportAccess(state.attempts_sent + policy.attempts_already_sent, [&](auto & access)
-            {
-                return owner.backend->write(key, bytes, expected_value, access);
-            });
+            state.any_ambiguous = true;
+            latest_attempt_settled = false;
+            state.observed_stop = state.observed_stop || queryStopRequested();
+            return settle_for_stopped_owner();
         }
-        catch (const Exception & e)
+
+        if (attempt.error)
+            reportWriteFailure(observer, key, attempt.error);
+        bool refreshed = false;
+        if (refused)
         {
-            if (isDeterministicLocalFailure(e.code()))
-                throw;
-            if (observer.on_failure)
-                observer.on_failure("PUT", key, e);
-            /// ONE refresh per call, only for the class a credential could explain, and only when a
-            /// reissue could sign with what it installs. So an oversized entity never triggers a
-            /// re-acquisition, a denial fresh credentials do not fix is refused on the second look
-            /// rather than reissued to the deadline (the storage hands back a new client every time it
-            /// is asked), and under a single-attempt policy the refusal below is literally "no refresh
-            /// installed credentials and no earlier ambiguity".
-            credential_answer = isRefreshableCredentialError(e);
-            if (credential_answer && !state.refresh_attempted && !policy.single_attempt)
+            /// One refresh per call, and only when a resend could sign with what it installs.
+            if (attempt.kind == AttemptKind::CredentialRefused && !attempt.failed_after_stop && !state.refresh_attempted
+                && !policy.single_attempt)
             {
                 state.refresh_attempted = true;
                 refreshed = owner.backend->refreshCredentials();
             }
-            /// Mirrors the condition guarding the credential-owned reissue below exactly, so the two
-            /// can never drift: `state.any_ambiguous` here is still this attempt's INCOMING value,
-            /// because the update below only fires when `!credential_answer`, which `refreshed` implies
-            /// false for. `!policy.single_attempt` is redundant today -- `refreshed` can only be set
-            /// above under `!policy.single_attempt` already -- but it is kept so this stays an exact
-            /// copy of the reissue branch's condition rather than a hand-simplified one that could
-            /// silently stop matching it.
-            refresh_owns_reissue = refreshed && !policy.single_attempt && !state.any_ambiguous;
-            /// A refusal that FOLLOWS an ambiguous attempt of this inner write proves nothing about that
-            /// attempt, so it is settled by the read below instead of ending the call here.
-            const bool definitely_refused = !refreshed && isDefinitelyRefusedWrite(e);
-            if (definitely_refused && !state.any_ambiguous)
+            /// With an earlier attempt unanswered the refusal proves nothing about it, so the read below settles it.
+            if (!earlier_attempt_unanswered)
             {
+                if (refreshed)
+                {
+                    PauseOutcome paused = pauseAndReissue(state, bound);
+                    if (auto * ended = std::get_if<WriteResult>(&paused))
+                        return std::move(*ended);
+                    /// The store refused this attempt, so a vetoed resend leaves no outcome unknown.
+                    if (std::holds_alternative<QueryVetoedResend>(paused))
+                        throwVetoedCredentialRetryOfWrite(key, attempt.error);
+                    continue;
+                }
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
-                return Refused{e.code(), e.message(), state.attempts_sent};
+                return Refused{attempt.refusal_code, std::move(attempt.refusal_message), state.attempts_sent};
             }
-            /// A refusal-class exception is never a hint, even when an earlier ambiguity of this inner
-            /// write kept it from ending the call above: that earlier attempt's fate is what the read
-            /// below must settle, and a hint reissue would skip it. Both counters below are recorded
-            /// here, at classification, regardless of `policy.single_attempt` (`Retry::once` never acts
-            /// on either, but the attempt's transport error still named what it named) -- except when
-            /// the credential answer OWNS the reissue: a credential answer whose text happens to also
-            /// match a hint or fuse text is a credential reissue, not a hint or fuse one, and must not
-            /// inflate these counts. When an earlier ambiguity of this inner write keeps the credential
-            /// answer from owning the reissue, the hint/fuse mechanism reissues it instead, exactly as
-            /// if credentials had never been refreshed, so the counter must still count it.
-            connect_hint = !definitely_refused && isConnectFailureHint(e);
-            if (connect_hint && !refresh_owns_reissue)
-                ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
-            /// Checked AFTER the hint, so a hinted attempt stays hinted (reissued before its read); a
-            /// fuse timeout is reissued after the settle read runs below.
-            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent + policy.attempts_already_sent);
-            if (fuse && !refresh_owns_reissue)
-                ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
         }
-        catch (const std::exception & e)
+        else if (attempt.kind != AttemptKind::Conflict)
         {
-            /// Only the transport can have landed anything, and every exception it raises is a
-            /// `Poco::Exception`. A local fault -- a bad allocation, a logic error raised inside the
-            /// attempt -- is not a store answer, and settling it by a read would bury the bug behind an
-            /// outcome the store never gave. What is left is an unmodeled transport failure that may
-            /// still have landed, so `outcome` stays disengaged and the read below settles it.
-            if (!dynamic_cast<const Poco::Exception *>(&e))
-                throw;
-            if (observer.on_failure)
-                observer.on_failure("PUT", key, e);
-        }
-
-        if (outcome && outcome->has_value())
-        {
-            if (auto inc = owner.tryMint(key, std::move(**outcome)))
-                return postCommit(std::move(*inc), /*resolved_by_read=*/false, state, bound);
-            /// A 2xx carrying a value no grammar accepts: the write may well have landed, so this is an
-            /// ambiguity to settle by reading, never a corruption verdict about the object.
-            outcome.reset();
-        }
-        if (!outcome && !credential_answer)
             state.any_ambiguous = true;
-
-        /// Nothing for a read to settle: this attempt did not apply, and no EARLIER attempt of this
-        /// inner write is unresolved either. Re-send it under the credentials the refresh installed.
-        if (refresh_owns_reissue)
-        {
-            if (auto given_up = pauseAndReissue(state, bound))
-                return *given_up;
-            continue;
+            latest_attempt_settled = false;
         }
 
-        /// The failure text named a failed CONNECTION -- counted above, at classification, whether or
-        /// not this policy or the deadline/fence gates below let the reissue actually happen. A read now
-        /// would meet the same broken condition, so the reissue itself is the cheaper probe: the attempt
-        /// stays ambiguous (`any_ambiguous` is set above), and if the reissue meets a refused precondition
-        /// the read below settles it.
+        /// A refusal that fresh credentials may cure is resent like an ambiguity. Counted whether or not the policy
+        /// or the gates let the resend happen.
+        const bool connect_hint = attempt.connect_hint && (attempt.kind == AttemptKind::Ambiguous || refreshed);
+        if (connect_hint)
+            ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
+        if (attempt.fuse)
+            ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
+        /// A read now would meet the same broken connection, so the resend is the cheaper probe; a refused
+        /// precondition it meets is settled by the read below.
         if (connect_hint && !policy.single_attempt && policy.resend_unresolved)
         {
-            if (auto given_up = pauseFlat(state, bound))
-                return *given_up;
+            PauseOutcome paused = pauseFlat(state, bound);
+            if (auto * ended = std::get_if<WriteResult>(&paused))
+                return std::move(*ended);
+            if (std::holds_alternative<QueryVetoedResend>(paused))
+                return settle_for_stopped_owner();
             continue;
         }
 
-        /// Every refused precondition, and every ambiguous attempt that was not reissued on a
-        /// connect-failure hint, is settled by ONE exact read, under every policy: a refused
-        /// precondition does not say WHO holds the key, and a 404 and a 412 reach here as the same
-        /// answer. A hinted attempt reaches this read after a reissue that met a refused
-        /// precondition, or at once under a policy that never resends it (`single_attempt`,
-        /// `resend_unresolved = false`). A refused precondition needs only to know WHAT is there, so a presence-only
-        /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
-        /// the body read is unavoidable.
-        ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
-        const Resolved resolved = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
-            ? observePresence(key, policy, bound)
-            : observe(key, policy, bound);
-        state.last_seen = resolved.seen;
-        /// A bound refused the resolve, so say WHICH. Erasing it here is what let a lost fence be
-        /// reported as an ordinary conflict and a lease refusal as a policy deadline.
-        if (resolved.stop)
-            return gaveUpForReadStop(*resolved.stop, state, bound);
+        /// One exact read settles every refused precondition and every ambiguity, under every policy: a refused
+        /// precondition does not say WHO holds the key. A presence-only caller settles a refusal with a HEAD; proving
+        /// an ambiguous attempt landed needs the bytes.
+        if (auto settled = adjudicate(settlingRead(key, policy, state, resolve_refusal_with), bytes, expected, state, bound))
+            return *settled;
+        latest_attempt_settled = true;
 
-        /// No attempt of this inner write is unresolved, so the refused precondition IS the answer.
-        /// Identical bytes here are somebody else's object, and the caller that owns the key's meaning
-        /// decides what that means.
-        if (!state.any_ambiguous)
-            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
-
-        if (!preconditionStillSatisfiable(state.last_seen, expected))
-        {
-            /// The precondition has MOVED, and THAT is what makes byte equality a proof: an attempt
-            /// that never applied leaves the key exactly as it found it, so under an incarnation that
-            /// did not move our own bytes cannot be told from the bytes already there. A create reaches
-            /// here for every object it sees -- an occupied key never satisfies its precondition.
-            if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
-                return postCommit(obj->etag, /*resolved_by_read=*/true, state, bound);
-            /// Nothing of this inner write's is at the key, and a reissue would be refused too.
-            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
-        }
-
-        /// Unresolved but repeatable: the precondition would still be met -- or nothing was observed at
-        /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
-        /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
-        /// the store's own answer. A policy with no reissue has to say it settled nothing.
+        /// Unresolved: the precondition would still be met, or the read observed nothing. Re-sending the same bytes
+        /// under the same precondition is safe: it ends at the store's own answer.
         if (policy.single_attempt || !policy.resend_unresolved)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
-        /// The first attempt met the adaptive first-attempt timeout: a connection-quality answer, not a
-        /// store fault. The read above settled nothing new about it, so re-send at once as attempt 2
-        /// under the full attempt budget; the backoff index is untouched because no store fault was
-        /// seen yet.
-        if (fuse)
-        {
-            if (auto given_up = reissueAtOnce(state, bound))
-                return *given_up;
-            continue;
-        }
-        if (auto given_up = pauseAndReissue(state, bound))
-            return *given_up;
+        /// A stop during the settling read ends the call here instead of after a pause.
+        if (state.observed_stop || (!insideOwed() && ownerStopRequested()))
+            return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
+        /// A first-attempt timeout is a connection-quality answer, not a store fault: resend at once.
+        PauseOutcome paused = attempt.fuse ? reissueAtOnce(state, bound) : pauseAndReissue(state, bound);
+        if (auto * ended = std::get_if<WriteResult>(&paused))
+            return std::move(*ended);
+        if (std::holds_alternative<QueryVetoedResend>(paused))
+            return settle_for_stopped_owner();
     }
 }
 
@@ -1332,12 +1475,9 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
         else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
             current.reset();
 
-        if (policy.single_attempt)
+        if (policy.single_attempt || state.observed_stop)
             return result;
-        /// A clean lost race is settled: the resolve read holds the fresh object and the next
-        /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
-        /// growing schedule.
-        if (auto given_up = state.any_ambiguous ? pauseAndReissue(state, bound) : pauseForConflict(state, bound))
+        if (const std::optional<WriteResult> given_up = pauseAfterConflict(decisions, state, policy))
             return *given_up;
 
         /// Only when the resolve settled nothing is a fresh read owed; otherwise `current` already is
@@ -1360,7 +1500,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
 {
     WriteState state;
 
-    Resolved resolved = observePresence(key, policy, bound);
+    Resolved resolved = observe(key, policy, ResolveWith::Presence);
     state.last_seen = resolved.seen;
     std::optional<Meta> current;
     if (const auto * meta = std::get_if<Meta>(&state.last_seen))
@@ -1388,17 +1528,14 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
         else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
             current.reset();
 
-        if (policy.single_attempt)
-            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
-        /// A clean lost race is settled: the resolve read holds the fresh object and the next
-        /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
-        /// growing schedule.
-        if (auto given_up = state.any_ambiguous ? pauseAndReissue(state, bound) : pauseForConflict(state, bound))
+        if (policy.single_attempt || state.observed_stop)
+            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous, state.observed_stop};
+        if (const std::optional<WriteResult> given_up = pauseAfterConflict(decisions, state, policy))
             return *given_up;
 
         if (std::holds_alternative<NotObserved>(state.last_seen))
         {
-            resolved = observePresence(key, policy, bound);
+            resolved = observe(key, policy, ResolveWith::Presence);
             state.last_seen = resolved.seen;
             if (const auto * meta = std::get_if<Meta>(&state.last_seen))
                 current = *meta;

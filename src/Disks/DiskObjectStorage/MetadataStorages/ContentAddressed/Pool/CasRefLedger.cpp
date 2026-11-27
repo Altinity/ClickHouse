@@ -1496,7 +1496,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// Paces ONLY the re-reads a competing actor forced. A `Live` outcome is this open's own
         /// success and its single confirming re-read is not contention, so it is never delayed. The
         /// argument is the number of collisions so far, so the first one waits the shortest draw.
-        const auto paceReRead = [&] { op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1)); };
+        const auto paceReRead = [&] { op.sleepFor(Retry::backoff(static_cast<uint32_t>(attempt) + 1)); };
 
         const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout, policy);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),

@@ -7,18 +7,28 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/WriteMode.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
+#include <Common/CurrentThread.h>
+#include <Common/Exception.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <unistd.h>
+
+#include <Poco/Exception.h>
 
 #if USE_AWS_S3
 #include <IO/S3Common.h>
@@ -26,7 +36,10 @@
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int NETWORK_ERROR;
+extern const int QUERY_WAS_CANCELLED;
+extern const int S3_ERROR;
 }
 
 using namespace DB::Cas;
@@ -56,9 +69,9 @@ CasRequests makeRequests(Backend & backend, DB::Cas::tests::FakeClock * clock = 
     return CasRequests(std::move(ptr), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
-/// A Backend decorator whose read/head/list all throw an untyped runtime error when armed — modelling
-/// a backend with no sharper evidence than "something went wrong" (a network timeout, a 5xx, an
-/// unclassifiable failure). The fault is injected on the PRIMITIVES, which is what
+/// A Backend decorator whose read/head/list all throw a transport timeout when armed — modelling a
+/// backend with no sharper evidence than "something went wrong". An exception that is not a
+/// `Poco::Exception` is a local fault, which the probe lets through. The fault is injected on the PRIMITIVES, which is what
 /// `Backend::probeSentinelRaw`'s default derives its answer from; every other operation delegates to
 /// InMemoryBackend unchanged.
 class TransportFaultBackend final : public InMemoryBackend
@@ -67,21 +80,21 @@ public:
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::head(key, access);
     }
 
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::read(key, access);
     }
 
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
@@ -393,6 +406,354 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
     auto requests = makeRequests(instrumented);
     auto op = requests.admit();
     EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::ContainerAbsent);
+}
+
+#endif
+
+namespace
+{
+
+using DB::Cas::tests::CasKillableQuery;
+using DB::Cas::tests::onThread;
+
+struct ProbeObserved
+{
+    bool returned = false;
+    ProbeOutcome outcome = ProbeOutcome::Indeterminate;
+    int code = 0;
+    String what;
+};
+
+ProbeObserved probeOnce(CasRequests & requests, const String & key, const Retry & policy)
+{
+    ProbeObserved seen;
+    auto op = requests.admit();
+    try
+    {
+        seen.outcome = probeSentinel(op, key, policy).outcome;
+        seen.returned = true;
+    }
+    catch (const DB::Exception & e)
+    {
+        seen.code = e.code();
+        seen.what = e.message();
+    }
+    catch (const std::exception & e)
+    {
+        seen.code = -1;
+        seen.what = e.what();
+    }
+    return seen;
+}
+
+/// Counts probes and credential refreshes. A failure first asks the thread's query, as the S3 client does.
+class FailingProbeBackend final : public InMemoryBackend
+{
+public:
+    enum class Mode { Throw, ReturnIndeterminate, ReturnPresent };
+
+    Mode mode = Mode::Throw;
+    std::exception_ptr failure = std::make_exception_ptr(Poco::TimeoutException("the probe timed out"));
+    std::atomic<int> probes{0};
+    std::atomic<int> refreshes{0};
+
+    SentinelProbeResult probeSentinelRaw(const String &, TransportAccess &) override
+    {
+        ++probes;
+        DB::CurrentThread::checkIfNotCancelled();
+        if (mode == Mode::ReturnIndeterminate)
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        if (mode == Mode::ReturnPresent)
+            return {ProbeOutcome::Present, String("v")};
+        std::rethrow_exception(failure);
+    }
+
+    bool refreshCredentials() override
+    {
+        ++refreshes;
+        return true;
+    }
+};
+
+/// What the store answers to a request it refuses for credentials.
+std::exception_ptr credentialFailure()
+{
+#if USE_AWS_S3
+    return std::make_exception_ptr(DB::S3Exception("the store answered AccessDenied", Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
+#else
+    return std::make_exception_ptr(Poco::IOException("the store answered AccessDenied"));
+#endif
+}
+
+void stopBackground(std::optional<OwnerScope> & scope)
+{
+    scope.emplace(OwnerScope::background([] { throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped"); }));
+}
+
+}
+
+/// A stopped owner's probe surfaces the owner's verdict: no reissue, no credential refresh, and no
+/// `Indeterminate` returned in its place.
+TEST(CASSentinelProbe, StoppedProbePreservesCallerVerdict)
+{
+    for (const bool once : {true, false})
+    {
+        const Retry policy = once ? Retry::once() : Retry::standard();
+        SCOPED_TRACE(once ? "once" : "standard");
+
+        for (const auto mode : {FailingProbeBackend::Mode::Throw, FailingProbeBackend::Mode::ReturnIndeterminate})
+        {
+            SCOPED_TRACE(mode == FailingProbeBackend::Mode::Throw ? "backend throws" : "backend returns Indeterminate");
+            ProbeObserved seen;
+            int probes = 0;
+            int refreshes = 0;
+            onThread(true, [&]
+            {
+                CasKillableQuery query(getContext().context);
+                auto backend = std::make_shared<FailingProbeBackend>();
+                backend->mode = mode;
+                backend->failure = credentialFailure();
+                DB::Cas::tests::FakeClock clock;
+                CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+                query.kill();
+                seen = probeOnce(requests, "k", policy);
+                probes = backend->probes.load();
+                refreshes = backend->refreshes.load();
+            });
+            EXPECT_FALSE(seen.returned) << "the verdict, not an outcome";
+            EXPECT_EQ(seen.code, DB::ErrorCodes::QUERY_WAS_CANCELLED);
+            EXPECT_EQ(probes, 1);
+            EXPECT_EQ(refreshes, 0);
+        }
+
+        {
+            SCOPED_TRACE("background owner, backend returns Indeterminate");
+            ProbeObserved seen;
+            int probes = 0;
+            onThread(false, [&]
+            {
+                auto backend = std::make_shared<FailingProbeBackend>();
+                backend->mode = FailingProbeBackend::Mode::ReturnIndeterminate;
+                DB::Cas::tests::FakeClock clock;
+                CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+                std::optional<OwnerScope> scope;
+                stopBackground(scope);
+                seen = probeOnce(requests, "k", policy);
+                probes = backend->probes.load();
+            });
+            EXPECT_FALSE(seen.returned) << "the returned Indeterminate is replaced by the verdict";
+            EXPECT_EQ(seen.code, DB::ErrorCodes::ABORTED);
+            EXPECT_EQ(probes, 1);
+        }
+
+        {
+            SCOPED_TRACE("background owner, backend throws a credential answer");
+            ProbeObserved seen;
+            int probes = 0;
+            int refreshes = 0;
+            onThread(false, [&]
+            {
+                auto backend = std::make_shared<FailingProbeBackend>();
+                backend->failure = credentialFailure();
+                DB::Cas::tests::FakeClock clock;
+                CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+                std::optional<OwnerScope> scope;
+                stopBackground(scope);
+                seen = probeOnce(requests, "k", policy);
+                probes = backend->probes.load();
+                refreshes = backend->refreshes.load();
+            });
+            EXPECT_FALSE(seen.returned);
+            EXPECT_EQ(seen.code, DB::ErrorCodes::ABORTED);
+            EXPECT_EQ(probes, 1);
+            EXPECT_EQ(refreshes, 0);
+        }
+    }
+}
+
+/// A stop that lands during the pause before a reissue starts no further probe, even one that would succeed. The
+/// probe ends with what the failed one had: the exception behind it, or the inconclusive outcome itself.
+TEST(CASSentinelProbe, StopDuringProbeBackoffStartsNoReissue)
+{
+    for (const bool with_cause : {false, true})
+    {
+        SCOPED_TRACE(with_cause ? "the failed probe threw" : "the failed probe returned Indeterminate");
+        ProbeObserved seen;
+        int probes = 0;
+        onThread(true, [&]
+        {
+            CasKillableQuery query(getContext().context);
+            auto backend = std::make_shared<FailingProbeBackend>();
+            backend->mode = with_cause ? FailingProbeBackend::Mode::Throw : FailingProbeBackend::Mode::ReturnIndeterminate;
+            DB::Cas::tests::FakeClock clock;
+            auto sleep = clock.sleepFn();
+            CasRequests requests(backend, Fence::open(), clock.nowFn(), [&](uint64_t ms)
+            {
+                sleep(ms);
+                backend->mode = FailingProbeBackend::Mode::ReturnPresent;   /// the reissue would succeed: it must not start
+                query.kill();
+            }, nullptr, DB::Cas::kDefaultRequestWindowMs);
+            seen = probeOnce(requests, "k", Retry::standard());
+            probes = backend->probes.load();
+        });
+        if (with_cause)
+        {
+            EXPECT_FALSE(seen.returned);
+            EXPECT_EQ(seen.code, -1) << "the probe's own Poco timeout, not the query's verdict";
+            EXPECT_EQ(seen.what, "Timeout");
+        }
+        else
+        {
+            ASSERT_TRUE(seen.returned) << seen.what;
+            EXPECT_EQ(seen.outcome, ProbeOutcome::Indeterminate);
+        }
+        EXPECT_EQ(probes, 1);
+    }
+}
+
+/// A healthy first probe is never refused, whoever stopped.
+TEST(CASSentinelProbe, HealthyFirstProbeIsNotRefused)
+{
+    for (const bool background : {false, true})
+    {
+        SCOPED_TRACE(background ? "background owner" : "killed query");
+        onThread(true, [&]
+        {
+            CasKillableQuery query(getContext().context);
+            InMemoryBackend backend;
+            auto requests = makeRequests(backend);
+            auto op = requests.admit();
+            ASSERT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::once())));
+            std::optional<OwnerScope> scope;
+            if (background)
+                stopBackground(scope);
+            else
+                query.kill();
+            ASSERT_NE(ownerStopRequested(), nullptr);
+            EXPECT_EQ(probeSentinel(op, "k", Retry::standard()).outcome, ProbeOutcome::Present);
+            EXPECT_EQ(probeSentinel(op, "missing", Retry::standard()).outcome, ProbeOutcome::KeyAbsent);
+        });
+    }
+}
+
+#if USE_AWS_S3
+
+namespace
+{
+
+/// Fails every access with `code` after asking the thread's query, as the S3 client does.
+class ClientLikeS3ObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    mutable std::atomic<int> accesses{0};
+    Aws::S3::S3Errors code = Aws::S3::S3Errors::SERVICE_UNAVAILABLE;
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object, const DB::ReadSettings &, std::optional<size_t>, bool, bool) const override
+    {
+        fail(object.remote_path);
+    }
+
+    DB::SmallObjectDataWithMetadata readSmallObjectAndGetObjectMetadata( /// NOLINT
+        const DB::StoredObject & object, const DB::ReadSettings &, size_t, std::optional<size_t>) const override
+    {
+        fail(object.remote_path);
+    }
+
+    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool) const override { fail(path); }
+
+private:
+    [[noreturn]] void fail(const String & path) const
+    {
+        ++accesses;
+        DB::CurrentThread::checkIfNotCancelled();
+        throw DB::S3Exception("the store answered for " + path, code);
+    }
+};
+
+std::shared_ptr<ClientLikeS3ObjectStorage> makeClientLikeS3Storage(Aws::S3::S3Errors code)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto root = (std::filesystem::temp_directory_path()
+        / ("cas_sentinel_probe_stop_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1)))).string();
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    auto storage = DB::Cas::tests::ownedByDirectory(std::make_shared<ClientLikeS3ObjectStorage>(std::move(settings)), root);
+    storage->code = code;
+    return storage;
+}
+
+}
+
+/// A stopped query's native probe is inconclusive, a stored cause that is itself an `S3Exception` `NoSuchBucket` or
+/// `AccessDenied` included: none of them becomes an authoritative outcome, and the probe is not reissued.
+TEST(CASSentinelProbe, StoppedQueryNativeProbeIsNotAnAuthoritativeOutcome)
+{
+    struct Arm
+    {
+        const char * name;
+        Aws::S3::S3Errors store_code;
+        std::function<std::exception_ptr()> cause;
+    };
+    const std::vector<Arm> arms = {
+        {"plain kill", Aws::S3::S3Errors::SERVICE_UNAVAILABLE, [] { return std::exception_ptr{}; }},
+        {"stored NoSuchBucket", Aws::S3::S3Errors::NO_SUCH_BUCKET,
+         [] { return std::make_exception_ptr(DB::S3Exception("stored cause", Aws::S3::S3Errors::NO_SUCH_BUCKET)); }},
+        {"stored AccessDenied", Aws::S3::S3Errors::ACCESS_DENIED,
+         [] { return std::make_exception_ptr(DB::S3Exception("stored cause", Aws::S3::S3Errors::ACCESS_DENIED)); }},
+    };
+    for (const bool once : {true, false})
+    {
+        for (const auto & arm : arms)
+        {
+            SCOPED_TRACE(String(once ? "once, " : "standard, ") + arm.name);
+            auto storage = makeClientLikeS3Storage(arm.store_code);
+            ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+            ProbeObserved seen;
+            onThread(true, [&]
+            {
+                CasKillableQuery query(getContext().context);
+                DB::Cas::tests::FakeClock clock;
+                auto requests = makeRequests(backend, &clock);
+                query.kill(arm.cause());
+                seen = probeOnce(requests, nativeKeyUnder(storage, "some/key"), once ? Retry::once() : Retry::standard());
+            });
+            ASSERT_TRUE(seen.returned) << seen.what;
+            EXPECT_EQ(seen.outcome, ProbeOutcome::Indeterminate);
+            EXPECT_EQ(storage->accesses.load(), 1) << "no reissue";
+        }
+    }
+}
+
+/// The S3 client cannot see a background owner, so the store's own answer stays authoritative.
+TEST(CASSentinelProbe, BackgroundOwnerKeepsTheStoresAnswer)
+{
+    const std::vector<std::pair<Aws::S3::S3Errors, ProbeOutcome>> answers = {
+        {Aws::S3::S3Errors::NO_SUCH_BUCKET, ProbeOutcome::ContainerAbsent},
+        {Aws::S3::S3Errors::ACCESS_DENIED, ProbeOutcome::AccessDenied},
+        {Aws::S3::S3Errors::NO_SUCH_KEY, ProbeOutcome::KeyAbsent},
+    };
+    for (const auto & [code, expected] : answers)
+    {
+        SCOPED_TRACE(static_cast<int>(code));
+        auto storage = makeClientLikeS3Storage(code);
+        ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+        ProbeObserved seen;
+        onThread(false, [&]
+        {
+            auto requests = makeRequests(backend);
+            std::optional<OwnerScope> scope;
+            stopBackground(scope);
+            ASSERT_NE(ownerStopRequested(), nullptr);
+            seen = probeOnce(requests, nativeKeyUnder(storage, "some/key"), Retry::standard());
+        });
+        ASSERT_TRUE(seen.returned) << seen.what;
+        EXPECT_EQ(seen.outcome, expected);
+        EXPECT_EQ(storage->accesses.load(), 1);
+    }
 }
 
 #endif

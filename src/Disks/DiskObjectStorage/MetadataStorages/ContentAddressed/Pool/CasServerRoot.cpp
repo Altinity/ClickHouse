@@ -1968,7 +1968,7 @@ Observation MountLeaseRenewer::readUntilObserved(
     uint64_t pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, write_started_boot_ms, boot_clock());
     while (op.admitted())
     {
-        op.pause(pause_ms);
+        op.sleepFor(pause_ms);
         try
         {
             std::optional<Object> got = op.read(key, policy);
@@ -2080,7 +2080,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
             {
                 break;
             }
-            op.pause(pause_ms);
+            op.sleepFor(pause_ms);
             written = op.replace(key, body, expected, policy);
         }
     }

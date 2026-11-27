@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -264,6 +265,9 @@ detail::ConditionalWriteOutcome detail::finalizeConditionalWrite(WriteBuffer & b
     }
     catch (const S3Exception & e)
     {
+        /// A stopped query's stored cause can be a `412` and says nothing about the write; any other `412` is the store's.
+        if (isQueryStoredCause(std::current_exception()))
+            throw;
         if (e.isPreconditionFailed()
             || e.getExceptionName() == "NoSuchKey"
             || e.getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY)
@@ -355,6 +359,10 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
 /// Any other error (network, auth, throttle, corruption) propagates unchanged — fail-closed.
 static bool isObjectNotFound(const std::exception & e)
 {
+    /// A stopped query's stored cause can carry a not-found code and says nothing about the key. Any other miss
+    /// is the store's answer: the S3 client replaces a miss it sees under a killed query with the query's exception.
+    if (isQueryStoredCause(std::current_exception()))
+        return false;
 #if USE_AWS_S3
     if (const auto * s3e = dynamic_cast<const S3Exception *>(&e))
         return s3e->getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY
@@ -765,6 +773,9 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
 #if USE_AWS_S3
         catch (const S3Exception & e)
         {
+            /// A stopped query's stored cause says nothing about the key; any other error is the store's answer.
+            if (isQueryStoredCause(std::current_exception()))
+                return {ProbeOutcome::Indeterminate, std::nullopt};
             /// `read` already answers the key-absent half of the store's 404 family (see
             /// `isObjectNotFound`), so what reaches here is what it deliberately does not flatten.
             /// The limit of the one-read shape: every case below classifies an error a GET raised, so
@@ -784,6 +795,8 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
 #endif
         catch (...)
         {
+            if (isLocalFault(std::current_exception()))
+                throw;
             return {ProbeOutcome::Indeterminate, std::nullopt};
         }
     }
@@ -803,6 +816,8 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
     }
     catch (...)
     {
+        if (isLocalFault(std::current_exception()))
+            throw;
         return {ProbeOutcome::Indeterminate, std::nullopt};
     }
 }

@@ -50,7 +50,7 @@ struct Retry
     /// `GaveUp::Unresolved` so the caller decides new bytes. For namespace-create step 1, whose catalog
     /// row must differ per attempt. A clean conflict and a credential reissue are unaffected. Read
     /// paths ignore it. Clear it only in a loop that decides again on a fresh read (`casUpdateImpl`
-    /// with `CasOperation::pauseBeforeRedecide`); any other caller gets a bare `GaveUp::Unresolved`.
+    /// with `CasOperation::pauseAfterUnresolvedWrite`); any other caller gets a bare `GaveUp::Unresolved`.
     bool resend_unresolved = true;
     /// An absolute bound on the caller's clock that can only shorten the request. See `cappedAt`.
     std::optional<uint64_t> outside_cap_ms = std::nullopt;

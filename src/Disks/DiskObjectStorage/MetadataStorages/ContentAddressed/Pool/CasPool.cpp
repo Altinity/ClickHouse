@@ -1288,7 +1288,7 @@ void Pool::cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requeste
     /// The pass keeps the mount fence but backs off on the open plane's sleep, which `beginTeardown` wakes;
     /// the mount plane's sleep would hold a scheduler join for a whole pause.
     ref_ledger.cancelIdleOwnCreatingRows(
-        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.pause(ms); }, stop_requested);
+        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.sleepFor(ms); }, stop_requested);
 }
 
 void Pool::beginTeardown() noexcept

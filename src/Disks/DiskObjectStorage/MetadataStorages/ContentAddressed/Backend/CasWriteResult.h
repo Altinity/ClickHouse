@@ -52,7 +52,9 @@ struct Declined  { Observation seen; };
 /// caller outside the engine paces such a conflict on the growing schedule, as the engine's own
 /// loops do, and a clean lost race on the flat one. `attempts_sent` cannot stand in for it: a
 /// throttled first attempt whose resolve read finds the key moved is one attempt, ambiguous.
-struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; };
+/// `observed_stop` is true when an operation of the call failed and saw its query stopped: a loop takes the
+/// conflict as the answer and starts no further decision.
+struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; bool observed_stop = false; };
 /// The store itself refused the request (not a lost precondition) -- `store_error` is a ClickHouse
 /// error code and `message` explains it. `attempts_sent` is the same count `Conflict` carries, for
 /// the same reason.

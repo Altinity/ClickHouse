@@ -37,6 +37,10 @@ extern const int CORRUPTED_DATA;
 namespace DB::Cas
 {
 
+/// Neither a store or transport answer nor a stopped query's stored cause: a bug or a resource report, which
+/// request loops and backend adapters surface unchanged.
+bool isLocalFault(const std::exception_ptr & e);
+
 /// Typed erasure evidence for one key or one prefix. Ordinary `head`/`read` answer only two things
 /// for a plain caller: the object, or nullopt for the store's own authoritative "key not found" (see
 /// `isObjectNotFound`) -- every other fault (a missing bucket/container, a permission failure, a
@@ -297,8 +301,9 @@ public:
 
     /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
     /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`
-    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
-    /// call is `Indeterminate` -- never promoted to `KeyAbsent`. A backend able to surface real
+    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and any other answer from either
+    /// call is `Indeterminate` -- never promoted to `KeyAbsent`. A local fault propagates (`isLocalFault`), in
+    /// every override too. A backend able to surface real
     /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
     /// overrides this to sharpen the classification.
     virtual SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access)
@@ -316,6 +321,8 @@ public:
         }
         catch (...)
         {
+            if (isLocalFault(std::current_exception()))
+                throw;
             return {ProbeOutcome::Indeterminate, std::nullopt};
         }
     }

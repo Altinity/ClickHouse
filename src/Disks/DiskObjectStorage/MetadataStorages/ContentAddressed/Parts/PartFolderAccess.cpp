@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
@@ -286,6 +287,10 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
             try
             {
                 return future.get();                          /// Rethrows the leader's exception, if any.
+            }
+            catch (const LeaderStopped &)
+            {
+                continue;
             }
             catch (const std::exception & e)
             {
@@ -813,6 +818,11 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     catch (const Exception & e)
     {
         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+            throw;
+        /// A stopped background owner's miss is its verdict. A query's stored cause is no miss; a real one is.
+        if (auto stop = backgroundStopRequested())
+            std::rethrow_exception(stop);
+        if (isQueryStoredCause(std::current_exception()))
             throw;
         eraseView(key);
         return;   /// Raced away between the gate and dropRef; nothing was actually dropped here.

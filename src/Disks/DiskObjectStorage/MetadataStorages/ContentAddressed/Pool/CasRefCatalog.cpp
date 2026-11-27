@@ -530,6 +530,9 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         if (erase_acknowledged && std::holds_alternative<Committed>(erase))
             erase_acknowledged(old_life);
 
+        /// The erase saw its query stop on a failure: no further erase follows it.
+        const auto * conflict = std::get_if<Conflict>(&erase);
+        const bool erase_again = conflict && !conflict->observed_stop;
         /// Pause before the read: that read is the snapshot the next erase is conditioned on, and a
         /// write landing during a pause taken after it would refuse that erase every time.
         /// The argument counts reissues so far: `backoff(0)` is no wait at all. No erase follows the
@@ -559,7 +562,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         /// The row survived the attempt. Only a refused precondition may be tried again against the
         /// mandatory resolution snapshot above; every other alternative is terminal for this call, and
         /// a commit the resolution read contradicts is reported rather than believed.
-        if (!std::holds_alternative<Conflict>(erase))
+        if (!erase_again)
         {
             if (std::holds_alternative<Committed>(erase))
                 throwCasWriteRetryLater(fmt::format(
@@ -569,6 +572,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             throwCatalogWriteFailure(std::move(erase), fmt::format(
                 "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
         }
+        throwIfBackgroundStopped();
     }
 
     throwCasWriteRetryLater(fmt::format(
