@@ -164,10 +164,35 @@ private:
     friend void throwIfQueryStopped();
     friend std::exception_ptr backgroundStopRequested();
     friend bool isQueryStoredCause(const std::exception_ptr & e);
+    friend std::function<void()> uploadStopCheck();
     static thread_local State current;
 
     State saved;
     bool active = true;
+};
+
+/// The check an upload of a new build runs while it sends, built on the publishing thread; the callable may run on any
+/// thread. Empty inside `owed` or `shared` and on a thread with no thread group. Otherwise it runs the group's throwing
+/// cancellation predicate, which never throws for a background group such as a merge or a mutation. It holds the thread
+/// group, so it may outlive the scope that built it. Background owners are not part of it.
+std::function<void()> uploadStopCheck();
+
+/// Carries the stop check of the build being published from the publishing thread to the code that builds each
+/// body's throttler. Scopes nest; destruction restores the enclosing value.
+class UploadStopScope
+{
+public:
+    explicit UploadStopScope(std::function<void()> stop);
+    ~UploadStopScope();
+
+    UploadStopScope(const UploadStopScope &) = delete;
+    UploadStopScope & operator=(const UploadStopScope &) = delete;
+
+    /// Empty outside a scope.
+    static const std::function<void()> & current();
+
+private:
+    std::function<void()> saved;
 };
 
 }

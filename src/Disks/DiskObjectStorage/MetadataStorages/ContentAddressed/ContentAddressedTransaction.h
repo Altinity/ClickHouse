@@ -176,6 +176,8 @@ private:
             /// record into another part, and the copy shares the flag, so the parts together copy
             /// the staged envelope at most once.
             std::shared_ptr<std::atomic<bool>> publication_attempted = std::make_shared<std::atomic<bool>>(false);
+            /// The `remote_throttler` of the settings the file was written with; a hardlink or a move keeps it.
+            ThrottlerPtr remote_throttler;
         };
         std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
@@ -202,7 +204,7 @@ private:
     /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
-                           Cas::StagingBackend backend);
+                           Cas::StagingBackend backend, ThrottlerPtr remote_throttler);
 
     /// Builds the fixed-length CABL envelope header for a staging blob, with a fresh `incarnation_tag`,
     /// so the S3 staging object holds `[header][payload]` and the promote

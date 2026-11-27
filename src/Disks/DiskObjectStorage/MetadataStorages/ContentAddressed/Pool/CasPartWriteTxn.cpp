@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasUploadGuard.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -515,6 +516,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// each iteration of this loop builds one. The verbatim staged copy is additionally
             /// once-only per staging object: `beginPublication` spends a flag that the caller shares
             /// among every source over that object.
+            std::optional<BodyGuardScope> body_guard;
+            if (transport == BlobPublicationTransport::Streaming)
+                body_guard.emplace(key, makeUploadGuard(source.remote_throttler, UploadStopScope::current()));
             op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
         }
         catch (...)

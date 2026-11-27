@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasUploadGuard.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -928,12 +929,14 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
 
         /// Unconditional rewrite: default request mode and multipart policy, so generation stores are
         /// not restricted by the conditional single-PUT cap.
+        WriteSettings write_settings = blobPublicationWriteSettings();
+        write_settings.remote_throttler = BodyGuardScope::forKey(request.destination_key);
         auto out = object_storage->writeObject(
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
             blob_publication_detail::blobWriteBufferSize(streaming->fresh_envelope.size() + streaming->payload_size),
-            blobPublicationWriteSettings());
+            write_settings);
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
         blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, *out, *streaming, request.destination_key,
             "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published");

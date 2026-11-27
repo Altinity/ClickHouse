@@ -235,4 +235,59 @@ std::function<void()> OwnerScope::effectiveCheck()
     return current.background;
 }
 
+namespace
+{
+
+thread_local std::function<void()> upload_stop;
+
+template <typename Status>
+bool cancellationBlocked()
+{
+    if constexpr (requires { typename Status::QueryCancellationBlocker; })
+        return Status::QueryCancellationBlocker::isActive();
+    else
+        return false;
+}
+
+template <typename Group>
+inline constexpr bool kGroupHasCancellationSetter = requires(Group & group, std::function<bool()> is_canceled, std::function<void()> throw_if_canceled)
+{
+    group.setQueryCancellationPredicates(is_canceled, throw_if_canceled);
+};
+
+static_assert(!kGroupHasCancellationSetter<ThreadGroup>,
+    "merges are cancellable on this base: add a test that a merge's upload is stopped and correct the user docs on "
+    "stopping CAS work");
+
+}
+
+std::function<void()> uploadStopCheck()
+{
+    const auto & owner = OwnerScope::current;
+    if (owner.owed || owner.shared || cancellationBlocked<ThreadStatus>())
+        return {};
+    ThreadGroupPtr thread_group = CurrentThread::getGroup();
+    if (!thread_group)
+        return {};
+    auto predicate = thread_group->getSharedData().throw_if_query_canceled_predicate;
+    if (!predicate)
+        return {};
+    return [keep_group = std::move(thread_group), stop = std::move(predicate)] { stop(); };
+}
+
+UploadStopScope::UploadStopScope(std::function<void()> stop)
+    : saved(std::exchange(upload_stop, std::move(stop)))
+{
+}
+
+UploadStopScope::~UploadStopScope()
+{
+    upload_stop = std::move(saved);
+}
+
+const std::function<void()> & UploadStopScope::current()
+{
+    return upload_stop;
+}
+
 }

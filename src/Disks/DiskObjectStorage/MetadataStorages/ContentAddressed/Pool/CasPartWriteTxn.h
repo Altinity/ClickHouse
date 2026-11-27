@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Common/IThrottler.h>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -30,6 +31,8 @@ struct BlobSource
     std::optional<String> server_side_copy_from;
     std::shared_ptr<std::atomic<bool>> publication_attempted
         = std::make_shared<std::atomic<bool>>(false);
+    /// The bandwidth limit of the writer that produced the bytes; null for none.
+    ThrottlerPtr remote_throttler;
 
     /// Atomically consume the logical source's first-publication privilege -- the verbatim staged copy
     /// is available to exactly one physical publication of this source, whichever one gets here first.
