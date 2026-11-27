@@ -59,11 +59,11 @@ follower or a deferred round execution returns before that commit.
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
 | 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | Pages of the perpetual namespace janitor under a 20 s soft budget, reclaiming dead-life debris |
 | 17 | `ref_object_cleanup` | post-`CAS` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
-| 18 | `orphan_sweep` | post-`CAS` | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
+| 18 | `orphan_sweep` | post-`CAS`, right after phase 15 | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
 
 Phases 2 through 4 run on every leader round; a follower returns after phase 1. Phases 5–15 and
-17–18 run only when phase 4 decides to fold (phase 9 only when the round does not suppress destruction); phase 16 runs after phase 15 on a fold and right after
-phase 4 on a `DEFER`. A `DEFER` verdict is therefore not a bare no-op: it still runs one bounded
+17–18 run only when phase 4 decides to fold (phase 9 only when the round does not suppress destruction). On a fold, phase 18 runs
+right after phase 15, then phases 16 and 17; on a `DEFER`, phase 16 runs right after phase 4. A `DEFER` verdict is therefore not a bare no-op: it still runs one bounded
 namespace-janitor page with `suppress_destructive = true` — listing and classification only, no
 deletes and no cursor advance — and then returns, publishing no fold artifact and no commit `CAS`.
 Its lease `CAS` may already have created or renewed the lease in phase 1:
@@ -109,7 +109,7 @@ that object.
 - **Runs on:** always — the only phase a `NotALeader` round emits
 - **Reads:** `gc/state`; `gc/hb` (only when another GC owns the lease)
 - **Writes / deletes:** one successful `CAS` on `gc/state` (acquire, renew or steal); a conflict is
-  re-observed and re-decided by the request engine within the configured request window (`cas_request_window_ms`, default 120 s); no
+  re-observed and re-decided by the request engine, at most 100 times, each request within its own window (`cas_request_window_ms`, default 120 s); no
   deletes
 - **Safety:** the lease is *work de-duplication, not mutual exclusion* — see below
 - **Fails the round if:** this `Gc` instance saw `gc/state` before and it has since disappeared, or
@@ -186,9 +186,8 @@ evidence from the fold running now.
 - **Retry order:** when an erase is refused because the catalog changed, the drain pauses first
   (full-jitter backoff, growing to 5 s), then re-reads the catalog, then sends the next erase against
   that fresh read. A catalog write that lands during the pause therefore cannot refuse the next erase.
-  A permanently contended catalog ends the drain with `NETWORK_ERROR` at the request deadline or after
-  100 erase attempts on one row, whichever comes first; the deadline is one frozen window shared by
-  every attempt on that row.
+  A permanently contended catalog ends the drain with `NETWORK_ERROR` after
+  100 erases on one row, with no pause after the last. Each erase request has its own window.
 - **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (erases the store acknowledged,
   counted before the resolution read so a drain that throws still reports them, plus erases a
   resolution read proved); metric `cancelled_creating` (the `Creating` rows the drain cancelled;
@@ -625,10 +624,13 @@ role as the coverage record.
 ### Post-commit failures {#post-commit-failures}
 
 After a `Committed` result the round is committed — an exception in phases 14–18 does not un-commit
-it. Those phases tolerate the object outcomes they name (`NotFound`, `TokenMismatch`), but only
-phase 16 is wrapped in a catch-all; a backend or decode exception in phases 14, 15, 17 or 18
-propagates, and `system.cas_gc_log` then records an `Aborted` or `Error` finish (see
-[round outcomes](#round-outcomes)) for a round whose new `gc/state` is already durable. Read such a
+it. Those phases tolerate the object outcomes they name (`NotFound`, `TokenMismatch`). Phase 16 logs
+any other failure and goes on, unless the round was asked to stop. A backend or decode exception in
+phases 14, 15, 17 or 18 propagates. Phase 18 runs before phases 16 and 17, so its exception also skips
+them for that round. A propagated exception makes `system.cas_gc_log` record an
+`Aborted`, `Stopped` or `Error` finish (see
+[round outcomes](#round-outcomes)) for a round whose new `gc/state` is already durable. A manual round
+whose query is killed or timed out in these phases is recorded as `Stopped`. Read such a
 row as "committed round, failed tail": the next round starts from the committed state, and what
 the tail did not delete is picked up later — by the orphan sweep for phase 15's leftovers, by
 phase 17's recomputed plan, and for phase 18 only once the sweep cursor (already advanced by phase
@@ -702,8 +704,9 @@ nothing ends the pass. A pool without debris costs one `LIST` per round.
   page and checked again before the cursor is published; the incarnation segment in every key makes an old life's objects structurally
   unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
   it
-- **Fails the round if:** nothing — the whole phase is wrapped in a catch-all ("namespace janitor
-  stopped this round"). A failed batch `DELETE` leaks its keys and the cursor still advances. A failed
+- **Fails the round if:** the round was asked to stop and a request of the phase fails or leaves its
+  cursor write's outcome unknown. Any other failure is logged ("namespace janitor stopped this round")
+  and the round goes on. A failed batch `DELETE` leaks its keys and the cursor still advances. A failed
   `LIST` resets the cursor to the stream start only on the first page of the phase; on a later page
   the cursor the previous page published stays
 - **Observability:** phase row `namespace_cleanup`; metrics `janitor_pages`, `janitor_keys`,
@@ -761,7 +764,8 @@ from the catalog.
 
 ## Phase 18 — orphan sweep {#phase-18-orphan-sweep}
 
-The last phase: executes the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep)
+Runs right after phase 15, before the janitor and the ref object cleanup, because the committed cursor
+has already moved past its nominations. Executes the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep)
 planned in phase 10 and adopted by phase 13's `CAS`. Planning runs only when the schedule requests
 it and the destructive gate permits it. The default wait before starting another traversal is
 one hour, subject to the clock-skew rule below. Successful pages of an active traversal continue
@@ -1296,8 +1300,11 @@ A `Finish` row of `system.cas_gc_log` carries one of: `Success` (folded and comm
 (phase 4 chose not to fold), `NotALeader` (returned after phase 1), `Aborted` (the round threw a
 *transient* error — `S3_ERROR`, `NETWORK_ERROR`, `TIMEOUT_EXCEEDED`, `SOCKET_TIMEOUT`, `ABORTED`,
 `MEMORY_LIMIT_EXCEEDED` — and this `Gc` keeps its leadership and heartbeat, so the next round simply
-retries), `Stopped` (a transient error while the disk was being torn down), or `Error` (any other
-error code, notably `CORRUPTED_DATA` and `LOGICAL_ERROR`; leadership is dropped). The `error_code`
+retries), `Stopped` (the round was stopped: a manual round whose query was killed or timed out ended
+with `QUERY_WAS_CANCELLED` or a transient error, or a round ended with a transient error after the disk
+began tearing down or after it saw `SYSTEM CAS GC STOP`), or `Error` (any other
+error code, notably `CORRUPTED_DATA` and `LOGICAL_ERROR`; leadership is dropped). A `Stopped` round
+may already have committed its `gc/state`: see [post-commit failures](#post-commit-failures). The `error_code`
 column carries the code on `Aborted`, `Stopped` and `Error` and is `0` otherwise; every
 unrecognised code is `Error` by omission, never silently transient.
 
