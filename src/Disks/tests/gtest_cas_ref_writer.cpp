@@ -28,6 +28,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -5327,6 +5328,47 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingKeepsTheWriteLaneClosed
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }
 
+/// A failure after the lane closed but before the removal's error handler is armed sent nothing,
+/// so it must not leave a `Live` lane closed.
+TEST(CASRefWriterNamespaceRemoval, ThrowDuringRemovalSetupCannotStrandLiveLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/throw_during_removal_setup"};
+    publishEmptyPart(store, ns, "owned");
+
+    store->setRemovalAttemptHookForTest([] { throw std::runtime_error("setup failed"); });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    store->setRemovalAttemptHookForTest({});
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns)) << "the lane of a Live namespace must be open again";
+    EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// The guard must not reopen after an earlier ambiguous `Live -> Removing` send: that write may still land.
+TEST(CASRefWriterNamespaceRemoval, ThrowDuringRemovalSetupAfterAmbiguousWriteKeepsTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/throw_in_setup_after_ambiguous_write"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns);
+
+    store->setRemovalAttemptHookForTest([] { throw std::runtime_error("setup failed"); });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    store->setRemovalAttemptHookForTest({});
+    expectPositiveLaneClosed(store, ns);
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
 /// The uncertainty outlives the call that created it: a retried removal that fails before it sends
 /// anything, then sees an unchanged `Live` row, must not reopen the lane.
 TEST(CASRefWriterNamespaceRemoval, FailedRetryAfterAmbiguousBeginRemovingDoesNotReopenTheLane)
@@ -5375,9 +5417,9 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingSurvivesRefTableEvictio
     EXPECT_NO_THROW(store->dropNamespace(ns));
 }
 
-/// Upper bound on the virtual time one drop may spend: the window frozen at its entry, one backoff draw
-/// the pace does not consult the deadline for (the cap of `Retry::backoff`), and slack for
-/// the virtual clock's extra millisecond per pause.
+/// Upper bound on the virtual time a request may spend after it starts: its own window, one backoff draw
+/// the pace does not consult the deadline for (the cap of `Retry::backoff`), and slack for the virtual
+/// clock's extra millisecond per pause.
 const uint64_t kMaxBackoffDrawMs = 5000;
 const uint64_t kVirtualClockPauseSlackMs = 100;
 const uint64_t kOneWindowPlusBackoffMs
@@ -5880,9 +5922,9 @@ TEST(CASRefWriterNamespaceRemoval, EntryChangedAfterASentAttemptKeepsTheLaneClos
     expectPositiveLaneClosed(store, ns);
 }
 
-/// A creator-fence read made while the drop decides must draw on the drop's one frozen window: a slow
-/// first read plus a failing fence read must not exceed that window.
-TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDeadline)
+/// A slow first catalog read carries the clock past a whole window; the creator-fence read after it is
+/// sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsCreatorFenceReadAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
@@ -5898,14 +5940,14 @@ TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDe
     creating.creator = CreatorFence{.server_root_id = foreign_creator, .writer_epoch = 7, .fence_generation = 1};
     casAdmitEntryForTest(backend, layout, 1, creating);
 
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     size_t fence_reads = 0;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
         if (key == layout.mountKey(foreign_creator))
         {
@@ -5917,31 +5959,31 @@ TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDe
 
     const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
-    ASSERT_TRUE(first_catalog_read_done);
+    ASSERT_TRUE(first_read_ended_ms.has_value());
     EXPECT_GT(fence_reads, 0U) << "the creator fence was never read";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the creator-fence read outlived its own window";
 }
 
-/// The `gc/state` read is part of the removal decision, so it draws on the same window as the catalog read
-/// that came before it.
-TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsReads)
+/// A slow first catalog read carries the clock past a whole window; the `gc/state` read of the removal
+/// decision is sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsGcStateReadAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/one_window_across_reads"};
+    const RootNamespace ns{"srv1/gc_state_read_after_slow_read"};
     publishEmptyPart(store, ns, "owned");
 
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     size_t gc_state_reads = 0;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
         if (key == layout.gcStateKey())
         {
@@ -5953,32 +5995,32 @@ TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsReads)
 
     const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
-    ASSERT_TRUE(first_catalog_read_done);
-    EXPECT_GT(gc_state_reads, 0U) << "the gc/state read was never reached";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    ASSERT_TRUE(first_read_ended_ms.has_value());
+    EXPECT_GT(gc_state_reads, 0U) << "the gc/state read was never sent";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the gc/state read outlived its own window";
 }
 
-/// The `Live -> Removing` catalog update draws on the drop's one frozen window too: a slow first read
-/// plus catalog writes that never land must not exceed that window.
-TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsCatalogUpdate)
+/// A slow first catalog read carries the clock past a whole window; the `Live -> Removing` catalog
+/// update is sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsCatalogUpdateAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/one_window_across_catalog_update"};
+    const RootNamespace ns{"srv1/catalog_update_after_slow_read"};
     publishEmptyPart(store, ns, "owned");
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted;
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
     };
     SCOPE_EXIT({ backend->read_observer = nullptr; });
@@ -5986,27 +6028,51 @@ TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsCatalogUpdate)
     const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
-    ASSERT_TRUE(first_catalog_read_done);
-    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "no catalog write was attempted";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    ASSERT_TRUE(first_read_ended_ms.has_value());
+    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "no catalog write was sent";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the catalog update outlived its own window";
 }
 
-/// A local wait that outlasts the window is not cut short. The next read gives up at once with nothing
-/// sent, the catch-side read has its own window and finds the row `Live`, and the lane reopens.
-TEST(CASRefWriterNamespaceRemoval, AWaitLongerThanTheWindowEndsTheDropAndLeavesTheLaneOpen)
+/// A gap longer than the window between two requests of the removal does not end it: the reads after
+/// the gap are sent.
+/// The `gc/state` read then fails before any write is sent, the catch-side read finds the row `Live`, and
+/// the lane reopens.
+TEST(CASRefWriterNamespaceRemoval, AReadFailingAfterAGapLongerThanTheWindowLeavesTheLaneOpen)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/wait_longer_than_window"};
+    const RootNamespace ns{"srv1/gap_longer_than_window"};
     publishEmptyPart(store, ns, "owned");
 
-    store->setRemovalAttemptHookForTest([&] { clock->advance(kDefaultRequestWindowMs + 10'000); });
+    std::optional<uint64_t> gap_ended_ms;
+    store->setRemovalAttemptHookForTest([&]
+    {
+        clock->advance(kDefaultRequestWindowMs + 10'000);
+        gap_ended_ms = clock->nowMs();
+    });
     SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    size_t gc_state_reads = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.gcStateKey() && gap_ended_ms)
+        {
+            ++gc_state_reads;
+            throw DB::Exception(DB::ErrorCodes::S3_ERROR, "simulated transient GET failure");
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+    const size_t catalog_writes_before = catalogWritesInJournal(backend, layout);
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "gave up at the policy deadline", [&] { store->dropNamespace(ns); });
+    ASSERT_TRUE(gap_ended_ms.has_value());
+    EXPECT_GT(gc_state_reads, 0U) << "the removal's reads after the gap were never sent";
+    EXPECT_LE(clock->nowMs() - *gap_ended_ms, kOneWindowPlusBackoffMs)
+        << "the gc/state read outlived its own window";
+    EXPECT_EQ(catalogWritesInJournal(backend, layout), catalog_writes_before) << "a catalog write was sent";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
     EXPECT_NO_THROW(updatePublishedAt(store, ns));
 }
@@ -7753,7 +7819,7 @@ CasRequestBudget sealTestTinyBudget()
 
 /// ===================================================================================
 /// Layer 1 of the stuck-table-load fix: `ensureRefTableRecovered` retries a whole recovery attempt
-/// after a TRANSIENT object-store NETWORK_ERROR (bounded by `recovery_retry_budget_ms`), instead of
+/// after a TRANSIENT object-store NETWORK_ERROR (bounded by `kCasMaxRecoveryWalks`), instead of
 /// failing the table's async load permanently. Non-transient errors and the terminal vanish-race
 /// brake still fail fast.
 /// ===================================================================================
@@ -7857,11 +7923,13 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
         << "the chain is closed by one tombstone without enumerating the stream";
 }
 
-TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
+/// A transient failure that never clears ends recovery after `kCasMaxRecoveryWalks` walks, however much
+/// time the pauses take: seven 60 s pauses pass and no elapsed-time check ends the loop.
+TEST(CASRefWriterRecoveryRetry, TransientFailureThatNeverClearsPropagatesAfterTheWalkCap)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
-    const RootNamespace ns{"srv1/retry_budget"};
+    const RootNamespace ns{"srv1/retry_cap"};
 
     seedSealFixtureDeadEpochs(backend, layout, ns);
     seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
@@ -7873,13 +7941,11 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
 
     PoolConfig config;
     config.server_id = UInt128(1);
-    /// Lease TTL >> the recovery budget so the CLOCK-advancing backoff below trips the budget check,
-    /// not the mount fence -- this test specifically exercises the budget-exhaustion path.
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(600000);
+    /// Lease TTL far above the total pause time, so the fence never ends the loop before the cap does.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(3'600'000);
     config.cas_request_budget = sealTestTinyBudget();
-    config.cas_request_budget.recovery_retry_budget_ms = 5000;   /// small, deterministic
-    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
-    config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 60'000;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 60'000;
     config.boot_ms_fn = [fake_now] { return fake_now->load(); };
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
@@ -7889,9 +7955,16 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     /// The tombstone at `{2,2}`, the slot after the chain's last record, is the first log the walk writes.
     const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
-    backend->fault_count = 1000;   /// never stops failing within the budget
+    backend->fault_latched = true;
 
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries];
+    const uint64_t clock_before = fake_now->load();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
+
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before + (kCasMaxRecoveryWalks - 1))
+        << "eight walks mean seven pauses";
+    EXPECT_GE(fake_now->load() - clock_before, uint64_t{7} * 60'000) << "420 s of pauses passed, so no elapsed-time check ended the loop";
 }
 
 TEST(CASRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
@@ -8018,6 +8091,195 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     /// concurrent-safe second recovery would deadlock or mis-behave.
     sleep_should_throw->store(false);
     EXPECT_EQ(store->listRefs(ns).size(), 2u) << "a second touch must recover; the retry lane is not wedged";
+}
+
+/// ===================================================================================
+/// The recovery loop ends after `kCasMaxRecoveryWalks` walks in total, whichever mix of transient
+/// failures and structural restarts spent them. Pauses are no-ops, so only the cap can end the loop.
+/// ===================================================================================
+
+namespace
+{
+
+enum class WalkFate : uint8_t
+{
+    Succeed,
+    FailTransiently,
+    /// The walk ends by finding `_ckpt` replaced, which asks for a restart.
+    Restart,
+    Corrupt,
+};
+
+/// Decides each walk's fate from its position; a walk past the end of the script succeeds.
+struct RecoveryWalkScript
+{
+    std::vector<WalkFate> fates;
+    int transient_code = DB::ErrorCodes::S3_ERROR;
+    /// Set before the recovery starts; run on the recovering thread.
+    std::function<void(uint32_t walk)> before_walk;
+    std::function<void()> on_pause;
+    std::function<void(const String & key)> on_read;
+    std::atomic<bool> armed{false};
+    std::atomic<uint32_t> walks{0};
+    std::atomic<uint32_t> pauses{0};
+    std::atomic<uint32_t> ckpt_reads_in_walk{0};
+    std::atomic<bool> replacing_ckpt{false};
+
+    WalkFate current() const
+    {
+        const uint32_t n = walks.load();
+        return n >= 1 && n <= fates.size() ? fates[n - 1] : WalkFate::Succeed;
+    }
+};
+
+struct ScriptedRecovery
+{
+    std::shared_ptr<RefWriterTestBackend> backend;
+    std::shared_ptr<RecoveryWalkScript> script;
+    PoolPtr store;
+    RootNamespace ns;
+};
+
+/// With `production_backoff_ms`, the pool keeps its own backoff and pauses that long after a failed walk.
+ScriptedRecovery openScriptedRecovery(std::vector<WalkFate> fates, std::optional<uint64_t> production_backoff_ms = std::nullopt)
+{
+    ScriptedRecovery scripted;
+    scripted.backend = std::make_shared<RefWriterTestBackend>();
+    scripted.script = std::make_shared<RecoveryWalkScript>();
+    scripted.script->fates = std::move(fates);
+    scripted.ns = RootNamespace{"srv1/walk_cap"};
+    const Layout layout("p");
+
+    seedSealFixtureDeadEpochs(scripted.backend, layout, scripted.ns);
+    seedUncleanPredecessorMount(scripted.backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.boot_ms_fn = [] { return uint64_t{1'000'000}; };
+    config.wait_sleep_fn = [](uint64_t) {};
+    if (production_backoff_ms)
+    {
+        config.cas_request_budget.recovery_retry_initial_backoff_ms = *production_backoff_ms;
+        config.cas_request_budget.recovery_retry_max_backoff_ms = *production_backoff_ms;
+    }
+    config.recovery_pre_first_request_hook_for_test = [script = scripted.script]
+    {
+        if (!script->armed)
+            return;
+        const uint32_t walk = ++script->walks;
+        script->ckpt_reads_in_walk = 0;
+        if (script->before_walk)
+            script->before_walk(walk);
+        if (script->current() == WalkFate::FailTransiently)
+            throw DB::Exception(script->transient_code, "scripted walk failure");
+        if (script->current() == WalkFate::Corrupt)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "scripted walk corruption");
+    };
+    scripted.store = openPoolWithConfig(scripted.backend, config);
+    if (!production_backoff_ms)
+    {
+        scripted.store->setCasRetrySleepForTest([](uint64_t) {});
+        scripted.store->setRefRecoveryRetrySleepForTest([script = scripted.script](uint64_t, const auto &)
+        {
+            ++script->pauses;
+            if (script->on_pause)
+                script->on_pause();
+        });
+    }
+
+    /// A walk reads `_ckpt` first and last; replacing it between the two makes the last read disagree.
+    const NamespaceLifeId life = lifeIfCatalogedForTest(scripted.backend, layout, scripted.ns).value();
+    const String ckpt_key = layout.refCkptKey(life);
+    scripted.backend->read_observer = [script = scripted.script, ckpt_key, layout, life,
+                                       weak_backend = std::weak_ptr<RefWriterTestBackend>(scripted.backend)](const String & key)
+    {
+        if (script->armed && script->on_read)
+            script->on_read(key);
+        if (!script->armed || key != ckpt_key || script->replacing_ckpt)
+            return;
+        if (++script->ckpt_reads_in_walk != 2 || script->current() != WalkFate::Restart)
+            return;
+        script->replacing_ckpt = true;
+        SCOPE_EXIT({ script->replacing_ckpt = false; });
+        const BackendPtr backend_ptr = weak_backend.lock();
+        ASSERT_TRUE(backend_ptr);
+        const auto sampled = readCkptForTest(backend_ptr, layout, life);
+        ASSERT_TRUE(sampled);
+        ASSERT_TRUE(replaceForTest(backend_ptr, ckpt_key, encodeRefCkptAtGeneration(sampled->ckpt, 3), sampled->etag));
+    };
+    scripted.script->armed = true;
+    return scripted;
+}
+
+}
+
+TEST(CASRefWriterRecoveryRetry, SuccessOnTheEighthWalkInstalls)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(7, WalkFate::FailTransiently));
+
+    EXPECT_EQ(scripted.store->listRefs(scripted.ns).size(), 2u);
+    EXPECT_EQ(scripted.script->walks.load(), 8u);
+}
+
+TEST(CASRefWriterRecoveryRetry, ATransientFailureOnTheEighthWalkRethrows)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(8, WalkFate::FailTransiently));
+
+    /// The failure of the last walk propagates unchanged, not recoded as a retry-later error.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 7u) << "a pause follows every failed walk except the last";
+}
+
+TEST(CASRefWriterRecoveryRetry, AStructuralRestartOnTheEighthWalkReportsExhaustion)
+{
+    std::vector<WalkFate> fates(5, WalkFate::FailTransiently);
+    fates.insert(fates.end(), 3, WalkFate::Restart);
+    auto scripted = openScriptedRecovery(std::move(fates));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the last walk restarted because the checkpoint or its base moved",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 5u);
+}
+
+TEST(CASRefWriterRecoveryRetry, MixedFailuresEndAtEightWalks)
+{
+    using enum WalkFate;
+    auto scripted = openScriptedRecovery({Restart, FailTransiently, Restart, Restart, FailTransiently, Restart,
+                                          FailTransiently, FailTransiently});
+
+    /// Transient failures end at walks 2, 5, 7 and 8; the last one is not followed by a pause.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 3u);
+}
+
+/// The eighth walk is also the fourth restart in a row, so the structural brake reports it.
+TEST(CASRefWriterRecoveryRetry, TheEighthWalkAsTheFourthConsecutiveRestartHitsTheBrake)
+{
+    std::vector<WalkFate> fates(4, WalkFate::FailTransiently);
+    fates.insert(fates.end(), 4, WalkFate::Restart);
+    auto scripted = openScriptedRecovery(std::move(fates));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "restarted 3 times",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u);
+}
+
+/// Guard: restarts alone stop at the structural brake (the initial walk plus three restarts), well
+/// before the cap.
+TEST(CASRefWriterRecoveryRetry, TheStructuralBrakeEndsBeforeEightWalks)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(20, WalkFate::Restart));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "restarted 3 times",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 4u);
 }
 
 /// ===================================================================================

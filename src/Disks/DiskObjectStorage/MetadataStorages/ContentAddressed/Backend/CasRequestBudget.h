@@ -11,7 +11,7 @@ inline constexpr uint64_t kDefaultRequestWindowMs = 120000;
 /// The limits a writable mount is configured with. `CasMountRuntime::admit` measures a request against
 /// `lease_safety_margin_ms` plus a caller-supplied need expressed in attempt envelopes (one for an
 /// ordinary attempt, TWO for a ref-log append's write-plus-settlement-read -- see
-/// `CasMountRuntime::refAppendFenceOk`), and the three `recovery_retry_*` fields bound a whole
+/// `CasMountRuntime::refAppendFenceOk`), and the `recovery_retry_*` backoff fields pace a whole
 /// ref-table recovery; see `validateCasRequestBudget` for the relationship a writable mount enforces
 /// at startup.
 struct CasRequestBudget
@@ -42,19 +42,14 @@ struct CasRequestBudget
 
     /// Recovery-level retry (`CasRefLedger::ensureRefTableRecovered`): a whole ref-table recovery
     /// attempt (LIST + snapshot/log GETs + seal PUT) that fails with a transient NETWORK_ERROR is
-    /// retried, with capped-exponential backoff, until this total wall-clock budget is spent — then the
-    /// error propagates and the table's load fails for this touch (the `lazy_load_tables` database
-    /// setting makes the NEXT touch retry). This sits ON TOP of each write's own `Retry` policy window
-    /// (`request_window_ms`): one recovery attempt may itself burn that long inside a single seal PUT, so the
-    /// storage layer sets this to twice the window. Not part of the inequality set validated in
+    /// retried, with capped-exponential backoff, until `kCasMaxRecoveryWalks` walks have started — then
+    /// the error propagates and the table's load fails for this touch (the `lazy_load_tables` database
+    /// setting makes the NEXT touch retry). Not part of the inequality set validated in
     /// `validateCasRequestBudget`.
-    uint64_t recovery_retry_budget_ms = 2 * kDefaultRequestWindowMs;
     uint64_t recovery_retry_initial_backoff_ms = 1000;
     uint64_t recovery_retry_max_backoff_ms = 30000;
 };
 
-/// Sets `request_window_ms` and derives `recovery_retry_budget_ms` as twice the window, saturating: one
-/// recovery attempt can spend a whole window inside a single write.
 void setCasRequestWindow(CasRequestBudget & budget, uint64_t window_ms);
 
 /// Throws `BAD_ARGUMENTS` unless `attemptEnvelopeMs() < request_window_ms`: the bound of a read-only open,

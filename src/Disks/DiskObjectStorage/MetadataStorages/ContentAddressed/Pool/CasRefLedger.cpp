@@ -1659,7 +1659,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     ///
     /// Captured for the WHOLE call, not per attempt, for the same reason: the transient-retry loop below
     /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
-    /// re-drive under a moved generation (below), so the budget is never burned on a doomed retry.
+    /// re-drive under a moved generation (below), so no walk is spent on a doomed retry.
     const uint64_t admitted_generation = rt.admitted_fence_generation;
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery walk admission");
     /// Preserve this runtime's exact writer identity across the unlocked walk. The runtime stays in
@@ -1673,11 +1673,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     /// Outer transient-retry loop, so a blip does not fail a table load for good: a whole recovery attempt that
     /// fails with a TRANSIENT object-store transport error (`isTransientRecoveryError` -- `S3_ERROR`/
     /// socket/timeout from the direct LIST/GET backend calls, or a controller `NETWORK_ERROR`) is retried
-    /// with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of propagating
-    /// and failing this table's async load permanently. Non-transient errors (corruption, decode, a moved
-    /// fence, logic, resource limits) fail fast; so do the latched terminal cases below.
-    const uint64_t recovery_start_ms = boot_ms_now_fn();
+    /// with capped-exponential backoff until `kCasMaxRecoveryWalks` walks have started, instead of
+    /// propagating and failing this table's async load permanently. Non-transient errors (corruption,
+    /// decode, a moved fence, logic, resource limits) fail fast; so do the latched terminal cases below.
     uint64_t recovery_retry_num = 0;
+    /// Walks started so far, retried or restarted alike.
+    uint32_t walks_started = 0;
     bool vanish_brake_tripped = false;
     bool cancelled = false;
     for (;;)
@@ -1692,7 +1693,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                     if (attempt > kRefRecoveryMaxRestarts)
                     {
                         /// Terminal, NOT a transient object-store outage: latch so the outer retry loop
-                        /// rethrows immediately instead of re-driving this brake for the whole budget.
+                        /// rethrows immediately instead of re-driving this brake for the remaining walks.
                         vanish_brake_tripped = true;
                         if (hole_detail)
                             throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -1717,6 +1718,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 /// and `rt` is read only through atomics the poll consults. Unlocking is what keeps a
                 /// recovery's full I/O envelope from stalling every reader of this table -- and what lets
                 /// the self-remount barrier take the lock promptly to JOIN us.
+                ++walks_started;
                 lock.unlock();
                 std::optional<RecoveryResult> walked;
                 try
@@ -1740,7 +1742,20 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 lock.lock();
 
                 if (!walked)
+                {
+                    /// When the structural brake also trips on the next pass, it reports the more specific cause.
+                    if (walks_started >= kCasMaxRecoveryWalks && attempt < kRefRecoveryMaxRestarts)
+                    {
+                        /// A fence lost during the last walk is the answer, not the count.
+                        refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery restart");
+                        throwCasRequestRetryLater(fmt::format(
+                            "CAS ref-table recovery for namespace '{}': did not converge after {} walks ({})",
+                            ns.string(), walks_started,
+                            hole_detail ? "last walk found: " + *hole_detail
+                                        : String("the last walk restarted because the checkpoint or its base moved")));
+                    }
                     continue;   /// restart requested (vanished base, or a hole worth one more reading)
+                }
                 if (life_removed)
                     break;
 
@@ -1820,16 +1835,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             if (rt.recovery_cancel_requested.load(std::memory_order_acquire))
                 checkRecoveryStillAdmitted(ns, rt, cancelled, token);
 
-            const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
-            /// Fail closed BEFORE sleeping: budget spent, mount fence lost, this runtime superseded by a
-            /// self-remount, or the incarnation that admitted this recovery has moved (retrying under a
-            /// generation that is already stale can only ever be refused at the install).
-            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
-                || (token && token->stopping())
-                || !fence_ok_fn()
-                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-                || rt.superseded_by_remount.load(std::memory_order_acquire)
-                || fence_generation_fn() != admitted_generation)
+            /// Fail closed BEFORE sleeping.
+            if (!mayRetry())
+                throw;
+
+            /// The walk cap ends the loop without a pause; the original error propagates like the exits above.
+            if (walks_started >= kCasMaxRecoveryWalks)
                 throw;
 
             /// Saturating `initial << recovery_retry_num`: `initial > cap >> n` implies the unshifted
@@ -1844,9 +1855,9 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             ProfileEvents::increment(ProfileEvents::CASRefRecoveryRetries);
             LOG_WARNING(getLogger("CasRefLedger"),
                 "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
-                "(code {}: {}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
+                "(code {}: {}); retry #{} after {}ms backoff",
                 ns.string(), code, getCurrentExceptionMessage(/*with_stacktrace=*/false),
-                recovery_retry_num, backoff_ms, elapsed_ms, cas_request_budget.recovery_retry_budget_ms);
+                recovery_retry_num, backoff_ms);
 
             lock.unlock();
             /// Re-acquire the lock before letting any exception from the sleep unwind, so the SCOPE_EXIT
@@ -1862,16 +1873,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 throw;
             }
             lock.lock();
-            /// The fence/supersession/budget can all change during the unlocked sleep -- re-check before
-            /// starting the next full attempt so we never re-drive recovery on an orphaned runtime, past
-            /// the budget, or under a lost or moved fence (the sliced sleep may have woken early on fence
-            /// loss).
-            if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
-                || (token && token->stopping())
-                || !fence_ok_fn()
-                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-                || rt.superseded_by_remount.load(std::memory_order_acquire)
-                || fence_generation_fn() != admitted_generation)
+            /// A query stopped in the pause vetoes the next walk.
+            if (walk_failed && Cas::queryStopRequested())
+                std::rethrow_exception(unresolved_error ? unresolved_error : std::current_exception());
+            /// The fence and supersession can change during the unlocked sleep, which may also have woken
+            /// early on fence loss.
+            if (!mayRetry())
                 throw;
             /// loop: re-run recovery from a fresh checkpoint read, exact replay and walk
         }

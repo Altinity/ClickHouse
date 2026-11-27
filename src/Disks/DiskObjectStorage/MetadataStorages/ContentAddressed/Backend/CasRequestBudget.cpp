@@ -31,9 +31,6 @@ uint64_t CasRequestBudget::attemptEnvelopeMs() const
 void setCasRequestWindow(CasRequestBudget & budget, uint64_t window_ms)
 {
     budget.request_window_ms = window_ms;
-    budget.recovery_retry_budget_ms = window_ms > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max()
-        : 2 * window_ms;
 }
 
 void validateCasRequestWindow(const CasRequestBudget & budget)
