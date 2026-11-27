@@ -141,7 +141,7 @@ A query that is killed with `KILL QUERY` or hits its time limit stops `CAS` work
 - A retry after a failed request. The retry is not sent. When a read or a blob upload failed before the stop, the query fails with that request's error, or with a retry-later `NETWORK_ERROR` (210) that names a credential refusal, not with the stop's own error. That request's error can itself be `TIMEOUT_EXCEEDED` (159), when the failed attempt timed out. When a metadata write failed before the stop, the query fails with a retry-later `NETWORK_ERROR` (210) that says the write is unresolved and what a read of the key found; it does not carry the store's error. A metadata write that the store refused, with no earlier attempt left unanswered, keeps the store's error. When such a write was refused for its credentials and the stop cancels its resend with fresh credentials, it fails with a retry-later `NETWORK_ERROR` (210) that names the refusal. When the request fails after the stop, the S3 client reports the stop itself (see below). The pause before a retry notices the stop within 200 ms. A pause inside cleanup that the operation owes after a send runs to its end, and the request is sent once more unless the mount fence, the mount lease or a deadline stops it; if that attempt fails after the stop, it is not retried.
 - The next step of work that `CAS` can resume later: the catalog cleanup of a manual `SYSTEM CAS GC RUN`, the drain of `SYSTEM CAS DROP POOL MEMBER`, and the upload of a blob body the writer has to publish, because the store does not hold the blob or holds one the writer cannot reuse. The query fails with `QUERY_WAS_CANCELLED` or `TIMEOUT_EXCEEDED`. When an earlier upload attempt of the same blob failed, the check before the next upload fails the query with that attempt's error instead. The drain checks the stop before each of the member's namespaces, before the listing of its manifests and after each page of that listing arrives, before each group of its manifests and before each key it deletes. A `SYSTEM CAS DROP POOL MEMBER` stopped after its drain began leaves the member retired; rerun it to finish. Stopped before that, it can leave the member as it was.
 
-Everywhere else the `CAS` requests of a stopped query run as on a plain S3 disk. This covers the first attempt of every request, a new decision after another writer won a race before the stop, waits for other callers, cleanup after a failed write, transaction rollback, dropping a table or a temporary table, `SYSTEM CAS FORGET`, and the scan of `SYSTEM CAS FSCK`.
+Everywhere else the `CAS` requests of a stopped query run as on a plain S3 disk, except the upload of a part that is being built (see below). This covers the first attempt of every other request, a new decision after another writer won a race before the stop, waits for other callers, cleanup after a failed write, transaction rollback, dropping a table or a temporary table, `SYSTEM CAS FORGET`, and the scan of `SYSTEM CAS FSCK`.
 
 The S3 client reports a stopped query's error in place of any failed answer from the store, as on a plain S3 disk. This includes an expected answer of a healthy store, such as `404` for a key that does not exist. So the query can still fail with `QUERY_WAS_CANCELLED` or `TIMEOUT_EXCEEDED` when the store answers with an error after the stop. A bulk delete that the store answers successfully, with an error for one of its keys, keeps that key's error. Writes of several queries to one table's metadata can be sent together by one of them. When that query is stopped, such a failed answer can fail the other queries' writes in the same request too.
 
@@ -154,9 +154,26 @@ Two background owners stop `CAS` work at its next step, with their own error:
 
 A `GC` round that `SYSTEM CAS GC STOP` ends is recorded as `Stopped` in `system.cas_gc_log`. A manual round whose query is killed or timed out is recorded as `Stopped` when it ends with `QUERY_WAS_CANCELLED`, or with one of the transient errors `S3_ERROR`, `NETWORK_ERROR`, `SOCKET_TIMEOUT`, `TIMEOUT_EXCEEDED`, `ABORTED` or `MEMORY_LIMIT_EXCEEDED`. It is recorded as `Error` when it ends with any other error, for example `READONLY`. A stop that comes after the round's last check leaves the round's own outcome.
 
+A stop also ends the upload of a part that is being built:
+
+- The `INSERT` ends with `QUERY_WAS_CANCELLED` after `KILL QUERY`, or with `TIMEOUT_EXCEEDED` when it reaches
+  `max_execution_time` with `timeout_overflow_mode = 'throw'`. It may be retried unchanged.
+- The stop is noticed while a blob body is being sent, usually within a second. A bandwidth limit can add its own
+  wait. No time is promised.
+- With `cas_staging_backend = s3` the write to the staging object is what is stopped, also for a data file written
+  into an existing part.
+- A blob body that was cut may still have reached the store. Cleanup is best effort, and the rest is left to GC. The
+  next mount start removes a staging object.
+- The server aborts the incomplete multipart upload of a cut body. If the abort fails, the upload stays until the
+  bucket's lifecycle rule removes it.
+- A stopped upload may log an error line for each cancelled request of a multipart upload.
+- The upload of a merge, a mutation, a background replication fetch or a background move is not stopped. Server
+  shutdown waits for it. A fetch or a move that a query runs itself (`ALTER TABLE ... FETCH PARTITION`,
+  `ALTER TABLE ... MOVE PARTITION`) is stopped with that query.
+
 No stop interrupts:
 
-- A request already in flight.
+- Any other request already in flight.
 - The first attempt of a read, and a read that only waits for another reader's result.
 - A recovery walk that is already running. On S3 the walk of a stopped query still fails at the first error answer. A walk that looks for a record after its last one ends with such an answer, the `404` for that key; a walk that ends at the table's final removal record looks for none. The failed read is not retried. When the stop cuts short the read that follows a refused write of the walk, the walk ends with a retry-later `NETWORK_ERROR` (210) instead of starting again.
 - Cleanup that the operation owes after a send, and merges.

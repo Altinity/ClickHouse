@@ -453,6 +453,25 @@ Source: `ServerSettings.cpp`. This setting is process-wide rather than scoped to
 |---|---|---|
 | `cas_blob_upload_pool_size` | `64` | Size of the dedicated server-wide thread pool used to upload blobs in parallel when committing a `CAS` part. Zero is rejected: the pool must have at least one thread |
 
+## Write bandwidth limits {#write-bandwidth-limits}
+
+These limits pace blob bodies and part files staged in the object store with `cas_staging_backend = s3`:
+
+| Setting | Paces |
+|---|---|
+| `max_remote_write_network_bandwidth` | The uploads of the query |
+| `max_remote_write_network_bandwidth_for_server` | Every upload of the server, also merges, mutations and moves |
+| `max_network_bandwidth_for_user`, `max_network_bandwidth_for_all_users` | Uploads that run under a query, together with the query's other network traffic that these limits count |
+
+Part manifests, refs, the catalog, the mount lease, the GC state and deletes are never paced by these limits.
+
+A request that the S3 client sends by itself during an upload may be throttled with the upload. Two such requests
+are a token request with `http_client = gcp_oauth` and the bucket region lookup of a client that has not sent a
+request yet.
+
+After an upgrade, a server that already has one of these limits set starts to pace `CAS` uploads. A low server-wide
+limit makes merges and mutations hold their queue slots longer, and they are not stopped while they upload.
+
 ## `SYSTEM CAS` commands {#system-commands}
 
 `SYSTEM CAS GC RUN`, `SYSTEM CAS GC STOP`, `SYSTEM CAS GC START`, `SYSTEM CAS GC REBUILD`,
