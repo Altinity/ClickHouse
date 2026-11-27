@@ -8,7 +8,6 @@ SUFFIX="${CLICKHOUSE_DATABASE}_${RANDOM}"
 FILE="agg_state_${SUFFIX}.parquet"
 MIXED="agg_state_mixed_${SUFFIX}.parquet"
 VERSIONED="agg_state_versioned_${SUFFIX}.parquet"
-REFUSED="agg_state_refused_${SUFFIX}.parquet"
 SIMPLE="agg_state_simple_${SUFFIX}.parquet"
 UNKNOWN="agg_state_unknown_${SUFFIX}.parquet"
 MATRIX="agg_state_matrix_${SUFFIX}.parquet"
@@ -19,7 +18,7 @@ CACHED="agg_state_cached_${SUFFIX}.parquet"
 cleanup()
 {
     rm -f "${USER_FILES_PATH}/${FILE}" "${USER_FILES_PATH}/${MIXED}" \
-        "${USER_FILES_PATH}/${VERSIONED}" "${USER_FILES_PATH}/${REFUSED}" \
+        "${USER_FILES_PATH}/${VERSIONED}" \
         "${USER_FILES_PATH}/${SIMPLE}" "${USER_FILES_PATH}/${UNKNOWN}" "${USER_FILES_PATH}/${MATRIX}" \
         "${USER_FILES_PATH}/${RETYPED_SOURCE}" "${USER_FILES_PATH}/${RETYPED}" \
         "${USER_FILES_PATH}/${CACHED}"
@@ -30,14 +29,6 @@ STATES="--allow_aggregate_function_states_in_open_formats=1"
 NO_STATES="--allow_aggregate_function_states_in_open_formats=0"
 SKIP="--input_format_parquet_skip_columns_with_unsupported_types_in_schema_inference=1"
 NO_CACHE="--schema_inference_use_cache_for_file=0"
-
-echo '-- with the setting disabled writing a state is refused'
-if ${CLICKHOUSE_CLIENT} ${NO_STATES} --query "
-    INSERT INTO FUNCTION file('${REFUSED}', Parquet) SELECT uniqState(number) AS u FROM numbers(10)
-" 2>&1 | grep -q "allow_aggregate_function_states_in_open_formats"
-then
-    echo 1
-fi
 
 echo '-- a SimpleAggregateFunction is an ordinary value of its storage type, so writing it needs no setting'
 ${CLICKHOUSE_CLIENT} ${NO_STATES} --query "

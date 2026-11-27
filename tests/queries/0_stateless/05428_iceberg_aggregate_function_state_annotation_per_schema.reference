@@ -14,5 +14,3 @@ x	Int64
 2	20	Int64
 1	10	Int64
 2	20	Int64
-time travel
-1	10	SimpleAggregateFunction(max, Int32)

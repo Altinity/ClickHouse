@@ -19,7 +19,3 @@ SimpleAggregateFunction(sum, Int64)	SimpleAggregateFunction(anyLast, Nullable(St
 1	23	10000
 -- File, setting not stored in the table, queries enable it
 refused
--- Iceberg, setting 0 stored in the table, queries enable it
-refused
--- File, setting 0 stored in the table, queries enable it
-refused

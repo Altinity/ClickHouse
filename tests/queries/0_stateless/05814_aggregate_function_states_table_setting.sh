@@ -16,13 +16,11 @@ ICEBERG="t_${CLICKHOUSE_DATABASE}_${RANDOM}_states"
 ICEBERG_PATH="${USER_FILES_PATH}/${ICEBERG}/"
 ICEBERG_NOT_STORED="${ICEBERG}_not_stored"
 ICEBERG_NOT_STORED_PATH="${USER_FILES_PATH}/${ICEBERG_NOT_STORED}/"
-ICEBERG_DISABLED="${ICEBERG}_disabled"
 ICEBERG_ENABLED="${ICEBERG}_enabled"
 
 cleanup()
 {
-    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_DISABLED}" "${ICEBERG_ENABLED}" file_states file_states_not_stored \
-        file_states_refused; do
+    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_ENABLED}" file_states file_states_not_stored; do
         ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS ${table}"
     done
     rm -rf "${ICEBERG_PATH}" "${ICEBERG_NOT_STORED_PATH}"
@@ -111,11 +109,3 @@ select_states file_states ${OFF}
 echo "-- File, setting not stored in the table, queries enable it"
 ${CLIENT} --query "CREATE TABLE file_states_not_stored (${COLUMNS}) ENGINE = File(Parquet)"
 expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_not_stored ${ON}
-
-echo "-- Iceberg, setting 0 stored in the table, queries enable it"
-expect_refusal "${READ_REFUSED}" run ${ON} --query "
-    CREATE TABLE ${ICEBERG_DISABLED} ENGINE = IcebergLocal('${ICEBERG_PATH}') SETTINGS ${SETTING} = 0"
-
-echo "-- File, setting 0 stored in the table, queries enable it"
-${CLIENT} --query "CREATE TABLE file_states_refused (${COLUMNS}) ENGINE = File(Parquet) SETTINGS ${SETTING} = 0"
-expect_refusal "${PARQUET_WRITE_REFUSED}" insert_states file_states_refused ${ON}

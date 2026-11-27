@@ -35,14 +35,14 @@ check()
     ${CLIENT} --query "
         SELECT k, x, toTypeName(x) FROM icebergLocal('${TABLE_PATH}') ORDER BY k
         SETTINGS allow_aggregate_function_states_in_open_formats = 1"
-    echo "time travel"
-    ${CLIENT} --query "SELECT k, x, toTypeName(x) FROM ${TABLE} ORDER BY k SETTINGS iceberg_snapshot_id = ${SNAPSHOT}"
 }
 
 echo "widen"
 ${CLIENT} --query "ALTER TABLE ${TABLE} MODIFY COLUMN x SimpleAggregateFunction(max, Int64)"
 ${CLIENT} --query "INSERT INTO ${TABLE} VALUES (2, 20)"
 check
+echo "time travel"
+${CLIENT} --query "SELECT k, x, toTypeName(x) FROM ${TABLE} ORDER BY k SETTINGS iceberg_snapshot_id = ${SNAPSHOT}"
 
 echo "drop the annotation"
 ${CLIENT} --query "ALTER TABLE ${TABLE} MODIFY COLUMN x Int64"
