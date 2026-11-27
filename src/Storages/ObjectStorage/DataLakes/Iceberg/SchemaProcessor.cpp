@@ -56,7 +56,6 @@ namespace ErrorCodes
 extern const int LOGICAL_ERROR;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
-extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace Setting
@@ -1211,20 +1210,6 @@ IcebergSchemaProcessor::getAppliedClickHouseTypeAnnotations(const ClickHouseType
 {
     if (use_clickhouse_type_annotations)
         return clickhouse_type_annotations;
-
-    for (const auto & [field_id, annotation] : clickhouse_type_annotations)
-    {
-        if (typeNameHasAggregateFunction(annotation.type_name))
-            throw Exception(
-                ErrorCodes::SUPPORT_IS_DISABLED,
-                "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`, which has aggregate "
-                "function states: enable setting allow_aggregate_function_states_in_open_formats in the table's SETTINGS (for a "
-                "table function or a `DataLakeCatalog` table, in the query)",
-                field_id,
-                annotation.type_name,
-                f_clickhouse_type,
-                field_id);
-    }
     return {};
 }
 

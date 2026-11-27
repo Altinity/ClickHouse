@@ -110,7 +110,7 @@ static Int32 getHighestFieldIdFromType(const Poco::Dynamic::Var & type_var)
 /// unknown: the catalog may have applied the update and still reported a failure, in which case
 /// re-applying the same command on the refreshed metadata would fail with "Column already exists"
 /// or "Not found column" for an ALTER that actually succeeded.
-static bool alterAlreadyApplied(const MetadataGenerator & generator, const AlterCommand & command)
+static bool alterAlreadyApplied(const MetadataGenerator & generator, const AlterCommand & command, bool allow_aggregate_function_states)
 {
     switch (command.type)
     {
@@ -121,7 +121,8 @@ static bool alterAlreadyApplied(const MetadataGenerator & generator, const Alter
         case AlterCommand::Type::RENAME_COLUMN:
             return generator.isRenameColumnApplied(command.column_name, command.rename_to);
         case AlterCommand::Type::MODIFY_COLUMN:
-            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
+            return generator.isModifyColumnApplied(
+                command.column_name, command.data_type, command.first, command.after_column, allow_aggregate_function_states);
         default:
             return false;
     }
@@ -952,7 +953,8 @@ void alter(
 
         auto metadata_json_generator = MetadataGenerator(metadata);
 
-        if (commit_attempted && alterAlreadyApplied(metadata_json_generator, params[0]))
+        if (commit_attempted && alterAlreadyApplied(
+                metadata_json_generator, params[0], persistent_table_components.schema_processor->useClickHouseTypeAnnotations()))
         {
             LOG_WARNING(
                 log,

@@ -324,6 +324,19 @@ static bool clickHouseTypeAnnotationMatches(
     return (it == annotations.end() ? String{} : it->second.type_name) == getAggregateFunctionTypeAnnotation(type);
 }
 
+/// Whether a `MODIFY COLUMN` to `type` changes the annotation of `field`. Without allow_aggregate_function_states_in_open_formats
+/// the recorded annotations are not applied, so a type that records none leaves the one of the field as it is.
+static bool clickHouseTypeAnnotationChanges(
+    const Poco::JSON::Object::Ptr & metadata_object,
+    const Poco::JSON::Object::Ptr & field,
+    const DataTypePtr & type,
+    bool allow_aggregate_function_states)
+{
+    if (!allow_aggregate_function_states && getAggregateFunctionTypeAnnotation(type).empty())
+        return false;
+    return !clickHouseTypeAnnotationMatches(metadata_object, field, type);
+}
+
 /// The state versions of the aggregate functions nested in `type`, in traversal order.
 static std::vector<size_t> getAggregateFunctionStateVersions(DataTypePtr type)
 {
@@ -396,7 +409,8 @@ bool MetadataGenerator::isRenameColumnApplied(const String & column_name, const 
     return found_new_name;
 }
 
-bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
+bool MetadataGenerator::isModifyColumnApplied(
+    const String & column_name, DataTypePtr type, bool first, const String & after_column, bool allow_aggregate_function_states) const
 {
     auto current_schema = findCurrentSchema();
     if (!current_schema)
@@ -417,7 +431,7 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
             auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
             if (field->getValue<bool>(Iceberg::f_required) != expected_type.second
                 || !Iceberg::icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
-                || !clickHouseTypeAnnotationMatches(metadata_object, field, type))
+                || clickHouseTypeAnnotationChanges(metadata_object, field, type, allow_aggregate_function_states))
                 return false;
         }
 
@@ -1003,7 +1017,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(
                         type->getName());
 
                 /// `IDataType::equals` ignores the custom name of `SimpleAggregateFunction`.
-                if (!clickHouseTypeAnnotationMatches(metadata_object, current_field, type))
+                if (clickHouseTypeAnnotationChanges(metadata_object, current_field, type, allow_aggregate_function_states))
                     annotation_changed = true;
                 else if (!needs_reposition)
                     return false;

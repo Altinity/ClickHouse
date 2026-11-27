@@ -2,7 +2,7 @@
 # Tags: no-fasttest
 # `allow_aggregate_function_states_in_open_formats` in a table's `SETTINGS` is stored with the table and decides
 # for every query on it, also after the table is re-attached. Without it, the table has the server's value, disabled by
-# default, whatever the query sets: the recorded types are not applied, and a table with aggregate function states is refused.
+# default, whatever the query sets: the recorded types are not applied, so a state column is `String`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -17,10 +17,11 @@ ICEBERG_PATH="${USER_FILES_PATH}/${ICEBERG}/"
 ICEBERG_NOT_STORED="${ICEBERG}_not_stored"
 ICEBERG_NOT_STORED_PATH="${USER_FILES_PATH}/${ICEBERG_NOT_STORED}/"
 ICEBERG_ENABLED="${ICEBERG}_enabled"
+ICEBERG_DISABLED="${ICEBERG}_disabled"
 
 cleanup()
 {
-    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_ENABLED}" file_states file_states_not_stored; do
+    for table in "${ICEBERG}" "${ICEBERG_NOT_STORED}" "${ICEBERG_ENABLED}" "${ICEBERG_DISABLED}" file_states file_states_not_stored; do
         ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS ${table}"
     done
     rm -rf "${ICEBERG_PATH}" "${ICEBERG_NOT_STORED_PATH}"
@@ -59,7 +60,6 @@ reattach()
 
 # Each gate names what it refuses, which the query text does not contain.
 CREATE_OR_ALTER_REFUSED="has type .*, which Iceberg cannot express natively"
-READ_REFUSED="Iceberg field with id [0-9]* records ClickHouse type"
 PARQUET_WRITE_REFUSED="Writing aggregate function states of column 'u' into Parquet data format is disabled"
 
 expect_refusal()
@@ -86,8 +86,12 @@ select_states "${ICEBERG}" ${OFF}
 echo "-- Iceberg, setting not stored in the table, queries enable it"
 ON="--${SETTING}=1"
 expect_refusal "${CREATE_OR_ALTER_REFUSED}" run ${ON} --query "CREATE TABLE ${ICEBERG_NOT_STORED} (${COLUMNS}) ENGINE = IcebergLocal('${ICEBERG_NOT_STORED_PATH}')"
-# The same data as `${ICEBERG}`, through a table without the setting.
-expect_refusal "${READ_REFUSED}" run ${ON} --query "CREATE TABLE ${ICEBERG_NOT_STORED} ENGINE = IcebergLocal('${ICEBERG_PATH}')"
+# The same data as `${ICEBERG}`, through a table without the setting: the columns have their Iceberg types.
+${CLIENT} ${ON} --query "CREATE TABLE ${ICEBERG_DISABLED} ENGINE = IcebergLocal('${ICEBERG_PATH}')"
+run ${ON} --query "SELECT toTypeName(u), toTypeName(s) FROM ${ICEBERG_DISABLED} LIMIT 1"
+# A `MODIFY COLUMN` to the type the column has without the setting keeps its recorded type.
+run ${ON} --query "ALTER TABLE ${ICEBERG_DISABLED} MODIFY COLUMN s Int64 FIRST"
+run ${ON} --query "SELECT toTypeName(s) FROM icebergLocal('${ICEBERG_PATH}') LIMIT 1"
 # A `SimpleAggregateFunction` holds ordinary values of its storage type, so it needs no setting. Its type is recorded,
 # but only a table with the setting applies it.
 ${CLIENT} ${ON} --query "

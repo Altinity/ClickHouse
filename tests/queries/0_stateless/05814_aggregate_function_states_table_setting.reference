@@ -10,7 +10,8 @@
 10	23	19800
 -- Iceberg, setting not stored in the table, queries enable it
 refused
-refused
+String	Int64
+SimpleAggregateFunction(sum, Int64)
 0
 Int64	Nullable(String)	45
 SimpleAggregateFunction(sum, Int64)	SimpleAggregateFunction(anyLast, Nullable(String))	45

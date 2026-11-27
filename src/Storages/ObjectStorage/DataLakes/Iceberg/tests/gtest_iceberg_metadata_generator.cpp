@@ -1268,16 +1268,23 @@ TEST(IcebergMetadataGenerator, ModifyColumnChangingOnlyTheSimpleAggregateFunctio
     tryRegisterAggregateFunctions();
     auto metadata = makeMetadataWithField("s", "long", /* required */ true);
     const auto before = readSchemaState(metadata);
-    auto modify = [&](const String & type)
+    auto modify = [&](const String & type, bool allow_aggregate_function_states = true)
     {
         return MetadataGenerator(metadata).generateModifyColumnMetadata(
-            "s", DataTypeFactory::instance().get(type), getContext().context);
+            "s", DataTypeFactory::instance().get(type), getContext().context,
+            /* first */ false, /* after_column */ {}, allow_aggregate_function_states);
     };
 
     EXPECT_TRUE(modify("SimpleAggregateFunction(sum, Int64)"));
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(sum, Int64)");
     EXPECT_FALSE(modify("SimpleAggregateFunction(sum, Int64)"));
     EXPECT_TRUE(modify("SimpleAggregateFunction(max, Int64)"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, Int64)");
+    /// Without the setting the column reads as `Int64`, so modifying it to `Int64` changes nothing.
+    EXPECT_FALSE(modify("Int64", /* allow_aggregate_function_states */ false));
+    EXPECT_TRUE(MetadataGenerator(metadata).isModifyColumnApplied(
+        "s", DataTypeFactory::instance().get("Int64"), /* first */ false, /* after_column */ {},
+        /* allow_aggregate_function_states */ false));
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, Int64)");
     EXPECT_TRUE(modify("Int64"));
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);

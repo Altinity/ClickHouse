@@ -198,7 +198,7 @@ private:
     static ClickHouseTypeAnnotations getClickHouseTypeAnnotationsOfSchema(
         const Poco::JSON::Object::Ptr & schema, const ClickHouseTypeAnnotations & clickhouse_type_annotations);
     /// All of `clickhouse_type_annotations` with allow_aggregate_function_states_in_open_formats, and none without it, so
-    /// that every field has its Iceberg type. Without it, an annotation with aggregate function states is refused.
+    /// that every field has its Iceberg type.
     ClickHouseTypeAnnotations getAppliedClickHouseTypeAnnotations(const ClickHouseTypeAnnotations & clickhouse_type_annotations) const;
     bool clickHouseTypeAnnotationsUnchanged(Int32 schema_id, const ClickHouseTypeAnnotations & schema_annotations) const
         TSA_REQUIRES_SHARED(mutex);

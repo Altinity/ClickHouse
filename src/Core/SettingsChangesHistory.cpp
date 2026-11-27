@@ -52,7 +52,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.8.39.20001.altinityantalya",
         {
-            {"allow_aggregate_function_states_in_open_formats", false, false, "New setting allowing aggregate function states in Parquet files and Iceberg tables. With it disabled, the ClickHouse types recorded in them are not applied, a Parquet state column reads as `String`, and writing a state or querying an Iceberg table with a state column throws `SUPPORT_IS_DISABLED`."},
+            {"allow_aggregate_function_states_in_open_formats", false, false, "New setting allowing aggregate function states in Parquet files and Iceberg tables. With it disabled, the ClickHouse types recorded in them are not applied, a state column reads as `String`, and writing a state throws `SUPPORT_IS_DISABLED`."},
             {"export_merge_tree_part_check_destination_schema_staleness_ms", 0, 5000, "New setting: how stale the latest Iceberg destination metadata version may be when each part export task checks that the destination schema and partition spec did not change since the export was scheduled."},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "The setting is obsolete. `EXPORT PART` and `EXPORT PARTITION` cast values the way `INSERT ... SELECT` does."},
         });

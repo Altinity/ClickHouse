@@ -19,7 +19,6 @@
 namespace DB::ErrorCodes
 {
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
-    extern const int SUPPORT_IS_DISABLED;
 }
 
 using namespace DB::Iceberg;
@@ -645,7 +644,7 @@ TEST(IcebergSchemaProcessor, InheritedAnnotationDoesNotApplyToAnEvolvedField)
 }
 
 /// Without allow_aggregate_function_states_in_open_formats the annotations are not applied, so a field has its Iceberg type,
-/// and a field with aggregate function states is refused.
+/// and a field with aggregate function states reads as `String`.
 TEST(IcebergSchemaProcessor, AnnotationsAreNotAppliedWithoutTheSetting)
 {
     tryRegisterAggregateFunctions();
@@ -659,23 +658,16 @@ TEST(IcebergSchemaProcessor, AnnotationsAreNotAppliedWithoutTheSetting)
     EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "Int64");
     EXPECT_FALSE(processor.hasClickHouseTypeAnnotation(0, 1));
 
-    try
-    {
-        processor.addIcebergTableSchema(
-            parseSchema(R"json({"schema-id":1,"fields":[{"id":2,"name":"u","required":true,"type":"binary"}]})json"),
-            context,
-            {{2, {"AggregateFunction(uniq, UInt64)"}}});
-        FAIL() << "A field with aggregate function states must be refused without the setting";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
-    }
-    EXPECT_FALSE(processor.hasClickHouseTableSchemaById(1));
+    processor.addIcebergTableSchema(
+        parseSchema(R"json({"schema-id":1,"fields":[{"id":2,"name":"u","required":true,"type":"binary"}]})json"),
+        context,
+        {{2, {"AggregateFunction(uniq, UInt64)"}}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(1)->front().type->getName(), "String");
+    EXPECT_FALSE(processor.hasClickHouseTypeAnnotation(1, 2));
 }
 
 #if USE_AVRO
-TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesTheSchema)
+TEST(IcebergSchemaProcessor, SkippingTheSchemaDoesNotPublishIt)
 {
     tryRegisterAggregateFunctions();
     Poco::JSON::Parser parser;
@@ -700,15 +692,8 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
     EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "u").has_value());
 
-    try
-    {
-        DB::IcebergMetadata::parseTableSchema(metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Parse);
-        FAIL() << "Parsing a schema with aggregate function states must be refused without the setting";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
-    }
+    DB::IcebergMetadata::parseTableSchema(metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Parse);
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "String");
 }
 
 /// Per field, the property with the greatest schema id not above the requested one is in effect.

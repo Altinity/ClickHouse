@@ -95,7 +95,13 @@ public:
     bool isDropColumnApplied(const String & column_name) const;
     bool isRenameColumnApplied(const String & column_name, const String & new_column_name) const;
     /// `type` may be null for a position-only `MODIFY COLUMN`; `first` and `after_column` are checked against the field order.
-    bool isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
+    /// `allow_aggregate_function_states` is the table's `allow_aggregate_function_states_in_open_formats`.
+    bool isModifyColumnApplied(
+        const String & column_name,
+        DataTypePtr type,
+        bool first = false,
+        const String & after_column = {},
+        bool allow_aggregate_function_states = false) const;
 
 private:
     Poco::JSON::Object::Ptr metadata_object;

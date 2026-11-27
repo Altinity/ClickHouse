@@ -1295,9 +1295,9 @@ The recorded types are applied only with
 [`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats),
 disabled by default. The table metadata chooses the deserializer for the stored bytes, so enable the setting only for
 tables from trusted sources. When it is disabled, the `clickhouse.type` properties are not applied, so a
-`SimpleAggregateFunction(f, T)` column reads as `T`. Creating an `AggregateFunction` column and any query on a table
-that has one (`SELECT`, `INSERT`, `ALTER TABLE ... UPDATE`, `OPTIMIZE TABLE`, ...) throw `SUPPORT_IS_DISABLED`.
-`SimpleAggregateFunction` types are recorded either way.
+`SimpleAggregateFunction(f, T)` column reads as `T` and a state column as `String`, the serialized state. Creating or
+adding an `AggregateFunction` column throws `SUPPORT_IS_DISABLED`. `SimpleAggregateFunction` types are recorded either
+way, and `MODIFY COLUMN` to a type without one keeps the recorded type of the column.
 
 A table takes the value from its `SETTINGS` clause, or the server's value (from the server settings profile) without
 one; the query's value does not change it. The query's value applies to table functions such as `icebergS3` and to

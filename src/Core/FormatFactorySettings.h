@@ -1749,9 +1749,9 @@ them. A state is stored as binary, with its ClickHouse type recorded in `clickho
 or `clickhouse.type.<field-id>.<schema-id>` (Iceberg table properties). The recorded type chooses the deserializer for
 the stored bytes, so enable the setting only for trusted sources.
 
-When disabled, the recorded types are not applied, so a `SimpleAggregateFunction(f, T)` column is `T` and a Parquet state
-column reads as `String`. Writing an `AggregateFunction` column throws `SUPPORT_IS_DISABLED`, and so does any query on an
-Iceberg table with a state column. `SimpleAggregateFunction` types are recorded on write either way.
+When disabled, the recorded types are not applied, so a `SimpleAggregateFunction(f, T)` column is `T` and a state column
+reads as `String`. Writing an `AggregateFunction` column throws `SUPPORT_IS_DISABLED`. `SimpleAggregateFunction` types are
+recorded on write either way.
 
 A table (for example with the `S3`, `File` or `IcebergS3` engine) takes the value from the `SETTINGS` clause of its
 engine, or the server's value (from the server settings profile) without one. The query's value does not apply to a
