@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasMigratePool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
@@ -544,7 +545,7 @@ private:
         uint64_t last_progress_ms = pool.bootMsNow();
         while (!watched.empty())
         {
-            op.pause(options.poll_step_ms);
+            op.sleepFor(options.poll_step_ms);
             /// Taken before the reads: it can confirm that a token held, never date a sighting.
             const uint64_t sample_ms = pool.bootMsNow();
             if (sample_ms >= last_progress_ms + kProgressEveryMs)
@@ -577,7 +578,7 @@ private:
         }
 
         say(fmt::format("M2: waiting {} ms in which no mount slot and no GC lease may move", grace_ms));
-        op.pause(grace_ms);
+        op.sleepFor(grace_ms);
         checkUnchanged(tokens, pairs, Window::BeforeFloor);
         say(fmt::format("M2: {} mount slot(s), {} fenced; no slot and no GC lease moved in {} ms", slot_keys.size(), fenced,
             grace_ms));
@@ -705,8 +706,8 @@ private:
                 {
                     if (e.code() != ErrorCodes::CORRUPTED_DATA)
                         throw;
-                    e.addMessage("M3: GC of this build refuses a source-edge run of the fold seal that gc/state adopts. The run "
-                        "stopped before the floor was raised to 4");
+                    addMessageUnlessQueryStoredCause(e, "M3: GC of this build refuses a source-edge run of the fold seal that "
+                        "gc/state adopts. The run stopped before the floor was raised to 4");
                     throw;
                 }
             }
@@ -836,8 +837,8 @@ private:
         }
         catch (Exception & e)
         {
-            e.addMessage("an intent create failed; nothing was written after the intents, and a rerun passes only once the "
-                "store accepts the create");
+            addMessageUnlessQueryStoredCause(e, "an intent create failed; nothing was written after the intents, and a rerun "
+                "passes only once the store accepts the create");
             throw;
         }
         if (!result.confirmed())
@@ -965,8 +966,8 @@ private:
             }
             catch (Exception & e)
             {
-                e.addMessage("M9: {} marker(s) removed in earlier pages; the pool is migrated, and a rerun or `cas-fsck --fix "
-                    "legacy-markers` removes the rest", report.legacy_markers_deleted);
+                addMessageUnlessQueryStoredCause(e, fmt::format("M9: {} marker(s) removed in earlier pages; the pool is migrated, and "
+                    "a rerun or `cas-fsck --fix legacy-markers` removes the rest", report.legacy_markers_deleted));
                 throw;
             }
             meter.add(page.size());

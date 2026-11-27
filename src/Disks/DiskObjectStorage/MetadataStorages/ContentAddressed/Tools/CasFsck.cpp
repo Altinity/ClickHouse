@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
@@ -490,7 +491,8 @@ std::optional<RefTableState> walkRefStream(
         }
         catch (const Exception & e)
         {
-            if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
+            /// A query's stored cause is no finding about the chain, whatever its code.
+            if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || isQueryStoredCause(std::current_exception()))
                 throw;
             deadline.rethrowIfOutOfTime(op, e, kWalkingRefs);
             record_failure(e.code() == ErrorCodes::CORRUPTED_DATA, e.message());
@@ -2041,7 +2043,8 @@ LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> &
     {
         if (on_progress)
             on_progress(deleted.load());
-        e.addMessage(fmt::format("{} legacy marker(s) deleted before the stop; run again to continue", deleted.load()));
+        addMessageUnlessQueryStoredCause(e, fmt::format("{} legacy marker(s) deleted before the stop; run again to continue",
+            deleted.load()));
         throw;
     }
     return {deleted.load(), changed.load()};

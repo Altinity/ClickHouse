@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
@@ -54,13 +55,16 @@ std::string_view removalName(Removal r)
 ///
 /// A per-object failure — a backend exception, a `Mismatch` or `Gone` outcome, or an object
 /// disappearing between `LIST` and `HEAD` — is recorded as a warning and does not prevent the remaining
-/// objects from being attempted while `op` is still admitted. Returns only the objects whose
-/// exact-incarnation delete was reported as `Removed`.
+/// objects from being attempted while `op` is still admitted. A stopped owner ends the drain at the next object with
+/// its verdict; a delete that failed after its query stopped ends it with that failure.
+/// Returns only the objects whose exact-incarnation delete was reported as `Removed`.
 uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vector<String> & warnings)
 {
     uint64_t deleted = 0;
     op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
+        throwIfQueryStopped();
+        throwIfBackgroundStopped();
         try
         {
             std::optional<Etag> etag = listed.etag;
@@ -84,6 +88,7 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
         }
         catch (...)
         {
+            rethrowIfStoppedOwnersFailure();
             warnings.push_back("decommission drain: " + listed.key + " delete failed: "
                                 + getCurrentExceptionMessage(/*with_stacktrace=*/false));
             return op.admitted();
@@ -350,6 +355,7 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
     std::vector<std::pair<CatalogEntry, NamespaceLifeId>> owned_lives;
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
+        throwIfQueryStopped();
         if (entry.ns.string() != victim_srid && !entry.ns.string().starts_with(victim_namespace_prefix))
             continue;
         const auto life = catalog_cut.life_index.resolve(entry.incarnation);
@@ -361,6 +367,7 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
 
     for (const auto & [selected_entry, life] : owned_lives)
     {
+        throwIfQueryStopped();
         const RootNamespace & ns = life.ns;
         const String & ns_str = ns.string();
 
@@ -428,15 +435,24 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
     {
         const String debris_prefix = admin.layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
-        op.forEachListedKey(debris_prefix, [&](const ListedKey & listed)
+        /// Checked before each page is requested and again once it arrives, for a kill that landed during the fetch.
+        String cursor;
+        do
         {
-            if (const auto parsed = admin.layout().parseManifestKey(listed.key))
-                groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
-            return true;
-        }, Retry::standard());
+            throwIfQueryStopped();
+            ListPage page = op.list(debris_prefix, cursor, CasOperation::kCasListPageKeys, Retry::standard());
+            throwIfQueryStopped();
+            for (const ListedKey & listed : page.keys)
+                if (const auto parsed = admin.layout().parseManifestKey(listed.key))
+                    groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
+            cursor = std::move(page.next_cursor);
+        } while (!cursor.empty());
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
+        {
+            throwIfQueryStopped();
             report.manifest_debris_removed += sweepNamespace(
                 admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
+        }
     }
 
     /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses

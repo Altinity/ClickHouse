@@ -13,12 +13,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include "cas_killable_query.h"
 #include "cas_test_helpers.h"
 #include "config.h"
 #if USE_AWS_S3
 #include <IO/S3Common.h>
 #endif
 
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <Poco/Exception.h>
 #include <base/scope_guard.h>
 #include <algorithm>
@@ -1207,6 +1210,71 @@ TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
         report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected access denial on exact GET");
 }
 #endif
+
+/// A query's stored cause with the `CORRUPTED_DATA` code is no finding about the chain: a killed `SYSTEM CAS FSCK`
+/// whose base read fails with it leaves the namespace unchecked instead of reporting `ChainBroken`.
+TEST(CASFsckAuthority, StoredCorruptedDataIsNotChainBroken)
+{
+    class StoredCauseOnGetBackend final : public InMemoryBackend
+    {
+    public:
+        String key;
+        std::function<void()> on_get;
+
+        std::optional<Raw> read(const String & requested_key, TransportAccess & access) override
+        {
+            if (requested_key == key && on_get)
+                on_get();
+            return InMemoryBackend::read(requested_key, access);
+        }
+    };
+
+    auto backend = std::make_shared<StoredCauseOnGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/stored_corruption@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    RefTableState state;
+    applyRefLogTxn(state, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+    backend->key = layout.refSnapshotKey(life, base);
+
+    std::optional<FsckReport> report;
+    std::exception_ptr error;
+    std::thread worker([&]
+    {
+        DB::ThreadStatus thread_status;
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        /// The store fails the base read the way the S3 client does for a killed query: with the query's cause.
+        backend->on_get = [&]
+        {
+            query.kill(std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "the query's stored cause")));
+            DB::CurrentThread::checkIfNotCancelled();
+        };
+        try
+        {
+            report = runFsck(*store, /*detail=*/true);
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        backend->on_get = {};
+    });
+    worker.join();
+    ASSERT_TRUE(report.has_value()) << DB::getExceptionMessage(error, false);
+    EXPECT_EQ(report->chain_broken, 0u);
+    EXPECT_EQ(report->unchecked, 1u);
+}
 
 /// Cleanup may advance `_ckpt` after fsck sampled it and retire the old base before fsck exact-reads it.
 /// The miss is authority instability, so fsck walks again from the new `_ckpt`, which here names no base.
