@@ -2213,8 +2213,16 @@ def test_schema_inference_cache(started_cluster):
         check_cache_hits(
             instance, "test_cache.parquet", storage_name, started_cluster, bucket
         )
+        # For `s3`, the HEAD of the schema inference above put the object into the identity cache, so the
+        # modification time of this query comes from the cache. It is not proof the object is unchanged,
+        # so the number-of-rows cache is not used. `url` storage does not use the identity cache.
         check_cahce_num_rows_hits(
-            instance, "test_cache.parquet", storage_name, started_cluster, bucket
+            instance,
+            "test_cache.parquet",
+            storage_name,
+            started_cluster,
+            bucket,
+            amount=0 if storage_name == "s3" else 1,
         )
 
     test("s3")
