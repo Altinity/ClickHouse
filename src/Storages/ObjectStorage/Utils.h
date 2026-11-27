@@ -31,6 +31,10 @@ void validateSupportedColumns(
 /// An empty column name has no identifier to render it with, so it cannot survive analysis.
 void validateLakeSchemaColumnNames(const NamesAndTypesList & schema, std::string_view lake_name);
 
+/// Replace identity-cache metadata with a HEAD. A hit still has the previous size and ETag, and a caller
+/// that then skips the read never issues the GET that would notice a replace.
+void revalidateIdentityCachedObjectMetadata(ObjectInfo & object_info, const ObjectStoragePtr & object_storage);
+
 /// `pin_to_metadata_etag` pins the read to `object_info.metadata->etag` even when the backend's
 /// `validate_etag_on_read` setting is off. The Puffin deletion-vector cache uses it so bytes stored
 /// under a listed etag cannot come from a later in-place overwrite.
@@ -41,7 +45,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings = std::nullopt,
     bool allow_page_cache = true,
-    bool pin_to_metadata_etag = false);
+    bool pin_to_metadata_etag = false,
+    bool revalidate_identity_for_parquet_metadata_cache = false);
 
 ASTs::iterator getFirstKeyValueArgument(ASTs & args);
 std::unordered_map<std::string, Field> parseKeyValueArguments(const ASTs & function_args, ContextPtr context);

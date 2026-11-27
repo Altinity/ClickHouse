@@ -2213,6 +2213,24 @@ def test_schema_inference_cache(started_cluster):
         check_cache_hits(
             instance, "test_cache.parquet", storage_name, started_cluster, bucket
         )
+        # For `s3`, the HEAD of the schema inference above put the object into the identity cache, so the
+        # modification time of this query comes from the cache. It is not proof the object is unchanged,
+        # so the number-of-rows cache is not used. `url` storage does not use the identity cache.
+        check_cahce_num_rows_hits(
+            instance,
+            "test_cache.parquet",
+            storage_name,
+            started_cluster,
+            bucket,
+            amount=0 if storage_name == "s3" else 1,
+        )
+
+        # With `s3_validate_etag_on_read = 0` the identity cache is not consulted, so the HEAD of this query gives
+        # a modification time that is fresh, and the number-of-rows cache is used.
+        res = instance.query(
+            f"select count() from {storage_name}('http://{started_cluster.minio_host}:{started_cluster.minio_port}/{bucket}/test_cache.parquet') settings s3_validate_etag_on_read = 0"
+        )
+        assert int(res) == 100
         check_cahce_num_rows_hits(
             instance, "test_cache.parquet", storage_name, started_cluster, bucket
         )

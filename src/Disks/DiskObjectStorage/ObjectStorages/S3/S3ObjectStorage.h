@@ -147,6 +147,11 @@ public:
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
 
+    ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const override
+    {
+        return getObjectMetadataImpl(object.getPath(), with_tags, /*use_identity_cache=*/ false);
+    }
+
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
 
     /// Marks the HEAD request eligible for the typed NativeConditional mode, so the CAS backend's
@@ -247,6 +252,13 @@ private:
         const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client, size_t attempt_seed);
 
     std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
+
+    /// Drop the identity-cache entry for `path`. The next read of this key requests the metadata again.
+    void invalidateCachedIdentity(const std::string & path) const;
+
+    /// `use_identity_cache` false still stores the result. It only skips the lookup, so a content cache
+    /// can key itself on an ETag observed by this request.
+    ObjectMetadata getObjectMetadataImpl(const std::string & path, bool with_tags, bool use_identity_cache) const;
 
     /// The single-attempt client for the object-creating requests of a write that asks for it, else null.
     std::shared_ptr<const S3::Client> objectCreationClient(const WriteSettings & write_settings) const;

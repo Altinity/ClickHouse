@@ -199,6 +199,11 @@ ObjectMetadata CachedObjectStorage::getObjectMetadata(const std::string & path, 
     return object_storage->getObjectMetadata(path, with_tags);
 }
 
+ObjectMetadata CachedObjectStorage::getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const
+{
+    return object_storage->getObjectMetadataIgnoringIdentityCache(object, with_tags);
+}
+
 std::optional<ObjectMetadata> CachedObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const
 {
     return object_storage->tryGetObjectMetadata(path, with_tags);

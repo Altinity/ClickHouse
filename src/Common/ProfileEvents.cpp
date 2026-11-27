@@ -821,6 +821,8 @@ The server successfully detected this situation and will download merged part fr
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3ListObjectsMicroseconds, "Time of S3 API ListObjects execution.", ValueType::Microseconds) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
+    M(ObjectStorageIdentityCacheHits, "Number of object-storage identity (size/etag/Last-Modified) cache hits, avoiding a HEAD.", ValueType::Number) \
+    M(ObjectStorageIdentityCacheMisses, "Number of object-storage identity cache misses that triggered a metadata request.", ValueType::Number) \
     /* CA per-namespace S3 op instrumentation: one event per (namespace, op) cell of the table in */ \
     /* CasInstrumentedBackend.cpp; attributes PUTs/HEADs/404s/412s/LISTs to the CA operation type. */ \
     M(CASBlobPut,        "Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic.", ValueType::Number) \

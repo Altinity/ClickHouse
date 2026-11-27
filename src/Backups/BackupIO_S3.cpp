@@ -1,6 +1,7 @@
 #include <Backups/BackupIO_S3.h>
 
 #if USE_AWS_S3
+#include <Common/scope_guard_safe.h>
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
 #include <Common/HTTPHeaderFilter.h>
@@ -20,7 +21,7 @@
 #include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <Poco/Util/AbstractConfiguration.h>
 
 #include <aws/core/auth/AWSCredentials.h>
@@ -497,17 +498,34 @@ void BackupReaderS3::copyToDiskImpl(const String & path_in_backup, size_t offset
             auto runner = threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_READER);
             auto create_read_buffer = [&, this] { return readFile(path_in_backup); };
 
+            /// The restored object replaces `blob_path[0]` in `blob_path[1]`, which may hold an identity cached by an
+            /// earlier read. Key the entry by the destination endpoint, as `S3ObjectStorage` does for its own writes.
+            /// `getDescription` returns that endpoint and forwards through a cache layer, so a cached S3 disk works too.
+            /// The native copy is only taken when the destination has the S3 data source kind.
+            const String dest_endpoint = destination_disk->getObjectStorage()->getDescription();
+            const String dest_bucket = blob_path[1];
+            const String dest_key = blob_path[0];
+            /// Runs when the copy throws after an object-creating request was sent. The success path below runs it too.
+            auto invalidate_destination = [dest_endpoint, dest_bucket, dest_key]()
+            {
+                invalidateObjectStorageIdentityCache(dest_endpoint, dest_bucket, dest_key);
+            };
+
             if (is_range)
                 copyS3FileRange(
                     client, s3_uri.bucket, src_key, offset, size, /* src_object_size= */ file_size,
-                    dest_client, /* dest_bucket= */ blob_path[1], /* dest_key= */ blob_path[0],
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes);
+                    dest_client, dest_bucket, dest_key,
+                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes,
+                    invalidate_destination);
             else
                 copyS3File(
                     client, s3_uri.bucket, src_key, size,
-                    dest_client, /* dest_bucket= */ blob_path[1], /* dest_key= */ blob_path[0],
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes);
+                    dest_client, dest_bucket, dest_key,
+                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer, object_attributes,
+                    ObjectStorageCopyMode::Default, /* object_creation_client= */ nullptr, invalidate_destination);
 
+            /// The copy has returned, so `dest_key` now holds the restored object.
+            invalidate_destination();
             return size;
         };
 
@@ -649,6 +667,15 @@ void BackupWriterS3::copyFileFromDisk(
             const size_t source_size = ca_plan ? ca_plan->object.bytes_size
                 : (copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path));
             const bool whole_object = (src_offset == 0) && (length == source_size);
+            const String dest_key = fs::path(s3_uri.key) / path_in_backup;
+            /// Runs when the copy throws after `CopyObject`, `PutObject`, or `CompleteMultipartUpload`
+            /// was sent. The success path below invalidates only if the copy returns.
+            const String endpoint = s3_uri.endpoint;
+            const String bucket = s3_uri.bucket;
+            auto on_object_creation_failure = [endpoint, bucket, dest_key]()
+            {
+                invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
+            };
 
             if (whole_object)
             {
@@ -660,12 +687,16 @@ void BackupWriterS3::copyFileFromDisk(
                     length,
                     /* dest_s3_client */ client,
                     /* dest_bucket */ s3_uri.bucket,
-                    /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
+                    /* dest_key */ dest_key,
                     s3_settings.request_settings,
                     read_settings,
                     blob_storage_log,
                     runner,
-                    create_read_buffer);
+                    create_read_buffer,
+                    /* object_metadata= */ std::nullopt,
+                    ObjectStorageCopyMode::Default,
+                    /* object_creation_client= */ nullptr,
+                    on_object_creation_failure);
             }
             else
             {
@@ -678,14 +709,18 @@ void BackupWriterS3::copyFileFromDisk(
                     /* src_object_size= */ source_size,
                     /* dest_s3_client */ client,
                     /* dest_bucket */ s3_uri.bucket,
-                    /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
+                    /* dest_key */ dest_key,
                     s3_settings.request_settings,
                     read_settings,
                     blob_storage_log,
                     runner,
-                    create_read_buffer);
+                    create_read_buffer,
+                    /* object_metadata= */ std::nullopt,
+                    on_object_creation_failure);
             }
 
+            /// The copy has replaced `dest_key`. A read that cached the previous ETag must not send it as `If-Match`.
+            invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
             return; /// copied!
         }
     }
@@ -699,6 +734,9 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
     LOG_TRACE(log, "Copying file inside backup from {} to {}", source, destination);
 
     const auto source_key = fs::path(s3_uri.key) / source;
+    const String dest_key = fs::path(s3_uri.key) / destination;
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
     copyS3File(
         client,
         /* src_bucket */ s3_uri.bucket,
@@ -706,7 +744,7 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
         size,
         /* dest_s3_client= */ client,
         /* dest_bucket= */ s3_uri.bucket,
-        /* dest_key= */ fs::path(s3_uri.key) / destination,
+        /* dest_key= */ dest_key,
         s3_settings.request_settings,
         read_settings,
         blob_storage_log,
@@ -716,14 +754,31 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
             LOG_TRACE(log, "Falling back to copy file inside backup from {} to {} through direct buffers", source, destination);
             return std::make_unique<ReadBufferFromS3>(
                 client, s3_uri.bucket, source_key, s3_uri.version_id, s3_settings.request_settings, read_settings);
+        },
+        /* object_metadata= */ std::nullopt,
+        ObjectStorageCopyMode::Default,
+        /* object_creation_client= */ nullptr,
+        [endpoint, bucket, dest_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
         });
+    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
 
 void BackupWriterS3::copyDataToFile(const String & path_in_backup, const CreateReadBufferFunction & create_read_buffer, UInt64 start_pos, UInt64 length)
 {
-    copyDataToS3File(create_read_buffer, start_pos, length, client, s3_uri.bucket, fs::path(s3_uri.key) / path_in_backup,
+    const String dest_key = fs::path(s3_uri.key) / path_in_backup;
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
+    copyDataToS3File(create_read_buffer, start_pos, length, client, s3_uri.bucket, dest_key,
                      s3_settings.request_settings, blob_storage_log,
-                     threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER));
+                     threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
+                     /* object_metadata= */ std::nullopt,
+                     [endpoint, bucket, dest_key]()
+                     {
+                         invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
+                     });
+    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
 
 BackupWriterS3::~BackupWriterS3() = default;
@@ -752,37 +807,61 @@ std::unique_ptr<ReadBuffer> BackupWriterS3::readFile(const String & file_name, s
 
 std::unique_ptr<WriteBuffer> BackupWriterS3::writeFile(const String & file_name)
 {
+    /// Captured by value. The buffer can outlive this writer, and the cache itself is process-global.
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
+    const String object_key = fs::path(s3_uri.key) / file_name;
     return std::make_unique<WriteBufferFromS3>(
         client,
-        s3_uri.bucket,
-        fs::path(s3_uri.key) / file_name,
+        bucket,
+        object_key,
         DBMS_DEFAULT_BUFFER_SIZE,
         s3_settings.request_settings,
         blob_storage_log,
         std::nullopt,
         threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
-        write_settings);
+        write_settings,
+        /* object_creation_client */ nullptr,
+        [endpoint, bucket, object_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, object_key);
+        });
 }
 
 std::unique_ptr<WriteBuffer> BackupWriterS3::writeFileIfNotExists(const String & file_name)
 {
     WriteSettings conditional_write_settings = write_settings;
     conditional_write_settings.object_storage_write_if_none_match = "*";
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
+    const String object_key = fs::path(s3_uri.key) / file_name;
     return std::make_unique<WriteBufferFromS3>(
         client,
-        s3_uri.bucket,
-        fs::path(s3_uri.key) / file_name,
+        bucket,
+        object_key,
         DBMS_DEFAULT_BUFFER_SIZE,
         s3_settings.request_settings,
         blob_storage_log,
         std::nullopt,
         threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
-        conditional_write_settings);
+        conditional_write_settings,
+        /* object_creation_client */ nullptr,
+        [endpoint, bucket, object_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, object_key);
+        });
 }
 
 void BackupWriterS3::removeFile(const String & file_name)
 {
-    deleteFileFromS3(client, s3_uri.bucket, fs::path(s3_uri.key) / file_name, /* if_exists = */ true,
+    const String object_key = fs::path(s3_uri.key) / file_name;
+    /// Runs when the delete throws too: a lost response can follow an applied delete.
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
+    {
+        invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, object_key);
+    });
+    deleteFileFromS3(client, s3_uri.bucket, object_key, /* if_exists = */ true,
                      blob_storage_log);
 }
 
@@ -795,6 +874,15 @@ void BackupWriterS3::removeFiles(const Strings & file_names)
 
     /// One call of DeleteObjects() cannot remove more than 1000 keys.
     size_t batch_size = 1000;
+
+    /// A key that was deleted, or was already gone, must not keep its previous size and ETag. This also runs
+    /// when a later batch throws: earlier batches have already deleted their keys.
+    /// Locks memory exceptions: a destructor is noexcept, so a MEMORY_LIMIT_EXCEEDED thrown here would terminate.
+    SCOPE_EXIT_MEMORY(
+    {
+        for (const auto & key : keys)
+            invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, key);
+    });
 
     deleteFilesFromS3(client, s3_uri.bucket, keys, /* if_exists = */ true,
                       s3_capabilities, batch_size, blob_storage_log);

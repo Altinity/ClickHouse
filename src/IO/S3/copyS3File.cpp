@@ -92,7 +92,8 @@ namespace
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
             const LoggerPtr log_,
-            const std::shared_ptr<const S3::Client> & object_creation_client_ = nullptr)
+            const std::shared_ptr<const S3::Client> & object_creation_client_ = nullptr,
+            OnObjectCreationFailure on_object_creation_failure_ = {})
             : client_ptr(client_ptr_)
             , object_creation_client(object_creation_client_ ? object_creation_client_ : client_ptr_)
             , dest_bucket(dest_bucket_)
@@ -102,6 +103,7 @@ namespace
             , schedule(schedule_)
             , blob_storage_log(blob_storage_log_)
             , log(log_)
+            , on_object_creation_failure(std::move(on_object_creation_failure_))
             , num_parts(0)
             , normal_part_size(0)
         {
@@ -120,6 +122,11 @@ namespace
         ThreadPoolCallbackRunnerUnsafe<void> schedule;
         BlobStorageLogWriterPtr blob_storage_log;
         const LoggerPtr log;
+        /// Called from `performCopy` when this copy throws after an object-creating request was sent.
+        OnObjectCreationFailure on_object_creation_failure;
+        /// Set immediately before `CopyObject`, `PutObject`, or `CompleteMultipartUpload`. A lost
+        /// response can still have committed the destination. Read on the same thread that writes it.
+        bool object_creation_request_sent = false;
 
         /// Represents a task uploading a single part.
         /// Keep this struct small because there can be thousands of parts.
@@ -138,6 +145,12 @@ namespace
         DequeWithMemoryTracking<String> multipart_tags;
         std::atomic<size_t> num_finished_parts = 0;
         std::atomic<bool> has_failed = false;
+
+        void notifyObjectCreationFailure()
+        {
+            if (object_creation_request_sent && on_object_creation_failure)
+                on_object_creation_failure();
+        }
 
         void fillCreateMultipartRequest(S3::CreateMultipartUploadRequest & request)
         {
@@ -219,6 +232,9 @@ namespace
                     ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
                 Stopwatch watch;
+                /// Set before the call. A failure after S3 has committed the upload must still reach
+                /// `performCopy`, which drops the cached identity only once this request has been sent.
+                object_creation_request_sent = true;
                 auto outcome = object_creation_client->CompleteMultipartUpload(request);
                 auto elapsed = watch.elapsedMicroseconds();
 
@@ -450,8 +466,19 @@ namespace
             const S3::S3RequestSettings & request_settings_,
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
-            BlobStorageLogWriterPtr blob_storage_log_)
-            : UploadHelper(client_ptr_, dest_bucket_, dest_key_, request_settings_, object_metadata_, schedule_, blob_storage_log_, getLogger("copyDataToS3File"))
+            BlobStorageLogWriterPtr blob_storage_log_,
+            OnObjectCreationFailure on_object_creation_failure_)
+            : UploadHelper(
+                client_ptr_,
+                dest_bucket_,
+                dest_key_,
+                request_settings_,
+                object_metadata_,
+                schedule_,
+                blob_storage_log_,
+                getLogger("copyDataToS3File"),
+                /* object_creation_client_= */ nullptr,
+                std::move(on_object_creation_failure_))
             , create_read_buffer(create_read_buffer_)
             , offset(offset_)
             , size(size_)
@@ -460,13 +487,21 @@ namespace
 
         void performCopy()
         {
-            if (size <= request_settings[S3RequestSetting::max_single_part_upload_size])
-                performSinglepartUpload();
-            else
-                performMultipartUpload();
+            try
+            {
+                if (size <= request_settings[S3RequestSetting::max_single_part_upload_size])
+                    performSinglepartUpload();
+                else
+                    performMultipartUpload();
 
-            if (request_settings[S3RequestSetting::check_objects_after_upload])
-                checkObjectAfterUpload();
+                if (request_settings[S3RequestSetting::check_objects_after_upload])
+                    checkObjectAfterUpload();
+            }
+            catch (...)
+            {
+                notifyObjectCreationFailure();
+                throw;
+            }
         }
 
     private:
@@ -521,6 +556,8 @@ namespace
                     ProfileEvents::increment(ProfileEvents::DiskS3PutObject);
 
                 Stopwatch watch;
+                /// Set before the call. A lost `PutObject` response can still have committed the object.
+                object_creation_request_sent = true;
                 auto outcome = client_ptr->PutObject(request);
                 auto elapsed = watch.elapsedMicroseconds();
 
@@ -647,7 +684,8 @@ namespace
             std::function<void()> fallback_method_,
             bool is_ranged_copy_,
             bool allow_fallback_,
-            const std::shared_ptr<const S3::Client> & object_creation_client_)
+            const std::shared_ptr<const S3::Client> & object_creation_client_,
+            OnObjectCreationFailure on_object_creation_failure_)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -657,7 +695,8 @@ namespace
                 schedule_,
                 blob_storage_log_,
                 getLogger("copyS3File"),
-                object_creation_client_)
+                object_creation_client_,
+                std::move(on_object_creation_failure_))
             , src_bucket(src_bucket_)
             , src_key(src_key_)
             , offset(src_offset_)
@@ -672,6 +711,19 @@ namespace
         }
 
         void performCopy()
+        {
+            try
+            {
+                performCopyImpl();
+            }
+            catch (...)
+            {
+                notifyObjectCreationFailure();
+                throw;
+            }
+        }
+
+        void performCopyImpl()
         {
             LOG_TEST(log, "Copy object {} to {} using native copy", src_key, dest_key);
 
@@ -759,6 +811,8 @@ namespace
                 if (client_ptr->isClientForDisk())
                     ProfileEvents::increment(ProfileEvents::DiskS3CopyObject);
 
+                /// Set before the call. A lost `CopyObject` response can still have replaced the destination.
+                object_creation_request_sent = true;
                 auto outcome = object_creation_client->CopyObject(request);
                 if (outcome.IsSuccess())
                 {
@@ -915,7 +969,8 @@ void copyDataToS3File(
     const S3::S3RequestSettings & settings,
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
-    const std::optional<ObjectAttributes> & object_metadata)
+    const std::optional<ObjectAttributes> & object_metadata,
+    OnObjectCreationFailure on_object_creation_failure)
 {
     CopyDataToFileHelper helper{
         create_read_buffer,
@@ -927,7 +982,8 @@ void copyDataToS3File(
         settings,
         object_metadata,
         schedule,
-        blob_storage_log};
+        blob_storage_log,
+        std::move(on_object_creation_failure)};
     helper.performCopy();
 }
 
@@ -954,12 +1010,14 @@ namespace
         const std::optional<ObjectAttributes> & object_metadata,
         bool is_ranged_copy,
         ObjectStorageCopyMode copy_mode,
-        std::shared_ptr<const S3::Client> object_creation_client)
+        std::shared_ptr<const S3::Client> object_creation_client,
+        OnObjectCreationFailure on_object_creation_failure)
     {
         if (!dest_s3_client)
             dest_s3_client = src_s3_client;
 
-        std::function<void()> fallback_method = [&] mutable
+        /// Copy the callback. The native helper takes the original, and this fallback can run after that move.
+        std::function<void()> fallback_method = [&, on_object_creation_failure]() mutable
         {
             copyDataToS3File(
                 fallback_file_reader,
@@ -971,7 +1029,8 @@ namespace
                 settings,
                 blob_storage_log,
                 schedule,
-                object_metadata);
+                object_metadata,
+                on_object_creation_failure);
         };
 
         if (!settings[S3RequestSetting::allow_native_copy])
@@ -1003,7 +1062,8 @@ namespace
             std::move(fallback_method),
             is_ranged_copy,
             /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default,
-            object_creation_client};
+            object_creation_client,
+            std::move(on_object_creation_failure)};
         helper.performCopy();
     }
 }
@@ -1023,7 +1083,8 @@ void copyS3File(
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata,
     ObjectStorageCopyMode copy_mode,
-    std::shared_ptr<const S3::Client> object_creation_client)
+    std::shared_ptr<const S3::Client> object_creation_client,
+    OnObjectCreationFailure on_object_creation_failure)
 {
     /// The read-write fallback would write through the retrying client.
     chassert(!object_creation_client || copy_mode == ObjectStorageCopyMode::NativeOnly);
@@ -1046,7 +1107,8 @@ void copyS3File(
         object_metadata,
         /* is_ranged_copy= */ false,
         copy_mode,
-        std::move(object_creation_client));
+        std::move(object_creation_client),
+        std::move(on_object_creation_failure));
 }
 
 void copyS3FileRange(
@@ -1064,7 +1126,8 @@ void copyS3FileRange(
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata)
+    const std::optional<ObjectAttributes> & object_metadata,
+    OnObjectCreationFailure on_object_creation_failure)
 {
     copyS3FileImpl(
         std::move(src_s3_client),
@@ -1084,7 +1147,8 @@ void copyS3FileRange(
         object_metadata,
         /* is_ranged_copy= */ true,
         ObjectStorageCopyMode::Default,
-        /* object_creation_client= */ nullptr);
+        /* object_creation_client= */ nullptr,
+        std::move(on_object_creation_failure));
 }
 
 }

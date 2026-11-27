@@ -149,7 +149,7 @@ FooterBlobsPtr readFooterBlobs(
         read_settings.enable_filesystem_cache = false;
 
     auto read_buffer = createReadBuffer(
-        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, pin_listed_etag);
+        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, /*pin_to_metadata_etag=*/ pin_listed_etag);
 
     auto * seekable = dynamic_cast<SeekableReadBuffer *>(read_buffer.get());
     if (!seekable)
@@ -188,7 +188,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVectorUncached(
         read_settings.enable_filesystem_cache = false;
 
     auto read_buffer = createReadBuffer(
-        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, pin_listed_etag);
+        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, /*pin_to_metadata_etag=*/ pin_listed_etag);
 
     auto * seekable = dynamic_cast<SeekableReadBuffer *>(read_buffer.get());
     if (!seekable)

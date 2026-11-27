@@ -70,7 +70,8 @@ public:
         std::optional<size_t> file_size = std::nullopt,
         const S3CredentialsRefreshCallback & credentials_refresh_callback_ = [] {return nullptr;},
         BlobStorageLogWriterPtr blob_storage_log_ = {},
-        const String & expected_etag_ = {}
+        const String & expected_etag_ = {},
+        std::function<void()> on_identity_rejected_ = {}
         );
 
     ~ReadBufferFromS3() override = default;
@@ -130,6 +131,9 @@ private:
 
     Aws::S3::Model::GetObjectResult sendRequest(size_t attempt, size_t range_begin, std::optional<size_t> range_end_incl) const;
 
+    /// The cached identity of this key is not the object that was read. Drop it so a retry fetches again.
+    void rejectCachedIdentity() const;
+
     /// Drops the identity baseline. Called when the next request is a reissue for a range the caller
     /// explicitly repositioned to (seek, or a change of the read-until bound), as opposed to a retry of
     /// the same range after a failure: the bytes already delivered before the reposition reached the
@@ -164,6 +168,9 @@ private:
     const S3CredentialsRefreshCallback credentials_refresh_callback;
 
     mutable BlobStorageLogWriterPtr blob_storage_log;
+
+    /// Called when a GET finds this key replaced or missing. Empty when the caller has no identity cache.
+    std::function<void()> on_identity_rejected;
 };
 
 }

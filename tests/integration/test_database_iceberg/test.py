@@ -1363,6 +1363,9 @@ def test_select_manifest_without_sequence_number(started_cluster, rewrite_manife
             ["sequence_number", "min_sequence_number", "content"],
         )
 
+    # The rewrite goes straight to MinIO. The identity cache still holds the old ETag, and the next
+    # GET would send it as If-Match and fail.
+    node.query("SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE")
     node.query("SYSTEM DROP ICEBERG METADATA CACHE")
 
     assert num_rows == int(node.query(f"SELECT count() FROM (SELECT * FROM {table_ref})"))
@@ -1409,6 +1412,9 @@ def test_select_manifest_without_snapshot_id(started_cluster, rewrite_manifest_l
             ["sequence_number", "min_sequence_number", "content"],
         )
 
+    # The rewrite goes straight to MinIO. The identity cache still holds the old ETag, and the next
+    # GET would send it as If-Match and fail.
+    node.query("SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE")
     node.query("SYSTEM DROP ICEBERG METADATA CACHE")
 
     assert num_rows == int(node.query(f"SELECT count() FROM (SELECT * FROM {table_ref})"))

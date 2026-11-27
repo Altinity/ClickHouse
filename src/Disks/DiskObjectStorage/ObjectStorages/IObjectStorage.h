@@ -5,6 +5,7 @@
 #include <optional>
 #include <filesystem>
 #include <variant>
+#include <vector>
 
 #include <Poco/Timestamp.h>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -138,6 +139,19 @@ struct ObjectMetadata
     /// default epoch would make the schema/count caches treat the object as older than any cached entry and
     /// silently reuse a stale value. Cache validators must skip the cache when this is `false`.
     bool is_last_modified_known = true;
+    /// False when `last_modified` was reused from the identity cache. `_time` may still show it, but it was
+    /// not observed by this request. An external replace leaves that stored time older than the schema and
+    /// count registration time, so those caches would keep the previous schema and row count.
+    bool is_last_modified_fresh = true;
+    /// True when size and ETag were reused from the identity cache rather than observed by this request.
+    /// A filesystem or page cache keyed by that ETag can then serve the previous bytes without a GET.
+    bool is_from_identity_cache = false;
+
+    /// Schema and count caches may use `last_modified` only when this request observed it.
+    bool lastModifiedConfirmsUnchanged() const
+    {
+        return is_last_modified_known && is_last_modified_fresh;
+    }
     std::string etag;
     /// Whether `etag` is a strong content/version identifier, i.e. different content is
     /// guaranteed to produce a different `etag`. Real S3/Azure ETags and the sub-second
@@ -356,6 +370,14 @@ public:
     virtual ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags) const
     {
         return getObjectMetadata(object.getPath(), with_tags);
+    }
+
+    /// Same as `getObjectMetadata`, but do not answer from the identity cache. A content cache (filesystem
+    /// cache, page cache) keyed by a cached ETag would otherwise serve a replaced object's old bytes, because
+    /// a full hit never issues the GET that compares ETags. The default has no identity cache.
+    virtual ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const
+    {
+        return getObjectMetadata(object, with_tags);
     }
 
     /// Same as getObjectMetadata(), but ignores if object does not exist.

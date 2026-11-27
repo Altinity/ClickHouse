@@ -47,6 +47,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <Server/ServerType.h>
 #include <Storages/MarkCache.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <Storages/MergeTree/UniqueKey/UniqueKeyIndexCache.h>
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
@@ -620,6 +621,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable ResourceManagerPtr resource_manager;
     mutable UncompressedCachePtr uncompressed_cache TSA_GUARDED_BY(mutex);            /// The cache of decompressed blocks.
     mutable MarkCachePtr mark_cache TSA_GUARDED_BY(mutex);                            /// Cache of marks in compressed files.
+    mutable ObjectStorageIdentityCachePtr object_storage_identity_cache TSA_GUARDED_BY(mutex); /// Cache of object-storage identity (size/etag/Last-Modified) to avoid per-open HEADs.
     mutable UniqueKeyIndexCachePtr unique_key_index_cache TSA_GUARDED_BY(mutex);               /// RocksDB-compatible block cache over CacheBase for the UNIQUE KEY index (nullptr when RocksDB unavailable or disabled).
     mutable DeleteBitmapCachePtr delete_bitmap_cache TSA_GUARDED_BY(mutex);           /// UNIQUE KEY per-part delete-bitmap cache.
     mutable PrimaryIndexCachePtr primary_index_cache TSA_GUARDED_BY(mutex);
@@ -4735,6 +4737,59 @@ void Context::clearMarkCache() const
         cache->clear();
 
     JemallocCacheArena::purge();
+}
+
+void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (shared->object_storage_identity_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Object storage identity cache has been already created.");
+
+    /// A zero size disables the cache: leave the pointer unset so callers fall back to uncached reads.
+    /// `updateObjectStorageIdentityCacheConfiguration` creates it later if a reload sets a non-zero size.
+    if (max_size_in_bytes == 0)
+        return;
+
+    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio);
+}
+
+void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
+{
+    std::lock_guard lock(shared->mutex);
+
+    size_t size = config.getUInt64("object_storage_identity_cache_size", 67108864);
+    if (size > max_cache_size)
+        size = max_cache_size;
+
+    /// Startup with size 0 leaves the pointer unset. A reload that raises the size has to create the
+    /// cache here: returning would keep every read uncached until the next process start.
+    if (!shared->object_storage_identity_cache)
+    {
+        if (size == 0)
+            return;
+
+        const String policy = config.getString("object_storage_identity_cache_policy", "SLRU");
+        const double size_ratio = config.getDouble("object_storage_identity_cache_size_ratio", 0.5);
+        shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(policy, size, size_ratio);
+        return;
+    }
+
+    shared->object_storage_identity_cache->setMaxSizeInBytes(size);
+}
+
+std::shared_ptr<ObjectStorageIdentityCache> Context::getObjectStorageIdentityCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->object_storage_identity_cache;
+}
+
+void Context::clearObjectStorageIdentityCache() const
+{
+    ObjectStorageIdentityCachePtr cache = getObjectStorageIdentityCache();
+
+    if (cache)
+        cache->clear();
 }
 
 void Context::setUniqueKeyIndexCache(

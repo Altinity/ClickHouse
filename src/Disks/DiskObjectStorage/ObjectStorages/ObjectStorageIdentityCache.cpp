@@ -1,0 +1,101 @@
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
+
+#include <Common/ProfileEvents.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/LockMemoryExceptionInThread.h>
+#include <Interpreters/Context.h>
+
+namespace ProfileEvents
+{
+    extern const Event ObjectStorageIdentityCacheHits;
+    extern const Event ObjectStorageIdentityCacheMisses;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric ObjectStorageIdentityCacheBytes;
+    extern const Metric ObjectStorageIdentityCacheCells;
+}
+
+namespace DB
+{
+
+void invalidateObjectStorageIdentityCache(std::string_view endpoint, std::string_view bucket, std::string_view path)
+{
+    /// Callers run this after an object-changing request has already succeeded, and some of them do not sit in a
+    /// `SCOPE_EXIT_MEMORY`. Building the key allocates, so without this lock a query at its memory limit would throw
+    /// here and leave the previous identity cached.
+    LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+
+    auto global_context = Context::getGlobalContextInstance();
+    if (!global_context)
+        return;
+
+    auto cache = global_context->getObjectStorageIdentityCache();
+    if (!cache)
+        return;
+
+    cache->invalidate(makeObjectStorageIdentityCacheKey(endpoint, bucket, path));
+}
+
+ObjectStorageIdentityCache::ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
+    : Base(
+        cache_policy,
+        CurrentMetrics::ObjectStorageIdentityCacheBytes,
+        CurrentMetrics::ObjectStorageIdentityCacheCells,
+        max_size_in_bytes,
+        /*max_count*/ 0,
+        size_ratio)
+{
+}
+
+std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const String & key, UInt64 credential_hash)
+{
+    if (auto mapped = Base::get(key); mapped && mapped->credential_hash == credential_hash)
+    {
+        ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheHits);
+        return *mapped;
+    }
+
+    ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheMisses);
+    return std::nullopt;
+}
+
+ObjectStorageIdentityCache::Read ObjectStorageIdentityCache::beginFetch()
+{
+    std::lock_guard lock(order_mutex);
+    return Read{++clock};
+}
+
+void ObjectStorageIdentityCache::setIfNotInvalidated(const String & key, ObjectStorageIdentity identity, Read read)
+{
+    std::lock_guard lock(order_mutex);
+    if (read.seq < cleared_at)
+        return;
+    /// The key was invalidated after this fetch began, or a later fetch of it has already stored, even if its entry was
+    /// evicted since. A slot shared with another key can only cause a spurious skip.
+    UInt64 & barrier = slot_barrier[slotOf(key)];
+    if (read.seq < barrier)
+        return;
+    barrier = read.seq;
+    /// The cache policy holds a copy of the key in the hashmap and another one in its queue list.
+    identity.key_memory = 2 * key.capacity();
+    /// `Base::set` takes the cache mutex after `order_mutex`, the same order as `remove` and `clear`.
+    Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
+}
+
+void ObjectStorageIdentityCache::invalidate(const String & key)
+{
+    std::lock_guard lock(order_mutex);
+    slot_barrier[slotOf(key)] = ++clock;
+    Base::remove(key);
+}
+
+void ObjectStorageIdentityCache::clear()
+{
+    std::lock_guard lock(order_mutex);
+    cleared_at = ++clock;
+    Base::clear();
+}
+
+}

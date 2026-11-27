@@ -82,6 +82,10 @@ public:
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
 
+    /// Forward explicitly: the default implementation calls `getObjectMetadata`, which would answer from
+    /// the wrapped storage's identity cache and make every revalidation HEAD a no-op.
+    ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const override;
+
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
 
     void shutdown() override;
