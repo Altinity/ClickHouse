@@ -262,6 +262,6 @@ TEST(CASTokenIdentity, SameVersionOfTwoKeysThrows)
 #else
 TEST(CASTokenIdentityDeathTest, SameVersionOfTwoKeysAborts)
 {
-    EXPECT_DEATH(compareTokensOfTwoKeys(), "sameVersion compares tokens of two objects");
+    CAS_EXPECT_DEATH(compareTokensOfTwoKeys(), "sameVersion compares tokens of two objects");
 }
 #endif

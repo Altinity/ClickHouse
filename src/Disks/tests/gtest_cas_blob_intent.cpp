@@ -229,7 +229,7 @@ TEST(CASBlobIntentKey, KeyOver1024BytesIsALogicalError)
 #else
 TEST(CASBlobIntentKeyDeathTest, KeyOver1024BytesIsALogicalError)
 {
-    EXPECT_DEATH({ (void)overlongKey(); }, "");
+    CAS_EXPECT_DEATH({ (void)overlongKey(); }, "");
 }
 #endif
 
@@ -262,7 +262,7 @@ TEST(CASBlobIntentKeyDeathTest, KeyRefusesAHandBuiltNonCanonicalTag)
 {
     const Layout layout("p");
     for (const auto & identity : kNonCanonicalIdentities)
-        EXPECT_DEATH({ (void)layout.blobIntentKey(fixedRef(), identity); }, "") << identity.tag_hex;
+        CAS_EXPECT_DEATH({ (void)layout.blobIntentKey(fixedRef(), identity); }, "") << identity.tag_hex;
 }
 #endif
 
@@ -581,6 +581,6 @@ TEST(CASBlobIntentCreateDeathTest, LogicalErrorPropagates)
     IntentCreateFixture f;
     ThrowingWriteBackend backend(DB::ErrorCodes::LOGICAL_ERROR);
     OperationForTest op(backend);
-    EXPECT_DEATH({ (void)createBlobIntent(*op, f.layout, f.ref, f.identity, Retry::standard()); }, "");
+    CAS_EXPECT_DEATH({ (void)createBlobIntent(*op, f.layout, f.ref, f.identity, Retry::standard()); }, "");
 }
 #endif

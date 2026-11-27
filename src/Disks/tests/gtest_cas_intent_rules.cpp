@@ -609,7 +609,7 @@ TEST(CASIntentRulesDeathTest, EachUnreachableShapeThrows)
 {
     const Observations o = Observations::make();
     for (const auto & shape : unreachableShapes(o))
-        EXPECT_DEATH({ (void)decideIntentStep(shape.input); }, shape.message) << shape.what;
+        CAS_EXPECT_DEATH({ (void)decideIntentStep(shape.input); }, shape.message) << shape.what;
 }
 #endif
 

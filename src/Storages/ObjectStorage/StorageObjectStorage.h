@@ -118,6 +118,14 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    StorageMetadataHandle getExportDestinationMetadata(
+        const std::optional<std::string> & iceberg_metadata_json,
+        ContextPtr context) const override;
+
+    void checkExportDestinationUnchanged(
+        const std::optional<std::string> & iceberg_metadata_json,
+        ContextPtr context) const override;
+
     /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
     /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
     static void dropImpl(

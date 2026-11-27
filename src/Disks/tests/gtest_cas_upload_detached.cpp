@@ -513,7 +513,7 @@ TEST(CASUploadDetachedDeathTest, MergeValidatesSizesAborts)
     BlobUploadResult conflicting = r;
     conflicting.dep.size = r.dep.size + 1;   /// same ref, conflicting declared size
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { build->mergeBlobUploadResults(std::vector<BlobUploadResult>{r, conflicting}); }, "");
 }
 #endif

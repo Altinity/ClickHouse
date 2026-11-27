@@ -1612,7 +1612,7 @@ TEST(CASObjectStorageBackendDeathTest, EmuTokenSurvivesProcessRestartAcrossRecre
     /// See EmuTokenSurvivesProcessRestartAcrossRecreate above for the property under test; a
     /// LOGICAL_ERROR aborts the process under DEBUG_OR_SANITIZER_BUILD, so this arm pins the refusal
     /// via EXPECT_DEATH instead of an exception.
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         { op2.remove("k/restart", stale_token, Retry::once()); },
         "cannot be the precondition for");
 }
@@ -1918,7 +1918,7 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedConnec
     /// The mismatch is a programmer error (LOGICAL_ERROR): under DEBUG_OR_SANITIZER_BUILD it aborts the
     /// process before it can be caught, so that arm pins the refusal via EXPECT_DEATH.
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+    CAS_EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
 #else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
 #endif
@@ -1934,7 +1934,7 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedAttemp
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/6000, *budget.connect_timeout_cap_ms);
     /// Same split as the connect-cap twin above: a LOGICAL_ERROR aborts under DEBUG_OR_SANITIZER_BUILD.
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+    CAS_EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
 #else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
 #endif

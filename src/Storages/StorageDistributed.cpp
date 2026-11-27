@@ -1951,9 +1951,17 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
     size_t replica_index = 0;
     for (const auto & replicas : cluster->getShardsInfo())
     {
-        /// Skip unavailable hosts if necessary
+        /// Skip unavailable hosts if necessary. A pooled connection is pinged before use, so a peer
+        /// that stopped without closing the socket is replaced by one new connection instead of
+        /// blocking the query until `receive_timeout`. See `ReadFromCluster::initializePipeline`.
         auto try_results = replicas.pool->getMany(
-            timeouts, current_settings, PoolMode::GET_MANY, /*async_callback*/ {}, /*skip_unavailable_endpoints*/ true);
+            timeouts,
+            current_settings,
+            PoolMode::GET_MANY,
+            /*async_callback*/ {},
+            /*skip_unavailable_endpoints*/ true,
+            /*priority_func=*/{},
+            /*ping_pooled_connection=*/true);
 
         /// There will be only one replica, because we consider each replica as a shard
         for (const auto & try_result : try_results)

@@ -487,7 +487,7 @@ TEST(CASPartWriteTxnDeathTest, AdoptBeforePrecommitFailsClosed)
     const RootNamespace ns{"srv/tbl"};
     auto build = startBuildFor(s, ns, "ref_adopt");
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->putBlob(id, BlobSource::fromString(payload));
@@ -1008,7 +1008,7 @@ TEST(CASPartWriteTxn, InvalidDependencyProofFailsClosed)
             BlobPublicationTransport::Streaming}};
     build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&invalid, 1));
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_1", build->buildId(), id);
@@ -1132,7 +1132,7 @@ TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
     /// leaf), so this only confirms the fail-closed does not depend on the leaf being clean.
     DB::Cas::tests::plantIntentForCurrentBody(*b, s->layout(), DB::Cas::tests::legacyMetaTestRef(hexToU128(streamingHexOf("payload-NODEP"))));
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_1", build->buildId(), id);
@@ -1163,7 +1163,7 @@ TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     build->precommitAdd(ns, "part_1", mid);
 
     /// Promotion must fail closed because the leaf has no dependency proof. No ref is committed.
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_1", build->buildId(), mid);
@@ -1234,19 +1234,19 @@ TEST(CASPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
         << "abandon must best-effort delete this build's staged manifest debris";
 
     /// Further operations throw via requireAlive.
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->putBlob(idOf("after"), BlobSource::fromString("after"));
         },
         "has been abandoned");
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->stageManifest({blobManifestEntry("g", "kept")});
         },
         "has been abandoned");
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->precommitAdd(ns, "ref", mid);
@@ -1301,13 +1301,13 @@ TEST(CASPartWriteTxn, PromoteCrossNamespaceManifestFailsClosed)
     /// DIFFERENT namespace must fail closed.
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->precommitAdd(other_ns, "part_1", id);
         },
         "precommitAdd: manifest namespace");
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(other_ns, "part_1", build->buildId(), id);
@@ -2083,7 +2083,7 @@ TEST(CASPartWriteTxnDeathTest, StageManifestRefusesAnEntryPathWithDotDot)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             build->stageManifest({blobManifestEntry("a/../b.bin", "x")});
             std::_Exit(0);
@@ -2196,7 +2196,7 @@ TEST(CASPartWriteTxnDeathTest, PromoteOfAManifestStagedElsewhereAborts)
 {
     ForeignStagedManifest f(/*abandon_owner=*/false);
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
             std::_Exit(0);
@@ -2233,7 +2233,7 @@ TEST(CASPartWriteTxnDeathTest, PromoteOfAnAbandonedForeignManifestAbortsAsNotSta
 {
     ForeignStagedManifest f(/*abandon_owner=*/true);
 
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
             std::_Exit(0);
@@ -2284,7 +2284,7 @@ TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// satisfied by the ch128:X entry's materialized proof (same digest bytes, distinct object key). §4
     /// manifest-trust catches an unsatisfied leaf by the dependency set and
     /// fails closed with LOGICAL_ERROR — a staging bug — without any backend probe on the xxh3 key.
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_mixed", build->buildId(), id);

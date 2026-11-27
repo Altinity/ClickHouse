@@ -735,12 +735,17 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Int8:
         case TypeIndex::UInt16:
         case TypeIndex::Int16:
-        case TypeIndex::UInt32:
         case TypeIndex::Int32:
             return {"int", true};
-        case TypeIndex::UInt64:
+        case TypeIndex::UInt32:
         case TypeIndex::Int64:
             return {"long", true};
+        case TypeIndex::UInt64:
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Type {} cannot be stored in Iceberg: the widest Iceberg integer type is the signed 64-bit `long`, "
+                "which cannot represent every UInt64 value. Use Int64 or Decimal(20, 0) instead",
+                type->getName());
         case TypeIndex::Float32:
             return {"float", true};
         case TypeIndex::Float64:
@@ -873,11 +878,11 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         case TypeIndex::Int8:
         case TypeIndex::UInt16:
         case TypeIndex::Int16:
-        case TypeIndex::UInt32:
         case TypeIndex::Int32:
         case TypeIndex::Date:
         case TypeIndex::Date32:
             return "int";
+        case TypeIndex::UInt32:
         case TypeIndex::UInt64:
         case TypeIndex::Int64:
         case TypeIndex::DateTime:
@@ -1742,6 +1747,103 @@ MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
         known_compression_method,
         /* force_fetch_latest_metadata */ true,
         /* ignore_explicit_metadata_file_path */ false);
+}
+
+/// The metadata location exactly as the catalog reports it. `table_metadata` receives the table metadata, which
+/// `getMetadataLocation` needs to turn the raw value into a storage-relative one.
+static String getRawCatalogMetadataLocation(
+    const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context, DataLake::TableMetadata & table_metadata)
+{
+    table_metadata = DataLake::TableMetadata().withDataLakeSpecificProperties().withLocation();
+    const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+    catalog.getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+    auto specific_properties = table_metadata.getDataLakeSpecificProperties();
+    if (!specific_properties.has_value() || specific_properties->iceberg_metadata_file_location.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Catalog did not return a metadata file location for table '{}.{}'",
+            namespace_name, table_name);
+
+    return specific_properties->iceberg_metadata_file_location;
+}
+
+String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context)
+{
+    DataLake::TableMetadata table_metadata;
+    const auto raw_location = getRawCatalogMetadataLocation(catalog, storage_id, context, table_metadata);
+    return table_metadata.getMetadataLocation(raw_location);
+}
+
+LatestMetadata readLatestMetadata(
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    const DataLakeStorageSettings & data_lake_settings,
+    ContextPtr context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id,
+    LoggerPtr log)
+{
+    if (catalog)
+    {
+        /// The catalog, not the newest file in the `metadata` directory, holds the current
+        /// snapshot: a newer file may be left by a commit that failed before updating the catalog.
+        DataLake::TableMetadata table_metadata;
+        String raw_catalog_metadata_location = getRawCatalogMetadataLocation(*catalog, storage_id, context, table_metadata);
+        String catalog_metadata_location = table_metadata.getMetadataLocation(raw_catalog_metadata_location);
+
+        DataLakeStorageSettings effective_settings = data_lake_settings;
+        effective_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = catalog_metadata_location;
+        const auto catalog_metadata = getLatestOrExplicitMetadataFileAndVersion(
+            object_storage,
+            persistent_table_components.table_path,
+            effective_settings,
+            persistent_table_components.metadata_cache,
+            context,
+            log.get(),
+            persistent_table_components.table_uuid,
+            persistent_table_components.metadata_compression_method,
+            /* force_fetch_latest_metadata */ true,
+            /* ignore_explicit_metadata_file_path */ false);
+
+        auto metadata_object = deepCopy(getMetadataJSONObject(
+            catalog_metadata.path,
+            object_storage,
+            persistent_table_components.metadata_cache,
+            context,
+            log,
+            catalog_metadata.compression_method,
+            persistent_table_components.table_uuid));
+
+        /// The new metadata file must not reuse the name of a newer file left in the directory.
+        const auto max_directory_version = getMaxMetadataFileVersionInDirectory(object_storage, persistent_table_components.table_path);
+        const Int32 version = std::max(catalog_metadata.version, max_directory_version.value_or(catalog_metadata.version));
+
+        return {version, metadata_object, std::move(catalog_metadata_location), std::move(raw_catalog_metadata_location), catalog_metadata.path};
+    }
+
+    const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_table_components.table_path,
+        data_lake_settings,
+        persistent_table_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_table_components.table_uuid,
+        persistent_table_components.metadata_compression_method,
+        /* force_fetch_latest_metadata */ true,
+        /* ignore_explicit_metadata_file_path */ true);
+
+    auto metadata_object = deepCopy(getMetadataJSONObject(
+        metadata_file_path,
+        object_storage,
+        persistent_table_components.metadata_cache,
+        context,
+        log,
+        persistent_table_components.metadata_compression_method,
+        persistent_table_components.table_uuid));
+
+    return {metadata_version, metadata_object, {}, {}, metadata_file_path};
 }
 
 

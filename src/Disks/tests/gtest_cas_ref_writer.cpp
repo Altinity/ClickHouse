@@ -4038,8 +4038,13 @@ TEST(CASRefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrent
     }   /// predecessor destroyed: its mount lease is released
 
     /// The successor allocates a strictly higher durable writer_epoch; its own FRESH precommit must
-    /// survive the sweep its very first touch of the table triggers.
-    auto successor = openPool(backend);
+    /// survive the sweep its very first touch of the table triggers. The predecessor left its
+    /// precommits dangling, so the open pays the unclean-mount observation: fake the clock.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    PoolConfig successor_config;
+    successor_config.boot_ms_fn = [fake_boot] { return fake_boot->load(); };
+    successor_config.wait_sleep_fn = [fake_boot](uint64_t ms) { *fake_boot += ms; };
+    auto successor = openPoolWithConfig(backend, successor_config);
     auto build = startBuildFor(successor, ns, "fresh_x");
     const ManifestId fresh_id = build->stageManifest({});
     build->precommitAdd(ns, "fresh_x", fresh_id);   /// this call's own appendRefOps hoists the sweep first

@@ -139,7 +139,6 @@ namespace Setting
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
-    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
@@ -148,6 +147,7 @@ namespace Setting
     extern const SettingsTimezone iceberg_partition_timezone;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+    extern const SettingsUInt64 export_merge_tree_part_check_destination_schema_staleness_ms;
 }
 
 namespace ServerSetting
@@ -4069,8 +4069,13 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
+    /// The destination Iceberg metadata is read first: the export is validated and run against the destination types
+    /// that this metadata defines, not against the in-memory columns of the destination table, which are only the
+    /// ones it was declared with until a query reloads them from the Iceberg schema.
+    const auto iceberg_metadata_json = ExportPartitionUtils::getDestinationIcebergMetadataJsonIfDataLake(dest_storage, query_context);
+
     auto src_snapshot = getInMemoryMetadataPtr(query_context, false);
-    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
+    auto destination_snapshot = dest_storage->getExportDestinationMetadata(iceberg_metadata_json, query_context);
 
     /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
     ExportPartitionUtils::verifyExportSchemaCastable(
@@ -4148,19 +4153,20 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     descriptor.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     descriptor.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     descriptor.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
-    descriptor.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
     descriptor.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     descriptor.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     descriptor.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
+    descriptor.check_destination_schema_staleness_ms = query_context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_staleness_ms].value;
     descriptor.min_bytes_to_use_direct_io = query_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io];
 
     if (dest_storage->isDataLake())
     {
 #if USE_AVRO
-        descriptor.iceberg_metadata_json = ExportPartitionUtils::verifyAndExtractDestinationIcebergMetadataJson(
+        descriptor.iceberg_metadata_json = *iceberg_metadata_json;
+        ExportPartitionUtils::verifyDestinationIcebergPartitionCompatibility(
+            descriptor.iceberg_metadata_json,
             src_snapshot,
             destination_snapshot,
-            dest_storage,
             parts,
             partition_id,
             query_context);

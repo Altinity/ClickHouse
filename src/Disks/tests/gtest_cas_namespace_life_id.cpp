@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
@@ -199,8 +200,8 @@ TEST(CASNamespaceLifeId, ZeroIncarnationIsUnconstructible)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
 {
-    EXPECT_DEATH({ (void)NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}); }, "incarnation must be nonzero");
-    EXPECT_DEATH({ (void)renderIncarnation(UInt128{0}); }, "incarnation must be nonzero");
+    CAS_EXPECT_DEATH({ (void)NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}); }, "incarnation must be nonzero");
+    CAS_EXPECT_DEATH({ (void)renderIncarnation(UInt128{0}); }, "incarnation must be nonzero");
     EXPECT_NO_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA()));
 }
 #endif
