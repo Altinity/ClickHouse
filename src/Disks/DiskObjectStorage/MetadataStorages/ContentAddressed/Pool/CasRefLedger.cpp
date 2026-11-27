@@ -2430,31 +2430,37 @@ namespace
 {
 
 /// The row may still be `Live` here, so the text must not claim `Removing`.
-[[noreturn]] void throwRemovalWriteMayLand(const RootNamespace & ns)
+String removalWriteMayLandReason(const RootNamespace & ns)
 {
-    throwCasWriteRetryLater(fmt::format(
-        "CAS namespace '{}': a removal write may still land, so positive ref mutation admission is "
-        "closed until a retried removal completes or the disk is remounted; retry later", ns.string()));
+    return fmt::format(
+        "CAS namespace '{}': a removal write may still land, so writes are refused until a retried removal "
+        "completes or the disk is remounted; retry the `DROP TABLE` or other operation that removed it", ns.string());
 }
 
 /// True whether the removal is still running, done and waiting for GC to erase the row, or stuck; the
 /// remedy for a stuck one depends on the operation that started it, so the text names none.
-[[noreturn]] void throwRemovingObserved(const RootNamespace & ns)
+String removingObservedReason(const RootNamespace & ns)
 {
-    throwCasWriteRetryLater(fmt::format(
+    return fmt::format(
         "CAS namespace '{}' is Removing in the catalog: writes are refused and reads see no data until its removal "
         "completes and GC erases the row; retry later, and if it stays Removing see the CAS troubleshooting page",
-        ns.string()));
+        ns.string());
+}
+
+/// Only for a caller that has not queued its mutation yet.
+[[noreturn]] void throwAdmissionRefused(const String & reason)
+{
+    throw RefAdmissionRefusedException(makeCasWriteRetryLaterException(reason));
 }
 
 /// Flags read under `ref_queue_mutex`.
 [[noreturn]] void throwPositiveAdmissionClosed(const RootNamespace & ns, bool removing_observed, bool write_may_land)
 {
     if (write_may_land)
-        throwRemovalWriteMayLand(ns);
+        throwAdmissionRefused(removalWriteMayLandReason(ns));
     if (removing_observed)
-        throwRemovingObserved(ns);
-    throwCasWriteRetryLater(fmt::format(
+        throwAdmissionRefused(removingObservedReason(ns));
+    throwAdmissionRefused(fmt::format(
         "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
         "terminal fold and catalog removal complete; retry later", ns.string()));
 }
@@ -5666,10 +5672,10 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
                     write_may_land = rt->removal_write_may_land;
                 }
                 if (write_may_land)
-                    throwRemovalWriteMayLand(ns);
+                    throwAdmissionRefused(removalWriteMayLandReason(ns));
                 if (removing_observed)
-                    throwRemovingObserved(ns);
-                throwCasWriteRetryLater(fmt::format(
+                    throwAdmissionRefused(removingObservedReason(ns));
+                throwAdmissionRefused(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
             }
@@ -5741,7 +5747,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
-        throwRemovingObserved(ns);
+        throwAdmissionRefused(removingObservedReason(ns));
 
     const NamespaceLifeId life
         = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live

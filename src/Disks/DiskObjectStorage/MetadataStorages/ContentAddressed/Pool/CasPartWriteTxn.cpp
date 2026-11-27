@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
@@ -80,8 +81,8 @@ bool readBlobIntent(CasOperation & op, const Layout & layout, const BlobRef & re
     }
     catch (Exception & e)
     {
-        e.addMessage("while reading the deletion intent `{}`; a writer needs GET and LIST on `{}`, and a store that denies "
-            "LIST answers 403 for an absent intent", key, layout.blobIntentsPrefix());
+        addMessageUnlessQueryStoredCause(e, fmt::format("while reading the deletion intent `{}`; a writer needs GET and LIST on `{}`, "
+            "and a store that denies LIST answers 403 for an absent intent", key, layout.blobIntentsPrefix()));
         throw;
     }
 }
@@ -255,6 +256,16 @@ void PartWriteTxn::requireAlive() const
             "the mount was fenced out and self-remounted; restart the build", epoch, live));
 }
 
+void PartWriteTxn::requireAdoptable(std::string_view where) const
+{
+    requireAlive();
+    throwIfBackgroundStopped();
+    if (!store->mountRequests().resume(txn_generation).admitted())
+        throwCasTransientUnavailable(
+            fmt::format("PartWriteTxn::{}", where),
+            "the mount no longer admits the generation this build began under, so its upload results are not adopted");
+}
+
 PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
 {
     /// Serial API preserved for existing callers: run the transaction-detached primitive, then fold its
@@ -264,6 +275,9 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     /// the request's `declared_size` mirrors it.
     const uint64_t declared_size = source.size;
     const BlobUploadResult r = uploadBlobDetached(BlobUploadRequest{ref, std::move(source), declared_size});
+    if (adoption_hook_for_test)
+        adoption_hook_for_test(1);
+    requireAdoptable("putBlob");
     deps.insert_or_assign(r.ref, r.dep);
     return PutBlobResult{r.ref, r.dep.size};
 }
@@ -300,7 +314,7 @@ void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> resu
 
     /// Build-and-swap: apply every result into a COPY of the live `deps`. The live member is touched
     /// ONLY by the final `swap` below, which runs after every result has applied -- so a mid-loop
-    /// exception (a `bad_alloc` from map-node allocation, or one injected by `setMergeHookForTest`'s
+    /// exception (a `bad_alloc` from map-node allocation, or one injected by `setAdoptionHookForTest`'s
     /// hook) leaves `deps` byte-for-byte as it was before this call. Applying an already-validated
     /// duplicate a second time is idempotent (identical value, same key).
     std::map<DepKey, BlobDepRecord> candidate = deps;
@@ -309,9 +323,10 @@ void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> resu
     {
         candidate.insert_or_assign(r.ref, r.dep);
         ++applied;
-        if (merge_hook_for_test)
-            merge_hook_for_test(applied);
+        if (adoption_hook_for_test)
+            adoption_hook_for_test(applied);
     }
+    requireAdoptable("mergeBlobUploadResults");
     deps.swap(candidate);
 }
 
@@ -373,6 +388,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     constexpr int max_publication_attempts = 8;
     /// Every exit by exception after a failed attempt gave up on the blob.
     int failed_attempts = 0;
+    /// The latest failed publication: what a query stopped before the next one ends with.
+    std::exception_ptr last_failure;
     const int exceptions_at_entry = std::uncaught_exceptions();
     SCOPE_EXIT({
         if (failed_attempts > 0 && std::uncaught_exceptions() > exceptions_at_entry)
@@ -384,10 +401,11 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         /// Pace the reissues the way the request engine paces its own, and through the engine's own
         /// clock: an ambiguous publication is most often a store under load, and a large body
         /// republished eight times back to back is what makes that worse. After `requireAlive`, so a
-        /// cancelled or superseded build fails closed instead of spending a backoff first.
-        if (attempt > 0)
-            op.pause(Retry::backoff(attempt));
-        const std::optional<Meta> present = op.head(key, policy);
+        /// cancelled or superseded build fails closed instead of spending a backoff first. A query stopped in the
+        /// pause ends the upload with the failed publication's own error.
+        if (attempt > 0 && !sleepUnlessQueryStops(Retry::backoff(attempt), [&op](uint64_t ms) { op.sleepFor(ms); }))
+            rethrowVetoedPublicationFailure(key, last_failure);
+        const std::optional<Meta> present = op.head(key, Retry::standard());
         BlobPublicationReason reason = BlobPublicationReason::Absent;
 
         if (present)
@@ -460,6 +478,11 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             }
         }
 
+        /// A stop before a publication ends the upload: with the previous publication's failure if there is one.
+        if (!last_failure)
+            throwIfQueryStopped();
+        else if (queryStopRequested())
+            rethrowVetoedPublicationFailure(key, last_failure);
         const bool first_publication = source.beginPublication();
 
         BlobPublicationTransport transport;
@@ -494,11 +517,18 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// among every source over that object.
             op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
         }
-        catch (const std::exception & error)
+        catch (...)
         {
+            /// A stopped owner's failure is no store answer and is not retried: a landed body stays debris, never adopted.
+            /// The background verdict first; a query's veto converts a credential refusal as the pause does.
+            if (auto stop = backgroundStopRequested())
+                std::rethrow_exception(std::move(stop));
+            if (queryStopRequested())
+                rethrowVetoedPublicationFailure(key, std::current_exception());
             /// A publication this build is no longer admitted to make is not an ambiguity to retry:
             /// every further request of this operation refuses the same way.
-            if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
+            if (const auto * error = current_exception_cast<const std::exception *>();
+                error && (isDeterministicBlobPublicationFailure(*error) || !op.admitted()))
                 throw;
             ++failed_attempts;
             last_failure = std::current_exception();
@@ -597,10 +627,14 @@ String describeManifestPutGiveUp(const GaveUp & gave_up)
         case GaveUp::Why::Attempts:
             throw Exception(ErrorCodes::LOGICAL_ERROR, "A single part write is never capped by a decision count");
         case GaveUp::Why::Unresolved:
-            if (gave_up.sent_any)
+            if (gave_up.sent_any && std::holds_alternative<NotObserved>(gave_up.last_seen))
                 return fmt::format(
                     "is UNCERTAIN: {} attempt(s) sent and the resolving read did not complete ({}); the body may have landed",
                     gave_up.attempts_sent, detail::renderObservation(gave_up.last_seen));
+            if (gave_up.sent_any)
+                return fmt::format(
+                    "is UNCERTAIN: {} attempt(s) sent and not sent again after the resolving read found {}; the body may "
+                    "have landed", gave_up.attempts_sent, detail::renderObservation(gave_up.last_seen));
             return fmt::format(
                 "was not sent: a read of the current object did not complete ({})",
                 detail::renderObservation(gave_up.last_seen));
@@ -777,62 +811,79 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     /// live precommit with no cleanup owner and no body. Same discipline, and same reason, as the ref
     /// lane's preconstructed wedge. The three fields are plain assignments of already-materialized
     /// values, so this cannot throw between the record and the append.
+    /// A refusal restores what an earlier invocation of this transaction recorded, including its duty.
+    RootNamespace previous_target_ns = precommit_target_ns;
+    String previous_final_ref = precommit_final_ref;
+    const ManifestRef previous_manifest = precommit_manifest;
+    const PrecommitState previous_state = precommit_state;
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
     precommit_manifest = id.ref;
     precommit_state = PrecommitState::Uncertain;
 
-    store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
-        /// Capture everything the closure reads BY VALUE (the `store` handle, target namespace, ref name,
-        /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
-        /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
-        /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
-        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn, txn_build_id = build_id](const RefTableState & state) -> std::vector<RefOp>
-        {
-            /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
-            /// legitimate re-drive calling precommitAdd+promote again for content that is already
-            /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
-            /// for an already-owned manifest would violate "no conflicting owner may name the same
-            /// manifest", which the state machine enforces for every OTHER case.
-            ///
-            /// A3 mint-tightening's enforcement lives HERE, gated on this SAME live-state read, rather
-            /// than unconditionally before the closure: a legitimate re-drive can be handed an id that
-            /// this exact `PartWriteTxn` object never staged (e.g. a fresh build re-precommitting
-            /// content a PRIOR, since-destroyed build already promoted -- `CasPromoteRepublish.
-            /// PromoteSameManifestIsIdempotent`). That case is not a fresh ownership grant: the manifest
-            /// is already `final_ref_name`'s live, currently-protected binding, so re-affirming it
-            /// creates no new ABA surface. Checking membership-or-committed-match atomically under the
-            /// SAME state read (rather than a separate pre-check against a possibly-stale resolve) is
-            /// what keeps this race-free: a snapshot taken before the closure could see "already
-            /// committed to id.ref" and let a later closure invocation append a fresh owner_transition
-            /// after a concurrent repoint moved the ref away from id.ref in between -- exactly the
-            /// re-ownership of a dropped identity this check exists to prevent.
-            if (const auto it = state.getCommitted().find(final_ref_name);
-                it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
-                return {};
-            if (!id_staged_by_this_txn)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "precommitAdd: manifest '{}' was not staged by this transaction (build {}) and is not the current "
-                    "committed manifest of ref '{}' in namespace '{}' -- refusing to re-own a foreign or previously-dropped identity",
-                    manifestRefDebugString(id.ref), u128ToHex(txn_build_id), final_ref_name, target_ns.string());
-
-            std::vector<RefOp> ops;
-            if (state.getLifecycle() != RefLifecycle::Live)
+    try
+    {
+        store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
+            /// Capture everything the closure reads BY VALUE (the `store` handle, target namespace, ref name,
+            /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
+            /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
+            /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
+            [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn, txn_build_id = build_id](const RefTableState & state) -> std::vector<RefOp>
             {
-                /// Reaching an empty runtime here means catalog resolution admitted a new life. A
-                /// predecessor still `Removing` was refused before recovery, so rebirth needs no
-                /// physical marker or empty-prefix proof.
-                RefOp birth;
-                birth.kind = RefOpKind::NamespaceBirth;
-                ops.push_back(birth);
-            }
-            RefOp add;
-            add.kind = RefOpKind::OwnerTransition;
-            add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
-            ops.push_back(add);
-            return ops;
-        },
-        RootMutationOrigin::Writer, RootMutationKind::Precommit);
+                /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
+                /// legitimate re-drive calling precommitAdd+promote again for content that is already
+                /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
+                /// for an already-owned manifest would violate "no conflicting owner may name the same
+                /// manifest", which the state machine enforces for every OTHER case.
+                ///
+                /// A3 mint-tightening's enforcement lives HERE, gated on this SAME live-state read, rather
+                /// than unconditionally before the closure: a legitimate re-drive can be handed an id that
+                /// this exact `PartWriteTxn` object never staged (e.g. a fresh build re-precommitting
+                /// content a PRIOR, since-destroyed build already promoted -- `CasPromoteRepublish.
+                /// PromoteSameManifestIsIdempotent`). That case is not a fresh ownership grant: the manifest
+                /// is already `final_ref_name`'s live, currently-protected binding, so re-affirming it
+                /// creates no new ABA surface. Checking membership-or-committed-match atomically under the
+                /// SAME state read (rather than a separate pre-check against a possibly-stale resolve) is
+                /// what keeps this race-free: a snapshot taken before the closure could see "already
+                /// committed to id.ref" and let a later closure invocation append a fresh owner_transition
+                /// after a concurrent repoint moved the ref away from id.ref in between -- exactly the
+                /// re-ownership of a dropped identity this check exists to prevent.
+                if (const auto it = state.getCommitted().find(final_ref_name);
+                    it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
+                    return {};
+                if (!id_staged_by_this_txn)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "precommitAdd: manifest '{}' was not staged by this transaction (build {}) and is not the current "
+                        "committed manifest of ref '{}' in namespace '{}' -- refusing to re-own a foreign or previously-dropped identity",
+                        manifestRefDebugString(id.ref), u128ToHex(txn_build_id), final_ref_name, target_ns.string());
+
+                std::vector<RefOp> ops;
+                if (state.getLifecycle() != RefLifecycle::Live)
+                {
+                    /// Reaching an empty runtime here means catalog resolution admitted a new life. A
+                    /// predecessor still `Removing` was refused before recovery, so rebirth needs no
+                    /// physical marker or empty-prefix proof.
+                    RefOp birth;
+                    birth.kind = RefOpKind::NamespaceBirth;
+                    ops.push_back(birth);
+                }
+                RefOp add;
+                add.kind = RefOpKind::OwnerTransition;
+                add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
+                ops.push_back(add);
+                return ops;
+            },
+            RootMutationOrigin::Writer, RootMutationKind::Precommit);
+    }
+    catch (const RefAdmissionRefusedException &)
+    {
+        /// Refused before the lane queued the append: this invocation created no binding and owes no duty.
+        precommit_target_ns = std::move(previous_target_ns);
+        precommit_final_ref = std::move(previous_final_ref);
+        precommit_manifest = previous_manifest;
+        precommit_state = previous_state;
+        throw;
+    }
 
     /// The append returned: the precommit binding is durably this build's, so the duty settles from
     /// `Uncertain` to `Durable` and `ensureBlobPresent`'s materialization gate opens.

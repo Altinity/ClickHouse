@@ -1,11 +1,15 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -16,6 +20,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/HashingReadBuffer.h>
@@ -25,6 +30,8 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <Poco/Exception.h>
 #include <base/defines.h>
 #include "config.h"
@@ -46,6 +53,8 @@ extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
 extern const int NETWORK_ERROR;
+extern const int QUERY_WAS_CANCELLED;
+extern const int TIMEOUT_EXCEEDED;
 extern const int UNKNOWN_EXCEPTION;
 }
 
@@ -3081,6 +3090,9 @@ TEST(CASPartWriteTxn, StageManifestGiveUpTextCoversEveryOutcome)
         {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
           .attempts_sent = 5},
          "5 attempt(s) sent and the resolving read did not complete (nothing observed)", true},
+        {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = true, .last_seen = ProvenAbsent{},
+          .attempts_sent = 1},
+         "1 attempt(s) sent and not sent again after the resolving read found absent", true},
         {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = false, .last_seen = ProvenAbsent{}},
          "was not sent: a read of the current object did not complete (absent)", false},
     };
@@ -3130,4 +3142,349 @@ TEST(CASPartWriteTxn, StageManifestSentThenGaveUpSaysUncertain)
     ASSERT_GT(b->put_attempts, 1);
     EXPECT_NE(text.find("UNCERTAIN"), String::npos) << text;
     EXPECT_NE(text.find(fmt::format("{} attempt(s) sent", b->put_attempts)), String::npos) << text;
+}
+
+namespace
+{
+
+/// Runs `body` on a fresh thread with a `ThreadStatus` and a killable query attached, and returns the
+/// code `body` threw, or 0.
+int codeOnQueryThread(const std::function<void(DB::Cas::tests::CasKillableQuery &)> & body)
+{
+    int code = 0;
+    std::thread worker([&]
+    {
+        DB::ThreadStatus thread_status;
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        try
+        {
+            body(query);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+        catch (...)
+        {
+            code = -1;
+        }
+    });
+    worker.join();
+    return code;
+}
+
+enum class StopBeforeSwap : uint8_t { Query, Background, LeaseLoss };
+
+/// Stops the owner after the upload and before its result is recorded, on the fan-out merge and on the serial path.
+void expectStopBeforeDependencySwap(std::initializer_list<StopBeforeSwap> stop_kinds)
+{
+    using Stop = StopBeforeSwap;
+    for (const bool fanout : {true, false})
+    {
+        for (const Stop stop_kind : stop_kinds)
+        {
+            const char * stop_name = stop_kind == Stop::Query ? "query kill"
+                : stop_kind == Stop::Background                ? "background stop"
+                                                               : "lease loss";
+            SCOPED_TRACE(fmt::format("{} path, {}", fanout ? "fan-out" : "serial", stop_name));
+            auto b = std::make_shared<InMemoryBackend>();
+            auto s = openPool(b);
+            const String payload = "stop-before-dependency-swap";
+            const BlobRef ref = idOf(payload);
+            auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/stop-before-swap"}, "part", payload);
+            const auto deps_before = build->depsSnapshotForTest();
+
+            const int code = codeOnQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+            {
+                std::atomic<bool> background_stopped{false};
+                const auto background = DB::Cas::OwnerScope::background([&]
+                {
+                    if (background_stopped.load())
+                        throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+                });
+                const auto stop = [&]
+                {
+                    switch (stop_kind)
+                    {
+                        case Stop::Query:
+                            query.kill();
+                            return;
+                        case Stop::Background:
+                            background_stopped = true;
+                            return;
+                        case Stop::LeaseLoss:
+                            s->tripMountLost();
+                            DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(s);
+                            return;
+                    }
+                };
+                if (fanout)
+                {
+                    const BlobUploadResult result
+                        = build->uploadBlobDetached(BlobUploadRequest{ref, BlobSource::fromString(payload), payload.size()});
+                    build->setAdoptionHookForTest([&](size_t) { stop(); });
+                    build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&result, 1));
+                }
+                else
+                {
+                    build->setAdoptionHookForTest([&](size_t) { stop(); });
+                    (void)build->putBlob(ref, BlobSource::fromString(payload));
+                }
+            });
+
+            switch (stop_kind)
+            {
+                case Stop::Query:
+                    EXPECT_EQ(code, 0) << "a killed query's adoption proceeds";
+                    EXPECT_NE(build->depsSnapshotForTest(), deps_before) << "the uploaded body was not adopted";
+                    EXPECT_NE(build->dependencyProof(ref), std::nullopt);
+                    break;
+                case Stop::Background:
+                case Stop::LeaseLoss:
+                    EXPECT_EQ(code, stop_kind == Stop::Background ? DB::ErrorCodes::ABORTED : DB::ErrorCodes::NETWORK_ERROR);
+                    EXPECT_EQ(build->depsSnapshotForTest(), deps_before) << "the dependency was adopted after the stop";
+                    EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
+                    break;
+            }
+        }
+    }
+}
+
+}
+
+/// A background stop or a lease loss that lands before the dependency swap leaves the build without the dependency.
+TEST(CASPartWrite, BackgroundStopOrLeaseLossBeforeDependencySwapSkipsAdoption)
+{
+    expectStopBeforeDependencySwap({StopBeforeSwap::Background, StopBeforeSwap::LeaseLoss});
+}
+
+/// Adoption sends nothing and is no safe point, so a killed query adopts the body it uploaded.
+TEST(CASPartWrite, KilledQueryAdoptsTheUploadedBody)
+{
+    expectStopBeforeDependencySwap({StopBeforeSwap::Query});
+}
+
+/// The body landed and its reply was lost while the query timed out. The stop ends the upload with the
+/// publication's own failure: no further publication, and no observation that would adopt the landed body. A
+/// failure that is not a `std::exception` passes the request engine unclassified, so both exception types are
+/// covered.
+TEST(CASPartWrite, OwnerTimeoutAfterLandedBodyIsNotAdopted)
+{
+    for (const bool std_exception : {true, false})
+    {
+        SCOPED_TRACE(std_exception ? "std::exception" : "not a std::exception");
+        auto b = std::make_shared<BlobPutFaultBackend>();
+        auto s = openBlobFaultPool(b);
+        const RootNamespace ns{"srv/tbl"};
+        const String payload = "blob-payload-owner-timeout";
+        auto build = startBuildFor(s, ns, "part_owner_timeout");
+        const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+        build->precommitAdd(ns, "part_owner_timeout", id);
+
+        b->fault_count = 1;
+        b->land_despite_fault = true;
+        b->fault_is_not_std_exception = !std_exception;
+        const int code = codeOnQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            b->on_publish = [&]
+            {
+                query.kill(std::make_exception_ptr(DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "the query's timeout")));
+            };
+            (void)build->putBlob(idOf(payload), BlobSource::fromString(payload));
+        });
+        b->on_publish = {};
+
+        EXPECT_EQ(code, -1) << "the lost reply's own exception, which is not a DB::Exception, not the query's timeout";
+        EXPECT_EQ(b->publish_stream_attempts, 1) << "no further publication";
+        EXPECT_EQ(b->blob_head_attempts, 1) << "the landed body was observed again";
+        EXPECT_EQ(build->dependencyProof(idOf(payload)), std::nullopt) << "the landed body was adopted";
+        OperationForTest op(*b);
+        EXPECT_TRUE((*op).head(s->layout().blobKey(idOf(payload)), Retry::once()).has_value())
+            << "the landed body stays as debris";
+    }
+}
+
+/// A publication that failed while the query was live, then a kill in the pause before the retry: the retry's
+/// `HEAD` is not sent, and the upload ends with the failed publication's own error, not the query's.
+TEST(CASPartWrite, KillInPublicationRetryPauseKeepsThePublicationFailure)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-kill-in-retry-pause";
+    auto build = startBuildFor(s, ns, "part_kill_in_pause");
+    build->precommitAdd(ns, "part_kill_in_pause", build->stageManifest({blobManifestEntry("a.bin", payload)}));
+    b->fault_count = 1;
+
+    String failure;
+    std::thread killed([&]
+    {
+        DB::ThreadStatus thread_status;
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        s->mountRequests().setSleepFnForTest([&](uint64_t)
+        {
+            if (b->publish_stream_attempts > 0)
+                query.kill();
+        });
+        try
+        {
+            (void)build->putBlob(idOf(payload), BlobSource::fromString(payload));
+        }
+        catch (...)
+        {
+            failure = DB::getCurrentExceptionMessage(/*with_stacktrace=*/false);
+        }
+        s->mountRequests().setSleepFnForTest([](uint64_t) {});
+    });
+    killed.join();
+
+    EXPECT_NE(failure.find("simulated ambiguous publication"), String::npos) << failure;
+    EXPECT_EQ(b->blob_head_attempts, 1) << "the retry's HEAD was sent after the kill";
+    EXPECT_EQ(b->publish_stream_attempts, 1);
+    EXPECT_EQ(build->dependencyProof(idOf(payload)), std::nullopt);
+}
+
+#if USE_AWS_S3
+/// A credential refusal of a publication, then a kill in the pause before the retry: the upload ends as retry-later
+/// carrying the refusal, not with the raw refusal, which would read as damage.
+TEST(CASPartWrite, KillBeforeAPublicationsCredentialRetryEndsAsRetryLater)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-kill-before-credential-retry";
+    auto build = startBuildFor(s, ns, "part_kill_before_credential_retry");
+    build->precommitAdd(ns, "part_kill_before_credential_retry",
+        build->stageManifest({blobManifestEntry("a.bin", payload)}));
+    b->fault_count = 1;
+    b->fault = std::make_exception_ptr(
+        DB::S3Exception("the store answered AccessDenied", Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
+
+    int code = 0;
+    String failure;
+    std::thread killed([&]
+    {
+        DB::ThreadStatus thread_status;
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        s->mountRequests().setSleepFnForTest([&](uint64_t)
+        {
+            if (b->publish_stream_attempts > 0)
+                query.kill();
+        });
+        try
+        {
+            (void)build->putBlob(idOf(payload), BlobSource::fromString(payload));
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+            failure = e.message();
+        }
+        s->mountRequests().setSleepFnForTest([](uint64_t) {});
+    });
+    killed.join();
+
+    EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << failure;
+    EXPECT_NE(failure.find("the store answered AccessDenied"), String::npos) << failure;
+    EXPECT_NE(failure.find("credential retry"), String::npos) << failure;
+    EXPECT_EQ(b->publish_stream_attempts, 1);
+    EXPECT_EQ(build->dependencyProof(idOf(payload)), std::nullopt);
+}
+
+/// A credential refusal of a publication whose query was killed during it ends as retry-later carrying the refusal,
+/// as a kill in the pause does. A query's stored cause stays the same object, even a credential-class one.
+TEST(CASPartWrite, KillDuringAPublicationsCredentialRefusalEndsAsRetryLater)
+{
+    for (const bool stored_cause : {false, true})
+    {
+        SCOPED_TRACE(stored_cause ? "the query's stored cause" : "the store's refusal");
+        auto b = std::make_shared<BlobPutFaultBackend>();
+        auto s = openBlobFaultPool(b);
+        const RootNamespace ns{"srv/tbl"};
+        const String payload = "blob-payload-kill-during-credential-refusal";
+        auto build = startBuildFor(s, ns, "part_kill_during_credential_refusal");
+        build->precommitAdd(ns, "part_kill_during_credential_refusal",
+            build->stageManifest({blobManifestEntry("a.bin", payload)}));
+        b->fault_count = 1;
+        b->fault = std::make_exception_ptr(DB::S3Exception(
+            stored_cause ? "the query's stored cause" : "the store answered AccessDenied", Aws::S3::S3Errors::ACCESS_DENIED,
+            "AccessDenied"));
+
+        int code = 0;
+        String failure;
+        std::exception_ptr caught;
+        std::thread killed([&]
+        {
+            DB::ThreadStatus thread_status;
+            DB::Cas::tests::CasKillableQuery query(getContext().context);
+            b->on_publish = [&] { query.kill(stored_cause ? b->fault : nullptr); };
+            try
+            {
+                (void)build->putBlob(idOf(payload), BlobSource::fromString(payload));
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                failure = e.message();
+                caught = std::current_exception();
+            }
+        });
+        killed.join();
+
+        EXPECT_EQ(b->publish_stream_attempts, 1);
+        EXPECT_EQ(build->dependencyProof(idOf(payload)), std::nullopt);
+        if (stored_cause)
+        {
+            EXPECT_EQ(caught, b->fault) << "the stored cause was replaced: " << failure;
+            continue;
+        }
+        EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << failure;
+        EXPECT_NE(failure.find("the store answered AccessDenied"), String::npos) << failure;
+        EXPECT_NE(failure.find("credential retry"), String::npos) << failure;
+    }
+}
+#endif
+
+/// The serial upload of a killed query sends its `HEAD`. When it finds no reusable body, the upload ends with the
+/// query's error before the publication starts; a reusable body is adopted, since adoption starts no new work.
+TEST(CASPartWrite, KilledQuerysUploadStartsNoPublication)
+{
+    for (const bool body_present : {false, true})
+    {
+        SCOPED_TRACE(body_present ? "a reusable body is present" : "no body");
+        auto b = std::make_shared<BlobPutFaultBackend>();
+        auto s = openBlobFaultPool(b);
+        const RootNamespace ns{"srv/tbl"};
+        const String payload = "blob-payload-killed-before-publication";
+        if (body_present)
+        {
+            auto earlier = startBuildFor(s, ns, "part_earlier");
+            earlier->precommitAdd(ns, "part_earlier", earlier->stageManifest({blobManifestEntry("a.bin", payload)}));
+            (void)earlier->putBlob(idOf(payload), BlobSource::fromString(payload));
+        }
+        auto build = startBuildFor(s, ns, "part_killed");
+        const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+        build->precommitAdd(ns, "part_killed", id);
+        const int publications_before = b->publish_stream_attempts;
+        const int heads_before = b->blob_head_attempts;
+
+        const int code = codeOnQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            query.kill();
+            (void)build->putBlob(idOf(payload), BlobSource::fromString(payload));
+        });
+
+        EXPECT_EQ(b->blob_head_attempts - heads_before, 1) << "the HEAD is a first attempt, sent for a killed query";
+        EXPECT_EQ(b->publish_stream_attempts, publications_before) << "a publication started after the kill";
+        if (body_present)
+        {
+            EXPECT_EQ(code, 0);
+            EXPECT_NE(build->dependencyProof(idOf(payload)), std::nullopt) << "the reusable body was not adopted";
+        }
+        else
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::QUERY_WAS_CANCELLED);
+            EXPECT_EQ(build->dependencyProof(idOf(payload)), std::nullopt);
+        }
+    }
 }

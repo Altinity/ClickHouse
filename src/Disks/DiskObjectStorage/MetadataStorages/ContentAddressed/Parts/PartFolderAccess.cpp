@@ -257,6 +257,9 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     if (freshness != Freshness::CachedForLoad)
         return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
 
+    /// A cold build's leader stopped: its followers build again rather than share the leader's verdict.
+    struct LeaderStopped {};
+
     const String cache_key = key.cacheKey();
     /// Readers that resolved different manifests of one ref must not share a build.
     const String build_key = cache_key + '\0' + resolved.manifest_id.root_namespace.string() + '\0'

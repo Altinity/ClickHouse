@@ -2285,8 +2285,12 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
         const ConfirmVerdict verdict = confirmUnderSlot(
             ns, ref_name, [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
             slot_read_policy);
-        if (verdict.answer != ConfirmAnswer::Unknown || verdict.refusal == ConfirmVerdict::Refusal::OneWay
-            || ref_ledger.pinnedTableRetired(table, ns))
+        if (verdict.answer != ConfirmAnswer::Unknown)
+            return verdict.answer;
+        /// A stopped background owner gets its own verdict instead of any `Unknown`, so `republishRef` never reads the
+        /// destination for it.
+        Cas::throwIfBackgroundStopped();
+        if (verdict.refusal == ConfirmVerdict::Refusal::OneWay || ref_ledger.pinnedTableRetired(table, ns))
             return verdict.answer;
         const uint64_t now_ms = bootMsNow();
         if (now_ms >= deadline_ms)
@@ -2334,7 +2338,9 @@ ConfirmVerdict Pool::confirmUnderSlot(const RootNamespace & ns, const String & r
         catch (...)
         {
             throwIfConfirmTornDown(ns, ref_name);
-            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+            /// The owner's verdict is not a slot that could not be read; the counter is diagnostic, so a race here goes uncounted.
+            if (!Cas::ownerStopRequested())
+                ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
             throw;
         }
         /// A read that finished after teardown began answers for a mount that is going away.

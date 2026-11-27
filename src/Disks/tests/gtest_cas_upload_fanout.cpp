@@ -12,10 +12,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <base/scope_guard.h>
 #include <Poco/Exception.h>
 
@@ -46,9 +50,17 @@ using DB::Cas::tests::OperationForTest;
 
 namespace DB::ErrorCodes
 {
+extern const int CANNOT_SCHEDULE_TASK;
 extern const int LOGICAL_ERROR;
 extern const int INCORRECT_DATA;
+extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
+extern const int QUERY_WAS_CANCELLED;
+}
+
+namespace DB::FailPoints
+{
+extern const char thread_group_switcher_post_attach_failure[];
 }
 
 namespace CurrentMetrics
@@ -1010,6 +1022,164 @@ TEST(CASUploadFanout, TrackingSeamThrowStillDrains)
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a tracking-seam throw";
 }
 
+namespace
+{
+
+/// Counts blob publications and the blob `HEAD`s per key.
+class PublicationCountingBackend final : public InMemoryBackend
+{
+public:
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(mutex);
+            ++heads[key];
+        }
+        return InMemoryBackend::head(key, access);
+    }
+
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
+    {
+        ++publications;
+        InMemoryBackend::publish(request, access);
+    }
+
+    int headsOf(const String & key)
+    {
+        std::lock_guard lock(mutex);
+        return heads[key];
+    }
+
+    std::atomic<int> publications{0};
+
+private:
+    std::mutex mutex;
+    std::map<String, int> heads;
+};
+
+}
+
+/// A query killed while one upload task is parked still dispatches the sibling and lets it send its `HEAD`: a
+/// dispatch and a first attempt are not safe points. No worker starts a publication after the kill, the caller
+/// returns only after the parked task finished, and the build records no dependency.
+TEST(CASUploadFanout, StoppedWorkerStartsNoPublicationAndParentJoinsSibling)
+{
+    auto b = std::make_shared<PublicationCountingBackend>();
+    auto s = openPool(b);
+    auto build = precommitBuildFor(s, RootNamespace{"srv1/nsStoppedFanout"}, "part");
+    const auto deps_before = stableDeps(*build);
+
+    const String one = "stopped-fanout-one";
+    const String two = "stopped-fanout-two";
+    /// Dispatch runs in ascending-ref order.
+    const String parked = (idOf(one) < idOf(two)) ? one : two;
+    const String later = (parked == one) ? two : one;
+
+    constexpr auto watchdog = std::chrono::seconds(30);
+    BoundedEvent parked_running;
+    BoundedEvent killed;
+    BoundedEvent release_parked;
+    BoundedEvent parent_returned;
+    std::mutex dispatched_mutex;
+    std::vector<BlobRef> dispatched;
+    std::atomic<DB::Cas::tests::CasKillableQuery *> query_ptr{nullptr};
+
+    BlobUploadFanoutHooksForTest hooks;
+    hooks.in_task = [&](const BlobRef & ref)
+    {
+        {
+            std::lock_guard lock(dispatched_mutex);
+            dispatched.push_back(ref);
+        }
+        if (ref == idOf(parked))
+        {
+            parked_running.fire();
+            EXPECT_TRUE(release_parked.wait(watchdog));
+        }
+    };
+    hooks.after_enqueue = [&](const BlobRef & ref)
+    {
+        if (ref != idOf(parked))
+            return;
+        /// Running, so the unwind cannot cancel it before it starts.
+        EXPECT_TRUE(parked_running.wait(watchdog));
+        query_ptr.load()->kill();
+        killed.fire();
+    };
+
+    int code = 0;
+    int parked_heads_at_return = -1;
+    std::thread parent([&]
+    {
+        DB::ThreadStatus thread_status;
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        query_ptr = &query;
+        std::vector<BlobUploadRequest> reqs{localRequest(one), localRequest(two)};
+        auto pool = makePool(2);
+        try
+        {
+            fanOutBlobUploads(*build, reqs, *pool, &hooks);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+        parked_heads_at_return = b->headsOf(s->layout().blobKey(idOf(parked)));
+        parent_returned.fire();
+    });
+
+    EXPECT_TRUE(killed.wait(watchdog));
+    EXPECT_FALSE(parent_returned.wait(std::chrono::milliseconds(300)))
+        << "the caller returned while a dispatched upload task was still parked";
+    release_parked.fire();
+    EXPECT_TRUE(parent_returned.wait(watchdog));
+    parent.join();
+
+    EXPECT_EQ(code, DB::ErrorCodes::QUERY_WAS_CANCELLED);
+    EXPECT_EQ(parked_heads_at_return, 1) << "the parked task's upload ran before the caller returned";
+    EXPECT_EQ(dispatched.size(), 2u) << "the sibling was not dispatched after the kill";
+    EXPECT_EQ(b->headsOf(s->layout().blobKey(idOf(later))), 1) << "the sibling did not send its HEAD";
+    EXPECT_EQ(b->publications.load(), 0) << "a worker started a publication after the kill";
+    EXPECT_EQ(stableDeps(*build), deps_before) << "the build recorded a dependency of the stopped fan-out";
+}
+
+/// An upload worker that fails to join the inserting query's thread group sends nothing: outside the query a missing
+/// `HEAD` would not see the query's stop and the worker would publish. The fan-out fails and records no dependency.
+TEST(CASUploadFanout, WorkerOutsideTheQuerySendsNothing)
+{
+    CAS_SKIP_WITHOUT_FAILPOINTS();
+    auto b = std::make_shared<PublicationCountingBackend>();
+    auto s = openPool(b);
+    auto build = precommitBuildFor(s, RootNamespace{"srv1/nsDetachedWorker"}, "part");
+    const auto deps_before = stableDeps(*build);
+    const String one = "detached-worker-one";
+
+    int code = 0;
+    String failure;
+    DB::Cas::tests::onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery &)
+    {
+        /// Armed after the query's own attach, so the worker's switch is the one that fails; it fails one switch only.
+        DB::FailPointInjection::enableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+        SCOPE_EXIT({ DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure); });
+        std::vector<BlobUploadRequest> reqs{localRequest(one)};
+        auto pool = makePool(2);
+        try
+        {
+            fanOutBlobUploads(*build, reqs, *pool);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+            failure = e.message();
+        }
+    });
+
+    EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK) << failure;
+    EXPECT_EQ(b->publications.load(), 0) << "a worker outside the query published a blob";
+    EXPECT_EQ(b->headsOf(s->layout().blobKey(idOf(one))), 0) << "a worker outside the query sent a HEAD";
+    EXPECT_EQ(stableDeps(*build), deps_before);
+}
+
 /// A part's uploads run concurrently and each holds its payload reader until it finishes, so a small
 /// staged payload must not pin a full default-sized read buffer.
 TEST(CASUploadFanout, LocalStagedPayloadReaderIsSizedToThePayload)
@@ -1042,4 +1212,94 @@ TEST(CASUploadFanout, LocalStagedPayloadReaderIsSizedToThePayload)
     std::string large_read;
     DB::readStringUntilEOF(large_read, *large_reader);
     EXPECT_EQ(large_read, large);
+}
+
+namespace
+{
+
+/// Holds every intent `GET` until `expected` of them are in flight, runs `on_all_arrived` once, then answers as the S3
+/// client does: a miss checks the query, which throws the query's stored exception once it is killed.
+class IntentReadRendezvousBackend final : public InMemoryBackend
+{
+public:
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (intents_prefix.empty() || !key.starts_with(intents_prefix))
+            return InMemoryBackend::read(key, access);
+        {
+            std::unique_lock lock(mutex);
+            if (++arrived == expected)
+            {
+                on_all_arrived();
+                cv.notify_all();
+            }
+            else if (!cv.wait_for(lock, std::chrono::seconds(30), [&] { return arrived >= expected; }))
+                timed_out = true;
+        }
+        auto answer = InMemoryBackend::read(key, access);
+        if (!answer)
+            DB::CurrentThread::checkIfNotCancelled();
+        return answer;
+    }
+
+    /// Empty until the pool is open: the pool's own reads are not intent reads.
+    String intents_prefix;
+    int expected = 2;
+    std::function<void()> on_all_arrived;
+    bool timed_out = false;
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    int arrived = 0;
+};
+
+}
+
+/// Two upload tasks whose intent reads fail with the query's stored exception receive the same object, so neither
+/// may annotate it. The stored message must stay as the query set it; with an annotating catch it changes on every
+/// run, and TSan or ASan also sees the two unsynchronized writes to one string.
+TEST(CASUploadFanout, ConcurrentIntentReadsLeaveTheStoredQueryExceptionUnchanged)
+{
+    const String stored_text = "the query's stored network failure";
+    for (int iteration = 0; iteration < 50; ++iteration)
+    {
+        SCOPED_TRACE(iteration);
+        auto b = std::make_shared<IntentReadRendezvousBackend>();
+        auto s = openPool(b);
+        b->intents_prefix = s->layout().blobIntentsPrefix();
+        auto build = precommitBuildFor(s, RootNamespace{"srv1/nsStoredVerdict"}, "part");
+        const String one = "stored-verdict-one";
+        const String two = "stored-verdict-two";
+        seedPresentBody(*b, s->layout(), s->poolMeta(), one);
+        seedPresentBody(*b, s->layout(), s->poolMeta(), two);
+
+        const auto cause = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "{}", stored_text));
+        int code = 0;
+        DB::Cas::tests::onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            b->on_all_arrived = [&] { query.kill(cause); };
+            std::vector<BlobUploadRequest> reqs{localRequest(one), localRequest(two)};
+            auto pool = makePool(2);
+            try
+            {
+                fanOutBlobUploads(*build, reqs, *pool);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+            }
+        });
+
+        ASSERT_FALSE(b->timed_out) << "the two intent reads never overlapped";
+        EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR);
+        try
+        {
+            std::rethrow_exception(cause);
+        }
+        catch (const DB::Exception & e)
+        {
+            ASSERT_EQ(e.message(), stored_text) << "an intent read annotated the query's stored exception";
+        }
+    }
 }

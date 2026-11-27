@@ -1,10 +1,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/MemoryTracker.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <Common/ProfileEvents.h>
 #include <base/scope_guard.h>
 #include <Poco/Exception.h>
@@ -13,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <utility>
 #include <future>
 #include <latch>
 #include <optional>
@@ -31,6 +37,8 @@ namespace DB::ErrorCodes
     extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
     extern const int NO_REPLICA_HAS_PART;
+    extern const int QUERY_WAS_CANCELLED;
+    extern const int TIMEOUT_EXCEEDED;
 }
 
 namespace ProfileEvents
@@ -39,6 +47,7 @@ extern const Event CASRefRollbackBestEffortDropFailed;
 extern const Event CASOwnershipConflict;
 extern const Event CASRefMove;
 extern const Event CASRelinkConfirmRefusedStateLockBusy;
+extern const Event CASRelinkConfirmRefusedSlotUnreadable;
 }
 
 using namespace DB;
@@ -1345,6 +1354,32 @@ TEST(CASPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
     }
 }
 
+/// A killed query's abort on a healthy store does its whole cleanup on its own thread: when the call returns, the
+/// precommit binding is gone, the build floor has advanced and no cleanup duty is left for another caller.
+TEST(CASPartFolderAccess, KilledQueryAbandonOnSameThreadRemovesPrecommit)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+
+    std::thread killed([&]
+    {
+        ThreadStatus thread_status;
+        Cas::tests::CasKillableQuery query(getContext().context);
+        auto prepared = access.prepareEntries({ns, "part_1"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
+        ASSERT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", prepared.manifestId().ref}));
+        const uint64_t floor_before = store->minActive();
+        query.kill();
+
+        EXPECT_NO_THROW(prepared.abort());
+        EXPECT_FALSE(store->writerCleanupDutiesPendingForTest()) << "the abort left its removal to a later caller";
+        EXPECT_GT(store->minActive(), floor_before) << "the aborted build still holds the floor";
+        EXPECT_TRUE(store->livePrecommitsForTest(ns).empty()) << "the precommit binding stayed live";
+    });
+    killed.join();
+}
+
 /// A forgotten terminal must be impossible, not merely discouraged: `~PartWriteTxn` only retires the
 /// build sequence, so the handle's own destructor is the last-resort owner of the precommit removal.
 TEST(CASPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
@@ -1775,7 +1810,7 @@ namespace
 {
 
 /// A pool whose manifest decode cache is off, so every view build reaches the manifest GET.
-Cas::PoolPtr openPoolWithoutDecodeCache(const std::shared_ptr<CountingBackend> & backend)
+Cas::PoolPtr openPoolWithoutDecodeCache(Cas::BackendPtr backend)
 {
     return Cas::Pool::open(backend,
         Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .manifest_decode_cache_bytes = 0});
@@ -1906,11 +1941,32 @@ struct LeaderAndFollower
     bool follower_joined = false;
 };
 
+/// Readers that run inside a registered query. An empty function leaves that reader outside any query.
+struct ReaderQueries
+{
+    /// Runs while the leader is parked, with the leader's query.
+    std::function<void(Cas::tests::CasKillableQuery &)> leader_parked;
+    /// Runs on the follower's thread, with the follower's query, before it reads.
+    std::function<void(Cas::tests::CasKillableQuery &)> follower_before_read;
+};
+
+/// Runs `read` on the current raw thread, inside a registered query when `in_query` is set.
+ReaderOutcome readInQuery(bool in_query, const std::function<void(Cas::tests::CasKillableQuery &)> & with_query,
+                          const std::function<ReaderOutcome()> & read)
+{
+    if (!in_query)
+        return read();
+    ThreadStatus thread_status;
+    Cas::tests::CasKillableQuery query(getContext().context);
+    with_query(query);
+    return read();
+}
+
 /// One reader leads the cold build of `key` and is held in its manifest GET; `while_parked` runs, then a
 /// second reader starts and the GET is released once that reader has joined the build or returned.
 LeaderAndFollower leaderAndFollower(
     ParkFirstReadBackend & backend, Cas::CachedPartFolderAccess & access, const Cas::PartRefKey & key,
-    const std::function<void()> & while_parked = {})
+    const std::function<void()> & while_parked = {}, const ReaderQueries & queries = {})
 {
     std::promise<void> release;
     backend.release = release.get_future().share();
@@ -1946,15 +2002,24 @@ LeaderAndFollower leaderAndFollower(
     };
     SCOPE_EXIT({ finish(); });
 
-    leader_thread.emplace([&] { run.leader = readColdView(access, key); });
+    /// Published by the leader's thread before its read parks; used only while it is parked.
+    Cas::tests::CasKillableQuery * leader_query = nullptr;
+    leader_thread.emplace([&]
+    {
+        run.leader = readInQuery(bool(queries.leader_parked), [&](Cas::tests::CasKillableQuery & query) { leader_query = &query; },
+                                 [&] { return readColdView(access, key); });
+    });
     run.leader_parked = backend.parked.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
     if (run.leader_parked)
     {
         if (while_parked)
             while_parked();
+        if (queries.leader_parked)
+            queries.leader_parked(*leader_query);
         follower_thread.emplace([&]
         {
-            run.follower = readColdView(access, key);
+            run.follower = readInQuery(bool(queries.follower_before_read), queries.follower_before_read,
+                                       [&] { return readColdView(access, key); });
             arrive();
         });
         run.follower_arrived = arrived.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
@@ -2042,6 +2107,154 @@ TEST(CASPartFolderAccess, AFollowersOwnMemoryLimitIsFinal)
     EXPECT_EQ(follower.code, ErrorCodes::MEMORY_LIMIT_EXCEEDED);
     EXPECT_EQ(follower.message, "Query memory limit exceeded: the follower's");
     EXPECT_EQ(backend->getCount(manifest_key), 2u);
+}
+
+namespace
+{
+
+struct ColdBuildFixture
+{
+    std::shared_ptr<ParkFirstReadBackend> backend = std::make_shared<ParkFirstReadBackend>();
+    Cas::PoolPtr store = openPoolWithoutDecodeCache(std::make_shared<Cas::tests::CasClientLikeBackend>(backend));
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access{store, cacheOn()};
+    const Cas::ManifestId id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = Cas::Layout("p").manifestKey(id);
+
+    ColdBuildFixture()
+    {
+        backend->resetCounts();
+        backend->park_key = manifest_key;
+    }
+};
+
+}
+
+/// A leader whose query stopped hands its followers no verdict of its own: a live follower rebuilds the
+/// same manifest, and the leader reports its own stop.
+TEST(CASPartFolderAccess, StoppedLeaderLetsLiveFollowerRebuild)
+{
+    struct Arm
+    {
+        const char * name;
+        std::exception_ptr cause;
+        int code;
+    };
+    for (const auto & arm : {Arm{"kill", nullptr, ErrorCodes::QUERY_WAS_CANCELLED},
+                             Arm{"timeout", std::make_exception_ptr(Exception(ErrorCodes::TIMEOUT_EXCEEDED, "the query timed out")),
+                                 ErrorCodes::TIMEOUT_EXCEEDED}})
+    {
+        SCOPED_TRACE(arm.name);
+        ColdBuildFixture fx;
+        fx.backend->failNextReadWith(fx.manifest_key, std::make_exception_ptr(Poco::TimeoutException("the manifest read timed out")));
+
+        ReaderQueries queries;
+        queries.leader_parked = [&](Cas::tests::CasKillableQuery & query) { query.kill(arm.cause); };
+        const auto run = leaderAndFollower(*fx.backend, fx.access, fx.key, {}, queries);
+        ASSERT_TRUE(run.leader_parked && run.follower_arrived && run.follower_joined);
+
+        EXPECT_EQ(run.leader.code, arm.code) << run.leader.message;
+        EXPECT_EQ(run.leader.view, nullptr);
+        EXPECT_EQ(run.follower.code, 0) << run.follower.message;
+        ASSERT_NE(run.follower.view, nullptr);
+        EXPECT_EQ(run.follower.view->manifestId(), fx.id) << "the follower rebuilt the same manifest";
+        EXPECT_EQ(fx.backend->getCount(fx.manifest_key), 2u) << "the leader's failed read and the follower's rebuild";
+    }
+}
+
+/// A follower takes a successful shared build even when its own query was killed: a read-only follower
+/// has no owner check.
+TEST(CASPartFolderAccess, KilledReaderConsumesSuccessfulSharedBuild)
+{
+    ColdBuildFixture fx;
+
+    ReaderQueries queries;
+    queries.follower_before_read = [](Cas::tests::CasKillableQuery & query) { query.kill(); };
+    const auto run = leaderAndFollower(*fx.backend, fx.access, fx.key, {}, queries);
+    ASSERT_TRUE(run.leader_parked && run.follower_arrived && run.follower_joined);
+
+    EXPECT_EQ(run.leader.code, 0) << run.leader.message;
+    EXPECT_EQ(run.follower.code, 0) << run.follower.message;
+    ASSERT_NE(run.follower.view, nullptr);
+    EXPECT_EQ(run.follower.view, run.leader.view) << "the follower consumed the leader's build";
+    EXPECT_EQ(fx.backend->getCount(fx.manifest_key), 1u);
+}
+
+/// A live leader's transport timeout is the leader's to reissue; its follower does not take the build over.
+TEST(CASPartFolderAccess, LiveLeadersTransportTimeoutIsNotFollowerTakeover)
+{
+    ColdBuildFixture fx;
+    fx.backend->failNextReadWith(fx.manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::TIMEOUT_EXCEEDED, "the manifest read timed out")));
+
+    const auto run = leaderAndFollower(*fx.backend, fx.access, fx.key);
+    ASSERT_TRUE(run.leader_parked && run.follower_arrived && run.follower_joined);
+
+    EXPECT_EQ(run.leader.code, 0) << run.leader.message;
+    ASSERT_NE(run.leader.view, nullptr);
+    EXPECT_EQ(run.follower.view, run.leader.view) << "the follower consumed the leader's reissued build";
+    EXPECT_EQ(fx.backend->getCount(fx.manifest_key), 2u) << "both reads were the leader's";
+}
+
+namespace
+{
+
+/// `dropRefIfPresent` on a raw thread whose query was killed with a stored `FILE_DOESNT_EXIST`.
+int dropRefIfPresentWithStoredMiss(Cas::CachedPartFolderAccess & access, const Cas::PartRefKey & key)
+{
+    int code = 0;
+    std::thread dropper([&]
+    {
+        ThreadStatus thread_status;
+        Cas::tests::CasKillableQuery query(getContext().context);
+        query.kill(std::make_exception_ptr(Exception(ErrorCodes::FILE_DOESNT_EXIST, "the query's stored cause")));
+        try
+        {
+            access.dropRefIfPresent(key);
+        }
+        catch (const Exception & e)
+        {
+            code = e.code();
+        }
+    });
+    dropper.join();
+    return code;
+}
+
+}
+
+/// A stopped owner's stored `FILE_DOESNT_EXIST` is not "the ref raced away": on an unsuccessful read of a cold
+/// table, which the client-like backend answers with the stored cause, `dropRefIfPresent` throws it and the ref
+/// stays live.
+TEST(CASPartFolderAccess, StoppedOwnersStoredMissOnAColdTableKeepsTheRefLive)
+{
+    const Cas::RootNamespace ns{"srv/t1"};
+    const Cas::PartRefKey key{ns, "part_1"};
+    auto backend = std::make_shared<CountingBackend>();
+    auto client_like = std::make_shared<Cas::tests::CasClientLikeBackend>(backend);
+    publishPart(openPoolForTest(client_like), ns, "part_1", {inlineEntry("f", "x")});
+    auto store = openPoolForTest(client_like);
+    Cas::CachedPartFolderAccess access(store);
+    ASSERT_FALSE(store->refTableRecoveredForTest(ns));
+
+    EXPECT_EQ(dropRefIfPresentWithStoredMiss(access, key), ErrorCodes::FILE_DOESNT_EXIST);
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the verdict came from the cold table's read";
+    EXPECT_TRUE(access.existsRef(key, Cas::Freshness::ForceFresh)) << "the ref stays live";
+}
+
+/// On a warm table every request succeeds, so a killed query's drop is sent and lands.
+TEST(CASPartFolderAccess, KilledQuerysDropOnAWarmTableLands)
+{
+    const Cas::RootNamespace ns{"srv/t1"};
+    const Cas::PartRefKey key{ns, "part_1"};
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(std::make_shared<Cas::tests::CasClientLikeBackend>(backend));
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+
+    EXPECT_EQ(dropRefIfPresentWithStoredMiss(access, key), 0) << "a healthy drop of a killed query is sent";
+    EXPECT_FALSE(access.existsRef(key, Cas::Freshness::ForceFresh)) << "the drop landed";
 }
 
 /// A reader that resolved a newer manifest of the same ref must not receive the build of the older one.
@@ -2134,6 +2347,93 @@ TEST(CASPartFolderAccess, ALateFollowerTakesTheViewAnotherFollowerRebuilt)
     EXPECT_EQ(reads_before_second_resumes, 2u);
     EXPECT_EQ(backend->getCount(manifest_key), 2u) << "the late follower read the manifest again";
     EXPECT_EQ(second.view, first.view);
+}
+
+/// Followers of one failed cold build each rethrow their own copy of the leader's failure, of the same type, code and
+/// message: callers annotate what they catch, and two query threads must not append to one message.
+TEST(CASPartFolderAccess, FollowersOfAFailedBuildRethrowTheirOwnCopy)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->park_key = manifest_key;
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::CORRUPTED_DATA, "the leader's read failed")));
+    std::promise<void> release;
+    backend->release = release.get_future().share();
+
+    std::atomic<int> joins{0};
+    std::promise<void> both_joined;
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, [&]
+    {
+        if (++joins == 2)
+            both_joined.set_value();
+    });
+    SCOPE_EXIT({ access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, nullptr); });
+
+    const auto cold_read = [&](std::exception_ptr & failure)
+    {
+        try
+        {
+            (void)access.getView(key, Cas::Freshness::CachedForLoad);
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+    };
+    std::exception_ptr leader_failure;
+    std::exception_ptr first_failure;
+    std::exception_ptr second_failure;
+    std::thread leader_thread([&] { cold_read(leader_failure); });
+    const bool leader_parked = backend->parked.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    std::thread first_thread([&] { cold_read(first_failure); });
+    std::thread second_thread([&] { cold_read(second_failure); });
+    const bool followers_joined = both_joined.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    release.set_value();
+    leader_thread.join();
+    first_thread.join();
+    second_thread.join();
+    ASSERT_TRUE(leader_parked && followers_joined);
+
+    const auto object_of = [](const std::exception_ptr & failure) -> Exception *
+    {
+        if (!failure)
+            return nullptr;
+        try
+        {
+            std::rethrow_exception(failure);
+        }
+        catch (Exception & e)
+        {
+            return &e;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    };
+    Exception * leader = object_of(leader_failure);
+    Exception * first = object_of(first_failure);
+    Exception * second = object_of(second_failure);
+    ASSERT_TRUE(leader && first && second);
+    EXPECT_NE(first, second) << "two followers hold one exception object";
+    EXPECT_NE(first, leader);
+    EXPECT_NE(second, leader);
+    for (const Exception * follower : {first, second})
+    {
+        EXPECT_EQ(follower->code(), ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(follower->message(), leader->message());
+    }
+    const String second_before = second->message();
+    first->addMessage("annotated by the first follower");
+    EXPECT_EQ(second->message(), second_before);
+    EXPECT_EQ(leader->message().find("annotated"), String::npos);
 }
 
 TEST(CASPartFolderAccess, DropNamespaceErasesAllViews)
@@ -2560,4 +2860,389 @@ TEST(CASPartFolderAccess, MoveRetryAfterAmbiguousAppendIsIdempotent)
     EXPECT_FALSE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, expected.ref)) << "the landed move is not repeated";
     EXPECT_FALSE(access.existsRef({ns, "tmp_a"}, Cas::Freshness::ForceFresh));
     EXPECT_EQ(access.resolve({ns, "a"}, Cas::Freshness::ForceFresh)->manifest_id, expected);
+}
+
+namespace
+{
+
+/// A pool whose copy-confirm poll runs on a virtual clock. `moveSlot` makes a pass answer `Unknown`: the mount
+/// slot then shows a lease that is not this mount's. `on_snapshot` runs once, after the first ledger snapshot.
+/// Every pause runs `on_pause`, then advances the clock.
+struct CopyConfirmPollFixture
+{
+    std::shared_ptr<CountingBackend> backend = std::make_shared<CountingBackend>();
+    std::shared_ptr<std::atomic<uint64_t>> boot_ms = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    std::shared_ptr<Cas::Pool> store;
+    Cas::RootNamespace ns{"srv/t1"};
+    std::unique_ptr<Cas::CachedPartFolderAccess> access;
+    std::optional<Cas::CopySource> source;
+    uint64_t window_ms = 0;
+    std::atomic<size_t> pauses{0};
+    std::atomic<uint64_t> pause_advance_ms{0};
+    std::function<void()> on_pause;
+    std::function<void()> on_snapshot;
+
+    CopyConfirmPollFixture()
+    {
+        Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+        config.boot_ms_fn = [clock = boot_ms] { return clock->load(); };
+        config.mount_lease_ttl_ms = std::chrono::milliseconds(600'000);
+        store = Cas::Pool::open(std::make_shared<Cas::tests::CasClientLikeBackend>(backend), std::move(config));
+        access = std::make_unique<Cas::CachedPartFolderAccess>(store);
+        publishPart(store, ns, "src", {inlineEntry("f", "live")});
+        source = access->resolveCopySource({ns, "src"});
+        window_ms = store->poolConfig().cas_request_budget.request_window_ms;
+        store->setCasRetrySleepForTest([this](uint64_t ms)
+        {
+            ++pauses;
+            if (on_pause)
+                on_pause();
+            boot_ms->fetch_add(ms + pause_advance_ms);
+        });
+        store->setConfirmAfterLedgerSnapshotHookForTest([this]
+        {
+            auto once = std::move(on_snapshot);
+            on_snapshot = nullptr;
+            if (once)
+                once();
+        });
+    }
+
+    ~CopyConfirmPollFixture()
+    {
+        store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+        store->setCasRetrySleepForTest(nullptr);
+    }
+
+    String slotKey() const { return store->layout().mountKey("test"); }
+
+    void moveSlot()
+    {
+        rewriteSlot([](Cas::MountLease & lease) { lease.server_uuid += 1; });
+    }
+
+    void rewriteSlot(const std::function<void(Cas::MountLease &)> & change)
+    {
+        Cas::CasRequests requests = DB::Cas::tests::openRequestsForTest(*backend);
+        Cas::CasOperation op = requests.admit();
+        const auto current = op.read(slotKey(), Cas::Retry::standard());
+        ASSERT_TRUE(current.has_value());
+        Cas::MountLease lease = Cas::decodeMountLease(current->bytes);
+        change(lease);
+        ASSERT_TRUE(std::holds_alternative<Cas::Committed>(
+            op.replace(slotKey(), Cas::encodeMountLease(lease), current->etag, Cas::Retry::standard())));
+    }
+
+    void moveSlotOnce()
+    {
+        on_snapshot = [this] { moveSlot(); };
+    }
+};
+
+/// Runs `body` on a raw thread inside a registered query and returns the error code it threw (0 for none).
+int inQueryThrownCode(const std::function<void(Cas::tests::CasKillableQuery &)> & body)
+{
+    int code = 0;
+    std::thread worker([&]
+    {
+        ThreadStatus thread_status;
+        Cas::tests::CasKillableQuery query(getContext().context);
+        try
+        {
+            body(query);
+        }
+        catch (const Exception & e)
+        {
+            code = e.code();
+        }
+    });
+    worker.join();
+    return code;
+}
+
+struct StopArm
+{
+    const char * name;
+    /// No stop at all: the outcome a stopped query must also get.
+    bool live = false;
+    bool background = false;
+    std::exception_ptr cause;
+};
+
+std::vector<StopArm> backgroundStopArms()
+{
+    return {StopArm{.name = "background", .live = false, .background = true, .cause = nullptr}};
+}
+
+/// The live arm comes first: the stopped query arms compare against its outcome.
+std::vector<StopArm> queryStopArms()
+{
+    return {StopArm{.name = "live", .live = true, .background = false, .cause = nullptr},
+            StopArm{.name = "kill", .live = false, .background = false, .cause = nullptr},
+            StopArm{.name = "timeout", .live = false, .background = false,
+                    .cause = std::make_exception_ptr(Exception(ErrorCodes::TIMEOUT_EXCEEDED, "the query timed out"))}};
+}
+
+/// Runs `body` inside a registered query with a background owner; the `stop` it gets stops the arm's owner.
+int inQueryStoppedBy(const StopArm & arm, const std::function<void(const std::function<void()> & stop)> & body)
+{
+    return inQueryThrownCode([&](Cas::tests::CasKillableQuery & query)
+    {
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = backgroundOwnerStoppedBy(background_stopped);
+        body([&arm, &query, background_stopped]
+        {
+            if (arm.live)
+                return;
+            if (arm.background)
+                *background_stopped = true;
+            else
+                query.kill(arm.cause);
+        });
+    });
+}
+
+/// Stops each arm's owner before the first confirm pause, during it with the deadline reached, or during it with time
+/// left for another pass.
+void expectStopDuringConfirmPause(const std::vector<StopArm> & arms)
+{
+    enum class Where { BeforePause, InPauseAtDeadline, InPauseWithTimeLeft };
+    for (const Where where : {Where::BeforePause, Where::InPauseAtDeadline, Where::InPauseWithTimeLeft})
+    {
+        std::optional<Cas::ConfirmAnswer> live_answer;
+        for (const auto & arm : arms)
+        {
+            SCOPED_TRACE(String(arm.name) + "/" + std::to_string(static_cast<int>(where)));
+            CopyConfirmPollFixture fx;
+            ASSERT_TRUE(fx.source.has_value());
+            std::function<void()> stop;
+            if (where == Where::BeforePause)
+            {
+                fx.on_snapshot = [&]
+                {
+                    fx.moveSlot();
+                    stop();
+                };
+                fx.pause_advance_ms = fx.window_ms;
+            }
+            else
+            {
+                fx.moveSlotOnce();
+                fx.on_pause = [&]
+                {
+                    if (auto once = std::exchange(stop, nullptr))
+                        once();
+                };
+                fx.pause_advance_ms = where == Where::InPauseAtDeadline ? fx.window_ms : 0;
+            }
+
+            std::optional<Cas::ConfirmAnswer> answer;
+            const int code = inQueryStoppedBy(arm, [&](const std::function<void()> & stop_owner)
+            {
+                stop = stop_owner;
+                answer = fx.access->confirmCopySource(*fx.source);
+            });
+
+            if (arm.background)
+            {
+                EXPECT_EQ(code, ErrorCodes::ABORTED) << "the poll answered a stopped background owner";
+                EXPECT_EQ(fx.pauses.load(), where == Where::BeforePause ? 0u : 1u);
+                continue;
+            }
+            EXPECT_EQ(code, 0);
+            ASSERT_TRUE(answer.has_value());
+            if (arm.live)
+            {
+                EXPECT_NE(*answer, Cas::ConfirmAnswer::Yes) << "positive control: the slot moved";
+                live_answer = answer;
+                continue;
+            }
+            EXPECT_EQ(answer, live_answer) << "a stopped query gets the live owner's answer";
+            EXPECT_GE(fx.pauses.load(), 1u) << "the poll went on past the stop";
+        }
+    }
+}
+
+}
+
+/// A stopped background owner never receives `Unknown` from the poll, wherever the stop lands.
+TEST(CASPartFolderAccess, BackgroundStopDuringConfirmPauseThrowsNotUnknown)
+{
+    expectStopDuringConfirmPause(backgroundStopArms());
+}
+
+/// The confirm poll is no safe point for a query: a killed or timed-out query gets what a live owner gets.
+TEST(CASPartFolderAccess, KilledQuerysConfirmPollGetsTheLiveAnswer)
+{
+    expectStopDuringConfirmPause(queryStopArms());
+}
+
+namespace
+{
+
+/// A source pinned to a table a remount replaced: its `Unknown` is one-way.
+void expectOneWayUnknownForStoppedOwner(const std::vector<StopArm> & arms)
+{
+    for (const auto & arm : arms)
+    {
+        SCOPED_TRACE(arm.name);
+        CopyConfirmPollFixture fx;
+        ASSERT_TRUE(fx.source.has_value());
+        fx.rewriteSlot([](Cas::MountLease & lease)
+        {
+            lease.gc_fenced = true;
+            lease.seq += 1;
+        });
+        ASSERT_TRUE(fx.store->tryRemountOnce());
+        Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Yes;
+
+        const int code = inQueryStoppedBy(arm, [&](const std::function<void()> & stop)
+        {
+            stop();
+            answer = fx.access->confirmCopySource(*fx.source);
+        });
+
+        EXPECT_EQ(code, arm.background ? ErrorCodes::ABORTED : 0);
+        if (!arm.background)
+            EXPECT_EQ(answer, Cas::ConfirmAnswer::Unknown) << "the pinned table is retired";
+        EXPECT_EQ(fx.pauses.load(), 0u);
+    }
+}
+
+}
+
+/// A one-way `Unknown` is not handed to a stopped background owner.
+TEST(CASPartFolderAccess, BackgroundStoppedOwnerIsNotHandedAOneWayUnknown)
+{
+    expectOneWayUnknownForStoppedOwner(backgroundStopArms());
+}
+
+/// A live owner and a killed or timed-out query get the one-way `Unknown`.
+TEST(CASPartFolderAccess, KilledQueryIsHandedTheOneWayUnknown)
+{
+    expectOneWayUnknownForStoppedOwner(queryStopArms());
+}
+
+namespace
+{
+
+/// A rename whose copy confirm meets a moved slot; each arm's owner stops in the confirm pause.
+void expectStoppedRenameOutcome(const std::vector<StopArm> & arms)
+{
+    std::optional<int> live_code;
+    std::optional<bool> live_source_kept;
+    for (const auto & arm : arms)
+    {
+        SCOPED_TRACE(arm.name);
+        CopyConfirmPollFixture fx;
+        ASSERT_TRUE(fx.source.has_value());
+        const Cas::RootNamespace to{"srv/t2"};
+        fx.access->setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, [&]
+        {
+            publishPart(fx.store, to, "dst", {inlineEntry("f", "live")});
+        });
+        SCOPE_EXIT({ fx.access->setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, nullptr); });
+        fx.moveSlotOnce();
+        fx.pause_advance_ms = fx.window_ms;
+        std::function<void()> stop;
+        size_t journal_at_stop = 0;
+        fx.on_pause = [&]
+        {
+            journal_at_stop = fx.backend->journal().size();
+            if (auto once = std::exchange(stop, nullptr))
+                once();
+        };
+
+        const int code = inQueryStoppedBy(arm, [&](const std::function<void()> & stop_owner)
+        {
+            stop = stop_owner;
+            fx.access->republishRef({fx.ns, "src"}, {to, "dst"});
+        });
+        const auto journal = fx.backend->journal();
+        size_t destination_reads_after_stop = 0;
+        for (size_t i = journal_at_stop; i < journal.size(); ++i)
+            for (const String & key : journal[i].keys)
+                destination_reads_after_stop += journal[i].verb == JournalVerb::Read && key.contains("/manifests/" + to.string() + "/");
+        const bool source_kept = fx.access->existsRef({fx.ns, "src"}, Cas::Freshness::ForceFresh);
+
+        if (arm.background)
+        {
+            EXPECT_EQ(code, ErrorCodes::ABORTED) << "the rename was settled for a stopped background owner";
+            EXPECT_EQ(destination_reads_after_stop, 0u) << "the destination was read again after the stop";
+            EXPECT_TRUE(source_kept) << "the source was dropped";
+            continue;
+        }
+        if (arm.live)
+        {
+            EXPECT_GT(destination_reads_after_stop, 0u) << "positive control: the live owner reads the destination again";
+            EXPECT_EQ(code, 0) << "positive control: the live owner takes the equal committed destination";
+            EXPECT_FALSE(source_kept) << "positive control: the live owner's rename drops the source";
+            live_code = code;
+            live_source_kept = source_kept;
+            continue;
+        }
+        ASSERT_TRUE(live_code.has_value()) << "the live arm runs first";
+        EXPECT_EQ(code, *live_code) << "a stopped query's rename ends as a live owner's";
+        EXPECT_EQ(source_kept, *live_source_kept);
+        EXPECT_GT(destination_reads_after_stop, 0u);
+    }
+}
+
+}
+
+/// A stopped background owner leaves the destination unread and the source in place: an `Unknown` answer would
+/// send `republishRef` to read the destination again and take an equal committed one as the result.
+TEST(CASPartFolderAccess, BackgroundStoppedRenameDoesNotReadDestinationAgainOrDropSource)
+{
+    expectStoppedRenameOutcome(backgroundStopArms());
+}
+
+/// A killed or timed-out query's rename reads the destination again and ends as a live owner's does.
+TEST(CASPartFolderAccess, KilledQuerysRenameEndsAsALiveOwnersDoes)
+{
+    expectStoppedRenameOutcome(queryStopArms());
+}
+
+/// A stopped owner's first pass still sends its slot read: only a pass after the first is refused.
+TEST(CASPartFolderAccess, StoppedOwnersFirstConfirmPassStillReadsTheSlot)
+{
+    CopyConfirmPollFixture fx;
+    ASSERT_TRUE(fx.source.has_value());
+    const uint64_t reads_before = fx.backend->getCount(fx.slotKey());
+    Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
+
+    const int code = inQueryThrownCode([&](Cas::tests::CasKillableQuery & query)
+    {
+        query.kill();
+        answer = fx.access->confirmCopySource(*fx.source);
+    });
+
+    EXPECT_EQ(code, 0);
+    EXPECT_EQ(answer, Cas::ConfirmAnswer::Yes);
+    EXPECT_EQ(fx.backend->getCount(fx.slotKey()) - reads_before, 1u) << "the first pass did not read the slot";
+}
+
+/// A slot read that fails with the owner's verdict is not an unreadable slot: it is not counted as a refusal.
+TEST(CASPartFolderAccess, StoppedOwnersFailedSlotReadIsNotCountedAsUnreadable)
+{
+    CopyConfirmPollFixture fx;
+    ASSERT_TRUE(fx.source.has_value());
+    Cas::tests::CasKillableQuery * running = nullptr;
+    fx.on_snapshot = [&]
+    {
+        Cas::CasRequests requests = DB::Cas::tests::openRequestsForTest(*fx.backend);
+        Cas::CasOperation op = requests.admit();
+        ASSERT_EQ(op.removeCurrent(fx.slotKey(), Cas::Retry::standard()), Cas::Removal::Removed);
+        running->kill();
+    };
+    const uint64_t before = ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable];
+
+    const int code = inQueryThrownCode([&](Cas::tests::CasKillableQuery & query)
+    {
+        running = &query;
+        fx.access->confirmCopySource(*fx.source);
+    });
+
+    EXPECT_EQ(code, ErrorCodes::QUERY_WAS_CANCELLED);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable] - before, 0u);
 }
