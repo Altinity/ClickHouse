@@ -461,6 +461,12 @@ public:
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
     /// Returns the append lane state of `ns` without forcing recovery.
     RefLaneState laneStateForTest(const RootNamespace & ns);
+    struct RemovalFlagsForTest
+    {
+        bool attempt_active = false;
+        bool admission_closed = false;
+    };
+    RemovalFlagsForTest removalFlagsForTest(const RootNamespace & ns);
     /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
     /// Waits until all background snapshot publications for `ns` have completed.

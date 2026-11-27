@@ -4,17 +4,32 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Storages/MergeTree/checkDataPart.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <base/scope_guard.h>
 
+#include <Poco/Exception.h>
+
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unistd.h>
 
 /// Task 8 (rev.7 spec §1): the central six-class operation gate (`checkOpAdmitted`), the `Vanished` truth
 /// semantics, and the [D5] per-reason typed messages. These tests build a real
@@ -28,8 +43,14 @@
 /// captured handle -- the SAME object the metadata storage's `cas_store` points at -- rather than calling
 /// `store()` again after forcing a terminal state.
 
+namespace CurrentMetrics
+{
+extern const Metric IsServerShuttingDown;
+}
+
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 extern const int FILE_DOESNT_EXIST;
@@ -58,15 +79,15 @@ std::shared_ptr<ContentAddressedMetadataStorage> openGateStorage()
 
 /// Commit one real part (tmp -> final rename -> commit), leaving `kPartFile` durable and `kPartDir`/
 /// `kTableDir` non-empty. Every op below runs against this committed state.
-void commitOnePart(ContentAddressedMetadataStorage & storage)
+void commitOnePart(ContentAddressedMetadataStorage & storage, const std::string & table_dir = kTableDir)
 {
     auto tx = storage.createTransaction();
     auto & ca_tx = dynamic_cast<ContentAddressedTransaction &>(*tx);
-    auto buf = ca_tx.writeFile(kTableDir + "/tmp_insert_all_1_1_0/data.bin", 65536, WriteMode::Rewrite, {});
+    auto buf = ca_tx.writeFile(table_dir + "/tmp_insert_all_1_1_0/data.bin", 65536, WriteMode::Rewrite, {});
     const std::string bytes = "content-of-the-part";
     buf->write(bytes.data(), bytes.size());
     buf->finalize();
-    tx->moveDirectory(kTableDir + "/tmp_insert_all_1_1_0", kPartDir);
+    tx->moveDirectory(table_dir + "/tmp_insert_all_1_1_0", table_dir + "/all_1_1_0");
     tx->commit(NoCommitOptions{});
 }
 
@@ -434,4 +455,249 @@ TEST(CASOperationGate, RemoveThrowsDuringTransientAndDrainsAfterRecovery)
     EXPECT_FALSE(storage->existsDirectory(kPartDir))
         << "the re-queued removal must drain (really remove the part) once the disk recovers to Live";
     EXPECT_FALSE(storage->existsFile(kPartFile));
+}
+
+namespace
+{
+
+constexpr auto SHUTDOWN_WATCHDOG = std::chrono::seconds(30);
+
+/// The table dir shape of an `Atomic` database, which the catalog's drop worker removes.
+const std::string kAtomicTableDir = "store/a80/a80a80a8-0808-4808-8808-080808080808";
+const std::string kAtomicPartDir = kAtomicTableDir + "/all_1_1_0";
+
+/// Server shutdown as the drop worker sees it; restored when the test ends, also on a failed assertion.
+struct ServerShuttingDown
+{
+    ServerShuttingDown() = default;
+    ServerShuttingDown(const ServerShuttingDown &) = delete;
+    ServerShuttingDown & operator=(const ServerShuttingDown &) = delete;
+    ~ServerShuttingDown() { CurrentMetrics::set(CurrentMetrics::IsServerShuttingDown, 0); }
+    static void begin() { CurrentMetrics::set(CurrentMetrics::IsServerShuttingDown, 1); }
+};
+
+/// The code of removing `table_dir` in one committed transaction on the calling thread, 0 on success.
+int removeTableDir(ContentAddressedMetadataStorage & storage, const std::string & table_dir)
+{
+    return DB::Cas::tests::exceptionCodeOf([&]
+    {
+        auto tx = storage.createTransaction();
+        tx->removeRecursive(table_dir, /*should_remove_objects=*/nullptr);
+        tx->commit(NoCommitOptions{});
+    });
+}
+
+/// Local object storage whose next catalog write is lost before it lands, as a timed-out PUT. The first
+/// catalog probe after that loss runs `on_settlement_probe`.
+class LosingCatalogWriteObjectStorage : public LocalObjectStorage
+{
+public:
+    using LocalObjectStorage::LocalObjectStorage;
+
+    std::unique_ptr<WriteBufferFromFileBase> writeObject(
+        const StoredObject & object, WriteMode mode, std::optional<ObjectAttributes> attributes,
+        size_t buf_size, const WriteSettings & write_settings) override
+    {
+        if (object.remote_path.ends_with(catalog_key))
+        {
+            ++catalog_writes;
+            if (lose_next_catalog_write.exchange(false))
+            {
+                lost = true;
+                throw Poco::TimeoutException("catalog write lost before it landed");
+            }
+        }
+        return LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    bool exists(const StoredObject & object) const override
+    {
+        if (lost && object.remote_path.ends_with(catalog_key) && on_settlement_probe)
+            std::exchange(on_settlement_probe, nullptr)();
+        return LocalObjectStorage::exists(object);
+    }
+
+    String catalog_key;
+    std::atomic<bool> lose_next_catalog_write{false};
+    std::atomic<bool> lost{false};
+    std::atomic<int> catalog_writes{0};
+    mutable std::function<void()> on_settlement_probe;
+};
+
+}
+
+/// A drop worker's table removal waiting for another removal's attempt leaves at server shutdown with 236.
+/// The holder, a query, keeps its claim and completes.
+TEST(CASOperationGate, ServerShutdownStopsTableRemovalFollowerWithoutTouchingOwner)
+{
+    auto storage = openGateStorage();
+    commitOnePart(*storage, kAtomicTableDir);
+    auto pool = storage->store();
+    const Cas::RootNamespace ns = storage->liveNamespace(*Cas::parseTableUuid(kAtomicTableDir));
+    ServerShuttingDown shutdown;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool holder_parked = false;
+    bool follower_returned = false;
+    bool holder_left = false;
+    std::atomic<bool> holder_entered{false};
+    pool->setRemovalAttemptHookForTest([&]
+    {
+        if (holder_entered.exchange(true))
+            return;
+        std::unique_lock lock(mutex);
+        holder_parked = true;
+        cv.notify_all();
+        cv.wait_for(lock, SHUTDOWN_WATCHDOG, [&] { return follower_returned; });
+        holder_left = true;
+    });
+    SCOPE_EXIT({ pool->setRemovalAttemptHookForTest({}); });
+
+    std::future<int> holder = std::async(std::launch::async, [&]
+    {
+        std::optional<ThreadStatus> thread_status;
+        thread_status.emplace();
+        Cas::tests::CasKillableQuery query(getContext().context);
+        return removeTableDir(*storage, kAtomicTableDir);
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, SHUTDOWN_WATCHDOG, [&] { return holder_parked; }));
+    }
+
+    int follower_code = 0;
+    bool returned_while_holder_parked = false;
+    Cas::CasRefLedger::RemovalFlagsForTest flags_on_return;
+    std::thread follower([&]
+    {
+        std::optional<ThreadStatus> thread_status;
+        thread_status.emplace();
+        /// The holder passed this hook before it parked, so shutdown begins while only the follower is in it.
+        pool->setRemovalRuntimeAcquiredHookForTest([] { ServerShuttingDown::begin(); });
+        follower_code = removeTableDir(*storage, kAtomicTableDir);
+        pool->setRemovalRuntimeAcquiredHookForTest(nullptr);
+        flags_on_return = pool->removalFlagsForTest(ns);
+        std::lock_guard lock(mutex);
+        follower_returned = true;
+        returned_while_holder_parked = !holder_left;
+        cv.notify_all();
+    });
+    follower.join();
+    ASSERT_EQ(holder.wait_for(SHUTDOWN_WATCHDOG), std::future_status::ready);
+
+    EXPECT_EQ(follower_code, ErrorCodes::ABORTED);
+    EXPECT_TRUE(returned_while_holder_parked) << "the stopped follower waited for the holder's attempt";
+    EXPECT_TRUE(flags_on_return.attempt_active) << "the holder's attempt must stay claimed";
+    EXPECT_TRUE(flags_on_return.admission_closed) << "the holder's closed lane must stay closed";
+    EXPECT_EQ(holder.get(), 0) << "a removal with a query attached is not stopped by server shutdown";
+    EXPECT_FALSE(storage->existsDirectory(kAtomicPartDir));
+}
+
+/// Shutdown begins while the drop worker settles a lost `Live -> Removing` write. The write is not resent,
+/// the worker gets the unresolved retry-later exit, and the lane stays closed against the write that may land.
+/// A retry without shutdown completes the removal.
+TEST(CASOperationGate, ServerShutdownAfterPossibleRemovingWriteRetainsClosure)
+{
+    static std::atomic<uint64_t> counter{0};
+    const std::string unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("ca_op_gate_lost_write_" + unique)).string();
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    auto object_storage = Cas::tests::ownedByDirectory(
+        std::make_shared<LosingCatalogWriteObjectStorage>(LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
+    const auto scratch = std::filesystem::temp_directory_path() / ("ca_op_gate_lost_write_scratch_" + unique);
+    auto storage = Cas::tests::ownedByDirectory(std::make_shared<ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", "", nullptr, Cas::tests::makeSettingsForTest("test", scratch)), scratch);
+    storage->startup();
+    commitOnePart(*storage, kAtomicTableDir);
+    auto pool = storage->store();
+    ServerShuttingDown shutdown;
+
+    object_storage->catalog_key = pool->layout().refCatalogKey();
+    object_storage->on_settlement_probe = [] { ServerShuttingDown::begin(); };
+    object_storage->lose_next_catalog_write = true;
+    const int catalog_writes_before = object_storage->catalog_writes;
+
+    std::thread worker([&]
+    {
+        std::optional<ThreadStatus> thread_status;
+        thread_status.emplace();
+        EXPECT_EQ(removeTableDir(*storage, kAtomicTableDir), ErrorCodes::NETWORK_ERROR);
+    });
+    worker.join();
+
+    EXPECT_TRUE(object_storage->lost) << "the Removing write was never sent";
+    EXPECT_FALSE(object_storage->on_settlement_probe) << "the lost write was never settled by a read";
+    EXPECT_EQ(object_storage->catalog_writes - catalog_writes_before, 1) << "a stopped worker resends nothing";
+    const auto flags = pool->removalFlagsForTest(storage->liveNamespace(*Cas::parseTableUuid(kAtomicTableDir)));
+    EXPECT_FALSE(flags.attempt_active);
+    EXPECT_TRUE(flags.admission_closed) << "the lane must stay closed against the write that may land";
+
+    CurrentMetrics::set(CurrentMetrics::IsServerShuttingDown, 0);
+    EXPECT_EQ(removeTableDir(*storage, kAtomicTableDir), 0) << "the retried removal must complete";
+    EXPECT_FALSE(storage->existsDirectory(kAtomicPartDir));
+}
+
+/// Shutdown that begins after the terminal record does not stop the removal: no owner check runs between
+/// that record and the return. Does not hold a publisher in flight.
+TEST(CASOperationGate, ShutdownAfterTerminalRecordDoesNotStopRemoval)
+{
+    auto storage = openGateStorage();
+    commitOnePart(*storage, kAtomicTableDir);
+    auto pool = storage->store();
+    ServerShuttingDown shutdown;
+
+    std::atomic<bool> removing{false};
+    std::atomic<bool> shutdown_after_terminal{false};
+    pool->setCarveHookForTest([&](Cas::CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase == Cas::CasRefLedger::CarvePhaseForTest::PostDurableInstall && removing && !shutdown_after_terminal.exchange(true))
+            ServerShuttingDown::begin();
+    });
+    SCOPE_EXIT({ pool->setCarveHookForTest({}); });
+
+    int code = -1;
+    std::thread worker([&]
+    {
+        std::optional<ThreadStatus> thread_status;
+        thread_status.emplace();
+        removing = true;
+        code = removeTableDir(*storage, kAtomicTableDir);
+    });
+    worker.join();
+
+    EXPECT_TRUE(shutdown_after_terminal) << "the terminal record was never appended";
+    EXPECT_EQ(code, 0);
+    EXPECT_FALSE(storage->existsDirectory(kAtomicPartDir));
+}
+
+/// A non-Atomic table directory, such as a temporary table's, is removed by a caller that never retries it,
+/// so server shutdown does not stop its removal.
+TEST(CASOperationGate, ShutdownDoesNotStopNonAtomicTableRemoval)
+{
+    const std::string table_dir = "data/_temporary_and_external_tables/_tmp_0a1b2c3d-0a1b-4c2d-8e3f-0a1b2c3d4e5f";
+    auto storage = openGateStorage();
+    commitOnePart(*storage, table_dir);
+    auto pool = storage->store();
+    const auto table_id = Cas::parseTableUuid(table_dir);
+    ASSERT_TRUE(table_id);
+    ASSERT_FALSE(Cas::endsWithTableUuidPair(table_dir));
+    const Cas::RootNamespace ns = storage->liveNamespace(*table_id);
+    ASSERT_TRUE(pool->namespaceStillLogicallyPresent(ns));
+    ServerShuttingDown shutdown;
+    ServerShuttingDown::begin();
+
+    int code = -1;
+    std::thread remover([&]
+    {
+        std::optional<ThreadStatus> thread_status;
+        thread_status.emplace();
+        code = removeTableDir(*storage, table_dir);
+    });
+    remover.join();
+
+    EXPECT_EQ(code, 0);
+    EXPECT_FALSE(storage->existsDirectory(table_dir + "/all_1_1_0"));
+    EXPECT_FALSE(pool->namespaceStillLogicallyPresent(ns));
 }

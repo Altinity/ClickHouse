@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
@@ -1872,14 +1873,24 @@ bool Pool::writerCleanupDutiesPending() const
         [](const auto & item) { return !item.second.pending.empty(); });
 }
 
+bool Pool::writerCleanupDrainingForTest(const RootNamespace & ns) const
+{
+    std::lock_guard lock(writer_cleanup_mutex);
+    const auto it = writer_cleanup_queues.find(ns);
+    return it != writer_cleanup_queues.end() && it->second.draining;
+}
+
 void Pool::drainWriterCleanupDuties(const RootNamespace & ns)
 {
     {
         std::unique_lock lock(writer_cleanup_mutex);
-        writer_cleanup_cv.wait(lock, [&]
+        Cas::waitStoppable(writer_cleanup_cv, lock, [&]
         {
             const auto it = writer_cleanup_queues.find(ns);
-            return it == writer_cleanup_queues.end() || !it->second.draining;
+            const bool ready = it == writer_cleanup_queues.end() || !it->second.draining;
+            if (!ready && writer_cleanup_wait_hook_for_test)
+                writer_cleanup_wait_hook_for_test();
+            return ready;
         });
 
         const auto it = writer_cleanup_queues.find(ns);
@@ -1905,6 +1916,8 @@ void Pool::drainWriterCleanupDuties(const RootNamespace & ns)
                 }
                 duty = it->second.pending.front();
             }
+            /// Before each duty, so a stop never falls between a settled duty and its retirement.
+            Cas::throwIfBackgroundStopped();
 
             ref_ledger.appendRefOps(
                 ns,

@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
+#include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/getRandomASCIIString.h>
@@ -30,6 +32,7 @@
 #include <base/scope_guard.h>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -37,6 +40,11 @@ namespace ProfileEvents
 {
     extern const Event CASBlobUploadFanoutBatches;
     extern const Event CASBlobUploadFanoutTasks;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric IsServerShuttingDown;
 }
 
 namespace fs = std::filesystem;
@@ -62,6 +70,13 @@ namespace
 bool hasSuffix(std::string_view s, std::string_view suffix)
 {
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+}
+
+/// True when the removal is retried after a restart, so server shutdown may stop it: today only the catalog's drop
+/// worker removes an `Atomic` table directory without a query. A new such caller must requeue a failed removal.
+bool tableRemovalResumesAfterRestart(const std::string & path)
+{
+    return endsWithTableUuidPair(path) && !CurrentThread::tryGetQueryContext();
 }
 
 }
@@ -1320,6 +1335,13 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// file go in one dropNamespace.
     if (auto uuid = Cas::parseTableUuid(path))
     {
+        std::optional<Cas::OwnerScope> shutdown_owner;
+        if (Cas::tableRemovalResumesAfterRestart(path))
+            shutdown_owner.emplace(Cas::OwnerScope::background([]
+            {
+                if (CurrentMetrics::get(CurrentMetrics::IsServerShuttingDown))
+                    throw Exception(ErrorCodes::ABORTED, "CAS table namespace removal stopped by server shutdown");
+            }));
         metadata_storage.partAccess()->dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }

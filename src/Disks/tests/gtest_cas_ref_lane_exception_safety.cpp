@@ -2,11 +2,14 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Common/Exception.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -214,4 +217,117 @@ TEST(CASRefWriterLaneExceptionSafety, PreTenureAllocFailureReleasesBaton)
         << "a pre-tenure allocation failure left the caller's item stranded in rt->pending";
     EXPECT_FALSE(store->refLeaderActiveForTest(ns))
         << "a pre-tenure allocation failure left the append-lane baton held with no live leader";
+}
+
+/// A removal waits, untimed, until the lane drains. When the last queued writer withdraws at the pre-tenure point,
+/// that withdrawal is the drain, so it must wake the removal: no other writer is admitted to do it.
+TEST(CASRefWriterLaneExceptionSafety, PreTenureFailureOfTheLastQueuedWriterWakesAWaitingRemoval)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForRefLane(backend);
+    const RootNamespace ns{"srv1/reflane_pretenure_removal"};
+    /// One ref for every writer: the leader never carves a second item of the same ref into its batch.
+    const auto append = [&]
+    {
+        store->appendRefOps(ns, MutationScope::ref("ref"),
+            [](const RefTableState &) -> std::vector<RefOp> { return {}; },
+            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    };
+    append();
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool leader_parked = false;
+    bool release_leader = false;
+    bool park_follower = false;
+    bool follower_parked = false;
+    bool release_follower = false;
+
+    std::atomic<int> park_leader{1};
+    store->setRefPreCarveHookForTest([&]
+    {
+        if (park_leader.exchange(0) != 1)
+            return;
+        std::unique_lock lock(m);
+        leader_parked = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_leader; });
+    });
+    std::thread leader(append);
+    {
+        std::unique_lock lock(m);
+        cv.wait(lock, [&] { return leader_parked; });
+    }
+
+    /// A background owner is polled outside the queue mutex while the follower waits, which is where it is held.
+    std::thread follower([&]
+    {
+        const auto owner = OwnerScope::background([&]
+        {
+            std::unique_lock lock(m);
+            if (!park_follower)
+                return;
+            follower_parked = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_follower; });
+        });
+        EXPECT_THROW(append(), DB::Exception) << "the follower must see its own pre-tenure failure";
+    });
+    while (store->refQueuePendingForTest(ns) < 2)
+        std::this_thread::yield();
+    {
+        std::unique_lock lock(m);
+        park_follower = true;
+        cv.wait(lock, [&] { return follower_parked; });
+        release_leader = true;
+    }
+    cv.notify_all();
+    leader.join();
+    ASSERT_EQ(store->refQueuePendingForTest(ns), 1u) << "the follower's item must still be queued";
+    ASSERT_FALSE(store->refLeaderActiveForTest(ns));
+
+    std::atomic<int> tenure_fault{1};
+    store->setRefPreTenureHookForTest([&]
+    {
+        if (tenure_fault.exchange(0) == 1)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected pre-tenure fault");
+    });
+    auto removal = std::make_shared<std::promise<std::exception_ptr>>();
+    std::future<std::exception_ptr> removal_done = removal->get_future();
+    std::thread remover([store, ns, removal]
+    {
+        try
+        {
+            (void)store->dropNamespace(ns);
+            removal->set_value(nullptr);
+        }
+        catch (...)
+        {
+            removal->set_value(std::current_exception());
+        }
+    });
+    /// The removal closes admission and checks the drain in one critical section, so from here it is waiting.
+    while (!store->removalFlagsForTest(ns).admission_closed)
+        std::this_thread::yield();
+    {
+        std::lock_guard lock(m);
+        release_follower = true;
+    }
+    cv.notify_all();
+    follower.join();
+
+    const bool woke = removal_done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    EXPECT_TRUE(woke) << "the removal still waits for a lane that is already drained";
+    if (!woke)
+    {
+        /// Nothing can wake it now; leave it parked rather than hang the binary.
+        remover.detach();
+        return;
+    }
+    remover.join();
+    store->setRefPreTenureHookForTest(nullptr);
+    store->setRefPreCarveHookForTest(nullptr);
+    const std::exception_ptr error = removal_done.get();
+    EXPECT_FALSE(error) << "the removal must complete";
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }

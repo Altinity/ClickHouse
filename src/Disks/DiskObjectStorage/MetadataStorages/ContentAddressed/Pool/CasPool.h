@@ -1035,6 +1035,7 @@ public:
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
     /// Test seam: this table's append lane state.
     RefLaneState laneStateForTest(const RootNamespace & ns);
+    CasRefLedger::RemovalFlagsForTest removalFlagsForTest(const RootNamespace & ns) { return ref_ledger.removalFlagsForTest(ns); }
 
     /// Whether this resident table still owes a stale-precommit sweep (armed by recovery; re-armed by a
     /// failed attempt; cleared permanently only by a verified-clean sweep).
@@ -1083,6 +1084,11 @@ public:
     /// the direct signal that a settlement failure retained its duty for retry, independent of any
     /// build-floor side effect that could have the same shape for an unrelated reason.
     bool writerCleanupDutiesPendingForTest() const { return writerCleanupDutiesPending(); }
+    /// Test seam: whether a caller is draining the writer cleanup duties of `ns`.
+    bool writerCleanupDrainingForTest(const RootNamespace & ns) const;
+    /// TEST SEAM: runs under the cleanup-duty mutex each time a caller finds another drainer and waits for it.
+    /// Must not take that mutex. Set only while no drain runs.
+    void setWriterCleanupWaitHookForTest(std::function<void()> hook) { writer_cleanup_wait_hook_for_test = std::move(hook); }
 
     /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
@@ -1385,6 +1391,8 @@ private:
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
 
+    /// TEST SEAM for `setWriterCleanupWaitHookForTest`.
+    std::function<void()> writer_cleanup_wait_hook_for_test = {};
     /// TEST SEAM for `setConfirmAfterOwnershipCaptureHookForTest`; set only while no confirm runs.
     std::function<void()> confirm_after_ownership_capture_hook_for_test = {};
     /// TEST SEAM for `setConfirmAfterLedgerSnapshotHookForTest`; set only while no confirm runs.

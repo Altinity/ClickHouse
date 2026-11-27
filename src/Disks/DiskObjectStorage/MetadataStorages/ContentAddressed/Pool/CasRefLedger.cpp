@@ -2315,6 +2315,15 @@ RefLaneState CasRefLedger::laneStateForTest(const RootNamespace & ns)
     return rt->lane_state;
 }
 
+CasRefLedger::RemovalFlagsForTest CasRefLedger::removalFlagsForTest(const RootNamespace & ns)
+{
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return {};
+    std::lock_guard<std::mutex> lock(ref_queue_mutex);
+    return {.attempt_active = rt->removal_attempt_active, .admission_closed = rt->removal_admission_closed};
+}
+
 bool CasRefLedger::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
     const auto rt = lookupRefTableRuntime(ns);
@@ -5975,7 +5984,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         return {};   /// as for a name without a row
     {
         std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
-        rt->cv.wait(queue_lock, [&]
+        Cas::waitStoppable(rt->cv, queue_lock, [&]
         {
             return !rt->removal_attempt_active;
         });
@@ -5996,22 +6005,6 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             return {};
     }
 
-    /// Close the local positive lane BEFORE publishing `Removing`. Calls already admitted ahead of
-    /// this point drain first; later positive callers observe the flag in the same queue critical
-    /// section as enqueue and receive the typed retry-later refusal. The terminal item below is the one
-    /// deliberate exception.
-    {
-        std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
-        rt->removal_admission_closed = true;
-        rt->cv.wait(queue_lock, [&]
-        {
-            return !rt->leader_active && rt->pending.empty();
-        });
-    }
-
-    if (removal_attempt_hook_for_test)
-        removal_attempt_hook_for_test();
-
     /// Admitted under the runtime this drop closed and drained, not under the current generation: after a
     /// remount another runtime of this name may be open, and `Removing` must not land under it.
     const auto runtime_live = [&rt]
@@ -6019,7 +6012,6 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt->superseded_by_remount.load(std::memory_order_acquire);
     };
-    CasOperation removal_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
@@ -6063,8 +6055,25 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     std::optional<CasOperation> removal_op;
     try
     {
-        refuseUnlessAdmitted(removal_op, "beginning removal");
-        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout, policy);
+        /// Close the local positive lane BEFORE publishing `Removing`. Calls already admitted ahead of
+        /// this point drain first; later positive callers observe the flag in the same queue critical
+        /// section as enqueue and receive the typed retry-later refusal. The terminal item below is the one
+        /// deliberate exception.
+        {
+            std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
+            rt->removal_admission_closed = true;
+            Cas::waitStoppable(rt->cv, queue_lock, [&]
+            {
+                return !rt->leader_active && rt->pending.empty();
+            });
+        }
+
+        if (removal_attempt_hook_for_test)
+            removal_attempt_hook_for_test();
+
+        removal_op.emplace(mount_requests.resume(rt->admitted_fence_generation, runtime_live));
+        refuseUnlessAdmitted(*removal_op, "beginning removal");
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*removal_op, layout, policy);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
         if (entry_it == snapshot.catalog.entries.end())
@@ -6086,18 +6095,20 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         {
             observed_live = *entry_it;
             uint64_t removal_started_round = 0;
-            if (const auto got = removal_op.read(layout.gcStateKey(), policy))
+            if (const auto got = removal_op->read(layout.gcStateKey(), policy))
                 removal_started_round = decodeGcState(got->bytes).round;
 
             /// The flag turns on at the first sent attempt of the `Live -> Removing` write. Before it nothing
             /// can land, so a failure may reopen the lane. After it every exception, `FencedOut` and
-            /// `EntryChanged` may follow an attempt that can still land.
-            removal_op.observeRequests(RequestObserver{
+            /// `EntryChanged` may follow an attempt that can still land: a later refusal does not prove
+            /// that an earlier send cannot land, because the row has no revision field and, on a store
+            /// with content-derived ETags, unrelated churn can restore that send's precondition.
+            removal_op->observeRequests(RequestObserver{
                 .on_write_attempt = [&removal_write_outcome_unknown](uint32_t) { removal_write_outcome_unknown = true; },
                 .on_failure = {},
             });
             switch (CasRefCatalog::beginRemoving(
-                removal_op, layout, *observed_live, removal_started_round, policy))
+                *removal_op, layout, *observed_live, removal_started_round, policy))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
