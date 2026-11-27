@@ -86,8 +86,8 @@ public:
         const std::string & path, size_t buf_size, WriteMode mode,
         const WriteSettings & settings, bool autocommit) override;
 
-    /// Creates the inner buffer for a content-addressed path. Part blobs are hashed while being
-    /// staged, small metadata files are accumulated in memory and classified at finalize, and
+    /// Creates the inner buffer for a content-addressed path. Inline candidates that outgrow
+    /// the per-file limit stream to local staging. Part blobs are hashed as they are written, and
     /// verbatim namespace or mountpoint files are read-modify-written when append is requested.
     std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const std::string & path,
@@ -450,10 +450,7 @@ private:
     std::function<void()> check_fence_before_finalize;
 };
 
-/// Write buffer for bytes that live INSIDE pool metadata (a small inline part file staged into the
-/// manifest tree, or a verbatim namespace file PUT on finalize). Accumulates in memory (the bytes are
-/// tiny) and hands them to the callback at finalize; the callback decides where they go and whether
-/// they are durable immediately (verbatim) or at commit (staged into the part's manifest entries).
+/// Accumulates a verbatim namespace or mountpoint file for the write performed at finalize.
 class CaInlineWriteBuffer : public WriteBufferFromFileBase
 {
 public:
@@ -468,8 +465,7 @@ public:
 private:
     /// Appends bytes to the in-memory payload under the base write-buffer contract.
     void nextImpl() override;
-    /// Hands the complete inline payload to the callback; the callback decides whether it is staged
-    /// in a manifest or written immediately as a verbatim file.
+    /// Passes the complete verbatim payload to the callback.
     void finalizeImpl() override;
 
     OnInlined on_inlined;

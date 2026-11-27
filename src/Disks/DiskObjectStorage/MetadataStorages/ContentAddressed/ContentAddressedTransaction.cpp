@@ -1147,128 +1147,82 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// filename left to special-case. During part build these files land in the initial manifest with
     /// every other staged file; a standalone write on an already-committed part repoints.
 
-    /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash,
-    /// then stage the blob as PENDING (precommit-first). The blob is NOT uploaded/promoted here;
-    /// `publishStaging` uploads it (Local) or promotes the S3 staging object post-precommit.
-    /// Staging records no dependency proof and performs no pool operation; successful post-precommit
-    /// publication records `Materialized`.
-    if (Cas::partFileMustStayBlob(r->file))
-    {
-        /// When this disk explicitly opts in to `staging_backend=s3`, `startup` has already required
-        /// provider-native same-store copy, so stream directly to a fresh per-mount staging object
-        /// while hashing. The default `local` setting keeps the existing local-temp-file path below.
-        /// Hash with this pool's node-local write algorithm rather than a hardcoded city hash;
-        /// `PoolMeta` no longer records a single pool-wide algorithm --
-        /// mixed-algo pools track `algos_used`; `writeAlgo()` is the write-mint accessor now).
-        const auto hash_algo = metadata_storage.store()->writeAlgo();
-        /// `hash_hex` is rendered by the streaming write buffer at `hash_algo`'s own width —
-        /// parse it back at that SAME width via `Cas::codecFor(hash_algo)` (never a pool-wide
-        /// `DigestCodec`, which no longer exists) into a full `BlobRef` pair.
+    const bool must_stay_blob = Cas::partFileMustStayBlob(r->file);
+    const auto hash_algo = metadata_storage.store()->writeAlgo();
 
-        if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
-        {
-            /// Build the fixed-length CABL envelope header now (before
-            /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
-            /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
-            /// is left 0 (not known at stream time — diagnostic-only, not read by GC/read paths). The
-            /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
-            /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
-            std::string envelope_header = buildS3StagingBlobHeader(*r);
-            /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
-            /// design, so its admission is re-checked there through the callback below, against the
-            /// generation captured HERE. The epoch in the key and the generation the finalize rechecks are
-            /// one capture, so a remount between them cannot stage new-generation bytes under an old epoch.
-            const Cas::PoolPtr pool = metadata_storage.store();
-            const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
-            const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
-            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
-            return std::make_unique<Cas::CaContentWriteBuffer>(
-                std::move(object_sink),
-                staging_key,
-                std::move(envelope_header),
-                hash_algo,
-                buf_size,
-                settings.use_adaptive_write_buffer,
-                settings.adaptive_write_buffer_initial_size,
-                [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & key)
-                {
-                    const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
-                    stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
-                },
-                [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
-        }
+    if (must_stay_blob && metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
+    {
+        /// Build the fixed-length CABL envelope header now (before
+        /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
+        /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
+        /// is left 0 (not known at stream time — diagnostic-only, not read by GC/read paths). The
+        /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
+        /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
+        std::string envelope_header = buildS3StagingBlobHeader(*r);
+        /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
+        /// design, so its admission is re-checked there through the callback below, against the
+        /// generation captured HERE. The epoch in the key and the generation the finalize rechecks are
+        /// one capture, so a remount between them cannot stage new-generation bytes under an old epoch.
+        const Cas::PoolPtr pool = metadata_storage.store();
+        const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
+        const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
+
+        auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
 
         return std::make_unique<Cas::CaContentWriteBuffer>(
-            metadata_storage.scratchPath(),
+            std::move(object_sink),
+            staging_key,
+            std::move(envelope_header),
             hash_algo,
             buf_size,
             settings.use_adaptive_write_buffer,
             settings.adaptive_write_buffer_initial_size,
-            [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & temp_path)
+            [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & key)
+            {
+                const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
+                stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
+            },
+            [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
+    }
+
+    /// Oversized inline candidates use local staging even on disks with S3 staging enabled.
+    auto create_local_blob_writer = [this, route = *r, hash_algo, buf_size,
+                                     adaptive = settings.use_adaptive_write_buffer, initial_size = settings.adaptive_write_buffer_initial_size]
+    {
+        return std::make_unique<Cas::CaContentWriteBuffer>(
+            metadata_storage.scratchPath(),
+            hash_algo,
+            buf_size,
+            adaptive,
+            initial_size,
+            [this, route, hash_algo](const std::string & hash_hex, size_t size, const std::string & temp_path)
             {
                 const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
                 stageBlobPartFile(route, ref, size, temp_path, Cas::StagingBackend::Local);
             });
-    }
+    };
 
-    /// Inline candidate (small eager metadata): buffer in memory, decide at finalize. <= INLINE_CAP
-    /// rides the single tree object as an Inline entry (one-GET part open); an oversized
-    /// candidate spills to a blob (the safety net).
-    return std::make_unique<Cas::CaInlineWriteBuffer>(
-        [this, route = *r](std::string bytes)
+    if (must_stay_blob)
+        return create_local_blob_writer();
+
+    return std::make_unique<WriteBufferInlineOrBlob>(
+        path, INLINE_CAP, /*create_blob_if_empty=*/false, std::move(create_local_blob_writer),
+        [this, route = std::move(*r), hash_algo](FinalizeResult result)
         {
-            /// Mint via the one write hash function, `Cas::poolContentHash` (algorithm, payload) -> BlobRef
-            /// (`CasPartWriteTxn.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
-            /// and a standalone blob of identical content get the same ref (same content hash identity)
-            /// under EVERY algo, including sha256.
-            const auto hash_algo = metadata_storage.store()->writeAlgo();
-            const Cas::BlobRef ref = Cas::poolContentHash(hash_algo, bytes);
-            if (bytes.size() <= INLINE_CAP)
-            {
-                auto & st = stagingFor(route);
-                /// An inline (no-blob) entry still requires a PartWriteTxn. `publishStaging` stages the
-                /// manifest body, precommits, and promotes the ref even for a part with NO blob uploads;
-                /// it asserts `st.build != nullptr` whenever `st.entries` is non-empty. Without this, a
-                /// part whose files are ALL inline (a tiny/empty merge output, every file <= INLINE_CAP)
-                /// reaches `publishStaging` with entries but no PartWriteTxn -> LOGICAL_ERROR "staged entries
-                /// without a PartWriteTxn" -> a logical-error exception under abort_on_logical_error
-                /// since the inline-files feature). The blob path already establishes the PartWriteTxn via
-                /// `buildFor`; the inline path must do the same.
-                buildFor(route, st);
-                Cas::ManifestEntry entry;
-                entry.path = route.file;
-                entry.placement = Cas::EntryPlacement::Inline;
-                entry.ref = ref;   /// content hash identity (same for inline and blob of same content)
-                /// `blob_size` stays 0 (its default) for an Inline entry — matching decode, which never
-                /// fills it for Inline. `entry.size()` is the logical size, derived from `inline_bytes`.
-                entry.inline_bytes = std::move(bytes);
-                putEntry(st, std::move(entry), nullptr);
-            }
-            else
-            {
-                /// Safety fallback: an unexpectedly large candidate spills to a blob (preserves the
-                /// invariant that big files are not held inline). Write the buffered bytes to a unique
-                /// local temp file (same scratchPath + random-name scheme as CaContentWriteBuffer), then
-                /// stage exactly like a streaming blob.
-                std::filesystem::create_directories(metadata_storage.scratchPath());
-                const std::string temp_path =
-                    metadata_storage.scratchPath() + "/inline_overflow_" + getRandomASCIIString(32) + ".tmp";
-                {
-                    WriteBufferFromFile tmp(temp_path);
-                    tmp.write(bytes.data(), bytes.size());
-                    tmp.finalize();
-                }
-                /// Until stageBlobPartFile takes ownership, WE own the temp file — mirror the blob path,
-                /// where CaContentWriteBuffer's dtor removes it unless the callback succeeded. If
-                /// stageBlobPartFile throws, drop the orphan instead of leaking it into scratch. This
-                /// fallback is always `Cas::StagingBackend::Local` — an oversized inline candidate is rare
-                /// enough (a safety net, not a hot path) that S3-staging mode does not cover it.
-                bool staged = false;
-                SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, ref, bytes.size(), temp_path, Cas::StagingBackend::Local);
-                staged = true;
-            }
-        });
+            auto * inlined = std::get_if<InlineData>(&result);
+            if (!inlined)
+                return; /// The local writer already registered the pending blob.
+
+            auto & st = stagingFor(route);
+            buildFor(route, st);
+            Cas::ManifestEntry entry;
+            entry.path = route.file;
+            entry.placement = Cas::EntryPlacement::Inline;
+            entry.ref = Cas::poolContentHash(hash_algo, inlined->data);
+            entry.inline_bytes = std::move(inlined->data);
+            putEntry(st, std::move(entry), nullptr);
+        },
+        buf_size);
 }
 
 void ContentAddressedTransaction::createDirectory(const std::string &)

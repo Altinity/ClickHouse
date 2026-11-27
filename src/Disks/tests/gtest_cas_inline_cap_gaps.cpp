@@ -6,9 +6,12 @@
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTracker.h>
+#include <Common/ThreadStatus.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <filesystem>
+#include <future>
 #include <map>
 
 namespace DB::ErrorCodes
@@ -606,4 +609,89 @@ TEST(CASInlineCapGaps, RepointRefusesBaseChangedAfterSpillUpload)
     EXPECT_EQ(readPartFile(*storage, dir + "/0.idx"), "winner");
     EXPECT_FALSE(storage->existsFile(dir + "/spill.idx"));
     EXPECT_TRUE(storage->store()->livePrecommitsForTest(storage->liveNamespace(uuid)).empty());
+}
+
+namespace
+{
+
+void checkInlineCandidateWritePeak(size_t num_files, size_t chunks_per_file, Int64 limit)
+{
+#if defined(SANITIZER)
+    GTEST_SKIP() << "operator new is not charged to the memory tracker under sanitizers";
+#endif
+    auto storage = openStorage();
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    const std::string directory = table_dir + "all_1_1_0/";
+    const Int64 peak = std::async(std::launch::async, [&]
+    {
+        MemoryTracker tracker(&total_memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor_=*/false);
+        DB::ThreadStatus thread_status;
+        thread_status.memory_tracker.setParent(&tracker);
+        thread_status.untracked_memory_limit = 0;
+
+        const std::string chunk(mib, 'x');
+        std::vector<std::unique_ptr<DB::WriteBufferFromFileBase>> writers;
+        for (size_t i = 0; i < num_files; ++i)
+            writers.push_back(ca_tx.writeFile(directory + std::to_string(i) + ".dct.idx", mib, DB::WriteMode::Rewrite, {}));
+        for (size_t i = 0; i < chunks_per_file; ++i)
+            for (auto & writer : writers)
+                writer->write(chunk.data(), chunk.size());
+        for (auto & writer : writers)
+            writer->finalize();
+        return tracker.getPeak();
+    }).get();
+    ::testing::Test::RecordProperty("peak_bytes", std::to_string(peak));
+    EXPECT_LE(peak, limit);
+}
+
+}
+
+TEST(CASInlineCandidateMemory, ALargeInlineCandidateIsNotHeldWholeInMemory)
+{
+    checkInlineCandidateWritePeak(1, 64, 8 * mib);
+}
+
+TEST(CASInlineCandidateMemory, TwoLargeInlineCandidatesOpenAtOnceStayBounded)
+{
+    checkInlineCandidateWritePeak(2, 32, 12 * mib);
+}
+
+TEST(CASInlineCandidateMemory, BytesPastTheThresholdReachScratchBeforeFinalize)
+{
+    auto storage = openStorage();
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    const std::string path = table_dir + "all_1_1_0/skip.dct.idx";
+    auto writer = ca_tx.writeFile(path, 64 * kib, DB::WriteMode::Rewrite, {});
+    const auto bytes = payload(2 * mib, 13);
+    writer->write(bytes.data(), bytes.size());
+    writer->sync();
+    const auto & scratch = storage->scratchPath();
+    size_t staged_bytes = 0;
+    if (std::filesystem::exists(scratch))
+        for (const auto & entry : std::filesystem::directory_iterator(scratch))
+            if (entry.is_regular_file())
+                staged_bytes += entry.file_size();
+    EXPECT_EQ(staged_bytes, bytes.size());
+
+    writer->cancel();
+    EXPECT_TRUE(!std::filesystem::exists(scratch) || std::filesystem::is_empty(scratch));
+    EXPECT_FALSE(tx->tryGetInFlightFileSize(path).has_value());
+}
+
+TEST(CASInlineCandidateMemory, ThresholdPreservesPlacementAndPayload)
+{
+    auto storage = openStorage();
+    const std::string ref = "all_1_1_0";
+    const std::string dir = table_dir + ref + "/";
+    const auto at_limit = payload(mib, 5);
+    const auto over_limit = at_limit + 'Z';
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, dir + "at.idx", at_limit);
+    writeFileTx(*tx, dir + "over.idx", over_limit);
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->tryGetInManifestBytes(dir + "at.idx") == at_limit);
+    expectBlob(*storage, ref, "over.idx", over_limit);
 }

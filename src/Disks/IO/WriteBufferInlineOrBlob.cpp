@@ -34,7 +34,8 @@ void WriteBufferInlineOrBlob::spill()
     underlying = create_underlying();
     if (!accumulated.empty())
         underlying->write(accumulated.data(), accumulated.size());
-    accumulated.clear();
+
+    String{}.swap(accumulated);
 }
 
 void WriteBufferInlineOrBlob::nextImpl()

@@ -881,6 +881,29 @@ TEST(CASS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
     EXPECT_EQ(got, payload);
 }
 
+TEST(CASS3Staging, OversizedInlineCandidateKeepsLocalStaging)
+{
+    auto objects = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto storage = makeS3StagingMetadataStorageForTest(objects, "mountInlineOverflow");
+    storage->startup();
+    auto tx = storage->createTransaction();
+    const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/skip.dct.idx";
+    const std::string bytes(1024 * 1024 + 1, 'x');
+    writeThroughS3Transaction(dynamic_cast<DB::ContentAddressedTransaction &>(*tx), path, bytes);
+
+    DB::RelativePathsWithMetadata staged;
+    objects->listObjects(storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_TRUE(staged.empty());
+    auto reader = tx->tryReadFileInFlight(path, DB::ReadSettings{}, {});
+    ASSERT_NE(reader, nullptr);
+    std::string actual;
+    DB::readStringUntilEOF(actual, *reader);
+    EXPECT_TRUE(actual == bytes);
+    reader.reset();
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_FALSE(storage->tryGetInManifestBytes(path).has_value());
+}
+
 /// An aborted transaction deletes its own S3 staging object instead of leaving it for the next mount.
 TEST(CASS3Staging, AbortDeletesS3Staging)
 {
