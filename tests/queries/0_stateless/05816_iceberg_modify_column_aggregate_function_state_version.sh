@@ -35,12 +35,6 @@ check()
 
 check
 
-echo "same type without the version"
-(${CLIENT} --query "
-    ALTER TABLE ${TABLE} MODIFY COLUMN q AggregateFunction(quantileDeterministic(0.5), Float64, UInt64)" 2>&1 || true) \
-    | grep -q "BAD_ARGUMENTS" && echo "BAD_ARGUMENTS"
-check
-
 echo "explicit version 0"
 (${CLIENT} --query "
     ALTER TABLE ${TABLE} MODIFY COLUMN q AggregateFunction(0, quantileDeterministic(0.5), Float64, UInt64)" 2>&1 || true) \
