@@ -1,0 +1,23 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <cas_staged>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>itest-staging</cas_server_root_id>
+                <cas_staging_backend>s3</cas_staging_backend>
+                <endpoint>http://rustfs1:11121/test/cas_staging_it/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <s3_min_upload_part_size>5242880</s3_min_upload_part_size>
+                <s3_max_single_part_upload_size>5242880</s3_max_single_part_upload_size>
+            </cas_staged>
+        </disks>
+        <policies>
+            <cas_staged>
+                <volumes><main><disk>cas_staged</disk></main></volumes>
+            </cas_staged>
+        </policies>
+    </storage_configuration>
+</clickhouse>

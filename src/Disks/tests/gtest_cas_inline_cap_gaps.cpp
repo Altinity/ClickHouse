@@ -11,12 +11,14 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <map>
 
 namespace DB::ErrorCodes
 {
     extern const int INCORRECT_DATA;
+    extern const int LIMIT_EXCEEDED;
 }
 
 /// A part or a nested scratch storage whose small files sum past the manifest's inline budget must
@@ -694,4 +696,234 @@ TEST(CASInlineCandidateMemory, ThresholdPreservesPlacementAndPayload)
 
     EXPECT_TRUE(storage->tryGetInManifestBytes(dir + "at.idx") == at_limit);
     expectBlob(*storage, ref, "over.idx", over_limit);
+}
+
+TEST(CASInlineCandidateMemory, ClosedCandidatesStayInStagingUntilPlacement)
+{
+    auto storage = openStorage();
+    const std::string ref = "all_1_1_0";
+    const std::string dir = table_dir + ref + "/";
+    const std::string bytes = payload(600 * kib, 7);
+    auto tx = storage->createTransaction();
+    const auto retained = std::async(std::launch::async, [&]
+    {
+        MemoryTracker tracker(&total_memory_tracker, VariableContext::Process, false);
+        DB::ThreadStatus thread_status;
+        thread_status.memory_tracker.setParent(&tracker);
+        thread_status.untracked_memory_limit = 0;
+        for (size_t i = 0; i < 64; ++i)
+            writeFileTx(*tx, dir + std::to_string(i) + ".idx", bytes);
+        return tracker.get();
+    }).get();
+#if !defined(SANITIZER)
+    /// The closed payloads total 37.5 MiB. Only path metadata should remain on the writer thread.
+    EXPECT_LT(retained, static_cast<Int64>(inline_total_budget));
+#endif
+    ::testing::Test::RecordProperty("retained_bytes_before_commit", std::to_string(retained));
+
+    size_t staged_bytes = 0;
+    for (const auto & file : std::filesystem::directory_iterator(storage->scratchPath()))
+        staged_bytes += file.file_size();
+    EXPECT_EQ(staged_bytes, 64 * bytes.size());
+    tx->commit(DB::NoCommitOptions{});
+    const auto manifest = manifestOf(*storage, uuid, ref);
+    ASSERT_EQ(manifest.entries.size(), 64u);
+    EXPECT_EQ(inlineTotal(manifest), (inline_total_budget / bytes.size()) * bytes.size());
+    for (const auto & entry : manifest.entries)
+        EXPECT_TRUE(readPartFile(*storage, dir + entry.path) == bytes) << entry.path;
+    EXPECT_TRUE(std::filesystem::is_empty(storage->scratchPath()));
+}
+
+TEST(CASInlineCapGaps, StagedAliasesKeepTheirSourceAndOriginalPlacementEligibility)
+{
+    auto storage = openStorage();
+    const auto src = table_dir + "all_1_1_0/";
+    const auto dst = table_dir + "all_2_2_0/";
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, src + "a.txt", "x");
+    writeFileTx(*tx, src + "a.bin", "x");
+    tx->createHardLink(src + "a.txt", dst + "copied.bin");
+    tx->moveFile(src + "a.bin", dst + "moved.txt");
+    writeFileTx(*tx, src + "a.txt", "replacement");
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_EQ(storage->tryGetInManifestBytes(dst + "copied.bin"), "x");
+    expectBlob(*storage, "all_2_2_0", "moved.txt", "x");
+    EXPECT_FALSE(storage->existsFile(src + "a.bin"));
+    EXPECT_EQ(storage->tryGetInManifestBytes(src + "a.txt"), "replacement");
+}
+
+TEST(CASInlineCapGaps, TransferAlonePreservesNestedBaseButOwnWriteReplacesIt)
+{
+    for (const bool write_first : {false, true})
+    {
+        for (const bool own_write : {false, true})
+        {
+            SCOPED_TRACE(write_first);
+            SCOPED_TRACE(own_write);
+            auto storage = openStorage();
+            const auto src = table_dir + "all_1_1_0/";
+            const auto dst = table_dir + "tmp_merge_all_1_2_1/";
+            auto tx = storage->createTransaction();
+            writeFileTx(*tx, dst + "text_index_tmp/0.idx", "base");
+            tx->commit(DB::NoCommitOptions{});
+
+            tx = storage->createTransaction();
+            writeFileTx(*tx, src + "pending.idx", "m");
+            if (own_write && write_first)
+                writeFileTx(*tx, dst + "own.idx", "w");
+            tx->moveFile(src + "pending.idx", dst + "moved.idx");
+            if (own_write && !write_first)
+                writeFileTx(*tx, dst + "own.idx", "w");
+            tx->commit(DB::NoCommitOptions{});
+
+            EXPECT_EQ(storage->tryGetInManifestBytes(dst + "moved.idx"), "m");
+            EXPECT_FALSE(storage->existsFile(src + "pending.idx"));
+            EXPECT_EQ(storage->existsFile(dst + "text_index_tmp/0.idx"), !own_write);
+        }
+    }
+}
+
+TEST(CASInlineCapGaps, ReusingRemovedPartNameDoesNotAllowReplacingAnotherWritersSegments)
+{
+    auto storage = openStorage();
+    const auto dir = table_dir + "tmp_merge_all_1_2_1";
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, dir + "/discarded.txt", "old");
+    tx->removeDirectory(dir);
+    auto segments = storage->createTransaction();
+    writeFileTx(*segments, dir + "/text_index_tmp/0.idx", "segment");
+    segments->commit(DB::NoCommitOptions{});
+
+    writeFileTx(*tx, table_dir + "all_1_1_0/moved.txt", "new");
+    tx->moveFile(table_dir + "all_1_1_0/moved.txt", dir + "/moved.txt");
+    EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
+    EXPECT_EQ(storage->tryGetInManifestBytes(dir + "/text_index_tmp/0.idx"), "segment");
+    EXPECT_FALSE(storage->existsFile(dir + "/moved.txt"));
+}
+
+TEST(CASInlineCapGaps, RenamingStagedDirectoryAcceptsIdenticalBorrowedInline)
+{
+    auto storage = openStorage();
+    const auto src = table_dir + "tmp_merge_all_1_2_1";
+    const auto dst = table_dir + "all_1_2_1";
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, table_dir + "all_1_1_0/source.txt", "same");
+    tx->commit(DB::NoCommitOptions{});
+    tx = storage->createTransaction();
+    tx->createHardLink(table_dir + "all_1_1_0/source.txt", dst + "/file.txt");
+    writeFileTx(*tx, src + "/file.txt", "same");
+    tx->moveDirectory(src, dst);
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_EQ(storage->tryGetInManifestBytes(dst + "/file.txt"), "same");
+}
+
+TEST(CASInlineCapGaps, CorruptSelectedInlineDoesNotRepoint)
+{
+    for (const bool truncate : {false, true})
+    {
+        SCOPED_TRACE(truncate);
+        auto storage = openStorage();
+        const String path = table_dir + "all_1_1_0/small.idx";
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, path, "old");
+        tx->commit(DB::NoCommitOptions{});
+        tx = storage->createTransaction();
+        auto writer = dynamic_cast<DB::ContentAddressedTransaction &>(*tx).writeFile(path, 4096, DB::WriteMode::Rewrite, {});
+        writer->write("new", 3);
+        writer->finalize();
+        if (truncate)
+            std::filesystem::resize_file(writer->getFileName(), 2);
+        else
+        {
+            std::ofstream out(writer->getFileName(), std::ios::binary);
+            out.write("bad", 3);
+            ASSERT_TRUE(out.good());
+        }
+        EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
+        EXPECT_EQ(storage->tryGetInManifestBytes(path), "old");
+    }
+}
+
+TEST(CASInlineCapGaps, SpilledCandidateIsNotReadToChoosePlacement)
+{
+    auto storage = openStorage();
+    const String bytes = payload(mib, 80);
+    const auto dir = table_dir + "all_2_2_0/";
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, table_dir + "all_1_1_0/same.bin", bytes);
+    tx->commit(DB::NoCommitOptions{});
+
+    tx = storage->createTransaction();
+    writeFullBudget(*tx, dir.substr(0, dir.size() - 1), "other");
+    auto writer = dynamic_cast<DB::ContentAddressedTransaction &>(*tx).writeFile(dir + "first.idx", 4096, DB::WriteMode::Rewrite, {});
+    writer->write(bytes.data(), bytes.size());
+    writer->finalize();
+    /// The first path sorts first among 17 equally large candidates. Its blob already exists:
+    /// neither placement planning nor reuse requires reopening its staging file.
+    ASSERT_TRUE(std::filesystem::remove(writer->getFileName()));
+    tx->commit(DB::NoCommitOptions{});
+    expectBlob(*storage, "all_2_2_0", "first.idx", bytes);
+}
+
+TEST(CASInlineCapGaps, LoadTimeFileAboveThePerFileThresholdIsABlobToday)
+{
+    auto storage = openStorage();
+    const std::string table = "e07/e07e07e0-0707-4707-8707-070707070707/";
+    const std::string tmp_part = table + "tmp_insert_all_1_1_0";
+    const std::string final_part = table + "all_1_1_0";
+
+    std::map<std::string, std::string> files;
+    files["data.bin"] = payload(64 * kib, 1);
+    files["columns.txt"] = payload(inline_file_threshold, 2);
+    files["serialization.json"] = payload(inline_file_threshold + 1, 3);
+
+    auto tx = storage->createTransaction();
+    for (const auto & [name, bytes] : files)
+        writeFileTx(*tx, tmp_part + "/" + name, bytes);
+    tx->moveDirectory(tmp_part, final_part);
+    const std::string error = commitErrorOf(*tx);
+    ASSERT_TRUE(error.empty()) << error;
+
+    expectReadsBack(*storage, final_part, files);
+    const auto manifest = manifestOf(*storage, "e07e07e0-0707-4707-8707-070707070707", "all_1_1_0");
+    ASSERT_TRUE(DB::Cas::findEntry(manifest.entries, "columns.txt") && DB::Cas::findEntry(manifest.entries, "serialization.json"));
+    EXPECT_EQ(DB::Cas::findEntry(manifest.entries, "columns.txt")->placement, DB::Cas::EntryPlacement::Inline);
+    EXPECT_EQ(DB::Cas::findEntry(manifest.entries, "serialization.json")->placement, DB::Cas::EntryPlacement::Blob);
+}
+
+/// A part name is carried in every ref-log record of the part, and a record has a byte cap. A partition
+/// key of many integer columns gives a name of several kilobytes. The refusal arrives at commit, after
+/// the part's files and its manifest were written, and the same insert can never pass.
+TEST(CASInlineCapGaps, PartNameOverTheRefRecordCapIsRefusedOnlyAtCommit)
+{
+    auto storage = openStorage();
+    const std::string table = "e08/e08e08e0-0808-4808-8808-080808080808/";
+
+    std::string partition_id;
+    for (size_t column = 0; column < 200; ++column)
+        partition_id += (column ? "-" : "") + std::string("18446744073709551615");
+    const std::string part_name = partition_id + "_1_1_0";
+    ASSERT_GT(part_name.size(), 4096u);
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, table + "tmp_insert_" + part_name + "/data.bin", payload(64 * kib, 1));
+    writeFileTx(*tx, table + "tmp_insert_" + part_name + "/count.txt", "1");
+
+    const std::string error = commitErrorOf(*tx);
+    EXPECT_NE(error.find(std::to_string(DB::ErrorCodes::LIMIT_EXCEEDED) + ": "), std::string::npos) << error;
+    EXPECT_NE(error.find("per-op cap"), std::string::npos) << error;
+}
+
+TEST(CASInlineCandidateMemory, LargeCandidateMatchesDirectBlobHashAndReadsBack)
+{
+    auto storage = openStorage();
+    const auto dir = table_dir + "tmp_insert_all_1_1_0/";
+    const auto bytes = payload(64 * mib, 13);
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, dir + "same.bin", bytes);
+    writeFileTx(*tx, dir + "skp_idx_t.dct.idx", bytes);
+    tx->moveDirectory(table_dir + "tmp_insert_all_1_1_0", table_dir + "all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+    expectBlob(*storage, "all_1_1_0", "same.bin", bytes);
+    expectBlob(*storage, "all_1_1_0", "skp_idx_t.dct.idx", bytes);
 }

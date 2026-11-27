@@ -1624,7 +1624,7 @@ TEST(CASWiringInFlight, StagedFilesVisibleBeforeCommit)
     EXPECT_EQ(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/uuid.txt"), std::optional<uint64_t>(3));
     EXPECT_FALSE(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/missing.bin").has_value());
 
-    /// Bytes read back: a pending blob from the local temp file (B188); staged mutable bytes from memory.
+    /// Both pending files are readable from staging before their final placement is chosen.
     {
         auto buf = tx->tryReadFileInFlight("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj/data.bin", {}, std::nullopt);
         ASSERT_TRUE(buf);
@@ -1766,6 +1766,47 @@ TEST(CASWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
     EXPECT_EQ(after.unreachable, 0u)
         << "manifestA's unique blobs (data-A / mark-A) must be RECLAIMED once the displacement folds, "
         << "not just recognized as unreachable; unreachable=" << after.unreachable;
+}
+
+TEST(CASWiringGc, SharedBlobRemainsReadableAfterFailedMergeScratchIsReclaimed)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    const String original = table + "all_1_1_0/data.bin";
+    const String output = table + "tmp_merge_all_1_2_1";
+    auto input = storage->createTransaction();
+    writeThroughTransaction(*input, original, "shared");
+    input->commit(DB::NoCommitOptions{});
+
+    auto segments = storage->createTransaction();
+    writeThroughTransaction(*segments, output + "/text_index_tmp/shared.bin", "shared");
+    writeThroughTransaction(*segments, output + "/text_index_tmp/unique.bin", "only scratch owns this");
+    segments->commit(DB::NoCommitOptions{});
+    const auto live_key = storage->getStorageObjects(original).at(0).remote_path;
+    ASSERT_EQ(live_key, storage->getStorageObjects(output + "/text_index_tmp/shared.bin").at(0).remote_path);
+    const auto dead_key = storage->getStorageObjects(output + "/text_index_tmp/unique.bin").at(0).remote_path;
+    ASSERT_FALSE(live_key.empty());
+    ASSERT_NE(live_key, dead_key);
+    DB::Cas::tests::OperationForTest op(*storage->store()->poolBackendPtr());
+    ASSERT_TRUE((*op).head(dead_key, Retry::standard()));
+
+    {
+        auto failed_merge = storage->createTransaction();
+        writeThroughTransaction(*failed_merge, output + "/data.bin", "unfinished output");
+    }
+    auto cleanup = storage->createTransaction();
+    cleanup->removeDirectory(output);
+    cleanup->commit(DB::NoCommitOptions{});
+
+    for (size_t i = 0; i < 8 && (*op).head(dead_key, Retry::standard()); ++i)
+        storage->runOneGcRoundForTest();
+    ASSERT_FALSE((*op).head(dead_key, Retry::standard()));
+    const auto object = storage->getStorageObjects(original).at(0);
+    auto reader = storage->readBlobPayload({object.remote_path, storage->store()->poolMeta().blob_header_len, object.bytes_size},
+        original, DB::ReadSettings{});
+    String actual;
+    DB::readStringUntilEOF(actual, *reader);
+    EXPECT_EQ(actual, "shared");
 }
 
 /// ==== The DataPartsExchange facade (manifest relink, part_manifest_v2) ====
@@ -2516,6 +2557,27 @@ int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record
 
 }
 
+TEST(CASWiringPrecommitOrder, InlineOnlyPartDoesNotAccessAnyFinalBlobKey)
+{
+    auto recording = makeRecordingStorageForTest("inline_order");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::path(recording->getCommonKeyPrefix()) / "scratch");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(recording, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    recording->ops.clear();
+
+    const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/count.txt";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, path, "42");
+    EXPECT_FALSE(std::filesystem::is_empty(storage->scratchPath()));
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_GE(firstPrecommitWriteIdx(recording->ops), 0);
+    for (const auto & op : recording->ops)
+        EXPECT_EQ(op.key.find("/blobs/"), String::npos) << op.op << " " << op.key;
+    EXPECT_EQ(storage->tryGetInManifestBytes(path), "42");
+}
+
 /// B188: every pool op (read OR write) on /blobs/ or /trees/ must come AFTER the first write that
 /// appends the create-precommit owner event (the first root-shard CAS) — including HEAD
 /// (exists/getObjectMetadata) and GET (readObject), since the
@@ -2710,6 +2772,52 @@ TEST(CASWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 /// (the cross-part pending-source branch: `&dst_st != src_st`, copies the PendingBlob record so
 /// publishStaging uploads it for the dst part too). After commit both parts must read back the
 /// identical content.
+TEST(CASWiringInFlight, OpenLocalReaderRetainsFileThroughCommitOrAbort)
+{
+    for (bool commit : {false, true})
+    {
+        SCOPED_TRACE(commit);
+        auto storage = openWiringStorage();
+        auto tx = storage->createTransaction();
+        const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
+        writeThroughTransaction(*tx, path, "staged");
+        auto reader = tx->tryReadFileInFlight(path, {}, {});
+        ASSERT_TRUE(reader);
+        const auto staging_path = reader->getFileName();
+        if (commit)
+            tx->commit(DB::NoCommitOptions{});
+        tx.reset();
+        ASSERT_TRUE(std::filesystem::exists(staging_path));
+        reader->seek(5, SEEK_SET);
+        char byte;
+        reader->readStrict(&byte, 1);
+        EXPECT_EQ(byte, 'd');
+        reader.reset();
+        EXPECT_FALSE(std::filesystem::exists(staging_path));
+    }
+}
+
+TEST(CASWiringPending, SingleByteTransferCanPublishANewPart)
+{
+    for (const bool move : {false, true})
+    {
+        SCOPED_TRACE(move);
+        auto storage = openWiringStorage();
+        const String dir = "a11/a11a11a1-1111-4111-8111-111111111111/";
+        const String src = dir + "all_2_2_0/a.txt";
+        const String dst = dir + "all_1_1_0/b.txt";
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, src, "x");
+        if (move)
+            tx->moveFile(src, dst);
+        else
+            tx->createHardLink(src, dst);
+        tx->commit(DB::NoCommitOptions{});
+        EXPECT_EQ(storage->tryGetInManifestBytes(dst), "x");
+        EXPECT_EQ(storage->existsFile(src), !move);
+    }
+}
+
 TEST(CASWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
 {
     auto storage = openWiringStorage();
