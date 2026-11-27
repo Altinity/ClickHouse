@@ -63,38 +63,38 @@ std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const St
 
 ObjectStorageIdentityCache::Read ObjectStorageIdentityCache::beginFetch()
 {
-    std::lock_guard lock(epoch_mutex);
-    return Read{epoch, ++next_fetch_seq};
+    std::lock_guard lock(order_mutex);
+    return Read{++clock};
 }
 
-void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read)
+void ObjectStorageIdentityCache::setIfNotInvalidated(const String & key, ObjectStorageIdentity identity, Read read)
 {
-    std::lock_guard lock(epoch_mutex);
-    if (epoch != read.epoch)
+    std::lock_guard lock(order_mutex);
+    if (read.seq < cleared_at)
         return;
-    /// A later fetch of this key has already stored, even if its entry was evicted since. A slot shared with another key
-    /// can only cause a spurious skip.
-    UInt64 & last_seq = last_stored_seq[std::hash<String>()(key) % FETCH_SEQ_SLOTS];
-    if (last_seq > read.seq)
+    /// The key was invalidated after this fetch began, or a later fetch of it has already stored, even if its entry was
+    /// evicted since. A slot shared with another key can only cause a spurious skip.
+    UInt64 & barrier = slot_barrier[slotOf(key)];
+    if (read.seq < barrier)
         return;
-    last_seq = read.seq;
+    barrier = read.seq;
     /// The cache policy holds a copy of the key in the hashmap and another one in its queue list.
     identity.key_memory = 2 * key.capacity();
-    /// `Base::set` takes the cache mutex after `epoch_mutex`, the same order as `remove` and `clear`.
+    /// `Base::set` takes the cache mutex after `order_mutex`, the same order as `remove` and `clear`.
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }
 
 void ObjectStorageIdentityCache::invalidate(const String & key)
 {
-    std::lock_guard lock(epoch_mutex);
-    ++epoch;
+    std::lock_guard lock(order_mutex);
+    slot_barrier[slotOf(key)] = ++clock;
     Base::remove(key);
 }
 
 void ObjectStorageIdentityCache::clear()
 {
-    std::lock_guard lock(epoch_mutex);
-    ++epoch;
+    std::lock_guard lock(order_mutex);
+    cleared_at = ++clock;
     Base::clear();
 }
 

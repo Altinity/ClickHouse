@@ -34,7 +34,7 @@ struct ObjectStorageIdentity
     /// and per-query `headers(...)` carry credentials that are not part of the AWS credentials at all.
     UInt64 credential_hash = 0;
 
-    /// Memory held by the composite key the entry is stored under, in bytes. Set by `setIfEpoch`, so the weight counts it.
+    /// Memory held by the composite key the entry is stored under, in bytes. Set by `setIfNotInvalidated`, so the weight counts it.
     /// The cache policies keep every key twice, as the key of the hashmap and in the eviction queue list.
     /// Not part of the object's identity.
     size_t key_memory = 0;
@@ -82,10 +82,13 @@ void invalidateObjectStorageIdentityCache(std::string_view endpoint, std::string
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. A write, copy, or delete by
-/// this server, and a read that finds the object replaced or missing, removes the entry and advances
-/// the epoch. A metadata fetch takes `beginFetch` before its request and stores its result only if
-/// that epoch is unchanged and no fetch of the same key started later, so an older observation cannot
-/// put a stale identity back. The next read of that key requests the metadata again.
+/// this server, and a read that finds the object replaced or missing, removes the entry. A metadata
+/// fetch takes `beginFetch` before its request and stores its result only if that key was not
+/// invalidated, the cache was not cleared, and no fetch of the same key started later has stored since,
+/// so an older observation cannot put a stale identity back. Writes to other objects do not stop a
+/// fetch from storing: a server that writes to S3 all the time (a MergeTree table or a system log on an
+/// S3 disk) would otherwise never fill the cache. The next read of an invalidated key requests the
+/// metadata again.
 /// Low-level object-storage code reaches the cache via Context::getGlobalContextInstance() and must
 /// tolerate a null pointer (no global context yet) by simply issuing the metadata request uncached.
 class ObjectStorageIdentityCache
@@ -100,40 +103,43 @@ public:
     /// An entry learned by another principal is a miss and is left in place. Increments the hit/miss ProfileEvents.
     std::optional<ObjectStorageIdentity> tryGet(const String & key, UInt64 credential_hash);
 
-    /// Epoch at the start of a metadata fetch, and a sequence that orders that fetch against others.
+    /// The position of a metadata fetch in the order of fetches, invalidations and clears.
     struct Read
     {
-        UInt64 epoch = 0;
         UInt64 seq = 0;
     };
 
-    /// Call before the metadata request and pass the result to `setIfEpoch`.
+    /// Call before the metadata request and pass the result to `setIfNotInvalidated`.
     Read beginFetch();
 
-    /// Store `identity` only when `read.epoch` is still current and no later fetch of `key` has stored.
-    /// "Has stored" is remembered after the entry is evicted, so cache pressure cannot let an older fetch
-    /// overwrite a newer observation.
-    void setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read);
+    /// Store `identity` unless `key` was invalidated or the cache was cleared after `read` began, or a later
+    /// fetch of `key` has stored. "Has stored" is remembered after the entry is evicted, so cache pressure
+    /// cannot let an older fetch overwrite a newer observation.
+    void setIfNotInvalidated(const String & key, ObjectStorageIdentity identity, Read read);
 
-    /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.
+    /// Drop the entry. A fetch of `key` already in flight will not put the old identity back.
     void invalidate(const String & key);
 
-    /// Drop every entry and advance the epoch. Overrides `CacheBase::clear`, so a call through a
-    /// `CacheBase` pointer also advances the epoch and a fetch in flight across the drop cannot store afterwards.
+    /// Drop every entry. A fetch already in flight will not store afterwards. Overrides `CacheBase::clear`, so a
+    /// call through a `CacheBase` pointer also stops the fetches in flight across the drop.
     void clear() override;
 
 private:
-    mutable std::mutex epoch_mutex;
-    /// Advanced by every `invalidate` and `clear`. Guarded by `epoch_mutex`. It is never reset, so a
-    /// fetch in flight can never match a later epoch by accident.
-    UInt64 epoch = 0;
-    /// Advanced by every `beginFetch`. Guarded by `epoch_mutex`.
-    UInt64 next_fetch_seq = 0;
-    /// The highest sequence that stored an entry, per hash slot of the key. Unlike the entry itself, it survives
-    /// eviction. Two keys can share a slot, which only makes `setIfEpoch` skip a store that was safe to do:
-    /// the next read of that key requests the metadata again. Guarded by `epoch_mutex`.
-    static constexpr size_t FETCH_SEQ_SLOTS = 4096;
-    std::array<UInt64, FETCH_SEQ_SLOTS> last_stored_seq{};
+    static constexpr size_t SLOTS = 65536;
+
+    static size_t slotOf(const String & key) { return std::hash<String>()(key) % SLOTS; }
+
+    mutable std::mutex order_mutex;
+    /// Logical time. Advanced by every `beginFetch`, `invalidate` and `clear`, so each of them gets a time
+    /// that no other has. Guarded by `order_mutex`.
+    UInt64 clock = 0;
+    /// The time of the last `clear`. A fetch that began before it must not store. Guarded by `order_mutex`.
+    UInt64 cleared_at = 0;
+    /// Per hash slot of the key, the time of the last invalidation or store of a key in the slot. A fetch
+    /// that began before it must not store. Unlike the entry itself, it survives eviction. Two keys can
+    /// share a slot, which only makes `setIfNotInvalidated` skip a store that was safe to do: the next read
+    /// of that key requests the metadata again. Guarded by `order_mutex`.
+    std::array<UInt64, SLOTS> slot_barrier{};
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;

@@ -1157,9 +1157,9 @@ ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, 
         }
     }
 
-    /// Captured before the request. `setIfEpoch` stores the result only while this epoch is unchanged
-    /// and no later fetch of the same key has stored, so a write, copy, delete, drop, or an older
-    /// observation cannot put a stale identity back.
+    /// Captured before the request. `setIfNotInvalidated` stores the result only if this key was not
+    /// invalidated since, the cache was not cleared, and no later fetch of the same key has stored, so a
+    /// write, copy, delete, drop, or an older observation cannot put a stale identity back.
     ObjectStorageIdentityCache::Read identity_read;
     if (identity_cache)
         identity_read = identity_cache->beginFetch();
@@ -1224,7 +1224,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, 
             identity.last_modified = static_cast<Int64>(result.last_modified.epochTime());
         /// After a credential refresh the client that signed the HEAD may not be the one looked up.
         identity.credential_hash = s3CredentialHash(*client.get());
-        identity_cache->setIfEpoch(identity_key, std::move(identity), identity_read);
+        identity_cache->setIfNotInvalidated(identity_key, std::move(identity), identity_read);
     }
 
     return result;
