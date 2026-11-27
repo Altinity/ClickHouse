@@ -18,7 +18,7 @@ if (ARCH_AARCH64)
         # crc32 is optional in v8.0 and mandatory in v8.1. Enable it as __crc32()* is used in lot's of places and even very old ARM CPUs
         # support it.
         set (COMPILER_FLAGS "${COMPILER_FLAGS} -march=armv8+crc")
-        list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+crc,-neon")
+        list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+crc")
     else ()
         # ARMv8.2 is quite ancient but the lowest common denominator supported by both Graviton 2 and 3 processors [1, 10]. In particular, it
         # includes LSE (made mandatory with ARMv8.1) which provides nice speedups without having to fall back to compat flag
@@ -76,10 +76,10 @@ elseif (ARCH_PPC64LE)
     # Note that gcc and clang have support for x86 SSE2 intrinsics when building for PowerPC
     option (POWER9 "Build for Power 9 CPU and above" 0)
     if(POWER9)
-        set (COMPILER_FLAGS "${COMPILER_FLAGS} -maltivec -mcpu=power9 -D__SSE2__=1 -DNO_WARN_X86_INTRINSICS")
+        set (COMPILER_FLAGS "${COMPILER_FLAGS} -maltivec -mcpu=power9")
         list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+power9-altivec")
     else ()
-        set (COMPILER_FLAGS "${COMPILER_FLAGS} -maltivec -mcpu=power8 -D__SSE2__=1 -DNO_WARN_X86_INTRINSICS")
+        set (COMPILER_FLAGS "${COMPILER_FLAGS} -maltivec -mcpu=power8")
         list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+power8-altivec")
     endif ()
 

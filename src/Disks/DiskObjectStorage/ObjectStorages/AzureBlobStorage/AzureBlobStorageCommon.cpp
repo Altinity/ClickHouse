@@ -88,6 +88,7 @@ namespace ServerSetting
 
 namespace ErrorCodes
 {
+    extern const int AZURE_BLOB_STORAGE_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
 }
@@ -209,13 +210,21 @@ String ContainerClientWrapper::GetBlobPath(const String & blob_name) const
         "Failed to parse Azure connection string or blob URL: {}", e.what());
 }
 
+/// The connection string the clients are created from. A disk can set it together with an `endpoint`, whose host
+/// the clients then do not use. The default-constructed `auth_method` of a SAS or catalog path is empty.
+static const String & getClientConnectionString(const ConnectionParams & params)
+{
+    const auto & connection_string = std::get<ConnectionString>(params.auth_method).toUnderType();
+    return connection_string.empty() ? params.endpoint.storage_account_url : connection_string;
+}
+
 String ConnectionParams::getConnectionURL() const
 {
     if (std::holds_alternative<ConnectionString>(auth_method))
     {
         try
         {
-            auto parsed_connection_string = Azure::Storage::_internal::ParseConnectionString(endpoint.storage_account_url);
+            auto parsed_connection_string = Azure::Storage::_internal::ParseConnectionString(getClientConnectionString(*this));
             return parsed_connection_string.BlobServiceUrl.GetAbsoluteUrl();
         }
         catch (const std::logic_error & e)
@@ -225,6 +234,28 @@ String ConnectionParams::getConnectionURL() const
     }
 
     return endpoint.storage_account_url;
+}
+
+String ConnectionParams::getConnectionURLWithoutQuery() const
+{
+    if (std::holds_alternative<ConnectionString>(auth_method))
+    {
+        try
+        {
+            /// `ParseConnectionString` appends the SAS of the connection string to `BlobServiceUrl` as its query.
+            auto url = Azure::Storage::_internal::ParseConnectionString(endpoint.storage_account_url).BlobServiceUrl;
+            const auto query = url.GetQueryParameters();
+            for (const auto & [key, value] : query)
+                url.RemoveQueryParameter(key);
+            return url.GetAbsoluteUrl();
+        }
+        catch (const std::logic_error & e)
+        {
+            translateAzureSdkParseError(e);
+        }
+    }
+
+    return endpoint.storage_account_url.substr(0, endpoint.storage_account_url.find_first_of("?#"));
 }
 
 std::unique_ptr<ServiceClient> ConnectionParams::createForService() const
@@ -364,6 +395,8 @@ std::unique_ptr<ContainerClient> getContainerClient(const ConnectionParams & par
             ProfileEvents::increment(ProfileEvents::DiskAzureCreateContainer);
 
         auto raw_client = service_client->CreateBlobContainer(params.endpoint.container_name).Value;
+        /// `CreateBlobContainer` returns a client without `ClickhouseOptions`.
+        raw_client.SetClickhouseOptions(params.client_options.ClickhouseOptions);
         return std::make_unique<ContainerClient>(std::move(raw_client), params.endpoint.prefix);
     }
     catch (const Azure::Storage::StorageException & e)
@@ -374,6 +407,13 @@ std::unique_ptr<ContainerClient> getContainerClient(const ConnectionParams & par
             return params.createForContainer();
         throw;
     }
+}
+
+String getETag(const Azure::ETag & etag, const String & blob_path)
+{
+    if (!etag.HasValue())
+        throw Exception(ErrorCodes::AZURE_BLOB_STORAGE_ERROR, "Azure Blob Storage endpoint did not return an ETag for blob {}", blob_path);
+    return etag.ToString();
 }
 
 AuthMethod getAuthMethod(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
