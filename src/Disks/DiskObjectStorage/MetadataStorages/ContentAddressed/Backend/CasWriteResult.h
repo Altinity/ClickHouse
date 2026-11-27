@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 
@@ -59,7 +60,7 @@ struct Refused   { int store_error; String message; uint32_t attempts_sent = 0; 
 /// No attempt landed and none can be proven safe to keep making.
 struct GaveUp
 {
-    enum class Why : uint8_t { Deadline, FenceLost, Unresolved };
+    enum class Why : uint8_t { Deadline, FenceLost, Unresolved, Attempts };
     enum class Source : uint8_t { Policy, Lease };
     Why why; Source deadline_source; bool sent_any; Observation last_seen;
     /// The HTTP attempts this call made, the same count `Committed` carries. Operator counters -- the
@@ -120,6 +121,8 @@ inline std::optional<Etag> orThrow(WriteResult && result, std::string_view what)
                     throwCasTransientUnavailable(String(what), "mount fence tripped: the durable write is refused because this node no longer holds the mount incarnation it was admitted under");
                 case GaveUp::Why::Deadline:
                     throwCasWriteRetryLater(fmt::format("{}: gave up at the {} deadline after {} attempt(s)", what, g.deadline_source == GaveUp::Source::Lease ? "lease" : "policy", g.sent_any ? "one or more" : "zero"));
+                case GaveUp::Why::Attempts:
+                    throwCasWriteRetryLater(fmt::format("{}: did not converge after {} decisions", what, kCasMaxDecisions));
                 case GaveUp::Why::Unresolved:
                     throwCasWriteRetryLater(g.sent_any
                         ? fmt::format("{}: the write is unresolved (sent, resolve read found {})", what, renderObservation(g.last_seen))

@@ -122,6 +122,10 @@ String describeRequestFailure(std::string_view verb, const String & key, const s
 /// commit: a read, a probe, a delete, or recovery and maintenance work.
 [[noreturn]] void throwCasRequestRetryLater(const String & why);
 
+/// For a loop that capped its own iterations and has no `WriteResult` to carry `GaveUp::Why::Attempts`.
+/// Same class as `throwCasWriteRetryLater`; `unit` names what `count` counts.
+[[noreturn]] void throwDidNotConverge(std::string_view what, uint32_t count, std::string_view unit);
+
 /// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
 /// `std::exception_ptr` for call sites that fail a pending future/promise rather than throw directly.
 /// Both entry points route through the SAME construction internally, so the error code / message shape
@@ -329,30 +333,31 @@ public:
     Dialect backendDialect() const;
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
-    /// that reissue something the engine must not reissue for them.
-    void pause(uint64_t ms) { sleep(ms); }
-    /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
-    /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
-    /// attempt reservations (the re-read and the write) do not fit in `policy`.
-    std::optional<WriteResult> pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy);
+    /// that reissue something the engine must not reissue for them. It only sleeps: no owner, fence or deadline check.
+    void sleepFor(uint64_t ms) { sleep(ms); }
+    /// The pause before a loop re-decides after `unresolved`. Returns the give-up instead of sleeping
+    /// when the fence is lost, the mount lease has no room for the pause, or the pause does not fit before `policy`'s
+    /// lease or absolute deadline; and after sleeping when any of these holds at wake-up, or when the query stopped
+    /// during it. No window is consulted: the next decision's requests bind their own.
+    std::optional<GaveUp> pauseAfterUnresolvedWrite(uint64_t ms, const GaveUp & unresolved, const Retry & policy);
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
+    enum class AdmissionLoss : uint8_t { Fence, Lease };
+    /// Why this operation is no longer admitted, or nullopt while it is. A loop asks at its count cap: a
+    /// fence lost or a lease spent during the last request is the answer, not the count.
+    std::optional<AdmissionLoss> lostAdmission() const;
     void observeRequests(RequestObserver observer_) { observer = std::move(observer_); }
 
     /// The write lane for keys several writers of this pool share.
     CasHotKeys & hotKeys() const { return *owner.hot_keys; }
 
-    /// `policy` with its window turned into an absolute deadline on this operation's clock, taken NOW.
-    /// A hand-written loop freezes its policy once before it starts and passes the frozen value to
-    /// every call it makes, so the loop ends when the window it was given ends -- rather than granting
-    /// each verb of each iteration a fresh one, which is how a bounded document promise became hours
-    /// of paced retrying. A policy that already carries a deadline is returned unchanged, so freezing
-    /// twice cannot extend it.
-    Retry freeze(const Retry & policy) const;
-    /// Would a read verb start its first attempt now under a policy frozen to `deadline_ms`? The same test the
-    /// verb applies before it sends, without any lease bound. A caller with a deadline of its own asks first, so
-    /// its running out of time is its own error and not the verb's retry-later give-up.
+    /// Would a read verb (one envelope; a conditional write reserves two) start its first attempt now under
+    /// `policy`? The same deadline test the verb applies before it sends, lease bound included, not its
+    /// fence check. A caller with a deadline of its own asks first, so its running out of time is its own
+    /// error and not the verb's retry-later give-up.
+    bool oneAttemptFits(const Retry & policy) const;
+    /// The same, before an absolute `deadline_ms` and without any lease bound.
     bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
     /// `OnMemoryLimit::Propagate` makes a `MEMORY_LIMIT_EXCEEDED` from an admitted attempt escape at once: the
@@ -450,31 +455,33 @@ private:
     /// `NETWORK_ERROR`, so a caller that SWALLOWS the exception -- only the resolve read does -- cannot
     /// recover from it which bound refused, and reporting a lease refusal as a policy deadline is the
     /// confusion `GaveUp::Source` exists to prevent. `PolicyExhausted` names the `Retry` bound, whose
-    /// own source is `Bound::lease_bound`.
+    /// own source is `Bound::source`.
     enum class ReadStop : uint8_t { FenceLost, NoBudgetLease, PolicyExhausted };
 
     /// What the resolve read saw, and why it stopped when it saw nothing. `stop` is set ONLY when a
     /// bound refused; a read that failed at the transport leaves it empty, and that is the one case
-    /// `NotObserved` is still the whole story.
+    /// `NotObserved` is still the whole story. `source` is the source of the read's own bound.
     struct Resolved
     {
         Observation seen;
         std::optional<ReadStop> stop;
+        GaveUp::Source source = GaveUp::Source::Policy;
+        /// The read failed and saw its query stopped.
+        bool observed_stop = false;
     };
 
-    /// One read-class request under the policy: admission, attempt, classification, jittered reissue.
-    /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
+    /// One read-class request under the policy: admission, attempt, classification, jittered reissue,
+    /// all within the window it binds at its start. Returns whatever `once` returns, or throws -- the
+    /// read surface reports failure by exception.
     template <typename Fn>
     auto readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                  const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
+                  Fn && once, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
 
-    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound,
+    std::optional<Object> readUnder(const String & key, const Retry & policy,
                                     OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
-    std::optional<Meta>   headUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
-    ListPage               listUnder(const String & prefix, const String & cursor, size_t limit,
-                                    const Retry & policy, const Retry::Bound & bound);
-    Removal               removeUnder(const String & key, const String & expected_value,
-                                      const Retry & policy, const Retry::Bound & bound);
+    std::optional<Meta>   headUnder(const String & key, const Retry & policy);
+    ListPage               listUnder(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
+    Removal               removeUnder(const String & key, const String & expected_value, const Retry & policy);
 
     /// How a write settles a REFUSED PRECONDITION, which needs only to know what is at the key. An
     /// ambiguous attempt always reads the body, whichever this says, because only the bytes can prove
@@ -484,7 +491,8 @@ private:
     /// The write engine: one call, any policy. `Committed` and `Conflict` are proven by an exact read
     /// or by the reissue's own 2xx before they are reported; an attempt whose transport error named a
     /// failed connection is reissued before its read. `Refused`, `Declined` and `GaveUp` report what
-    /// the store or the bounds said.
+    /// the store or the bounds said. The window bound at entry governs every send of these bytes; the
+    /// read that settles an attempt is a request of its own and binds its own window from `policy`.
     WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                           const Retry & policy, const Retry::Bound & bound, WriteState & state,
                           ResolveWith resolve_refusal_with);
@@ -497,26 +505,45 @@ private:
     WriteResult postCommit(Etag inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound);
     WriteResult gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const;
     /// The bound that refused the resolve read, reported as the outcome it actually is.
-    WriteResult gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const;
+    WriteResult gaveUpForReadStop(ReadStop stop, GaveUp::Source source, WriteState & state) const;
     /// A resolve read that produced nothing. The fence is NOT resampled: a second sample reports a
     /// state the read never saw, which is how a lease refusal used to be reported as a policy deadline.
-    WriteResult gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
-                                             const Retry::Bound & bound) const;
+    WriteResult gaveUpAfterFailedObservation(const Resolved & resolved, WriteState & state) const;
+    /// The loops' answer after their last allowed decision lost its race.
+    WriteResult gaveUpAfterDecisionCap(WriteState & state, const Retry & policy) const;
+
+    /// Why a pause between decisions ended the call.
+    /// `QueryStopped` follows only `PauseAfter::Failure`.
+    enum class PauseStop : uint8_t { FenceLost, NoBudget, Lease, OutsideCap, QueryStopped };
+    /// What the pause follows. A query's stop is consulted only after a failure: a conflict is an answer,
+    /// and the work after it proceeds for a killed query as on plain S3.
+    enum class PauseAfter : uint8_t { Conflict, Failure };
+    /// The pause between two decisions: admission for the pause, then the policy's explicit lease and outside cap,
+    /// then the sleep, then admission, lease and cap again so no `decide` runs past them. It consults
+    /// no window: the next decision's requests bind their own when they are sent.
+    std::optional<PauseStop> pauseUnderPolicy(uint64_t ms, const Retry & policy, PauseAfter after, void (*record)());
+    /// `pauseUnderPolicy` reported as a give-up. A value means the call ended; nullopt means
+    /// `decide` may run again.
+    std::optional<GaveUp> pauseBetweenDecisions(uint64_t ms, WriteState & state, const Retry & policy, PauseAfter after,
+                                                void (*record)() = detail::recordReissue);
+    /// The read-modify-write loops' step after a lost decision: the decision cap, else the pause before the next
+    /// decision. A value means the call ended.
+    std::optional<WriteResult> pauseAfterConflict(uint32_t decisions, WriteState & state, const Retry & policy);
+    /// The caller may send another attempt.
+    struct ResumeAfterPause {};
+    /// A query stopped in the pause and vetoes the next attempt; the pause also set `state.observed_stop`.
+    struct QueryVetoedResend {};
+    /// How a gated pause ended: resume, a query's veto, or the call's outcome.
+    using PauseOutcome = std::variant<ResumeAfterPause, QueryVetoedResend, WriteResult>;
     /// The shared shape behind every gated pause below: admission for `envelopes` attempt reservations
     /// plus `pause_ms`, the deadline check, the counter this pause records itself under, then the sleep
     /// -- called even with a zero `pause_ms` UNLESS `should_sleep` is false, which is reserved for the
-    /// fuse's zero-pause reissue (a pace of "no pause", not "a zero-length one"). A value means the call
-    /// ended during it; nullopt means the caller may send another attempt.
-    std::optional<WriteResult> gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
-                                         const Retry::Bound & bound, void (*record)(), bool should_sleep);
-    /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
-    /// caller may send another attempt. Under `WriteState::spacing` this and the two siblings below
-    /// sleep `reissuePause` instead.
-    std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
-    /// The sibling for a clean lost race: the same admission and the same reservation, a flat
-    /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
-    /// starts its own schedule at the beginning.
-    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
+    /// fuse's zero-pause reissue (a pace of "no pause", not "a zero-length one").
+    PauseOutcome gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
+                            const Retry::Bound & bound, void (*record)(), bool should_sleep);
+    /// Admission, then the jittered sleep. Under `WriteState::spacing` this and the two siblings below
+    /// sleep `reissuePause` instead. Only a write's own reissues use these, with the write's own bound.
+    PauseOutcome pauseAndReissue(WriteState & state, const Retry::Bound & bound);
     /// The sibling for a failure text that named a failed connection. The same admission and the same
     /// reservation, a flat `kConnectHintPauseMs` sleep, and `state.reissues` untouched.
     std::optional<WriteResult> pauseFlat(WriteState & state, const Retry::Bound & bound);
@@ -545,7 +572,7 @@ private:
     [[noreturn]] void giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when);
     [[noreturn]] void giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what);
     [[noreturn]] void giveUpReadDeadline(std::string_view verb, const String & subject,
-                                         const Retry::Bound & bound, uint32_t attempts_made);
+                                         GaveUp::Source source, uint32_t attempts_made);
 
     CasRequests & owner;
     uint64_t admitted_generation;
@@ -554,13 +581,18 @@ private:
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
+    /// The source of the bound the latest read-class request was given, for the same reader.
+    GaveUp::Source last_read_source = GaveUp::Source::Policy;
     RequestObserver observer;
 };
 
 template <typename Fn>
 auto CasOperation::readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                            const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit)
+                            Fn && once, OnMemoryLimit on_memory_limit)
 {
+    const Retry::Bound bound = owner.bindPolicy(policy);
+    const GaveUp::Source source = bound.source == Retry::Bound::Source::Lease ? GaveUp::Source::Lease : GaveUp::Source::Policy;
+    last_read_source = source;
     bool refresh_attempted = false;
     uint64_t attempt_started_ms = 0;
     /// Two counters, deliberately kept separate: `attempt_no` is the PHYSICAL attempt count handed to
@@ -578,7 +610,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             case Gate::Ok: break;
         }
         if (!fits(reservation, bound))
-            giveUpReadDeadline(verb, subject, bound, attempt_no - 1);
+            giveUpReadDeadline(verb, subject, source, attempt_no - 1);
 
         if (policy.attempt_spacing_ms)
             attempt_started_ms = owner.now_ms();
@@ -620,7 +652,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
                     case Gate::Ok: break;
                 }
                 if (!fits(needed, bound))
-                    giveUpReadDeadline(verb, subject, bound, attempt_no);
+                    giveUpReadDeadline(verb, subject, source, attempt_no);
                 detail::recordReissue();
                 continue;
             }

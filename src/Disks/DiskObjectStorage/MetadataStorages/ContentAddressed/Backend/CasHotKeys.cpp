@@ -32,7 +32,7 @@ namespace
 
 GaveUp::Source sourceFor(const Retry::Bound & bound)
 {
-    return bound.lease_bound ? GaveUp::Source::Lease : GaveUp::Source::Policy;
+    return bound.source == Retry::Bound::Source::Lease ? GaveUp::Source::Lease : GaveUp::Source::Policy;
 }
 
 /// The wait slice: how late, at most, a waiter notices its own fence or deadline. A handover wakes it
@@ -194,8 +194,7 @@ void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint6
     }
 }
 
-WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry & policy, const Retry::Bound & bound,
-                             const Decide & decide)
+WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide)
 {
     CasOperation::WriteState state;
     std::optional<Object> base;
@@ -214,13 +213,13 @@ WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry 
     const auto read_base = [&]() -> std::optional<WriteResult>
     {
         ProfileEvents::increment(ProfileEvents::CASHotKeyReadStarts);
-        CasOperation::Resolved resolved = op.observe(key, policy, bound);
+        CasOperation::Resolved resolved = op.observe(key, policy);
         state.last_seen = resolved.seen;
         base.reset();
         if (const auto * object = std::get_if<Object>(&state.last_seen))
             base = *object;
         else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-            return op.gaveUpAfterFailedObservation(resolved.stop, state, bound);
+            return op.gaveUpAfterFailedObservation(resolved, state);
         return std::nullopt;
     };
     if (!from_cache)

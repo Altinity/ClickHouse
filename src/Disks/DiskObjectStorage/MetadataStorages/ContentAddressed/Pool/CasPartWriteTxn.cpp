@@ -600,6 +600,8 @@ String describeManifestPutGiveUp(const GaveUp & gave_up)
             if (lease)
                 return "was not sent: the mount lease has too little time left, so writes are paused";
             return "was not sent: the request window ran out before the first attempt";
+        case GaveUp::Why::Attempts:
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "A single part write is never capped by a decision count");
         case GaveUp::Why::Unresolved:
             if (gave_up.sent_any)
                 return fmt::format(

@@ -2176,6 +2176,8 @@ MountRenewResult MountLeaseRenewer::renewOn(
             case GaveUp::Why::Unresolved:
                 classification = MountRenewTerminalClassification::Unresolved;
                 break;
+            case GaveUp::Why::Attempts:
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "A mount renewal write is never capped by a decision count");
         }
         markMountRenewTermination(classification);
         result.failure = makeCasWriteRetryLaterExceptionPtr(fmt::format(

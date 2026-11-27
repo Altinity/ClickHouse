@@ -100,6 +100,11 @@ void logCasWriteRetryLater(const String & why)
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
 }
 
+[[noreturn]] void throwDidNotConverge(std::string_view what, uint32_t count, std::string_view unit)
+{
+    throwCasWriteRetryLater(fmt::format("{}: did not converge after {} {}", what, count, unit));
+}
+
 [[noreturn]] void throwCasRequestRetryLater(const String & why)
 {
     LogSeriesLimiter log(getLogger("CasRequestRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
@@ -200,7 +205,7 @@ bool isAuthoritativeAbsence([[maybe_unused]] const std::exception & e)
 
 GaveUp::Source sourceFor(const Retry::Bound & bound)
 {
-    return bound.lease_bound ? GaveUp::Source::Lease : GaveUp::Source::Policy;
+    return bound.source == Retry::Bound::Source::Lease ? GaveUp::Source::Lease : GaveUp::Source::Policy;
 }
 
 /// Could the precondition this write was built with still be met by what the resolve read saw? A
@@ -504,7 +509,7 @@ Retry CasOperation::freeze(const Retry & policy) const
 
 bool CasOperation::oneAttemptFitsBefore(uint64_t deadline_ms) const
 {
-    return fits(reservedFor(0, 1), Retry::Bound{.deadline_ms = deadline_ms, .lease_bound = false});
+    return fits(reservedFor(0, 1), Retry::Bound{.deadline_ms = deadline_ms, .source = Retry::Bound::Source::OutsideCap});
 }
 
 std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
@@ -513,10 +518,61 @@ std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const 
     state.attempts_sent = unresolved.attempts_sent;
     state.sent_any = unresolved.sent_any;
     state.last_seen = unresolved.last_seen;
-    /// Room for the next decision's two requests: its catalog read and its write.
-    constexpr uint32_t envelopes_for_next_decision = 2;
-    return gatedPause(ms, envelopes_for_next_decision, state, owner.bindPolicy(policy), detail::recordReissue,
-                      /*should_sleep=*/true);
+    return pauseBetweenDecisions(ms, state, policy, PauseAfter::Failure);
+}
+
+std::optional<CasOperation::PauseStop> CasOperation::pauseUnderPolicy(uint64_t ms, const Retry & policy, PauseAfter after,
+                                                                      void (*record)())
+{
+    /// Admission for `needed_ms` of pause, so a pause never outlives the mount lease. A window belongs to
+    /// one request and the next request binds its own when it is sent, so only the policy's absolute limits
+    /// can refuse a pause. The owner is checked last, so a lost fence or lease stays the typed outcome.
+    auto check_pause = [&](uint64_t needed_ms) -> std::optional<PauseStop>
+    {
+        switch (gate(needed_ms))
+        {
+            case Gate::FenceLost: return PauseStop::FenceLost;
+            case Gate::NoBudget:  return PauseStop::NoBudget;
+            case Gate::Ok: break;
+        }
+        if (policy.lease_deadline_ms && !fits(needed_ms, {.deadline_ms = *policy.lease_deadline_ms, .source = Retry::Bound::Source::Lease}))
+            return PauseStop::Lease;
+        if (policy.outside_cap_ms && !fits(needed_ms, {.deadline_ms = *policy.outside_cap_ms, .source = Retry::Bound::Source::OutsideCap}))
+            return PauseStop::OutsideCap;
+        throwIfBackgroundStopped();
+        if (after == PauseAfter::Failure && !insideOwed() && queryStopRequested())
+            return PauseStop::QueryStopped;
+        return std::nullopt;
+    };
+    if (auto stop = check_pause(ms))
+        return stop;
+    record();
+    /// A query cut short here is reported by the check below, after the typed bounds.
+    if (after == PauseAfter::Failure)
+        sleepUnlessQueryStops(ms, [this](uint64_t slice_ms) { sleep(slice_ms); });
+    else
+        sleep(ms);
+    /// A sleep can end on or past a limit it fitted before, and `decide` must not run after it.
+    return check_pause(0);
+}
+
+std::optional<GaveUp> CasOperation::pauseBetweenDecisions(uint64_t ms, WriteState & state, const Retry & policy,
+                                                               PauseAfter after, void (*record)())
+{
+    const std::optional<PauseStop> stop = pauseUnderPolicy(ms, policy, after, record);
+    if (!stop)
+        return std::nullopt;
+    switch (*stop)
+    {
+        /// Named the way every request names a lost fence: by the bound the policy would get now.
+        case PauseStop::FenceLost:  return gaveUp(GaveUp::Why::FenceLost, sourceFor(owner.bindPolicy(policy)), state);
+        case PauseStop::NoBudget:   return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+        case PauseStop::Lease:      return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+        case PauseStop::OutsideCap: return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Policy, state);
+        /// The failure the pause followed stays unresolved; no decision follows it.
+        case PauseStop::QueryStopped: return gaveUp(GaveUp::Why::Unresolved, sourceFor(owner.bindPolicy(policy)), state);
+    }
+    UNREACHABLE();
 }
 
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
@@ -570,17 +626,16 @@ void CasOperation::giveUpReadNoBudget(std::string_view verb, const String & subj
 }
 
 void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subject,
-                                      const Retry::Bound & bound, uint32_t attempts_made)
+                                      GaveUp::Source source, uint32_t attempts_made)
 {
     last_read_stop = ReadStop::PolicyExhausted;
     throwCasRequestRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
-                                          verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
+                                          verb, subject, source == GaveUp::Source::Lease ? "lease" : "policy", attempts_made));
 }
 
-std::optional<Object> CasOperation::readUnder(
-    const String & key, const Retry & policy, const Retry::Bound & bound, OnMemoryLimit on_memory_limit)
+std::optional<Object> CasOperation::readUnder(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit)
 {
-    return readLoop("read", key, policy, bound, [&](auto & access) -> std::optional<Object>
+    return readLoop("read", key, policy, [&](auto & access) -> std::optional<Object>
     {
         auto raw = owner.backend->read(key, access);
         if (!raw)
@@ -589,9 +644,9 @@ std::optional<Object> CasOperation::readUnder(
     }, on_memory_limit);
 }
 
-std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
+std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & policy)
 {
-    return readLoop("head", key, policy, bound, [&](auto & access) -> std::optional<Meta>
+    return readLoop("head", key, policy, [&](auto & access) -> std::optional<Meta>
     {
         auto raw = owner.backend->head(key, access);
         if (!raw)
@@ -600,10 +655,9 @@ std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & po
     });
 }
 
-ListPage CasOperation::listUnder(const String & prefix, const String & cursor, size_t limit,
-                                const Retry & policy, const Retry::Bound & bound)
+ListPage CasOperation::listUnder(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
 {
-    return readLoop("list", prefix, policy, bound, [&](auto & access)
+    return readLoop("list", prefix, policy, [&](auto & access)
     {
         Backend::RawListPage raw = owner.backend->list(prefix, cursor, limit, access);
         ListPage page;
@@ -620,10 +674,11 @@ ListPage CasOperation::listUnder(const String & prefix, const String & cursor, s
     });
 }
 
-Removal CasOperation::removeUnder(const String & key, const String & expected_value,
-                                  const Retry & policy, const Retry::Bound & bound)
+Removal CasOperation::removeUnder(const String & key, const String & expected_value, const Retry & policy)
 {
-    const Backend::RawRemoval raw = readLoop("remove", key, policy, bound, [&](auto & access)
+    /// A mutation, so unlike a read it does not start for a stopped background owner.
+    throwIfBackgroundStopped();
+    const Backend::RawRemoval raw = readLoop("remove", key, policy, [&](auto & access)
     {
         return owner.backend->remove(key, expected_value, access);
     });
@@ -643,17 +698,17 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
 
 std::optional<Object> CasOperation::read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit)
 {
-    return readUnder(key, policy, owner.bindPolicy(policy), on_memory_limit);
+    return readUnder(key, policy, on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)
 {
-    return headUnder(key, policy, owner.bindPolicy(policy));
+    return headUnder(key, policy);
 }
 
 ListPage CasOperation::list(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
 {
-    return listUnder(prefix, cursor, limit, policy, owner.bindPolicy(policy));
+    return listUnder(prefix, cursor, limit, policy);
 }
 
 void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
@@ -684,7 +739,7 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
         return;
     const Retry::Bound bound = owner.bindPolicy(policy);
     const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
-    readLoop("removeManyWriteOnce", subject, policy, bound, [&](auto & access)
+    readLoop("removeManyWriteOnce", subject, policy, [&](auto & access)
     {
         owner.backend->removeManyWriteOnce(keys, access);
         return true;
@@ -693,18 +748,17 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
 
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
-    return removeUnder(key, owner.valueFor(key, seen), policy, owner.bindPolicy(policy));
+    return removeUnder(key, owner.valueFor(key, seen), policy);
 }
 
 Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = owner.bindPolicy(policy);
     for (uint32_t attempt = 1;; ++attempt)
     {
-        const std::optional<Meta> seen = headUnder(key, policy, bound);
+        const std::optional<Meta> seen = headUnder(key, policy);
         if (!seen)
             return Removal::Gone;
-        const Removal removed = removeUnder(key, owner.valueFor(key, seen->etag), policy, bound);
+        const Removal removed = removeUnder(key, owner.valueFor(key, seen->etag), policy);
         if (removed != Removal::Mismatch)
             return removed;
 
@@ -715,20 +769,32 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
             throwCasRequestRetryLater(fmt::format(
                 "removeCurrent of '{}': the observed incarnation was replaced and the policy allows no reissue", key));
 
-        /// Another incarnation became current between the observation and the delete. Re-observe, paced
-        /// like every other reissue: the reservation covers the next `head` and the `remove` after it.
-        const uint64_t pause_ms = Retry::backoff(attempt);
-        const uint64_t needed = reservedFor(pause_ms, 2);
-        switch (gate(needed))
+        if (attempt == kCasMaxDecisions)
         {
-            case Gate::FenceLost: giveUpReadFenceLost("removeCurrent", key, "before the reissue");
-            case Gate::NoBudget:  giveUpReadNoBudget("removeCurrent", key, "for the reissue");
-            case Gate::Ok: break;
+            if (const std::optional<AdmissionLoss> lost = lostAdmission())
+            {
+                if (*lost == AdmissionLoss::Fence)
+                    giveUpReadFenceLost("removeCurrent", key, "at the decision cap");
+                giveUpReadNoBudget("removeCurrent", key, "at the decision cap");
+            }
+            throwDidNotConverge(fmt::format("CAS remove of '{}'", key), kCasMaxDecisions, "decisions");
         }
-        if (!fits(needed, bound))
-            giveUpReadDeadline("removeCurrent", key, bound, attempt);
-        detail::recordReissue();
-        sleep(pause_ms);
+
+        /// Another incarnation became current between the observation and the delete. Re-observe, paced
+        /// like every other reissue; the next `head` and `remove` bind their own windows.
+        if (const std::optional<PauseStop> stop
+            = pauseUnderPolicy(Retry::backoff(attempt), policy, PauseAfter::Conflict, detail::recordReissue))
+        {
+            switch (*stop)
+            {
+                case PauseStop::FenceLost:  giveUpReadFenceLost("removeCurrent", key, "before the reissue");
+                case PauseStop::NoBudget:   giveUpReadNoBudget("removeCurrent", key, "for the reissue");
+                case PauseStop::Lease:      giveUpReadDeadline("removeCurrent", key, GaveUp::Source::Lease, attempt);
+                case PauseStop::OutsideCap: giveUpReadDeadline("removeCurrent", key, GaveUp::Source::Policy, attempt);
+                /// Only a pause after a failure reports a stopped query, and this one follows a conflict.
+                case PauseStop::QueryStopped: UNREACHABLE();
+            }
+        }
     }
 }
 
@@ -752,7 +818,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             /// answer; before the first one the caller is told no request happened.
             if (last_probe)
                 return *last_probe;
-            giveUpReadDeadline("probeSentinel", key, bound, attempt - 1);
+            giveUpReadDeadline("probeSentinel", key, sourceFor(bound), attempt - 1);
         }
 
         detail::recordAttempt();
@@ -803,8 +869,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 
 std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = owner.bindPolicy(policy);
-    std::unique_ptr<ReadBuffer> body = readLoop("stream", key, policy, bound, [&](auto & access)
+    std::unique_ptr<ReadBuffer> body = readLoop("stream", key, policy, [&](auto & access)
     {
         return owner.backend->stream(key, access);
     });
@@ -817,8 +882,8 @@ std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry
 
 void CasOperation::publish(const BlobPublishRequest & request, const Retry & policy)
 {
-    const Retry::Bound bound = owner.bindPolicy(policy);
-    readLoop("publish", request.destination_key, policy, bound, [&](auto & access)
+    throwIfBackgroundStopped();
+    readLoop("publish", request.destination_key, policy, [&](auto & access)
     {
         owner.backend->publish(request, access);
     });
@@ -883,29 +948,61 @@ WriteResult CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteSt
     return GaveUp{why, source, state.sent_any, state.last_seen, state.attempts_sent};
 }
 
-WriteResult CasOperation::gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const
+WriteResult CasOperation::gaveUpForReadStop(ReadStop stop, GaveUp::Source source, WriteState & state) const
 {
     switch (stop)
     {
         case ReadStop::FenceLost:
-            return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
+            return gaveUp(GaveUp::Why::FenceLost, source, state);
         case ReadStop::NoBudgetLease:
             /// The fence's budget IS the mount lease, so the lease is the bound that ended this call.
             return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
         case ReadStop::PolicyExhausted:
-            return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
+            return gaveUp(GaveUp::Why::Deadline, source, state);
     }
     UNREACHABLE();
 }
 
-WriteResult CasOperation::gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
-                                                       const Retry::Bound & bound) const
+WriteResult CasOperation::gaveUpAfterFailedObservation(const Resolved & resolved, WriteState & state) const
 {
-    if (stop)
-        return gaveUpForReadStop(*stop, state, bound);
+    if (resolved.stop)
+        return gaveUpForReadStop(*resolved.stop, resolved.source, state);
     /// No bound refused; the read itself failed. That is what `Unresolved` names, and it is the honest
     /// answer -- claiming a deadline the clock never reached would misreport which bound to widen.
-    return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
+    return gaveUp(GaveUp::Why::Unresolved, resolved.source, state);
+}
+
+std::optional<CasOperation::AdmissionLoss> CasOperation::lostAdmission() const
+{
+    switch (gate(0))
+    {
+        case Gate::FenceLost: return AdmissionLoss::Fence;
+        case Gate::NoBudget:  return AdmissionLoss::Lease;
+        case Gate::Ok:        return std::nullopt;
+    }
+    UNREACHABLE();
+}
+
+WriteResult CasOperation::gaveUpAfterDecisionCap(WriteState & state, const Retry & policy) const
+{
+    if (const std::optional<AdmissionLoss> lost = lostAdmission())
+        return *lost == AdmissionLoss::Fence
+            ? gaveUp(GaveUp::Why::FenceLost, sourceFor(owner.bindPolicy(policy)), state)
+            : gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+    return gaveUp(GaveUp::Why::Attempts, GaveUp::Source::Policy, state);
+}
+
+std::optional<WriteResult> CasOperation::pauseAfterConflict(uint32_t decisions, WriteState & state, const Retry & policy)
+{
+    if (decisions == kCasMaxDecisions)
+        return gaveUpAfterDecisionCap(state, policy);
+    /// A clean lost race is settled: the resolve read holds the fresh object and the next
+    /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
+    /// growing schedule. Either way the conflict is an answer, so the pause does not consult the query.
+    return state.any_ambiguous
+        ? pauseBetweenDecisions(reissuePause(state, Retry::backoff(++state.reissues)), state, policy, PauseAfter::Conflict)
+        : pauseBetweenDecisions(reissuePause(state, Retry::conflictBackoff()), state, policy, PauseAfter::Conflict,
+                                detail::recordConflictPause);
 }
 
 WriteResult CasOperation::postCommit(Etag inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound)
@@ -982,9 +1079,9 @@ std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const
 }
 
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
-                                    const Retry & policy, const Retry::Bound & bound, WriteState & state,
-                                    ResolveWith resolve_refusal_with)
+                                    const Retry & policy, WriteState & state, ResolveWith resolve_refusal_with)
 {
+    const Retry::Bound bound = owner.bindPolicy(policy);
     std::optional<String> expected_value;
     if (expected)
         expected_value = owner.valueFor(key, *expected);
@@ -1197,29 +1294,28 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 WriteResult CasOperation::create(const String & key, const String & bytes, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, std::nullopt, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
+    return writeLoop(key, bytes, std::nullopt, policy, state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, seen, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
+    return writeLoop(key, bytes, seen, policy, state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
 {
-    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
-    Resolved resolved = observe(key, policy, bound);
+    Resolved resolved = observe(key, policy);
     state.last_seen = resolved.seen;
     std::optional<Object> current;
     if (const auto * obj = std::get_if<Object>(&state.last_seen))
         current = *obj;
     else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(resolved.stop, state, bound);
+        return gaveUpAfterFailedObservation(resolved, state);
 
-    for (;;)
+    for (uint32_t decisions = 1;; ++decisions)
     {
         /// Outside every classification: `decide` is the caller's own control flow, and an exception
         /// from it is theirs to see unchanged.
@@ -1228,7 +1324,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, state,
             ResolveWith::Body);
         if (!std::holds_alternative<Conflict>(result))
             return result;
@@ -1252,21 +1348,20 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
         /// what the store held.
         if (std::holds_alternative<NotObserved>(state.last_seen))
         {
-            resolved = observe(key, policy, bound);
+            resolved = observe(key, policy);
             state.last_seen = resolved.seen;
             if (const auto * obj = std::get_if<Object>(&state.last_seen))
                 current = *obj;
             else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
                 current.reset();
             else
-                return gaveUpAfterFailedObservation(resolved.stop, state, bound);
+                return gaveUpAfterFailedObservation(resolved, state);
         }
     }
 }
 
 WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy)
 {
-    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
     Resolved resolved = observePresence(key, policy, bound);
@@ -1275,16 +1370,16 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
     if (const auto * meta = std::get_if<Meta>(&state.last_seen))
         current = *meta;
     else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(resolved.stop, state, bound);
+        return gaveUpAfterFailedObservation(resolved, state);
 
-    for (;;)
+    for (uint32_t decisions = 1;; ++decisions)
     {
         const std::optional<String> next = decide(current);
         if (!next)
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, state,
             ResolveWith::Presence);
         /// A refused precondition was settled by a HEAD, but proving an ambiguous attempt landed needs
         /// the bytes; this loop is presence-only by contract, so that body stops here.
@@ -1314,7 +1409,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
                 current.reset();
             else
-                return gaveUpAfterFailedObservation(resolved.stop, state, bound);
+                return gaveUpAfterFailedObservation(resolved, state);
         }
     }
 }

@@ -147,19 +147,17 @@ TEST(CASRetry, PoliciesAreShapedAsSpecified)
 {
     const uint64_t now = 1'000'000;
     EXPECT_EQ(Retry::standard().bind(now, kEngineTestWindowMs).deadline_ms, now + 90'000);
-    EXPECT_FALSE(Retry::standard().bind(now, kEngineTestWindowMs).lease_bound);
+    EXPECT_NE(Retry::standard().bind(now, kEngineTestWindowMs).source, Retry::Bound::Source::Lease);
     EXPECT_FALSE(Retry::standard().single_attempt);
     EXPECT_TRUE(Retry::once().single_attempt);
     const Retry::Bound lease = Retry::untilLeaseSafe(now + 10'000, 2'000).bind(now, kEngineTestWindowMs);
     EXPECT_EQ(lease.deadline_ms, now + 8'000);
-    EXPECT_TRUE(lease.lease_bound);
+    EXPECT_EQ(lease.source, Retry::Bound::Source::Lease);
     EXPECT_EQ(Retry::within(1'000).bind(now, kEngineTestWindowMs).deadline_ms, now + 1'000);
 }
 
-/// A frozen policy is ONE absolute deadline: time passing does not buy a later one, freezing again
-/// cannot extend it, and the lease bound still wins when it is the smaller of the two -- which is what
-/// keeps `GaveUp::Source` able to say which bound refused.
-TEST(CASRetry, AFrozenPolicyIsOneDeadlineAndTheLeaseStillWins)
+/// A cap later than the request's own window leaves the window.
+TEST(CASRetry, AnOutsideCapLaterThanTheWindowLeavesTheWindow)
 {
     FakeClock clock;
     auto backend = std::make_shared<InMemoryBackend>();
@@ -176,8 +174,14 @@ TEST(CASRetry, AFrozenPolicyIsOneDeadlineAndTheLeaseStillWins)
     EXPECT_EQ(frozen.asSingleAttempt().policy_deadline_ms, frozen.policy_deadline_ms);
     EXPECT_TRUE(frozen.asSingleAttempt().single_attempt);
 
-    clock.now += 50'000;
-    EXPECT_EQ(op.freeze(frozen).policy_deadline_ms, frozen.policy_deadline_ms);
+/// A bound names the bound that set its deadline; a tie goes to the request window, then to the outside cap.
+TEST(CASRetry, BindNamesTheExactSourceOfItsDeadline)
+{
+    using Source = Retry::Bound::Source;
+    const uint64_t now = 1'000'000;
+    EXPECT_EQ(Retry::standard().bind(now, kEngineTestWindowMs).source, Source::RequestWindow);
+    EXPECT_EQ(Retry::standard().cappedAt(now + 10'000).bind(now, kEngineTestWindowMs).source, Source::OutsideCap);
+    EXPECT_EQ(Retry::untilLeaseSafe(now + 10'000, 2'000).bind(now, kEngineTestWindowMs).source, Source::Lease);
 
     const Retry::Bound leashed = op.freeze(Retry::untilLeaseSafe(start + 10'000, 2'000)).bind(clock.now, kEngineTestWindowMs);
     EXPECT_EQ(leashed.deadline_ms, start + 8'000);
@@ -272,6 +276,227 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
         [&] { orThrow(WriteResult{unsent_unresolved}, "t"); });
     DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the write is unresolved (sent",
         [&] { orThrow(WriteResult{unresolved}, "t"); });
+}
+
+TEST(CASRequests, GaveUpAttemptsThrowsRetryLaterWithTheDecisionCount)
+{
+    const GaveUp capped{
+        .why = GaveUp::Why::Attempts, .deadline_source = GaveUp::Source::Policy,
+        .sent_any = true, .last_seen = NotObserved{}};
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 decisions",
+        [&] { orThrow(WriteResult{capped}, "t"); });
+}
+
+TEST(CASRequests, ThrowDidNotConvergeNamesItsUnit)
+{
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "casUpdate: did not converge after 7 submissions",
+        [&] { throwDidNotConverge("casUpdate", 7, "submissions"); });
+}
+
+TEST(CASRequests, PauseBeforeRedecideSleepsWithTheSmallestValidWindow)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const GaveUp unresolved{
+        .why = GaveUp::Why::Unresolved, .deadline_source = GaveUp::Source::Policy,
+        .sent_any = true, .last_seen = NotObserved{}};
+    /// Two envelopes plus 1 ms is the smallest window a write accepts; a 2 ms pause must not need more.
+    const Retry policy = Retry::within(2 * requests.attemptReservationMs() + 1);
+
+    EXPECT_FALSE(op.pauseAfterUnresolvedWrite(2, unresolved, policy).has_value());
+    ASSERT_EQ(clock.sleeps.size(), 1u);
+    EXPECT_EQ(clock.sleeps.front(), 2u);
+}
+
+namespace
+{
+
+GaveUp unresolvedAfterOneSend()
+{
+    return GaveUp{.why = GaveUp::Why::Unresolved, .deadline_source = GaveUp::Source::Policy,
+                  .sent_any = true, .last_seen = NotObserved{}, .attempts_sent = 1};
+}
+
+/// The give-up `pauseAfterUnresolvedWrite` returned for a 2 ms pause, which must not have slept.
+GaveUp refusedPause(CasOperation & op, FakeClock & clock, const Retry & policy)
+{
+    const std::optional<WriteResult> given_up = op.pauseAfterUnresolvedWrite(2, unresolvedAfterOneSend(), policy);
+    EXPECT_TRUE(clock.sleeps.empty());
+    if (!given_up || !std::holds_alternative<GaveUp>(*given_up))
+    {
+        ADD_FAILURE() << "the pause was not refused";
+        return unresolvedAfterOneSend();
+    }
+    return std::get<GaveUp>(*given_up);
+}
+
+}
+
+TEST(CASRequests, PauseBeforeRedecideRefusesAPauseThatEndsAfterTheOutsideCap)
+{
+    FakeClock clock;
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock);
+    auto op = requests.admit();
+
+    const GaveUp gave_up = refusedPause(op, clock, Retry::standard().cappedAt(clock.now + 1));
+    EXPECT_EQ(gave_up.why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up.deadline_source, GaveUp::Source::Policy);
+    EXPECT_EQ(gave_up.attempts_sent, 1u);
+}
+
+TEST(CASRequests, PauseBeforeRedecideRefusesAPauseThatEndsAfterTheExplicitLease)
+{
+    FakeClock clock;
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock);
+    auto op = requests.admit();
+
+    const GaveUp gave_up = refusedPause(op, clock, Retry::untilLeaseSafe(clock.now + 1, /*margin=*/0));
+    EXPECT_EQ(gave_up.why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up.deadline_source, GaveUp::Source::Lease);
+}
+
+/// A lost fence names the bound a request would be given now, as every request does: the lease only
+/// when it ends before the window.
+TEST(CASRequests, PauseBeforeRedecideRefusesAfterAFenceLossAndNamesTheBoundARequestWouldGet)
+{
+    FakeClock clock;
+    Fence lost{
+        [] { return uint64_t(1); },
+        [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
+        [](uint64_t) {}};
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock, lost);
+    auto op = requests.admit();
+
+    const GaveUp under_window = refusedPause(op, clock, Retry::standard());
+    EXPECT_EQ(under_window.why, GaveUp::Why::FenceLost);
+    EXPECT_EQ(under_window.deadline_source, GaveUp::Source::Policy);
+
+    const GaveUp under_near_lease = refusedPause(op, clock, Retry::untilLeaseSafe(clock.now + 1'000, /*margin=*/0));
+    EXPECT_EQ(under_near_lease.why, GaveUp::Why::FenceLost);
+    EXPECT_EQ(under_near_lease.deadline_source, GaveUp::Source::Lease);
+
+    const GaveUp under_far_lease = refusedPause(op, clock, Retry::untilLeaseSafe(clock.now + 10 * kEngineTestWindowMs, /*margin=*/0));
+    EXPECT_EQ(under_far_lease.why, GaveUp::Why::FenceLost);
+    EXPECT_EQ(under_far_lease.deadline_source, GaveUp::Source::Policy);
+}
+
+/// The mount lease has less time left than the pause: the call ends unslept and names the lease. A
+/// shorter pause still sleeps.
+TEST(CASRequests, PauseBeforeRedecideRefusesAPauseLongerThanTheMountLeaseLeft)
+{
+    FakeClock clock;
+    const uint64_t lease_left_ms = 1'000;
+    Fence short_lease{
+        [] { return uint64_t{0}; },
+        [&](uint64_t, uint64_t needed_ms) { return needed_ms >= lease_left_ms ? Fence::Admit::NoBudget : Fence::Admit::Ok; },
+        [](uint64_t) {}};
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock, short_lease);
+    auto op = requests.admit();
+
+    const std::optional<WriteResult> given_up = op.pauseAfterUnresolvedWrite(lease_left_ms, unresolvedAfterOneSend(), Retry::standard());
+    EXPECT_TRUE(clock.sleeps.empty());
+    ASSERT_TRUE(given_up.has_value());
+    const auto * gave_up = std::get_if<GaveUp>(&*given_up);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+    EXPECT_EQ(gave_up->attempts_sent, 1u);
+
+    EXPECT_FALSE(op.pauseAfterUnresolvedWrite(lease_left_ms - 1, unresolvedAfterOneSend(), Retry::standard()).has_value());
+    EXPECT_EQ(clock.sleeps, std::vector<uint64_t>{lease_left_ms - 1});
+}
+
+/// A pause that fits exactly ends on the limit, and the call ends there instead of deciding again.
+TEST(CASRequests, PauseBeforeRedecideEndingOnTheOutsideCapEndsTheCall)
+{
+    FakeClock clock;
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock);
+    auto op = requests.admit();
+
+    const std::optional<WriteResult> given_up
+        = op.pauseAfterUnresolvedWrite(50, unresolvedAfterOneSend(), Retry::standard().cappedAt(clock.now + 50));
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+    ASSERT_TRUE(given_up.has_value());
+    const auto * gave_up = std::get_if<GaveUp>(&*given_up);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Policy);
+}
+
+TEST(CASRequests, PauseBeforeRedecideEndingOnTheExplicitLeaseEndsTheCall)
+{
+    FakeClock clock;
+    auto requests = makeRequests(std::make_shared<InMemoryBackend>(), clock);
+    auto op = requests.admit();
+
+    const std::optional<WriteResult> given_up
+        = op.pauseAfterUnresolvedWrite(50, unresolvedAfterOneSend(), Retry::untilLeaseSafe(clock.now + 50, /*margin=*/0));
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+    ASSERT_TRUE(given_up.has_value());
+    const auto * gave_up = std::get_if<GaveUp>(&*given_up);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+}
+
+namespace
+{
+
+/// One lost race, then a pause that sleeps 10 s past what it asked for. `policy_ending_at` builds the
+/// policy from the instant the room for one write and one conflict pause ends. Returns the result and
+/// how many times `decide` ran.
+std::pair<WriteResult, int> raceThenOversleep(const std::function<Retry(uint64_t)> & policy_ending_at)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto rival_requests = makeRequests(backend, clock);
+    auto rival = rival_requests.admit();
+    requests.setSleepFnForTest([&](uint64_t ms) { clock.sleepFn()(ms + 10'000); });
+    bool staged = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (staged)
+            return;
+        staged = true;
+        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+    });
+
+    int decisions = 0;
+    auto op = requests.admit();
+    const Retry policy = policy_ending_at(clock.now + 2 * requests.attemptReservationMs() + 1'000);
+    WriteResult result = op.readModifyWrite("k",
+        [&](const std::optional<Object> &) -> std::optional<String>
+        {
+            ++decisions;
+            return String("mine");
+        },
+        policy);
+    return {std::move(result), decisions};
+}
+
+}
+
+TEST(CASRequests, ReadModifyWriteWakingPastTheOutsideCapRunsNoSecondDecide)
+{
+    const auto [result, decisions] = raceThenOversleep([](uint64_t end) { return Retry::standard().cappedAt(end); });
+    EXPECT_EQ(decisions, 1);
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Policy);
+}
+
+TEST(CASRequests, ReadModifyWriteWakingPastTheExplicitLeaseRunsNoSecondDecide)
+{
+    const auto [result, decisions] = raceThenOversleep([](uint64_t end) { return Retry::untilLeaseSafe(end, /*margin=*/0); });
+    EXPECT_EQ(decisions, 1);
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
 }
 
 TEST(CASFence, OpenFenceAdmitsEverythingAndNeverMoves)
@@ -645,18 +870,18 @@ TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
     /// A window one short of the whole range, so any `now` above 1 overflows a naive addition.
     EXPECT_EQ(Retry::within(largest - 1).bind(2, kEngineTestWindowMs).deadline_ms, largest);
     EXPECT_EQ(Retry::within(largest - 1).bind(1, kEngineTestWindowMs).deadline_ms, largest);
-    EXPECT_FALSE(Retry::within(largest - 1).bind(2, kEngineTestWindowMs).lease_bound);
+    EXPECT_NE(Retry::within(largest - 1).bind(2, kEngineTestWindowMs).source, Retry::Bound::Source::Lease);
 
     const uint64_t now = 1'000'000;
     /// The lease bound lands exactly on the policy deadline. The lease is taken only when it is
     /// STRICTLY smaller, so the tie belongs to the policy and `GaveUp` will not name the lease.
     const Retry::Bound tie = Retry::untilLeaseSafe(now + 92'000, 2'000).bind(now, kEngineTestWindowMs);
     EXPECT_EQ(tie.deadline_ms, now + 90'000);
-    EXPECT_FALSE(tie.lease_bound);
+    EXPECT_NE(tie.source, Retry::Bound::Source::Lease);
 
     const Retry::Bound lease = Retry::untilLeaseSafe(now + 91'999, 2'000).bind(now, kEngineTestWindowMs);
     EXPECT_EQ(lease.deadline_ms, now + 89'999);
-    EXPECT_TRUE(lease.lease_bound);
+    EXPECT_EQ(lease.source, Retry::Bound::Source::Lease);
 }
 
 TEST(CASRetrySpacing, UntilDefinitiveHasNoDeadlineAndSpacesItsAttempts)
@@ -670,7 +895,7 @@ TEST(CASRetrySpacing, UntilDefinitiveHasNoDeadlineAndSpacesItsAttempts)
     {
         const Retry::Bound bound = policy.bind(now, kEngineTestWindowMs);
         EXPECT_EQ(bound.deadline_ms, largest) << "now " << now;
-        EXPECT_FALSE(bound.lease_bound) << "now " << now;
+        EXPECT_NE(bound.source, Retry::Bound::Source::Lease) << "now " << now;
     }
     EXPECT_FALSE(Retry::standard().attempt_spacing_ms.has_value());
     EXPECT_FALSE(Retry::untilLeaseSafe(2'000'000, 2'000).attempt_spacing_ms.has_value());
@@ -1510,6 +1735,94 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     EXPECT_EQ(backend->getTotal(), 1u);
 }
 
+TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecide)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    bool lost = false;
+    Fence fence{
+        [] { return uint64_t(1); },
+        [&](uint64_t, uint64_t) { return lost ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+        [&](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto rival_requests = makeRequests(backend, clock);
+    auto rival = rival_requests.admit();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        clock.sleepFn()(ms);
+        lost = true;
+    });
+
+    bool staged = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (staged)
+            return;
+        staged = true;
+        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+    });
+
+    int decisions = 0;
+    auto op = requests.admit();
+    WriteResult result = op.readModifyWrite("k",
+        [&](const std::optional<Object> &) -> std::optional<String>
+        {
+            ++decisions;
+            return String("mine");
+        },
+        Retry::standard());
+
+    /// The conflict was informative, so the loop would decide again; the fence moved in the pause.
+    EXPECT_EQ(decisions, 1);
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+}
+
+TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecideOnPresence)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    bool lost = false;
+    Fence fence{
+        [] { return uint64_t(1); },
+        [&](uint64_t, uint64_t) { return lost ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+        [&](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto rival_requests = makeRequests(backend, clock);
+    auto rival = rival_requests.admit();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        clock.sleepFn()(ms);
+        lost = true;
+    });
+
+    bool staged = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (staged)
+            return;
+        staged = true;
+        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+    });
+
+    int decisions = 0;
+    auto op = requests.admit();
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [&](const std::optional<Meta> &) -> std::optional<String>
+        {
+            ++decisions;
+            return String("mine");
+        },
+        Retry::standard());
+
+    /// The conflict was informative, so the loop would decide again; the fence moved in the pause.
+    EXPECT_EQ(decisions, 1);
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+}
+
 TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsReissued)
 {
     FakeClock clock;
@@ -1832,7 +2145,7 @@ TEST(CASRequests, ReadModifyWriteLosesNoIncrementUnderContentionAndBoundsAHotKey
     ASSERT_TRUE(counted.has_value());
     EXPECT_EQ(counted->bytes, "100");   /// every conflict re-decided against what the resolve read saw
 
-    /// A key rewritten under EVERY attempt is bounded by the deadline instead of looping forever.
+    /// A key rewritten under EVERY attempt is bounded by the decision cap instead of looping forever.
     FakeClock clock;
     auto hot = makeRequests(backend, clock);
     auto competitor = makeRequests(backend, clock);
@@ -1852,7 +2165,7 @@ TEST(CASRequests, ReadModifyWriteLosesNoIncrementUnderContentionAndBoundsAHotKey
     WriteResult result = op.readModifyWrite("ctr", increment, Retry::standard());
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
-    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Attempts);
     EXPECT_TRUE(gave_up->sent_any);
     EXPECT_FALSE(clock.sleeps.empty());   /// it paced its retries rather than spinning
 }

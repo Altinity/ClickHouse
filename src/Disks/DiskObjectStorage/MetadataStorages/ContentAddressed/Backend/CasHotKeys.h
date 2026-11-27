@@ -104,8 +104,7 @@ private:
     };
     using Cache = CacheBase<String, Remembered, std::hash<String>, RememberedWeight>;
 
-    WriteResult hold(const String & key, CasOperation & op, const Retry & policy, const Retry::Bound & bound,
-                     const Decide & decide);
+    WriteResult hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
     void leave(const String & key, Item & item, bool entered_hold, uint64_t entered_ms, CasOperation & op) noexcept;
 
     std::optional<Object> cached(const String & key) const;

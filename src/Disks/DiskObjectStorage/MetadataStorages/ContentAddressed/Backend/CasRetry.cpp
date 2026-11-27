@@ -36,14 +36,16 @@ uint64_t Retry::drawSpacing(uint64_t attempt_spacing_ms_)
 Retry::Bound Retry::bind(uint64_t now_ms, uint64_t default_window_ms) const
 {
     const uint64_t effective_window_ms = window_ms.value_or(default_window_ms);
-    const uint64_t own_deadline_ms = policy_deadline_ms
-        ? *policy_deadline_ms
-        : (now_ms > std::numeric_limits<uint64_t>::max() - effective_window_ms
-               ? std::numeric_limits<uint64_t>::max()
-               : now_ms + effective_window_ms);
-    if (lease_deadline_ms && *lease_deadline_ms < own_deadline_ms)
-        return {*lease_deadline_ms, true};
-    return {own_deadline_ms, false};
+    Bound bound{
+        .deadline_ms = now_ms > std::numeric_limits<uint64_t>::max() - effective_window_ms
+            ? std::numeric_limits<uint64_t>::max()
+            : now_ms + effective_window_ms,
+        .source = Bound::Source::RequestWindow};
+    if (outside_cap_ms && *outside_cap_ms < bound.deadline_ms)
+        bound = {*outside_cap_ms, Bound::Source::OutsideCap};
+    if (lease_deadline_ms && *lease_deadline_ms < bound.deadline_ms)
+        bound = {*lease_deadline_ms, Bound::Source::Lease};
+    return bound;
 }
 
 }

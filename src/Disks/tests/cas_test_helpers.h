@@ -132,6 +132,24 @@ inline String tokenText(const std::optional<Etag> & token)
 namespace DB::Cas::tests
 {
 
+/// The `DB::Exception` code `call` throws, -1 for any other exception, 0 when it returns.
+inline int exceptionCodeOf(const std::function<void()> & call)
+{
+    try
+    {
+        call();
+    }
+    catch (const DB::Exception & e)
+    {
+        return e.code();
+    }
+    catch (...)
+    {
+        return -1;
+    }
+    return 0;
+}
+
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
