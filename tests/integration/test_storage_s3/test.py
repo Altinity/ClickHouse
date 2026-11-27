@@ -2225,6 +2225,16 @@ def test_schema_inference_cache(started_cluster):
             amount=0 if storage_name == "s3" else 1,
         )
 
+        # With `s3_validate_etag_on_read = 0` the identity cache is not consulted, so the HEAD of this query gives
+        # a modification time that is fresh, and the number-of-rows cache is used.
+        res = instance.query(
+            f"select count() from {storage_name}('http://{started_cluster.minio_host}:{started_cluster.minio_port}/{bucket}/test_cache.parquet') settings s3_validate_etag_on_read = 0"
+        )
+        assert int(res) == 100
+        check_cahce_num_rows_hits(
+            instance, "test_cache.parquet", storage_name, started_cluster, bucket
+        )
+
     test("s3")
     test("url")
 
