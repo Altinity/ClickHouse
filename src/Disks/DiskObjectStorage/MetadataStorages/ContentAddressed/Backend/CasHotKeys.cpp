@@ -61,10 +61,8 @@ CasHotKeys::~CasHotKeys()
 
 WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide)
 {
-    /// Frozen here so that the queue wait and the write share one deadline; a policy already frozen
-    /// by the caller's loop is returned unchanged.
-    const Retry frozen = op.freeze(policy);
-    const Retry::Bound bound = op.owner.bindPolicy(frozen);
+    /// The wait has its own end, taken here; each request after it binds its own window.
+    const Retry::Bound wait_end = op.owner.bindPolicy(policy);
     const uint64_t entered_ms = op.owner.now_ms();
 
     Item item{};
@@ -112,7 +110,7 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
         switch (op.gate(0))
         {
             case CasOperation::Gate::FenceLost:
-                leaving = op.gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), nothing_sent);
+                leaving = op.gaveUp(GaveUp::Why::FenceLost, sourceFor(wait_end), nothing_sent);
                 break;
             case CasOperation::Gate::NoBudget:
                 leaving = op.gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, nothing_sent);
@@ -120,8 +118,11 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
             case CasOperation::Gate::Ok:
                 break;
         }
-        if (!leaving && !op.fits(0, bound))
-            leaving = op.gaveUp(GaveUp::Why::Deadline, sourceFor(bound), nothing_sent);
+        if (!leaving && !op.fits(0, wait_end))
+            leaving = op.gaveUp(GaveUp::Why::Deadline, sourceFor(wait_end), nothing_sent);
+        /// The front caller gets its first read. Waiters check their background owner after fence admission.
+        if (waited && !leaving)
+            throwIfBackgroundStopped();
 
         /// Read outside the mutex, as `leave` already does: the mutex is a leaf that calls nothing,
         /// and `now_ms` is a closure the pool injects, not a fixed clock.
@@ -139,7 +140,7 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
         lane.cv.wait_for(lock, kWaitSlice);
     }
     ProfileEvents::increment(ProfileEvents::CASHotKeyQueueWaitMicroseconds, (op.owner.now_ms() - entered_ms) * 1000);
-    return hold(key, op, frozen, bound, decide);
+    return hold(key, op, policy, decide);
 }
 
 void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint64_t entered_ms, CasOperation & op) noexcept

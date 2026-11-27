@@ -637,13 +637,15 @@ public:
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
     /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
-    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
-    /// ledger waits for a held state lock again and bounds the mount-slot read, which reissues a transient transport failure until then;
-    /// any other failure propagates at once. One wait for the lock is not bounded.
-    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the deadline, a
+    /// (`CasRefLedger::confirmPinnedRef`). The poll's end, the request window from the call's start, decides whether the
+    /// ledger waits for a held state lock again and whether another pass starts. The mount-slot read of a pass binds its own
+    /// request window when it starts, and reissues a transient transport failure until that window ends; any other failure
+    /// propagates at once.
+    /// One wait for the lock is not bounded.
+    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the poll's end, a
     /// refusal of a state the pinned runtime cannot leave, or a pin that can never confirm
-    /// (`CasRefLedger::pinnedTableRetired`). No ledger lock is held between passes. Throws `ABORTED` once the pool's
-    /// teardown has begun.
+    /// (`CasRefLedger::pinnedTableRetired`). A started pass finishes, even past the poll's end.
+    /// No ledger lock is held between passes. Throws `ABORTED` once the pool's teardown has begun.
     ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
                                    const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.

@@ -1275,10 +1275,8 @@ private:
     /// Every `createNamespace`/`completeCreation`/`reconcileStaleCreator` outcome that writes nothing
     /// (`FencedOut`, `Superseded`, a reconciled entry, `EntryChanged`) re-reads the catalog and loops;
     /// `CreatorFenceStillLive` throws the retry-later class, which this function's caller (the transient
-    /// retry loop) or a higher one re-drives. One `Retry` is frozen before the loop and shared by every
-    /// read and every protocol call it makes, so the whole resolution ends within one standard window;
-    /// a re-read forced by a competing actor is paced by a jittered sleep, and an iteration cap is the
-    /// secondary bound.
+    /// retry loop) or a higher one re-drives. A re-read forced by a competing actor is paced by a
+    /// jittered sleep, and a cap on rounds ends the loop.
     NamespaceLifeId resolveNamespaceLife(
         const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
         bool * lifecycle_refusal = nullptr);

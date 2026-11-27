@@ -1115,13 +1115,12 @@ TEST(CASRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
 }
 #endif
 
-/// Persistent contention ends at the write policy's DEADLINE, with the typed retryable error -- not
-/// after a fixed number of unslept iterations, and not in an infinite spin. `mutate` re-arms the
-/// one-shot conflict injection on every call, so every attempt is refused; the injected clock reaches
-/// the deadline without the test sleeping at all.
-TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
+/// Persistent contention ends after 100 submissions, each refusal but the last followed by a pause,
+/// with the typed retryable error. `mutate` re-arms the one-shot conflict injection on every call, so
+/// every write is refused.
+TEST(CASRefCatalog, CasUpdateEndsAfterAHundredPacedSubmissions)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<WriteCountingBackend>();
     DB::Cas::tests::FakeClock clock;
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     requests.setNowFnForTest(clock.nowFn());
@@ -1129,10 +1128,9 @@ TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    const uint64_t started_at = clock.now;
+    const uint64_t writes_before = backend->writes(layout.refCatalogKey());
 
-    int mutate_calls = 0;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 submissions)", [&]
     {
         CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & cur)
         {
@@ -1142,11 +1140,8 @@ TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
             return next;
         });
     });
-    EXPECT_GT(mutate_calls, 1);   /// genuinely retried, not a single-shot failure
-    EXPECT_FALSE(clock.sleeps.empty()) << "every retry must back off; an unslept loop would burn the "
-                                          "deadline on requests instead of waiting out the contention";
-    EXPECT_GE(clock.now - started_at, kDefaultRequestWindowMs - 5000)
-        << "the loop ended at the policy's own deadline, not at an iteration count";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_before, 100u);
+    EXPECT_EQ(clock.sleeps.size(), 99u) << "every refusal but the last is paced";
 }
 
 TEST(CASRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
@@ -1544,7 +1539,7 @@ TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
         EXPECT_EQ(current.entries.front().ns, RootNamespace{"b0"}) << "the writer's row stays, the erased row is gone";
     }
 
-    /// A pause that itself runs past the window is followed by no erase write.
+    /// A pause that runs past a whole window is followed by the next erase: it binds its own window.
     {
         auto backend = std::make_shared<WriteCountingBackend>();
         DB::Cas::tests::FakeClock clock;
@@ -1553,24 +1548,17 @@ TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
         auto pause = clock.sleepFn();
         requests.setSleepFnForTest([&](uint64_t ms) { pause(ms + 200'000); });
         CasOperation op = requests.admit();
-        const Layout layout("erase-pause-past-deadline");
+        const Layout layout("erase-pause-past-a-window");
         seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
         const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
         backend->refuseNextWrite(layout.refCatalogKey());
-        try
-        {
-            (void)deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh);
-            ADD_FAILURE() << "a pause that crosses the window must end the call";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-            EXPECT_NE(e.message().find("deadline"), String::npos) << e.message();
-        }
-        EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
-            << "only the refused erase; nothing is sent after the pause crossed the deadline";
-        EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
+        EXPECT_EQ(deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh),
+            CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+        EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 2u)
+            << "the refused erase and the erase after the pause";
+        EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     }
 }
 
@@ -1855,13 +1843,9 @@ TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterIns
         << "the message must name the life still observed: " << message;
 }
 
-/// The loop captures ONE bound before it starts and every call it makes shares it, so a permanently
-/// contended catalog gives up "retry later" inside one request window rather than spending a fresh
-/// window per verb across a hundred paced iterations -- which is hours against a document that
-/// promises one window. Every erase is refused and the injected clock absorbs every paced retry,
-/// so what ends the call is visible in the virtual time it took. The attempt cap stays as the
-/// secondary bound; it is not what ends this call.
-TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemptCap)
+/// Every erase is refused. Each request binds its own window, so the attempt cap ends the call: 100
+/// erases, a pause after each refusal but the last, and the resolution read after every erase.
+TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpAfterAHundredErases)
 {
     class AlwaysRefusesCatalogWrites final : public WriteCountingBackend
     {
@@ -1911,7 +1895,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemp
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     backend->refused_key = layout.refCatalogKey();
 
-    const uint64_t start = clock.now;
+    const size_t sleeps_before = clock.sleeps.size();
     String message;
     try
     {
@@ -2667,20 +2651,62 @@ TEST(CASRefCatalog, CreateNamespaceStep1FailsAtOnceWhenItsCatalogReadIsRefused)
 }
 #endif
 
-/// The pause before a new decision is gated like the engine's own reissue pause: with no room left
-/// for the pause and one attempt, the call ends without sleeping.
-TEST(CASRefCatalog, CreateNamespaceStep1DoesNotPausePastItsDeadline)
+/// The first step-1 write takes more than a window and its response is lost. The next decision's read
+/// and write each bind their own window, so the row is created.
+TEST(CASRefCatalog, CreateNamespaceStep1PausesThenDecidesAgainInItsOwnWindow)
 {
     Step1Fixture t;
     t.f.pool.setAttemptReservationForTest(1'000);
     t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
-    /// Leaves 1.5 s of the window: enough for the settle read, too little for a pause plus two envelopes.
+    bool slowed = false;
+    uint64_t first_write_ended_ms = 0;
+    t.backend->on_write = [&]
+    {
+        if (std::exchange(slowed, true))
+            return;
+        t.f.clock.now.fetch_add(kDefaultRequestWindowMs + 1);
+        first_write_ended_ms = t.f.clock.now.load();
+    };
+    const size_t sleeps_before = t.f.clock.sleeps.size();
+
+    ASSERT_EQ(t.createA(), CasRefCatalog::NamespaceCreationOutcome::Live);
+    t.expectDistinctIncarnationsAndTheLastOneLive();
+    EXPECT_EQ(t.step1Incarnations().size(), 2u);
+    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 1u);
+    /// Only pauses move the clock after the slow write, so the call ends well inside the next window.
+    EXPECT_LE(t.f.clock.now.load() - first_write_ended_ms, kDefaultRequestWindowMs + 1'000 + 5'000);
+}
+
+/// The same with an explicit lease that leaves 1.5 s: the pause fits under the lease, the next write's
+/// two envelopes do not, so no second write is sent.
+TEST(CASRefCatalog, CreateNamespaceStep1PausesThenSendsNoWriteWithoutRoomUnderItsLease)
+{
+    Step1Fixture t;
+    t.f.pool.setAttemptReservationForTest(1'000);
+    t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
+    const Retry policy = Retry::untilLeaseSafe(t.f.clock.now.load() + kDefaultRequestWindowMs, 0);
     t.backend->on_write = [&] { t.f.clock.now.fetch_add(kDefaultRequestWindowMs - 1'500); };
     const size_t sleeps_before = t.f.clock.sleeps.size();
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)t.createA(); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)CasRefCatalog::createNamespace(t.pool_op, t.layout, 1, RootNamespace{"a"}, t.creator, policy); });
     EXPECT_EQ(t.backend->bodies.size(), 1u);
-    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 0u);
+    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 1u);
+}
+
+/// The smallest window a write accepts is two envelopes and 1 ms. After a lost step-1 write the next
+/// decision's write gets a whole such window of its own, so the row is created.
+TEST(CASRefCatalog, CreateNamespaceStep1DecidesAgainWithTheSmallestValidWindow)
+{
+    Step1Fixture t;
+    t.f.pool.setAttemptReservationForTest(1'000);
+    t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
+    /// Each catalog write takes 2 ms, so no window that started before a write has room for another.
+    t.backend->on_write = [&] { t.f.clock.now.fetch_add(2); };
+
+    ASSERT_EQ(CasRefCatalog::createNamespace(t.pool_op, t.layout, 1, RootNamespace{"a"}, t.creator, Retry::within(2'001)),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+    t.expectDistinctIncarnationsAndTheLastOneLive();
 }
 
 /// The step-1 write lands and its response is lost; before the next decision a sibling completes the

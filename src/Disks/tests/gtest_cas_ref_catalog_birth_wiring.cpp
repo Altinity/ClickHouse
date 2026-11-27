@@ -9,6 +9,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -683,11 +684,15 @@ public:
     }
 
     bool churning = false;
+    size_t churned_reads = 0;
 
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (churning && key == catalog_key)
+        {
+            ++churned_reads;
             bumpEveryCreatorFence(access);
+        }
         return InMemoryBackend::read(key, access);
     }
 
@@ -711,15 +716,16 @@ private:
 }
 
 /// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
-/// One `Retry` frozen before the loop bounds the WHOLE resolution to a single standard window, and
-/// every re-read a competing actor forces is paced by a jittered sleep -- so a permanently churning
-/// catalog costs one window, not one fresh window per verb per iteration hammered with no wait between
-/// them.
-///
-/// What the clock bound below does NOT check: it bounds this call's own wall time, not the number of
-/// requests the loop sent, and it says nothing about the paths that converge.
-TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWithinOneWindow)
+/// Every re-read a competing actor forces is paced, and the loop ends after its 32 rounds. The pause
+/// before the last round carries the clock past a whole window, so the last round is sent only if each
+/// of its requests binds its own window.
+TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsAfterItsRounds)
 {
+    constexpr size_t kRounds = 32;
+    /// One attempt's reservation on a disk with default settings, and the longest `Retry::backoff` draw.
+    constexpr uint64_t kEnvelopeMs = 7'000;
+    constexpr uint64_t kMaxBackoffMs = 5'000;
+
     auto backend = std::make_shared<ChurningCatalogBackend>(Layout{"p"}.refCatalogKey());
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
@@ -735,18 +741,28 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWit
         .creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1}};
     CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
 
-    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    auto now_ms = std::make_shared<uint64_t>(0);
+    size_t pauses = 0;
+    std::optional<uint64_t> last_round_started_ms;
+    size_t reads_before_last_round = 0;
+    store->setCasRequestNowFnForTest([now_ms] { return *now_ms; });
+    store->setCasRetrySleepForTest([&, now_ms](uint64_t ms)
+    {
+        *now_ms += ms;
+        if (++pauses == kRounds - 1)
+        {
+            *now_ms += DB::Cas::kDefaultRequestWindowMs;
+            last_round_started_ms = *now_ms;
+            reads_before_last_round = backend->churned_reads;
+        }
+    });
     backend->churning = true;
-    const size_t pauses_before = clock->pauseCount();
-    const uint64_t now_before = clock->nowMs();
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->namespaceLife(ns); });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, fmt::format("after {} attempts", kRounds),
+        [&] { store->namespaceLife(ns); });
 
-    /// Sixteen jittered draws cannot exhaust the request window even at their ceiling, so an unpaced loop
-    /// reaches its iteration cap having slept nothing at all.
-    EXPECT_GE(clock->pauseCount() - pauses_before, 16u) << "each forced re-read is paced";
-    /// The frozen window, plus at most one backoff draw the pace does not consult the deadline for,
-    /// plus the virtual clock's one extra millisecond per pause.
-    EXPECT_LE(clock->nowMs() - now_before, DB::Cas::kDefaultRequestWindowMs + 5'000 + 100)
-        << "one standard window bounds the whole loop";
+    EXPECT_GE(pauses, kRounds - 1) << "each re-read a lost round forced is paced";
+    ASSERT_TRUE(last_round_started_ms.has_value());
+    EXPECT_EQ(backend->churned_reads - reads_before_last_round, 2u) << "the last round's loop read and its decision read";
+    EXPECT_LE(*now_ms - *last_round_started_ms, kEnvelopeMs + kMaxBackoffMs);
 }

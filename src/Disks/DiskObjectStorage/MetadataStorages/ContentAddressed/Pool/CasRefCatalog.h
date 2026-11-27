@@ -68,9 +68,8 @@ public:
     /// re-encoding the stale candidate. `mutate` must return a canonically ordered, grammar-valid
     /// candidate; `encodeRefCatalog` (called internally) enforces that.
     ///
-    /// The engine's own policy is the bound: persistent conflict ends at the write deadline with the
-    /// typed retryable error `throwCasWriteRetryLater`, rather than spinning forever against a
-    /// pathologically busy catalog.
+    /// Persistent conflict ends after `kCasMaxDecisions` submissions with the typed retryable error
+    /// `throwCasWriteRetryLater`, rather than spinning forever against a pathologically busy catalog.
     ///
     /// A read that finds the object ABSENT is corruption, not a fresh bootstrap -- `mutate` is never
     /// offered an absent catalog to build a replacement authority from, so no mutation can replace
@@ -193,8 +192,8 @@ public:
     /// `_ckpt` or other physical cleanup; debris belongs to the janitor.
     /// `refresh_authority` runs in every attempt, inside the catalog's hot-key lane and before `op`'s
     /// admission is checked, for a caller whose liveness is a cached flag; a caller whose liveness needs
-    /// no refresh passes a no-op. Its reads hold the lane, so it receives the cancel's own frozen policy to
-    /// bound them; a refresh that cannot finish in time must leave `op` unadmitted. The predicate runs
+    /// no refresh passes a no-op. Its reads hold the lane, so it receives the cancel's policy to bound
+    /// them; a refresh that cannot finish in time must leave `op` unadmitted. The predicate runs
     /// there too, on the catalog the attempt writes over.
     /// A cancel whose response is lost returns `Cancelled` while the catalog still holds the bytes it wrote,
     /// and `EntryChanged` once a later write replaced them.

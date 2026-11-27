@@ -58,7 +58,7 @@ public:
     /// every erase is authorised by a reading taken in its own attempt, and it is run once more before
     /// the drain-complete verdict, which would otherwise report from the reading its last erase left.
     /// It is a refresh, not a verdict: the verdict stays `op.admitted()`. Each call receives the policy that
-    /// bounds its reads: a cancel's own frozen policy inside the catalog lane, `Retry::standard` elsewhere.
+    /// bounds its reads: the cancel's policy inside the catalog lane, `Retry::standard` elsewhere.
     ///
     /// `before_erase` is called with each `Removing` life before its first erase attempt, so the caller
     /// can record the retirement while the row still exists; the erase may not follow. A `Creating` life

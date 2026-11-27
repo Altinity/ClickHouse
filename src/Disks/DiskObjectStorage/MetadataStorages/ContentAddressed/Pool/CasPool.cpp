@@ -2273,7 +2273,7 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
     /// Every pass repeats the ownership capture, the ledger snapshot and the slot read. The destination's reference is durable
     /// before the first pass and GC deletes a body only on an untouched zero of a complete cut, so a later full pass proves the
     /// same ownership overlap as an earlier one. An exact name and token may legitimately reappear after a move away and back.
-    const Retry slot_read_policy = Retry::standard().cappedAt(deadline_ms);
+    const Retry slot_read_policy = Retry::standard();
     for (uint32_t pass = 1;; ++pass)
     {
         throwIfConfirmTornDown(ns, ref_name);
@@ -2287,10 +2287,11 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
         if (now_ms >= deadline_ms)
             return verdict.answer;
         throwIfConfirmTornDown(ns, ref_name);
-        /// Teardown does not wake this pause, and no query cancellation reaches this layer.
-        mount_requests.pause(std::min(Retry::backoff(pass), deadline_ms - now_ms));
-        /// A pass whose slot read could not finish by the deadline would fail on the read instead of refusing.
-        if (!mount_requests.admit().oneAttemptFitsBefore(deadline_ms))
+        /// Teardown does not wake this pause; the owner is asked before and after it.
+        mount_requests.sleepFor(std::min(Retry::backoff(pass), deadline_ms - now_ms));
+        Cas::throwIfBackgroundStopped();
+        /// A pass starts only before the poll's end; a started pass finishes, its slot read binds its own window.
+        if (bootMsNow() >= deadline_ms)
             return verdict.answer;
     }
 }

@@ -3590,7 +3590,7 @@ TEST(CASCatalogLifecycleReconciler, ALeaderDeposedWhileQueuedForTheCatalogLaneSe
     std::thread other_writer([&]
     {
         CasOperation other_op = requests.admit();
-        (void)other_op.hotKeys().submit(catalog_key, other_op, other_op.freeze(Retry::standard()),
+        (void)other_op.hotKeys().submit(catalog_key, other_op, Retry::standard(),
             [&](const std::optional<Object> &) -> std::optional<String>
             {
                 holding.count_down();
@@ -3628,10 +3628,11 @@ TEST(CASCatalogLifecycleReconciler, ALeaderDeposedWhileQueuedForTheCatalogLaneSe
     EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
 }
 
-/// The leader reaches the catalog lane with a quarter of its cancel's window left, and every read of
-/// `gc/state` fails retryably. The authority check ends by the cancel's deadline: no cancel is sent, the
-/// row stays, and the writer queued behind gets the lane by then.
-TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsByTheCancelDeadline)
+/// The leader reaches the catalog lane after three quarters of a window in the queue, and every read
+/// of `gc/state` fails retryably. The authority check in the lane gets a window of its own, measured
+/// from its start: no cancel is sent, the row stays, and the writer queued behind gets the lane once
+/// that window ends.
+TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsOneWindowAfterItsStart)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -3646,14 +3647,19 @@ TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsBy
     const CatalogEntry stalled = seedStalledCreating(op, store, "00/slow-authority@cas@",
         hexToU128("000000000000000000000000000000d5"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
     backend->clearJournal();
-    backend->afterReadOf(gc_state_key, [] { throw Poco::TimeoutException("injected timeout of the gc/state read"); });
+    std::atomic<uint64_t> last_authority_read_at = 0;
+    backend->afterReadOf(gc_state_key, [&]
+    {
+        last_authority_read_at = clock.now.load();
+        throw Poco::TimeoutException("injected timeout of the gc/state read");
+    });
 
     std::latch holding(1);
     std::latch release(1);
     std::thread other_writer([&]
     {
         CasOperation other_op = requests.admit();
-        (void)other_op.hotKeys().submit(catalog_key, other_op, other_op.freeze(Retry::standard()),
+        (void)other_op.hotKeys().submit(catalog_key, other_op, Retry::standard(),
             [&](const std::optional<Object> &) -> std::optional<String>
             {
                 holding.count_down();
@@ -3665,8 +3671,10 @@ TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsBy
 
     /// Fail-closed like the GC leader's own refresh: authority is held only after a completed read.
     std::atomic<bool> authority_held = true;
+    std::atomic<uint64_t> last_check_started_at = 0;
     const auto refresh = [&](const Retry & bound)
     {
+        last_check_started_at = clock.now.load();
         authority_held = false;
         try
         {
@@ -3680,8 +3688,9 @@ TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsBy
         }
     };
     CasOperation leader_op = requests.admit([&] { return authority_held.load(); });
-    /// The cancel freezes `Retry::standard` before it queues; no fake time passes before that.
-    const uint64_t cancel_deadline = clock.now.load() + DB::Cas::kDefaultRequestWindowMs;
+    /// The end a window shared by the queue wait and the check would have; no fake time passes before
+    /// the leader queues.
+    const uint64_t shared_deadline = clock.now.load() + DB::Cas::kDefaultRequestWindowMs;
     const CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(leader_op, layout, parent, everyCreatorTerminal);
     CatalogLifecycleReconcileResult result;
@@ -3705,7 +3714,7 @@ TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsBy
         {
             CasOperation queued_op = requests.admit();
             (void)queued_op.hotKeys().submit(catalog_key, queued_op,
-                queued_op.freeze(Retry::within(10 * DB::Cas::kDefaultRequestWindowMs)),
+                Retry::within(10 * DB::Cas::kDefaultRequestWindowMs),
                 [&](const std::optional<Object> &) -> std::optional<String>
                 {
                     lane_reached_at = clock.now.load();
@@ -3731,8 +3740,11 @@ TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsBy
     EXPECT_EQ(reconciler.cancelledCreating(), 0u);
     EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
     ASSERT_NE(lane_reached_at.load(), 0u) << "the writer queued behind the leader got the lane";
-    EXPECT_LE(lane_reached_at.load(), cancel_deadline)
-        << "the lane was held " << lane_reached_at.load() - cancel_deadline << " ms past the cancel's deadline";
+    EXPECT_GT(last_authority_read_at.load(), shared_deadline) << "the check in the lane was cut at the shared deadline";
+    /// One envelope and the longest backoff past the check's own window.
+    const uint64_t check_end = last_check_started_at.load() + DB::Cas::kDefaultRequestWindowMs;
+    EXPECT_LE(lane_reached_at.load(), check_end + requests.attemptReservationMs() + 5'000)
+        << "the lane was held " << lane_reached_at.load() - check_end << " ms past the check's own window";
 }
 
 /// One creator root has rows at two writer epochs, and its slot is live at the later one. The earlier
@@ -5060,7 +5072,7 @@ TEST(CASOwnCreatingCancel, AnAdmissionStartingInsideTheLaneKeepsTheRow)
     std::thread holder([&]
     {
         CasOperation holder_op = store->mountRequests().admit();
-        (void)holder_op.hotKeys().submit(catalog_key, holder_op, holder_op.freeze(Retry::standard()),
+        (void)holder_op.hotKeys().submit(catalog_key, holder_op, Retry::standard(),
             [&](const std::optional<Object> &) -> std::optional<String>
             {
                 holding.count_down();

@@ -2520,6 +2520,8 @@ public:
     using InMemoryBackend::head;
     int fault_count = 0;                 /// remaining ambiguous faults on matching create attempts
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
+    bool fault_is_not_std_exception = false;  /// the injected fault does not derive from `std::exception`
+    std::exception_ptr fault;            /// thrown instead of the ambiguous timeout when set
     int publish_stream_attempts = 0;     /// unconditional streaming publications observed
     int publish_copy_attempts = 0;       /// unconditional native-copy publications observed
     int blob_head_attempts = 0;          /// transaction-level blob observations
@@ -2556,12 +2558,20 @@ public:
                 InMemoryBackend::publish(request, access);
             else if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
                 (void)streaming->open_payload();
+            if (fault_is_not_std_exception)
+                throw NotAStdException{};
+            if (fault)
+                std::rethrow_exception(fault);
             throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous publication (response lost)");
         }
         InMemoryBackend::publish(request, access);
     }
 
 private:
+    struct NotAStdException
+    {
+    };
+
     static bool isBlobBodyKey(const String & key)
     {
         return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
@@ -2696,16 +2706,10 @@ TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
         << "a repeated incarnation_tag is a repeated incarnation: GC's condemn would name the live body";
 }
 
-/// The publication loop captures ONE bound before it starts, and every verb of every iteration shares
-/// it -- so eight iterations cannot spend eight request windows. Here each ambiguous
-/// publication burns four ninths of the window on the injected clock, so the third one carries the loop
-/// past the window it captured and the next iteration's HEAD refuses to start. The insert is refused as
-/// retry-later, which is what a caller can act on; the alternative is a single blob upload sitting on
-/// the request for twenty-five minutes. The eight-attempt cap stays as the secondary bound.
-///
-/// The throw and the publication count are what fail if the shared bound regresses: without it this
-/// same fixture publishes a fourth time and the call SUCCEEDS.
-TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
+/// Each request of the publication loop has a window of its own, so a publication that burns four ninths
+/// of a window does not shorten the next request. The loop ends at the eight-publication cap and the
+/// retry-later error it throws carries the last publication's message.
+TEST(CASPartWrite, EnsureBlobPresentEndsAtTheEighthAmbiguousPublication)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b);
@@ -2721,16 +2725,74 @@ TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
     build->precommitAdd(ns, "part_blob_long_loop", id);
 
     int payload_streams = 0;
-    b->fault_count = 3;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    b->fault_count = 8;
+    String message;
+    try
     {
         (void)build->putBlob(idOf(payload), countingSource(payload, payload_streams));
-    });
+        ADD_FAILURE() << "the eighth ambiguous publication must end the loop";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        message = e.message();
+    }
 
-    EXPECT_EQ(b->publish_stream_attempts, 3) << "the fourth iteration must not start a publication";
-    /// The clock is past the captured deadline when the loop stops, which is what stopped it: two
-    /// publications leave it inside the window and the third carries it past.
-    EXPECT_GE(now->load(), kDefaultRequestWindowMs);
+    EXPECT_EQ(b->publish_stream_attempts, 8);
+    EXPECT_NE(message.find("simulated ambiguous publication"), String::npos) << message;
+    /// More than three request windows: no window spans the loop's requests.
+    EXPECT_GT(now->load(), kDefaultRequestWindowMs * 3);
+}
+
+/// The eighth publication is the last one the loop may make: a body that lands on it is committed.
+TEST(CASPartWrite, ABodyPublishedOnTheEighthAttemptCommits)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-eighth";
+    auto build = startBuildFor(s, ns, "part_blob_eighth");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_eighth", id);
+
+    int payload_streams = 0;
+    b->fault_count = 7;
+    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+
+    EXPECT_EQ(res.size, payload.size());
+    EXPECT_EQ(b->publish_stream_attempts, 8);
+    EXPECT_NO_THROW(build->promote(ns, "part_blob_eighth", build->buildId(), id));
+}
+
+/// A fault that is not a `std::exception` ends the loop like any other ambiguous publication, and
+/// the error still says what the last publication failed with.
+TEST(CASPartWrite, ANonStdExceptionOnTheEighthPublicationKeepsItsMessage)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-non-std";
+    auto build = startBuildFor(s, ns, "part_blob_non_std");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_non_std", id);
+
+    int payload_streams = 0;
+    b->fault_count = 8;
+    b->fault_is_not_std_exception = true;
+    String message;
+    try
+    {
+        (void)build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+        ADD_FAILURE() << "the eighth ambiguous publication must end the loop";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        message = e.message();
+    }
+
+    EXPECT_EQ(b->publish_stream_attempts, 8);
+    EXPECT_NE(message.find("NotAStdException"), String::npos) << message;
 }
 
 namespace

@@ -323,17 +323,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     /// a dependency under an incarnation the precommit never saw. The build's own facts -- cancellation
     /// and a superseded writer epoch -- stay in `requireAlive`, where each states which one refused.
     CasOperation op = store->mountRequests().resume(txn_generation);
-    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD and intent read
-    /// below shares this deadline, so a body whose publication keeps coming back ambiguous is refused
-    /// as retry-later inside one standard window instead of spending a fresh window per verb across
-    /// eight iterations. The paced retry is a bare sleep that does not consult the deadline, so the
-    /// loop can sleep one backoff (at most 5 s) past it before the next verb refuses to start. The
-    /// attempt cap below is the secondary bound.
-    const Retry policy = op.freeze(Retry::standard());
-    /// The unrepeatable publication, under the SAME bound: the engine may never reissue an envelope
-    /// (see the publication call below), but the loop's deadline still governs whether one may start.
-    const Retry publication_policy = policy.asSingleAttempt();
-
     const BlobRef & ref = req.ref;
     const BlobSource & source = req.source;
     const String key = store->layout().blobKey(ref);
@@ -366,8 +355,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     };
 
     constexpr int max_publication_attempts = 8;
-    /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
-    /// loop's deadline alike.
+    /// Every exit by exception after a failed attempt gave up on the blob.
     int failed_attempts = 0;
     const int exceptions_at_entry = std::uncaught_exceptions();
     SCOPE_EXIT({
@@ -409,7 +397,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                 /// Sent after this `HEAD` answered. A 404 does not prove no round condemned this incarnation: a transition
                 /// deletes the old intent after condemning. Adopting is safe because the edge was durable before the
                 /// `HEAD`, so the next destructive cut counts it.
-                if (readBlobIntent(op, store->layout(), ref, *identity, policy))
+                if (readBlobIntent(op, store->layout(), ref, *identity, Retry::standard()))
                 {
                     reason = BlobPublicationReason::IntentPresent;
                     ProfileEvents::increment(ProfileEvents::CASBlobReuseIntentPresent);
@@ -488,7 +476,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// each iteration of this loop builds one. The verbatim staged copy is additionally
             /// once-only per staging object: `beginPublication` spends a flag that the caller shares
             /// among every source over that object.
-            op.publish(BlobPublishRequest{key, std::move(publication)}, publication_policy);
+            op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
         }
         catch (const std::exception & error)
         {
@@ -497,27 +485,17 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
             ++failed_attempts;
-            recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, error.what());
+            last_failure = std::current_exception();
+            /// `Poco::Exception::what` is only the class name; the message carries the cause.
+            const String message = getCurrentExceptionMessage(/*with_stacktrace=*/false);
+            recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, message);
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
                     "attempts: {}",
                     key,
                     max_publication_attempts,
-                    error.what()));
-            continue;
-        }
-        catch (...)
-        {
-            ++failed_attempts;
-            recordFailedPublicationAttempt(
-                key, transport, attempt, max_publication_attempts, getCurrentExceptionMessage(/*with_stacktrace=*/false));
-            if (attempt + 1 == max_publication_attempts)
-                throwCasWriteRetryLater(fmt::format(
-                    "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
-                    "attempts",
-                    key,
-                    max_publication_attempts));
+                    message));
             continue;
         }
 

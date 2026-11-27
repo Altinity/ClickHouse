@@ -57,9 +57,9 @@ public:
     using Decide = std::function<std::optional<String>(const std::optional<Object> &)>;
 
     /// One hold on `key`: wait for the turn, obtain a base, run `decide`, one engine write, remember.
-    /// `policy` is frozen at entry, so time in the queue spends the caller's window. Returns the
-    /// engine's own result for that write, in class and content, and propagates a `decide`'s
-    /// exception as `readModifyWrite` does, never from a cached base.
+    /// The wait ends at the window of `policy`, or its earlier lease, taken at entry; the base read and
+    /// the write each bind their own. Returns the engine's own result for that write, in class and
+    /// content, and propagates a `decide`'s exception as `readModifyWrite` does, never from a cached base.
     WriteResult submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
 
     /// Items in the key's queue, the holder included; 0 for a key with no lane.

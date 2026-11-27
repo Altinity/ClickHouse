@@ -765,7 +765,7 @@ void CasRefLedger::cancelIdleOwnCreatingRows(
     {
         LOG_ERROR(getLogger("CasRefLedger"), "CAS ref catalog '{}': mandatory catalog absent; skipping owner cleanup", key);
     };
-    const Retry policy = op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
     const std::optional<Object> got = op.read(key, policy);
     if (!got)
     {
@@ -1484,20 +1484,12 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
     const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
     bool * lifecycle_refusal)
 {
-    /// The SECONDARY bound. Wall-clock time is already bounded by the frozen policy below, which
-    /// every verb of every iteration shares; this cap exists so a sequence that somehow converges on
-    /// neither a resolution nor the deadline still ends. A duel between two openers (one creating, one
-    /// reconciling a stale creator) converges in a handful of rounds.
+    /// A duel between two openers (one creating, one reconciling a stale creator) converges in a
+    /// handful of rounds.
     static constexpr size_t kMaxResolveAttempts = 32;
     const CreatorFence our_fence{server_root_id, live_epoch, admitted_generation};
     CasOperation op = mount_requests.resume(admitted_generation);
-
-    /// ONE bound for the whole loop, frozen before the first iteration: every read and every protocol
-    /// call below shares this deadline, so a namespace whose catalog entry keeps moving gives up
-    /// retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration. The paced re-read below is a bare sleep that does not consult the deadline, so the
-    /// loop can sleep one backoff (at most 5 s) past it before the next read refuses to start.
-    const Retry policy = op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
 
     for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
     {
@@ -5749,9 +5741,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
     ColdAdmission admission = beginColdAdmission(ns);
     CasOperation initial_op = mount_requests.admit();
-    /// One deadline for every request that leads to the removal decision. The wait for the lane to
-    /// drain and for another removal attempt counts against it but is never cut short.
-    const Retry policy = initial_op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
     const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout, policy);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -5863,6 +5853,42 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         observed_live = *initial_it;
     bool removing_durable = false;
     bool removal_write_outcome_unknown = false;
+
+    /// Resolves the removal state from a fresh catalog read. Returns true when the row is the durable
+    /// `Removing` of this life. Reopens the lane only when the row is exactly the observed `Live` one,
+    /// the mount fence is still admitted, and no `Removing` write may still land: that is,
+    /// `removal_write_outcome_unknown`, `rt->removal_write_may_land` and `rt->removing_observed` are all
+    /// clear. Every other case leaves the lane closed.
+    const auto resolveRemovalState = [&](CasOperation & op)
+    {
+        /// Owed to the closed lane: a stopped owner must not leave a proven `Live` lane closed.
+        const auto owed = Cas::OwnerScope::owed();
+        const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(op, layout, policy);
+        if (removal_reopen_read_hook_for_test)
+            removal_reopen_read_hook_for_test();
+        const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        if (observed_live
+            && fresh_it != fresh.catalog.entries.end()
+            && fresh_it->incarnation == observed_live->incarnation
+            && fresh_it->state == NsState::Removing)
+        {
+            return true;
+        }
+        if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
+        {
+            refuseUnlessAdmitted(op, "reopening the removal lane");
+            std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+            if (!removal_write_outcome_unknown && !rt->removal_write_may_land && !rt->removing_observed)
+            {
+                rt->removal_admission_closed = false;
+                rt->cv.notify_all();
+            }
+        }
+        return false;
+    };
+
+    std::optional<CasOperation> removal_op;
     try
     {
         refuseUnlessAdmitted(removal_op, "beginning removal");
@@ -5925,35 +5951,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     }
     catch (...)
     {
-        /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
-        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row, the
-        /// same mount fence and no `Removing` observation of this runtime, which may land after the read;
-        /// every other case stays closed and propagates the original error.
+        /// An ambiguous transition is resolved before the lane may reopen; otherwise the original error propagates.
+        /// A failure before the removal operation exists sent nothing: its error propagates even if the row reads `Removing`.
         try
         {
-            /// A fresh standard window, not `policy`: an expired policy would fail this read at once and
-            /// leave a healthy table closed.
-            const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
-            if (removal_reopen_read_hook_for_test)
-                removal_reopen_read_hook_for_test();
-            const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
-                [&](const CatalogEntry & entry) { return entry.ns == ns; });
-            if (observed_live
-                && fresh_it != fresh.catalog.entries.end()
-                && fresh_it->incarnation == observed_live->incarnation
-                && fresh_it->state == NsState::Removing)
+            if (removal_op)
+                removing_durable = resolveRemovalState(*removal_op);
+            else
             {
-                removing_durable = true;
-            }
-            else if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
-            {
-                refuseUnlessAdmitted(removal_op, "reopening the removal lane");
-                std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-                if (!removal_write_outcome_unknown && !rt->removal_write_may_land && !rt->removing_observed)
-                {
-                    rt->removal_admission_closed = false;
-                    rt->cv.notify_all();
-                }
+                CasOperation reopen_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
+                resolveRemovalState(reopen_op);
             }
         }
         catch (...) // NOLINT(bugprone-empty-catch)

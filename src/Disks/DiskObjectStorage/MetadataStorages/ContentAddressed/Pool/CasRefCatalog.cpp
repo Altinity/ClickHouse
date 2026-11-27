@@ -137,15 +137,6 @@ struct CatalogFenceMovedMarker : std::exception {};
 struct CatalogEntryMismatchMarker : std::exception {};
 struct CatalogCreatorStillLiveMarker : std::exception {};
 
-/// Live-lock brake for the ONE loop below that is written by hand rather than driven by the engine:
-/// the catalog is a single object mutated by every lifecycle transition of every namespace in the
-/// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
-///
-/// It bounds ATTEMPTS, and is the SECONDARY bound: the loop freezes one `Retry` before it starts and
-/// every verb of every iteration shares that absolute deadline, so wall-clock time is already bounded
-/// by one standard window. This cap exists so a call that somehow converges on neither still ends.
-constexpr size_t kMaxCatalogCasAttempts = 100;
-
 /// Proven absence of the catalog, for a caller that takes it as an answer rather than as corruption.
 struct CatalogAbsentMarker : std::exception {};
 
@@ -504,13 +495,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
-    /// ONE bound for the whole loop, frozen before the first iteration: every erase and every
-    /// resolution read below shares this deadline, so a permanently contended catalog gives up
-    /// retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration. The pause after a refused erase is a bare sleep that does not consult the deadline;
-    /// the read that follows it does, so a pause that crosses the deadline ends the call before the
-    /// next erase is sent.
-    const Retry policy = op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
 
     bool retirement_announced = false;
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
@@ -547,9 +532,10 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
         /// Pause before the read: that read is the snapshot the next erase is conditioned on, and a
         /// write landing during a pause taken after it would refuse that erase every time.
-        /// The argument counts reissues so far: `backoff(0)` is no wait at all.
-        if (std::holds_alternative<Conflict>(erase))
-            op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1));
+        /// The argument counts reissues so far: `backoff(0)` is no wait at all. No erase follows the
+        /// last attempt, so nothing waits for it.
+        if (erase_again && attempt + 1 < kCasMaxDecisions)
+            op.sleepFor(Retry::backoff(attempt + 1));
 
         /// An operation whose admission is gone cannot issue the resolution read either, so the call
         /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further
@@ -601,13 +587,10 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
             "creator fence",
             observed.ns.string());
 
-    /// One deadline for the cancel and its in-lane authority check, so a slow check cannot hold the lane
-    /// after the cancel could no longer write.
-    const Retry frozen = op.freeze(policy);
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
         /// Inside the lane: a leader deposed while it queued must not write on a reading taken before.
-        refresh_authority(frozen);
+        refresh_authority(policy);
         if (!op.admitted())
             throw CatalogFenceMovedMarker{};
 
@@ -626,7 +609,7 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
     /// unfinished life.
     try
     {
-        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, frozen,
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy,
                       /*absence_is_an_answer=*/catalog_absent != nullptr);
     }
     catch (const CatalogAbsentMarker &)
