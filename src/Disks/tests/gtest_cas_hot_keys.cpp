@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include "cas_test_helpers.h"
 
 #include <Common/ProfileEvents.h>
@@ -16,6 +17,8 @@
 #include <Poco/Exception.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <deque>
 #include <latch>
 #include <mutex>
@@ -31,6 +34,11 @@ namespace ProfileEvents
     extern const Event CASHotKeyReadStarts;
     extern const Event CASHotKeyCacheVerdictsReread;
     extern const Event CASRequestGaveUp;
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int ABORTED;
 }
 
 using namespace DB::Cas;
@@ -513,7 +521,7 @@ TEST(CASHotKeys, AnExternalWriterCostsOneResolveReadAndOneRetry)
     {
         WriteResult attempt = hot_keys.submit("k", op, Retry::standard(), appendTicket(2));
         if (std::holds_alternative<Conflict>(attempt))
-            op.pause(Retry::conflictBackoff());
+            op.sleepFor(Retry::conflictBackoff());
         else
             result = std::move(attempt);
     }
@@ -768,4 +776,171 @@ TEST(CASHotKeys, AnIdenticalCandidateLandedByAnotherServerIsTheEnginesCommit)
     EXPECT_TRUE(committed->resolved_by_read);
     EXPECT_TRUE(identicalToken(committed->etag, theirs));
     DB::Cas::tests::expectBytes(*backend, "k", "1,2");
+}
+
+/// A waiter whose owner stops while the holder is parked leaves the queue at once, and the waiter
+/// behind it takes its turn in order.
+TEST(CASHotKeys, CancelledWaiterWithdrawsWhileHolderIsParked)
+{
+    SyncClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    CasHotKeys hot_keys(0);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+    ParkFirstWrite park;
+    park.install(*backend, "k");
+    std::atomic<bool> stop{false};
+    std::atomic<bool> released{false};
+
+    std::optional<WriteResult> holder_result;
+    std::thread holder([&]
+    {
+        auto op = requests.admit();
+        holder_result = hot_keys.submit("k", op, Retry::standard(), appendTicket(1));
+    });
+    park.parked.wait();
+
+    std::promise<int> cancelled_code;
+    auto cancelled_returned = cancelled_code.get_future();
+    bool returned_while_parked = false;
+    std::thread cancelled([&]
+    {
+        auto owner = OwnerScope::background([&stop]
+        {
+            if (stop)
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+        });
+        auto op = requests.admit();
+        int code = 0;
+        try
+        {
+            (void)hot_keys.submit("k", op, Retry::standard(), appendTicket(2));
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+        returned_while_parked = !released;
+        cancelled_code.set_value(code);
+    });
+    while (hot_keys.queueDepthForTest("k") < 2)
+        std::this_thread::yield();
+
+    std::optional<WriteResult> next_result;
+    std::thread next([&]
+    {
+        auto op = requests.admit();
+        next_result = hot_keys.submit("k", op, Retry::standard(), appendTicket(3));
+    });
+    while (hot_keys.queueDepthForTest("k") < 3)
+        std::this_thread::yield();
+
+    stop = true;
+    const bool in_time = cancelled_returned.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+    EXPECT_TRUE(in_time) << "the cancelled waiter stayed queued behind the parked holder";
+    if (in_time)
+        EXPECT_EQ(hot_keys.queueDepthForTest("k"), 2u) << "the cancelled item left the queue";
+    released = true;
+    park.release.count_down();
+    holder.join();
+    cancelled.join();
+    next.join();
+
+    EXPECT_EQ(cancelled_returned.get(), DB::ErrorCodes::ABORTED);
+    EXPECT_TRUE(returned_while_parked);
+    ASSERT_TRUE(holder_result && std::holds_alternative<Committed>(*holder_result));
+    ASSERT_TRUE(next_result && std::holds_alternative<Committed>(*next_result));
+    EXPECT_EQ(backend->writeCount("k"), 2u) << "the cancelled waiter wrote nothing";
+    DB::Cas::tests::expectBytes(*backend, "k", "1,3");
+    EXPECT_EQ(hot_keys.laneCountForTest(), 0u);
+}
+
+/// A decision on a cached hint that ends because its owner stopped is no verdict on the hint: the
+/// stop is thrown, with no reread and no second decision.
+TEST(CASHotKeys, CancelledHintDecisionDoesNotReread)
+{
+    SyncClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    CasHotKeys hot_keys(16ULL << 20);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, Retry::standard(), appendTicket(1))));
+    const uint64_t gets_before = backend->getCount("k");
+    const uint64_t writes_before = backend->writeCount("k");
+    const auto reread_before = counter(ProfileEvents::CASHotKeyCacheVerdictsReread);
+
+    std::atomic<bool> stop{false};
+    auto owner = OwnerScope::background([&stop]
+    {
+        if (stop)
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+    });
+    int decisions = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    {
+        (void)hot_keys.submit("k", op, Retry::standard(), [&](const std::optional<Object> & current) -> std::optional<String>
+        {
+            ++decisions;
+            /// The owner stops while the decision runs, and the code it calls asks the owner.
+            stop = true;
+            throwIfBackgroundStopped();
+            return current->bytes + ",2";
+        });
+    });
+    EXPECT_EQ(decisions, 1);
+    EXPECT_EQ(backend->getCount("k") - gets_before, 0u) << "no reread";
+    EXPECT_EQ(backend->writeCount("k") - writes_before, 0u);
+    EXPECT_EQ(counter(ProfileEvents::CASHotKeyCacheVerdictsReread) - reread_before, 0u);
+}
+
+namespace
+{
+
+/// Runs `on_read` before each read.
+class ReadHookBackend final : public CountingBackend
+{
+public:
+    std::function<void()> on_read;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (on_read)
+            on_read();
+        return CountingBackend::read(key, access);
+    }
+};
+
+}
+
+/// A decline on a cached hint is reread; when the owner stops during that read, the decision on it does
+/// not run.
+TEST(CASHotKeys, StopDuringHintRereadSkipsTheSecondDecision)
+{
+    SyncClock clock;
+    auto backend = std::make_shared<ReadHookBackend>();
+    CasHotKeys hot_keys(16ULL << 20);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, Retry::standard(), appendTicket(1))));
+    const uint64_t gets_before = backend->getCount("k");
+    const auto reread_before = counter(ProfileEvents::CASHotKeyCacheVerdictsReread);
+
+    std::atomic<bool> stop{false};
+    auto owner = OwnerScope::background([&stop]
+    {
+        if (stop)
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+    });
+    backend->on_read = [&stop] { stop = true; };
+    int decisions = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    {
+        (void)hot_keys.submit("k", op, Retry::standard(), [&](const std::optional<Object> &) -> std::optional<String>
+        {
+            ++decisions;
+            return std::nullopt;
+        });
+    });
+    EXPECT_EQ(decisions, 1) << "the decision on the reread did not run";
+    EXPECT_EQ(backend->getCount("k") - gets_before, 1u);
+    EXPECT_EQ(counter(ProfileEvents::CASHotKeyCacheVerdictsReread) - reread_before, 1u);
 }

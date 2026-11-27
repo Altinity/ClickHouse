@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Common/Exception.h>
@@ -140,6 +141,13 @@ struct CatalogCreatorStillLiveMarker : std::exception {};
 /// Proven absence of the catalog, for a caller that takes it as an answer rather than as corruption.
 struct CatalogAbsentMarker : std::exception {};
 
+/// What `decide` threw, which `casUpdateImpl` delivers unchanged: a decision is not a sent write.
+struct CatalogDecisionFailure : std::exception
+{
+    explicit CatalogDecisionFailure(std::exception_ptr error_) : error(std::move(error_)) {}
+    std::exception_ptr error;
+};
+
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
 /// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
@@ -152,70 +160,126 @@ RefCatalog casUpdateImpl(
     const Retry & policy = Retry::standard(), bool absence_is_an_answer = false)
 {
     const String key = layout.refCatalogKey();
+    const String what = fmt::format("CAS ref catalog '{}' update", key);
     /// The candidate the LAST `decide` produced, which is the one the engine wrote: every earlier one
     /// belongs to an attempt whose precondition was refused.
     std::optional<RefCatalog> written;
 
     const auto decide = [&](const std::optional<Object> & current) -> std::optional<String>
     {
-        /// Absence of the mandatory catalog is corruption, not a fresh bootstrap. Refusing here is
-        /// what stops any mutation from replacing every other namespace with a one-update catalog.
-        if (!current)
+        try
         {
-            if (absence_is_an_answer)
-                throw CatalogAbsentMarker{};
-            throwMandatoryCatalogAbsent(key);
+            /// Absence of the mandatory catalog is corruption, not a fresh bootstrap. Refusing here is
+            /// what stops any mutation from replacing every other namespace with a one-update catalog.
+            if (!current)
+            {
+                if (absence_is_an_answer)
+                    throw CatalogAbsentMarker{};
+                throwMandatoryCatalogAbsent(key);
+            }
+            const RefCatalog durable = decodeRefCatalog(current->bytes);
+            CatalogLifeIndex(durable).throwIfAmbiguous("CAS ref catalog mutation");
+            RefCatalog candidate = mutate(durable);
+            String bytes = encode(candidate);
+            written = std::move(candidate);
+            return bytes;
         }
-        const RefCatalog durable = decodeRefCatalog(current->bytes);
-        CatalogLifeIndex(durable).throwIfAmbiguous("CAS ref catalog mutation");
-        RefCatalog candidate = mutate(durable);
-        String bytes = encode(candidate);
-        written = std::move(candidate);
-        return bytes;
+        catch (...)
+        {
+            throw CatalogDecisionFailure(std::current_exception());
+        }
     };
 
-    /// One hold at a time per pool on this key, from the pool's last known catalog when the lane holds
-    /// one. The loop is this function's: a `Conflict` is a lost race against another server (the lane
-    /// never conflicts with itself), repaid after the flat jitter, or after the growing schedule when
-    /// the conflict settled a transport fault. Under a single-attempt policy the first `Conflict` is
-    /// the answer, as the engine's own verb answers it.
-    const Retry frozen = op.freeze(policy);
-    /// Under `resend_unresolved = false` the engine returns an attempt whose fate is unknown instead of
-    /// resending its bytes, and this loop decides again on a fresh read. Attempt numbering continues,
-    /// so the next write is not a first attempt with the adaptive timeout again.
-    Retry attempt_policy = frozen;
-    uint32_t settled_faults = 0;
-    for (;;)
+    /// Set once a submission sent a write whose outcome stayed unresolved. That write can still land, so every exit
+    /// below but a commit, the typed outcomes, a failed decision and a local fault reports it.
+    bool sent_unresolved = false;
+    try
     {
-        WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide);
-        /// A write decided on a cached body can be refused by a deletion; its settling read already proved it.
-        if (const auto * conflict = std::get_if<Conflict>(&result);
-            absence_is_an_answer && conflict && std::holds_alternative<ProvenAbsent>(conflict->seen))
-            throw CatalogAbsentMarker{};
-        if (const auto * unresolved = std::get_if<GaveUp>(&result);
-            unresolved && unresolved->why == GaveUp::Why::Unresolved && unresolved->sent_any
-            && !frozen.resend_unresolved && !frozen.single_attempt)
+        /// One hold at a time per pool on this key, from the pool's last known catalog when the lane holds
+        /// one. The loop is this function's: a `Conflict` is a lost race against another server (the lane
+        /// never conflicts with itself), repaid after the flat jitter, or after the growing schedule when
+        /// the conflict settled a transport fault. Under a single-attempt policy the first `Conflict` is
+        /// the answer, as the engine's own verb answers it. Each request binds its own window, so the
+        /// count of submissions is what ends a loop that keeps losing; one submission may run `decide`
+        /// twice on a cached catalog, so `decide` calls are not counted.
+        ///
+        /// Under `resend_unresolved = false` the engine returns an attempt whose fate is unknown instead of
+        /// resending its bytes, and this loop decides again on a fresh read. Attempt numbering continues,
+        /// so the next write is not a first attempt with the adaptive timeout again.
+        Retry attempt_policy = policy;
+        uint32_t settled_faults = 0;
+        for (uint32_t submissions = 1;; ++submissions)
         {
-            attempt_policy.attempts_already_sent += unresolved->attempts_sent;
-            auto given_up = op.pauseBeforeRedecide(Retry::backoff(++settled_faults), *unresolved, frozen);
-            if (!given_up)
+            if (submissions > 1)
+                throwIfBackgroundStopped();
+            WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide);
+            if (std::holds_alternative<Committed>(result))
+                return std::move(*written);
+
+            /// Every other final outcome ends the call here, so the cap below never meets an operation that must end.
+            const auto * conflict = std::get_if<Conflict>(&result);
+            const auto * gave_up = std::get_if<GaveUp>(&result);
+            /// A write decided on a cached body can be refused by a deletion; its settling read already proved it.
+            if (absence_is_an_answer && conflict && std::holds_alternative<ProvenAbsent>(conflict->seen))
+                throw CatalogAbsentMarker{};
+            /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
+            /// `decide`, which throws the marker itself, and between two attempts, where the engine
+            /// notices it first and no further `decide` runs. Normalising the second onto the first is
+            /// what keeps "the fence moved" a returned outcome rather than an exception.
+            if (gave_up && gave_up->why == GaveUp::Why::FenceLost)
+                throw CatalogFenceMovedMarker{};
+
+            /// The only two reasons to submit again: another writer won the race, or the policy decides again
+            /// after a write whose outcome is unknown.
+            const bool lost_race = conflict && !conflict->observed_stop && !policy.single_attempt;
+            const bool decide_again_on_unresolved = gave_up && gave_up->why == GaveUp::Why::Unresolved
+                && gave_up->sent_any && !policy.resend_unresolved && !policy.single_attempt;
+            if (!lost_race && !decide_again_on_unresolved)
+                throwCatalogWriteFailure(std::move(result), what);
+            sent_unresolved = sent_unresolved || decide_again_on_unresolved;
+
+            if (submissions == kCasMaxDecisions)
+            {
+                const std::optional<CasOperation::AdmissionLoss> lost = op.lostAdmission();
+                if (!lost)
+                    throwDidNotConverge(what, kCasMaxDecisions, "submissions");
+                if (*lost == CasOperation::AdmissionLoss::Fence)
+                    throw CatalogFenceMovedMarker{};
+                throwCasWriteRetryLater(fmt::format("{}: gave up at the lease deadline after {} submissions", what, kCasMaxDecisions));
+            }
+            if (lost_race)
+            {
+                op.sleepFor(conflict->any_ambiguous ? Retry::backoff(++settled_faults) : Retry::conflictBackoff());
                 continue;
-            result = std::move(*given_up);
+            }
+            attempt_policy.attempts_already_sent += gave_up->attempts_sent;
+            std::optional<GaveUp> stopped = op.pauseAfterUnresolvedWrite(Retry::backoff(++settled_faults), *gave_up, policy);
+            if (!stopped)
+                continue;
+            if (stopped->why == GaveUp::Why::FenceLost)
+                throw CatalogFenceMovedMarker{};
+            throwCatalogWriteFailure(std::move(*stopped), what);
         }
-        if (const auto * conflict = std::get_if<Conflict>(&result); conflict && !frozen.single_attempt)
-        {
-            op.pause(conflict->any_ambiguous ? Retry::backoff(++settled_faults) : Retry::conflictBackoff());
-            continue;
-        }
-        /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
-        /// `decide`, which throws the marker itself, and between two attempts, where the engine
-        /// notices it first and no further `decide` runs. Normalising the second onto the first is
-        /// what keeps "the fence moved" a returned outcome rather than an exception.
-        if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
-            throw CatalogFenceMovedMarker{};
-        if (!std::holds_alternative<Committed>(result))
-            throwCatalogWriteFailure(std::move(result), fmt::format("CAS ref catalog '{}' update", key));
-        return std::move(*written);
+    }
+    catch (const CatalogDecisionFailure & failure)
+    {
+        std::rethrow_exception(failure.error);
+    }
+    catch (const CatalogFenceMovedMarker &)
+    {
+        throw;
+    }
+    catch (const CatalogAbsentMarker &)
+    {
+        throw;
+    }
+    catch (...)
+    {
+        if (!sent_unresolved || isLocalFault(std::current_exception()))
+            throw;
+        throwCasWriteRetryLater(fmt::format("{}: a sent write's outcome is unresolved; the call ended with: {}", what,
+            getCurrentExceptionMessage(/*with_stacktrace=*/false, /*check_embedded_stacktrace=*/false,
+                /*with_extra_info=*/false, /*with_version=*/false)));
     }
 }
 
@@ -498,7 +562,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
     const Retry policy = Retry::standard();
 
     bool retirement_announced = false;
-    for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
+    /// Each request binds its own window, so only the count ends a loop that keeps losing the catalog.
+    for (uint32_t attempt = 0; attempt < kCasMaxDecisions; ++attempt)
     {
         /// So the admission consulted below is not one reading taken before the first attempt.
         if (refresh_authority)
@@ -549,7 +614,23 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         /// The response to a conditional erase is not authority for what became durable. Resolve every
         /// attempted erase through one complete catalog read. This snapshot is also the next
         /// retry/selection cut, so no second read separates them.
-        catalog_snapshot = read(op, layout, policy);
+        try
+        {
+            /// Owed to the attempted erase: a landed erase must be observed.
+            const auto owed = OwnerScope::owed();
+            catalog_snapshot = read(op, layout, policy);
+        }
+        catch (...)
+        {
+            /// The erase may still land, so a stopped owner's failed read keeps its "outcome unknown" exit. A local
+            /// fault says nothing about the erase and propagates unchanged.
+            const auto * gave_up = std::get_if<GaveUp>(&erase);
+            if (gave_up && gave_up->why == GaveUp::Why::Unresolved && gave_up->sent_any && ownerStopRequested()
+                && !isLocalFault(std::current_exception()))
+                throwCatalogWriteFailure(std::move(erase), fmt::format(
+                    "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
+            throw;
+        }
 
         const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
         const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
@@ -575,9 +656,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         throwIfBackgroundStopped();
     }
 
-    throwCasWriteRetryLater(fmt::format(
-        "CAS ref catalog erase for namespace '{}' did not converge after {} attempts",
-        observed.ns.string(), kMaxCatalogCasAttempts));
+    throwDidNotConverge(fmt::format("CAS ref catalog erase for namespace '{}'", observed.ns.string()), kCasMaxDecisions, "attempts");
 }
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(

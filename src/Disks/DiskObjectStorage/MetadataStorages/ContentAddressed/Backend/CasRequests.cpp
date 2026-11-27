@@ -1456,6 +1456,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
 
     for (uint32_t decisions = 1;; ++decisions)
     {
+        throwIfBackgroundStopped();
         /// Outside every classification: `decide` is the caller's own control flow, and an exception
         /// from it is theirs to see unchanged.
         const std::optional<String> next = decide(current);
@@ -1510,6 +1511,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
 
     for (uint32_t decisions = 1;; ++decisions)
     {
+        throwIfBackgroundStopped();
         const std::optional<String> next = decide(current);
         if (!next)
             return Declined{state.last_seen};

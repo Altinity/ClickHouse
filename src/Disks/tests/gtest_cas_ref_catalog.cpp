@@ -1,6 +1,7 @@
 #include "cas_format_test_battery.h"
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/ProfileEvents.h>
@@ -13,6 +14,7 @@
 #include <Poco/StreamChannel.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <atomic>
 #include <expected>
 #include <functional>
 #include <latch>
@@ -64,6 +66,7 @@ public:
 
 namespace DB::ErrorCodes
 {
+    extern const int ABORTED;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int LIMIT_EXCEEDED;
@@ -1134,7 +1137,6 @@ TEST(CASRefCatalog, CasUpdateEndsAfterAHundredPacedSubmissions)
     {
         CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & cur)
         {
-            ++mutate_calls;
             backend->refuseNextWrite(layout.refCatalogKey());
             RefCatalog next = cur;
             return next;
@@ -1907,14 +1909,130 @@ TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpAfterAHundredErases)
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         message = e.message();
     }
-    EXPECT_NE(message.find("deadline"), String::npos)
-        << "the shared bound, not the attempt cap, is what ended this call: " << message;
-    /// Two windows, so the assertion survives the jitter of the paced retries while still failing a
-    /// loop that binds a fresh window per iteration -- that one spends minutes here.
-    EXPECT_LT(clock.now - start, 2 * kDefaultRequestWindowMs) << "the loop outlived the window it captured";
-    EXPECT_LT(backend->refusedAttempts(), 100u) << "the attempt cap must not be what ends this call";
-    /// Greater than one is what proves the loop iterated rather than failing on its first attempt.
-    EXPECT_GT(backend->refusedAttempts(), 1u);
+    EXPECT_NE(message.find("did not converge after 100 attempts"), String::npos) << message;
+    EXPECT_EQ(backend->refusedAttempts(), 100u);
+    EXPECT_EQ(clock.sleeps.size() - sleeps_before, 99u) << "no pause after the last refusal";
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
+}
+
+namespace
+{
+
+CatalogEntry removingEntryForStopTests()
+{
+    return CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Removing, .incarnation = UInt128{7}, .removal_started_round = 13};
+}
+
+CasFoldSeal readyParentForStopTests()
+{
+    CasFoldSeal parent;
+    parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    return parent;
+}
+
+/// Loses the reply of the next catalog write, running `on_lost` first; every catalog read after it fails.
+class LostEraseUnreadableCatalogBackend final : public WriteCountingBackend
+{
+public:
+    String catalog_key;
+    std::function<void()> on_lost;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (lost && key == catalog_key)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected catalog read failure");
+        return WriteCountingBackend::read(key, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        if (key != catalog_key || !on_lost || lost)
+            return WriteCountingBackend::write(key, bytes, expected_value, access);
+        lost = true;
+        on_lost();
+        throw Poco::TimeoutException("injected lost catalog erase reply");
+    }
+
+private:
+    bool lost = false;
+};
+
+}
+
+/// An erase whose reply was lost, whose owner stopped, and whose resolution read cannot complete ends with the
+/// erase's "outcome unknown" exit: the erase may still land.
+TEST(CASRefCatalogRemoval, UnresolvedEraseOfAStoppedOwnerKeepsItsExit)
+{
+    auto backend = std::make_shared<LostEraseUnreadableCatalogBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout("erase-unresolved-stop");
+    const CatalogEntry removing = removingEntryForStopTests();
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    std::atomic<bool> stopped = false;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->on_lost = [&stopped] { stopped = true; };
+
+    String message;
+    {
+        const auto owner = OwnerScope::background([&stopped]
+        {
+            if (stopped)
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+        });
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+        {
+            try
+            {
+                (void)deleteCompletedRemovingForTest(op, layout, removing, readyParentForStopTests(), noAuthorityRefresh);
+            }
+            catch (const DB::Exception & e)
+            {
+                message = e.message();
+                throw;
+            }
+        });
+    }
+    EXPECT_NE(message.find("unresolved"), String::npos) << message;
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 1u) << "only the seed: the lost erase bypasses the count, and nothing was resent";
+}
+
+/// An owner that stops while a conflicted erase is resolved starts no second decision: no authority refresh
+/// and no erase follow the resolution read.
+TEST(CASRefCatalogRemoval, StopDuringAConflictedErasesResolutionStartsNoNextDecision)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    FakeClock clock;
+    std::atomic<bool> stopped = false;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    /// The conflict's pause comes before the resolution read.
+    requests.setSleepFnForTest([&stopped](uint64_t) { stopped = true; });
+    CasOperation op = requests.admit();
+    const Layout layout("erase-conflict-stop");
+    const CatalogEntry removing = removingEntryForStopTests();
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    backend->refuseNextWrite(layout.refCatalogKey());
+
+    size_t refreshes = 0;
+    {
+        const auto owner = OwnerScope::background([&stopped]
+        {
+            if (stopped)
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+        });
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+        {
+            (void)deleteCompletedRemovingForTest(op, layout, removing, readyParentForStopTests(), [&refreshes] { ++refreshes; });
+        });
+    }
+    ASSERT_TRUE(stopped) << "premise: the erase conflicted and paused";
+    EXPECT_EQ(refreshes, 1u) << "a refresh for a second decision";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 2u) << "the seed and the conflicted erase";
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
 }
 

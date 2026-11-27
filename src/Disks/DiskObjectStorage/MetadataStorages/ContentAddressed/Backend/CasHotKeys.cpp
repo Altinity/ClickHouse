@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
 #include <Common/CurrentMetrics.h>
@@ -34,10 +35,6 @@ GaveUp::Source sourceFor(const Retry::Bound & bound)
 {
     return bound.source == Retry::Bound::Source::Lease ? GaveUp::Source::Lease : GaveUp::Source::Policy;
 }
-
-/// The wait slice: how late, at most, a waiter notices its own fence or deadline. A handover wakes it
-/// at once through the lane's condition variable.
-constexpr auto kWaitSlice = std::chrono::milliseconds(200);
 
 }
 
@@ -99,7 +96,7 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
         ~Leave() noexcept { owner.leave(key, item, entered_hold, entered_ms, op); }
     } guard{*this, key, item, entered_hold, entered_ms, op};
 
-    for (;;)
+    for (bool waited = false;; waited = true)
     {
         /// Outside the mutex: the engine's own admission in the engine's order (the fence generation,
         /// the lease budget, then the caller's liveness, which the engine reports as a lost fence),
@@ -137,7 +134,8 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
             entered_hold = true;
             break;
         }
-        lane.cv.wait_for(lock, kWaitSlice);
+        /// The slice also bounds how late the waiter notices its own fence or deadline; a handover wakes it at once.
+        lane.cv.wait_for(lock, kOwnerStopSlice);
     }
     ProfileEvents::increment(ProfileEvents::CASHotKeyQueueWaitMicroseconds, (op.owner.now_ms() - entered_ms) * 1000);
     return hold(key, op, policy, decide);
@@ -229,6 +227,7 @@ WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry 
 
     std::optional<String> candidate;
     bool verdict_on_hint = false;
+    throwIfBackgroundStopped();
     try
     {
         candidate = decide(base);
@@ -238,6 +237,12 @@ WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry 
     {
         if (!from_cache)
             throw;
+        /// A stopped background owner's exception says nothing about the hint, so it is not worth a reread. A
+        /// lost admission `decide` may have thrown on goes first: the reread's own gate reports it. A killed
+        /// query rereads, as a healthy read is never refused.
+        if (op.admitted())
+            if (auto stop = backgroundStopRequested())
+                std::rethrow_exception(stop);
         verdict_on_hint = true;
     }
     if (verdict_on_hint)
@@ -250,6 +255,7 @@ WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry 
         if (auto refused = read_base())
             return *refused;
         from_cache = false;
+        throwIfBackgroundStopped();
         candidate = decide(base);
     }
     if (!candidate)
