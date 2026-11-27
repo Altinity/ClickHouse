@@ -920,7 +920,9 @@ def test_shutdown_hands_atomic_drop_to_restart(node_stop):
     node_stop.query("INSERT INTO {} VALUES (1, 'x')".format(name))
     life_log = "cas/ns/stream/{}/_log/".format(life)
     uuid = _table_uuid(node_stop, name)
-    dropped_metadata = "ls /var/lib/clickhouse/metadata_dropped/ | grep -c {} || true".format(uuid)
+    # The database disk may be remote, so the dropped metadata is followed through the log, not the local filesystem.
+    metadata_removed = "Removing metadata .*{}.sql of dropped table".format(uuid)
+    removed_before = int(node_stop.count_in_log(metadata_removed).strip())
     stopped_before = int(node_stop.count_in_log("removal stopped by server shutdown").strip())
     shutting_down_before = int(node_stop.count_in_log("Waiting for current connections to close").strip())
     fatal_before = int(node_stop.count_in_log("<Fatal>").strip())
@@ -949,14 +951,15 @@ def test_shutdown_hands_atomic_drop_to_restart(node_stop):
     assert [r for r in trace if r["method"] == "PUT" and life_log in r["path"] and r["status"] == 200
             and r["t_mono_ms"] < held["t_mono_ms"]], trace
     assert not [r for r in trace if r["method"] == "PUT" and life_log in r["path"] and r["t_mono_ms"] > released_ms], trace
-    assert node_stop.exec_in_container(["bash", "-c", dropped_metadata]).strip() == "1"
+    assert int(node_stop.count_in_log(metadata_removed).strip()) == removed_before
     assert int(node_stop.count_in_log("removal stopped by server shutdown").strip()) > stopped_before
     # A crash during shutdown also ends the process; an orderly exit logs nothing fatal.
     assert int(node_stop.count_in_log("<Fatal>").strip()) == fatal_before
 
     restarted_ms = _stats()["trace"][-1]["t_mono_ms"]
     node_stop.start_clickhouse()
-    _wait_until(lambda: node_stop.exec_in_container(["bash", "-c", dropped_metadata]).strip() == "0", timeout=60)
+    # Only metadata that survived the exit can be found and removed by the restarted server.
+    _wait_until(lambda: int(node_stop.count_in_log(metadata_removed).strip()) > removed_before, timeout=60)
     assert node_stop.query("SELECT count() FROM system.dropped_tables WHERE uuid = '{}'".format(uuid)).strip() == "0"
 
     def appended_through_terminal():
