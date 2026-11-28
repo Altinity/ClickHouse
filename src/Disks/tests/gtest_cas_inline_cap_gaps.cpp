@@ -617,8 +617,9 @@ namespace
 void checkInlineCandidateWritePeak(size_t num_files, size_t chunks_per_file, Int64 limit)
 {
 #if defined(SANITIZER)
+    UNUSED(num_files, chunks_per_file, limit);
     GTEST_SKIP() << "operator new is not charged to the memory tracker under sanitizers";
-#endif
+#else
     auto storage = openStorage();
     auto tx = storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
@@ -643,6 +644,7 @@ void checkInlineCandidateWritePeak(size_t num_files, size_t chunks_per_file, Int
     }).get();
     ::testing::Test::RecordProperty("peak_bytes", std::to_string(peak));
     EXPECT_LE(peak, limit);
+#endif
 }
 
 }
