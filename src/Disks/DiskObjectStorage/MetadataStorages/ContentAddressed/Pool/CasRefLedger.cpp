@@ -1532,12 +1532,18 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
     CasOperation op = mount_requests.resume(admitted_generation);
     const Retry policy = Retry::standard();
 
+    uint32_t collisions = 0;
     for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
     {
-        /// Paces ONLY the re-reads a competing actor forced. A `Live` outcome is this open's own
-        /// success and its single confirming re-read is not contention, so it is never delayed. The
-        /// argument is the number of collisions so far, so the first one waits the shortest draw.
-        const auto paceReRead = [&] { op.sleepFor(Retry::backoff(static_cast<uint32_t>(attempt) + 1)); };
+        /// Paces ONLY the re-reads a competing actor forced, by the count of those collisions. A `Live`
+        /// outcome is this open's own success and its single confirming re-read is not contention, so it
+        /// is never delayed. The last attempt is followed by no re-read, so nothing waits for it.
+        const auto paceReRead = [&]
+        {
+            ++collisions;
+            if (const uint64_t pause_ms = Retry::conflictBackoff(collisions); pause_ms > 0 && attempt + 1 < kMaxResolveAttempts)
+                op.sleepFor(pause_ms);
+        };
 
         const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout, policy);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),

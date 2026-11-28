@@ -56,7 +56,8 @@ CasHotKeys::~CasHotKeys()
     chassert(lanes.empty());
 }
 
-WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide)
+WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide, Start start,
+                               OnLoss on_loss)
 {
     /// The wait has its own end, taken here; each request after it binds its own window.
     const Retry::Bound wait_end = op.owner.bindPolicy(policy);
@@ -138,7 +139,7 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
         lane.cv.wait_for(lock, kOwnerStopSlice);
     }
     ProfileEvents::increment(ProfileEvents::CASHotKeyQueueWaitMicroseconds, (op.owner.now_ms() - entered_ms) * 1000);
-    return hold(key, op, policy, decide);
+    return hold(key, op, policy, decide, start, on_loss);
 }
 
 void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint64_t entered_ms, CasOperation & op) noexcept
@@ -193,14 +194,16 @@ void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint6
     }
 }
 
-WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide)
+WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide, Start start,
+                             OnLoss on_loss)
 {
+    /// Every write of this hold, and its base read, are one submission's: they share one record of what was sent.
     CasOperation::WriteState state;
     std::optional<Object> base;
     bool from_cache = false;
     /// A single-attempt submission never starts from a hint: its one attempt is on fresh state, as
     /// the engine's own verb reads before it.
-    if (!policy.single_attempt)
+    if (!policy.single_attempt && start == Start::CacheOrRead)
     {
         if (auto remembered = cached(key))
         {
@@ -258,30 +261,62 @@ WriteResult CasHotKeys::hold(const String & key, CasOperation & op, const Retry 
         throwIfBackgroundStopped();
         candidate = decide(base);
     }
-    if (!candidate)
+    const auto declined = [&]
     {
         if (base)
             remember(key, *base);
         return Declined{state.last_seen};
-    }
-
-    WriteResult result = [&]
+    };
+    const bool retried_after_a_pause = on_loss == OnLoss::SubmitAgain && !policy.single_attempt;
+    const auto write = [&]
     {
+        /// A loss on a hint is settled: the retry below decides on that read. A loss on a fresh read that the
+        /// caller retries is repaid by its pause and a read after it, so a settling read would go unused.
+        const auto on_clean_refusal = from_cache || !retried_after_a_pause
+            ? CasOperation::OnCleanRefusal::Settle : CasOperation::OnCleanRefusal::ReturnUnobserved;
         try
         {
-            return base ? op.replace(key, *candidate, base->etag, policy) : op.create(key, *candidate, policy);
+            return op.writeLoop(key, *candidate, base ? std::optional<Etag>(base->etag) : std::nullopt, policy,
+                                state, CasOperation::ResolveWith::Body, on_clean_refusal);
         }
         catch (...)
         {
             forget(key);
             throw;
         }
-    }();
+    };
+    if (!candidate)
+        return declined();
+    WriteResult result = write();
+
+    /// A clean loss on a hint says only that the hint was old, not that the key is contended: decide
+    /// again on the resolve read and write at once, so nothing waits between that read and the write.
+    if (const auto * conflict = std::get_if<Conflict>(&result); from_cache && conflict && !conflict->any_ambiguous
+        && !conflict->observed_stop
+        && (std::holds_alternative<Object>(conflict->seen) || std::holds_alternative<ProvenAbsent>(conflict->seen)))
+    {
+        forget(key);
+        state.last_seen = conflict->seen;
+        base.reset();
+        if (const auto * object = std::get_if<Object>(&state.last_seen))
+            base = *object;
+        from_cache = false;
+        throwIfBackgroundStopped();
+        candidate = decide(base);
+        if (!candidate)
+            return declined();
+        result = write();
+    }
+
     std::visit(detail::Overload{
         [&](const Committed & committed) { remember(key, Object{*candidate, committed.etag}); },
         [&](const Conflict & conflict)
         {
-            if (const auto * object = std::get_if<Object>(&conflict.seen))
+            /// A caller that retries a `Conflict` pauses first, and a body read before that pause would
+            /// refuse its next write once anyone commits during it: the next hold reads instead.
+            const bool retried = retried_after_a_pause && !conflict.observed_stop;
+            const auto * object = std::get_if<Object>(&conflict.seen);
+            if (object && !retried)
                 remember(key, *object);
             else
                 forget(key);

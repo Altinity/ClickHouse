@@ -6130,9 +6130,9 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
 
-    /// What the decision that actually landed wrote. `readModifyWrite` re-decides on every conflict
-    /// against what the losing write's own resolve read observed, so the last decision is the committed
-    /// one, and a competing leader's write makes the next decision see a moved lease tuple.
+    /// What the decision that actually landed wrote. `readModifyWrite` re-decides after every conflict
+    /// on a read taken after its pause, so the last decision is the committed one, and a competing
+    /// leader's write makes the next decision see a moved lease tuple.
     GcState decided;
     bool decided_never_held = false;
     const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,

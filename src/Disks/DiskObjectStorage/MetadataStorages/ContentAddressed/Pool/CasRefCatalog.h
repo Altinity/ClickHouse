@@ -155,8 +155,9 @@ public:
     /// `catalog_snapshot`, and the mandatory resolution snapshot is returned in the result so a
     /// catalog-only drain can select the next row without an intervening read.
     ///
-    /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
-    /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
+    /// `refresh_authority` runs once before every attempt: before the first one's checks, and for each
+    /// later one right after its pause, before the catalog read that attempt is conditioned on, unless
+    /// a background owner stopped during that pause. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
     /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
     /// before the first erase must not authorise the rest. A caller whose liveness needs no refresh
     /// passes a no-op and says so.

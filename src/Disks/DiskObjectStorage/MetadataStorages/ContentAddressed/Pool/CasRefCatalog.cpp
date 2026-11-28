@@ -151,8 +151,7 @@ struct CatalogDecisionFailure : std::exception
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
 /// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
-/// `mutate` against the resolve read's fresh body -- the one the pool's hot-key lane remembers and
-/// the next hold starts from -- never re-encoding the stale candidate.
+/// `mutate` against a fresh read, never re-encoding the stale candidate.
 RefCatalog casUpdateImpl(
     CasOperation & op, const Layout & layout,
     const std::function<RefCatalog(const RefCatalog &)> & mutate,
@@ -196,23 +195,29 @@ RefCatalog casUpdateImpl(
     try
     {
         /// One hold at a time per pool on this key, from the pool's last known catalog when the lane holds
-        /// one. The loop is this function's: a `Conflict` is a lost race against another server (the lane
-        /// never conflicts with itself), repaid after the flat jitter, or after the growing schedule when
-        /// the conflict settled a transport fault. Under a single-attempt policy the first `Conflict` is
-        /// the answer, as the engine's own verb answers it. Each request binds its own window, so the
-        /// count of submissions is what ends a loop that keeps losing; one submission may run `decide`
-        /// twice on a cached catalog, so `decide` calls are not counted.
+        /// one; the lane itself retries a clean loss on that cached catalog at once. The loop is this
+        /// function's: a `Conflict` is a lost race against another server (the lane never conflicts with
+        /// itself), repaid after `Retry::conflictBackoff` of the run of consecutive clean losses, or after the fault
+        /// schedule when the conflict settled a transport fault; the next submission reads after the pause.
+        /// Under a single-attempt policy the first `Conflict` is the answer, as the engine's own verb answers
+        /// it. Each request binds its own window, so the count of submissions is what ends a loop that keeps
+        /// losing; one submission may run `decide` twice on a cached catalog, so `decide` calls are not counted.
         ///
         /// Under `resend_unresolved = false` the engine returns an attempt whose fate is unknown instead of
         /// resending its bytes, and this loop decides again on a fresh read. Attempt numbering continues,
         /// so the next write is not a first attempt with the adaptive timeout again.
         Retry attempt_policy = policy;
         uint32_t settled_faults = 0;
+        uint32_t clean_losses = 0;
         for (uint32_t submissions = 1;; ++submissions)
         {
+            /// Every submission after the first follows a pause, so it reads rather than start from a body
+            /// another holder of this pool remembered during that pause.
             if (submissions > 1)
                 throwIfBackgroundStopped();
-            WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide);
+            WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide,
+                submissions > 1 ? CasHotKeys::Start::Read : CasHotKeys::Start::CacheOrRead,
+                submissions < kCasMaxDecisions ? CasHotKeys::OnLoss::SubmitAgain : CasHotKeys::OnLoss::End);
             if (std::holds_alternative<Committed>(result))
                 return std::move(*written);
 
@@ -249,9 +254,17 @@ RefCatalog casUpdateImpl(
             }
             if (lost_race)
             {
-                op.sleepFor(conflict->any_ambiguous ? Retry::backoff(++settled_faults) : Retry::conflictBackoff());
+                /// The pause follows the run of consecutive clean losses; a settled fault ends that run.
+                if (conflict->any_ambiguous)
+                {
+                    clean_losses = 0;
+                    op.sleepFor(Retry::backoff(++settled_faults));
+                }
+                else if (const uint64_t pause_ms = Retry::conflictBackoff(++clean_losses); pause_ms > 0)
+                    op.sleepFor(pause_ms);
                 continue;
             }
+            clean_losses = 0;
             attempt_policy.attempts_already_sent += gave_up->attempts_sent;
             std::optional<GaveUp> stopped = op.pauseAfterUnresolvedWrite(Retry::backoff(++settled_faults), *gave_up, policy);
             if (!stopped)
@@ -562,11 +575,13 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
     const Retry policy = Retry::standard();
 
     bool retirement_announced = false;
+    uint32_t clean_losses = 0;
     /// Each request binds its own window, so only the count ends a loop that keeps losing the catalog.
     for (uint32_t attempt = 0; attempt < kCasMaxDecisions; ++attempt)
     {
-        /// So the admission consulted below is not one reading taken before the first attempt.
-        if (refresh_authority)
+        /// So the admission consulted below is not one reading taken before the first attempt. A later
+        /// attempt refreshes right after its pause, below.
+        if (refresh_authority && attempt == 0)
             refresh_authority();
 
         catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
@@ -600,10 +615,22 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         const bool erase_again = conflict && !conflict->observed_stop;
         /// Pause before the read: that read is the snapshot the next erase is conditioned on, and a
         /// write landing during a pause taken after it would refuse that erase every time.
-        /// The argument counts reissues so far: `backoff(0)` is no wait at all. No erase follows the
-        /// last attempt, so nothing waits for it.
+        /// A clean refusal is paced by the run of consecutive clean ones, which a refusal that settled a transport
+        /// fault ends; that one is paced by the fault schedule. No erase follows the last attempt, so nothing waits for it.
+        /// The next attempt's refresh follows the pause and precedes the read, so no request sits between
+        /// that read and the erase on it. A stopped background owner makes no next attempt, so it skips it.
         if (erase_again && attempt + 1 < kCasMaxDecisions)
-            op.sleepFor(Retry::backoff(attempt + 1));
+        {
+            if (conflict->any_ambiguous)
+            {
+                clean_losses = 0;
+                op.sleepFor(Retry::backoff(attempt + 1));
+            }
+            else if (const uint64_t pause_ms = Retry::conflictBackoff(++clean_losses); pause_ms > 0)
+                op.sleepFor(pause_ms);
+            if (refresh_authority && !backgroundStopRequested())
+                refresh_authority();
+        }
 
         /// An operation whose admission is gone cannot issue the resolution read either, so the call
         /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further

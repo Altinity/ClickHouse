@@ -17,6 +17,13 @@ uint64_t Retry::backoff(uint32_t attempt)
     return thread_local_rng() % (ceiling + 1);     /// full jitter: uniform(0, ceiling)
 }
 
+uint64_t Retry::conflictBackoff(uint32_t loss)
+{
+    const uint64_t steps = loss > 0 ? loss - 1 : 0;
+    const uint64_t base = std::min<uint64_t>(kCasConflictPauseCeilingMs, kCasConflictPauseStepMs * steps);
+    return base + thread_local_rng() % (base / 4 + 1);
+}
+
 uint64_t Retry::spacedPause(uint64_t spacing_draw_ms, uint64_t attempt_started_ms, uint64_t now_ms)
 {
     const uint64_t taken_ms = now_ms > attempt_started_ms ? now_ms - attempt_started_ms : 0;

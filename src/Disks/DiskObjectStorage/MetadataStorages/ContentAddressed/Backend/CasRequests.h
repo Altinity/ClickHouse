@@ -404,8 +404,8 @@ public:
 
     WriteResult create(const String & key, const String & bytes, const Retry & policy);
     WriteResult replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy);
-    /// Read, decide, write, and re-decide on conflict against what the write's own resolve read
-    /// already observed. `decide` returning nullopt is `Declined`.
+    /// Read, decide, write; on a conflict, pause, read again and re-decide on that read. `decide`
+    /// returning nullopt is `Declined`.
     WriteResult readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy);
     /// The same loop over `head`, settling a refused precondition with a `head` too. Proving that an
     /// ambiguous attempt landed needs the bytes, so that one path does read a body; either way the verb
@@ -447,6 +447,8 @@ private:
         bool any_ambiguous = false;
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;
+        /// The current run of consecutive clean lost races, which sets the length of the conflict pause.
+        uint32_t clean_conflicts = 0;
         bool refresh_attempted = false;
         /// An operation of this call failed and saw its query stopped: a write attempt, its settling read, or the
         /// pause before a reissue. The call starts no further discretionary request, also after a settled conflict.
@@ -466,6 +468,9 @@ private:
     /// confusion `GaveUp::Source` exists to prevent. `PolicyExhausted` names the `Retry` bound, whose
     /// own source is `Bound::source`.
     enum class ReadStop : uint8_t { FenceLost, NoBudgetLease, PolicyExhausted };
+    /// What refuses the next attempt of a read-class request bound to `bound`, if anything: the fence, the lease
+    /// budget for one request envelope, then the bound itself.
+    std::optional<ReadStop> refusedReadAttempt(const Retry::Bound & bound) const;
 
     /// What the resolve read saw, and why it stopped when it saw nothing. `stop` is set ONLY when a
     /// bound refused; a read that failed at the transport leaves it empty, and that is the one case
@@ -502,8 +507,14 @@ private:
     /// failed connection is reissued before its read. `Refused`, `Declined` and `GaveUp` report what
     /// the store or the bounds said. The window bound at entry governs every send of these bytes; the
     /// read that settles an attempt is a request of its own and binds its own window from `policy`.
+    /// What a clean refused precondition (no attempt of this call left unanswered) returns. `ReturnUnobserved`
+    /// skips the settling read and returns `Conflict{NotObserved}`, for a caller that pauses and reads again
+    /// before its next decision, which would overwrite that read unused.
+    enum class OnCleanRefusal : uint8_t { Settle, ReturnUnobserved };
+
     WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
-                          const Retry & policy, WriteState & state, ResolveWith resolve_refusal_with);
+                          const Retry & policy, WriteState & state, ResolveWith resolve_refusal_with,
+                          OnCleanRefusal on_clean_refusal = OnCleanRefusal::Settle);
     /// The resolve read: an exact read (a `HEAD` for `Presence`) under its own window from `policy`, reporting
     /// what it saw and, when it saw nothing, which of its bounds stopped it. A stopped owner's failure is
     /// `NotObserved` only when a bound refused the read or inside `owed`; otherwise it propagates.
@@ -533,15 +544,23 @@ private:
     enum class PauseAfter : uint8_t { Conflict, Failure };
     /// The pause between two decisions: admission for the pause, then the policy's explicit lease and outside cap,
     /// then the sleep, then admission, lease and cap again so no `decide` runs past them. It consults
-    /// no window: the next decision's requests bind their own when they are sent.
-    std::optional<PauseStop> pauseUnderPolicy(uint64_t ms, const Retry & policy, PauseAfter after, void (*record)());
+    /// no window: the next decision's requests bind their own when they are sent. With `zero_is_no_pause`, a
+    /// pause of 0 ms runs the checks once and neither records nor sleeps.
+    std::optional<PauseStop> pauseUnderPolicy(uint64_t ms, const Retry & policy, PauseAfter after, void (*record)(),
+                                              bool zero_is_no_pause = false);
     /// `pauseUnderPolicy` reported as a give-up. A value means the call ended; nullopt means
     /// `decide` may run again.
     std::optional<GaveUp> pauseBetweenDecisions(uint64_t ms, WriteState & state, const Retry & policy, PauseAfter after,
-                                                void (*record)() = detail::recordReissue);
+                                                void (*record)() = detail::recordReissue, bool zero_is_no_pause = false);
     /// The read-modify-write loops' step after a lost decision: the decision cap, else the pause before the next
     /// decision. A value means the call ended.
     std::optional<WriteResult> pauseAfterConflict(uint32_t decisions, WriteState & state, const Retry & policy);
+    /// The loop behind `readModifyWrite` (`Seen = Object`, GET) and `readModifyWriteOnPresence` (`Seen = Meta`, HEAD).
+    template <typename Seen>
+    WriteResult readModifyWriteImpl(const String & key, const std::function<std::optional<String>(const std::optional<Seen> &)> & decide,
+                                    const Retry & policy);
+    /// How the read-modify-write loops' write of decision number `decisions` answers a clean refusal.
+    static OnCleanRefusal onCleanRefusalBefore(uint32_t decisions, const Retry & policy);
     /// The caller may send another attempt.
     struct ResumeAfterPause {};
     /// A query stopped in the pause and vetoes the next attempt; the pause also set `state.observed_stop`.
@@ -618,15 +637,15 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         /// Not before the first attempt: a healthy read is never refused, as on a plain S3 disk.
         if (attempt_no > 1)
             throwIfBackgroundStopped();
-        const uint64_t reservation = reservedFor(0, 1);
-        switch (gate(reservation))
+        if (const std::optional<ReadStop> refused = refusedReadAttempt(bound))
         {
-            case Gate::FenceLost: giveUpReadFenceLost(verb, subject, "before the request");
-            case Gate::NoBudget:  giveUpReadNoBudget(verb, subject, "for one more request");
-            case Gate::Ok: break;
+            switch (*refused)
+            {
+                case ReadStop::FenceLost:       giveUpReadFenceLost(verb, subject, "before the request");
+                case ReadStop::NoBudgetLease:   giveUpReadNoBudget(verb, subject, "for one more request");
+                case ReadStop::PolicyExhausted: giveUpReadDeadline(verb, subject, source, attempt_no - 1);
+            }
         }
-        if (!fits(reservation, bound))
-            giveUpReadDeadline(verb, subject, source, attempt_no - 1);
 
         if (policy.attempt_spacing_ms)
             attempt_started_ms = owner.now_ms();

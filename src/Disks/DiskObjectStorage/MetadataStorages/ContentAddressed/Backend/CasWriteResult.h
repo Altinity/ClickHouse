@@ -49,8 +49,8 @@ struct Declined  { Observation seen; };
 /// carry: an operator's attempt counters sum over ALL the endings of a write, and losing the key is
 /// one an operator wants counted rather than dropped. `any_ambiguous` is true when an attempt of the
 /// inner write ended without proof of whether it applied before the resolve read settled the race: a
-/// caller outside the engine paces such a conflict on the growing schedule, as the engine's own
-/// loops do, and a clean lost race on the flat one. `attempts_sent` cannot stand in for it: a
+/// caller outside the engine paces such a conflict on the fault schedule (`Retry::backoff`), as the
+/// engine's own loops do, and a clean lost race on `Retry::conflictBackoff`. `attempts_sent` cannot stand in for it: a
 /// throttled first attempt whose resolve read finds the key moved is one attempt, ambiguous.
 /// `observed_stop` is true when an operation of the call failed and saw its query stopped: a loop takes the
 /// conflict as the answer and starts no further decision.
