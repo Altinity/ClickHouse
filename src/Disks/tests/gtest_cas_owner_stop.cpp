@@ -1469,6 +1469,14 @@ ConflictPauseRun runConflictPause(const ConflictPauseArm & arm, PauseOwner who)
     return run;
 }
 
+/// Decisions before the stopping pause: one per lost race, plus the first lost race, which is retried at once
+/// without a pause, plus, for the catalog, the first decision on the lane's cached catalog, whose loss is retried at
+/// once on its resolve read.
+int decisionsBeforeStop(const ConflictPauseArm & arm)
+{
+    return (arm.slow ? 3 : 1) + 1 + (arm.loop == DecisionLoop::Catalog ? 1 : 0);
+}
+
 }
 
 /// A stop during the pause after a lost race ends the loop: no decision and no write after it.
@@ -1477,7 +1485,7 @@ TEST_P(CASOwnerStopLoop, StopDuringConflictPauseSkipsNextDecision)
     const ConflictPauseArm arm = GetParam();
     const ConflictPauseRun run = runConflictPause(arm, PauseOwner::Background);
     EXPECT_EQ(codeOf(run.error), ErrorCodes::ABORTED);
-    EXPECT_EQ(run.decisions_at_stop, arm.slow ? 3 : 1) << "one pause after each lost race";
+    EXPECT_EQ(run.decisions_at_stop, decisionsBeforeStop(arm)) << "one pause after each lost race";
     EXPECT_EQ(run.decisions, run.decisions_at_stop) << "no decision after the stop";
     EXPECT_EQ(run.writes, run.writes_at_stop) << "no write after the stop";
 }
@@ -1491,7 +1499,7 @@ TEST_P(CASOwnerStopLoop, KilledQueryDecidesAgainAfterConflictPause)
     EXPECT_EQ(codeOf(run.error), 0) << messageOf(run.error);
     if (run.result)
         EXPECT_TRUE(std::holds_alternative<Committed>(*run.result));
-    EXPECT_EQ(run.decisions_at_stop, arm.slow ? 3 : 1) << "one pause after each lost race";
+    EXPECT_EQ(run.decisions_at_stop, decisionsBeforeStop(arm)) << "one pause after each lost race";
     EXPECT_EQ(run.decisions, run.decisions_at_stop + 1) << "one decision after the kill";
     EXPECT_EQ(run.writes, run.writes_at_stop + 1) << "one write after the kill";
 }
@@ -1559,10 +1567,14 @@ enum class UnresolvedStop : uint8_t
     /// Another server admits the namespace during the redecide pause; the owner stops between the check
     /// before `decide` and the marker that `decide` then throws.
     DecisionMarkerWhileStopping,
-    /// The second decision's write is refused with 412, and the query is killed in the read that settles the refusal.
+    /// The second decision's write is refused with 412, and the query is killed in the first read after that refusal:
+    /// the next submission's base read, as a retried refusal is not settled.
     KillSettlingSecondWrite,
-    /// As `KillSettlingSecondWrite`, but every write after the lost one is refused and the kill comes in the read
-    /// that settles the last submission the cap allows.
+    /// As `KillSettlingSecondWrite`, but every write after the lost one is refused and the kill comes in the base read
+    /// of the last submission the cap allows.
+    KillReadingForLastAllowedWrite,
+    /// As `KillReadingForLastAllowedWrite`, but the kill comes in the read that settles the last allowed write: no
+    /// submission follows that write, so its refusal is settled.
     KillSettlingLastAllowedWrite,
     /// The second decision's write is refused as `READONLY` by the store while the owner stops, so the engine returns
     /// that refusal.
@@ -1602,7 +1614,7 @@ UnresolvedCreateOutcome runUnresolvedCreate(std::optional<UnresolvedStop> stop_a
         }
         std::optional<CasKillableQuery> query;
         if (stop_at == UnresolvedStop::UnrecordedClientVerdict || stop_at == UnresolvedStop::KillSettlingSecondWrite
-            || stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
+            || stop_at == UnresolvedStop::KillReadingForLastAllowedWrite || stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
             query.emplace(getContext().context);
         BackendPtr backend = query ? BackendPtr(std::make_shared<CasClientLikeBackend>(inner)) : BackendPtr(inner);
 
@@ -1704,9 +1716,11 @@ UnresolvedCreateOutcome runUnresolvedCreate(std::optional<UnresolvedStop> stop_a
                 query->kill();
                 throw Poco::TimeoutException("ReadAfterWriteHookBackend: the settling read timed out");
             }
-            if (stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
+            if (stop_at == UnresolvedStop::KillReadingForLastAllowedWrite || stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
             {
-                if (inner->writesSinceArm() == kCasMaxDecisions)
+                const uint64_t kill_after_write
+                    = stop_at == UnresolvedStop::KillSettlingLastAllowedWrite ? kCasMaxDecisions : kCasMaxDecisions - 1;
+                if (inner->writesSinceArm() == kill_after_write)
                 {
                     query->kill();
                     throw Poco::TimeoutException("ReadAfterWriteHookBackend: the settling read timed out");
@@ -1719,7 +1733,8 @@ UnresolvedCreateOutcome runUnresolvedCreate(std::optional<UnresolvedStop> stop_a
         auto op = requests.admit();
         inner->arm();
         inner->injectAmbiguousWrite(key);
-        if (stop_at == UnresolvedStop::KillSettlingSecondWrite || stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
+        if (stop_at == UnresolvedStop::KillSettlingSecondWrite || stop_at == UnresolvedStop::KillReadingForLastAllowedWrite
+            || stop_at == UnresolvedStop::KillSettlingLastAllowedWrite)
             inner->refuseNextWrite(key);
         if (stop_at == UnresolvedStop::RefusedSecondWriteWhileStopping)
             inner->onBeforeWrite(key, [&]
@@ -1818,11 +1833,13 @@ TEST(CASOwnerStop, StoppedNamespaceCreateKeepsUnresolvedExit)
     }
 }
 
-/// A refused write whose settling read fails after a kill does not answer the first write, whose outcome is still
-/// unknown: the call keeps the unresolved exit and sends nothing more, also at the last submission the cap allows.
+/// A refused write followed by a read that fails after a kill does not answer the first write, whose outcome is still
+/// unknown: the call keeps the unresolved exit and sends nothing more, also in the last submission the cap allows,
+/// whether the kill comes in that submission's read or in the read that settles its refused write.
 TEST(CASOwnerStop, ObservedStopConflictKeepsAnEarlierUnresolvedExit)
 {
     for (const auto & [stop_at, writes] : {std::pair{UnresolvedStop::KillSettlingSecondWrite, uint64_t{2}},
+                                           std::pair{UnresolvedStop::KillReadingForLastAllowedWrite, uint64_t{kCasMaxDecisions - 1}},
                                            std::pair{UnresolvedStop::KillSettlingLastAllowedWrite, uint64_t{kCasMaxDecisions}}})
     {
         SCOPED_TRACE(writes);
@@ -1859,8 +1876,9 @@ TEST(CASOwnerStop, LocalFaultAfterAnUnresolvedWriteIsNotReplaced)
     EXPECT_EQ(out.catalog_writes, 2u) << "the lost write and the failed one, nothing after";
 }
 
-/// A catalog update that lost a race to another server stops before its next submission starts when the
-/// owner stops in the conflict pause. A lost fence the settling read observed stays the typed fence outcome.
+/// A catalog update that lost two races to another server stops before its next submission starts when the owner
+/// stops in the conflict pause after the second; the first is retried at once. A fence lost while the first write
+/// is in flight stays the typed fence outcome.
 TEST(CASOwnerStop, ConflictedCatalogUpdateStopsAtTheNextSubmission)
 {
     for (const bool fence_lost_in_flight : {false, true})
@@ -1897,11 +1915,12 @@ TEST(CASOwnerStop, ConflictedCatalogUpdateStopsAtTheNextSubmission)
             int competitor_writes = 0;
             backend->onBeforeWrite(key, [&]
             {
-                if (competing || competitor_writes > 0)
+                if (competing || competitor_writes > 1)
                     return;
                 competing = true;
                 CasRefCatalog::casAdmitEntry(competitor, layout, 1,
-                    CatalogEntry{.ns = RootNamespace{"b"}, .state = NsState::Live, .incarnation = UInt128(2)});
+                    CatalogEntry{.ns = RootNamespace{competitor_writes == 0 ? "b" : "c"}, .state = NsState::Live,
+                                 .incarnation = UInt128(2 + competitor_writes)});
                 ++competitor_writes;
                 competing = false;
                 if (fence_lost_in_flight)
@@ -1923,7 +1942,8 @@ TEST(CASOwnerStop, ConflictedCatalogUpdateStopsAtTheNextSubmission)
             {
                 error = std::current_exception();
             }
-            EXPECT_EQ(backend->writeCount(key) - writes_before, 2u) << "the competitor's write and one of the caller's";
+            EXPECT_EQ(backend->writeCount(key) - writes_before, fence_lost_in_flight ? 2u : 4u)
+                << "each of the caller's writes and the competitor's write before it";
             if (fence_lost_in_flight)
             {
                 EXPECT_EQ(codeOf(error), 0) << messageOf(error);
@@ -1938,7 +1958,7 @@ TEST(CASOwnerStop, ConflictedCatalogUpdateStopsAtTheNextSubmission)
                 EXPECT_EQ(backend->getCount(key), reads_at_pause) << "no base read for a next submission";
             }
             const auto snap = CasRefCatalog::read(competitor, layout);
-            ASSERT_EQ(snap.catalog.entries.size(), 2u);
+            ASSERT_EQ(snap.catalog.entries.size(), fence_lost_in_flight ? 2u : 3u);
             EXPECT_EQ(snap.catalog.entries.at(0).state, NsState::Live) << "the next submission never started";
         });
     }
@@ -1951,13 +1971,13 @@ namespace
 class ReplacedBeforeFirstRemoveBackend final : public CountingBackend
 {
 public:
-    explicit ReplacedBeforeFirstRemoveBackend(String key_) : key(std::move(key_)) {}
+    explicit ReplacedBeforeFirstRemoveBackend(String key_, int replacements_ = 1) : key(std::move(key_)), replacements(replacements_) {}
 
     std::function<void()> on_replaced;
 
     RawRemoval remove(const String & k, const String & expected_value, TransportAccess & access) override
     {
-        if (k == key && !replaced.exchange(true))
+        if (k == key && replaced.fetch_add(1) < replacements)
         {
             const auto current = InMemoryBackend::head(k, access);
             (void)InMemoryBackend::write(k, "replaced", current->value, access);
@@ -1969,13 +1989,15 @@ public:
 
 private:
     const String key;
-    std::atomic<bool> replaced{false};
+    const int replacements;
+    std::atomic<int> replaced{0};
 };
 
 }
 
-/// A stop around the reissue pause of `removeCurrent` sends no second HEAD: before the pause the call
-/// ends without sleeping, during the pause it ends before the HEAD.
+/// A stop around the reissue pause of `removeCurrent` sends no further HEAD. A stop at the first mismatch ends the
+/// call at the checks of its zero pause, without sleeping; a stop during the pause after the second mismatch ends it
+/// before the third HEAD.
 TEST(CASOwnerStop, StopAroundRemoveReissuePauseSendsNoHead)
 {
     for (const bool during_sleep : {false, true})
@@ -1983,7 +2005,7 @@ TEST(CASOwnerStop, StopAroundRemoveReissuePauseSendsNoHead)
         SCOPED_TRACE(during_sleep ? "stop during the sleep" : "stop before the pause");
         onThread(false, [&]
         {
-            auto backend = std::make_shared<ReplacedBeforeFirstRemoveBackend>("k");
+            auto backend = std::make_shared<ReplacedBeforeFirstRemoveBackend>("k", /*replacements=*/2);
             std::atomic<bool> stop{false};
             int sleeps = 0;
             CasRequests requests(backend, Fence::open(), {}, [&](uint64_t)
@@ -2008,8 +2030,8 @@ TEST(CASOwnerStop, StopAroundRemoveReissuePauseSendsNoHead)
                 code = codeOf(std::current_exception());
             }
             EXPECT_EQ(code, ErrorCodes::ABORTED);
-            EXPECT_EQ(backend->headCount("k"), 1u);
-            EXPECT_EQ(backend->deleteCount("k"), 1u);
+            EXPECT_EQ(backend->headCount("k"), during_sleep ? 2u : 1u);
+            EXPECT_EQ(backend->deleteCount("k"), during_sleep ? 2u : 1u);
             EXPECT_EQ(sleeps, during_sleep ? 1 : 0);
         });
     }
@@ -2750,8 +2772,9 @@ TEST(CASOwnerStop, ConflictThenStopUnderStandardRmwDecidesOnce)
     }
 }
 
-/// A clean 412 whose settling read fails after the kill: a one-shot caller gets the `Conflict`, and a loop starts no
-/// reread, decision or write after it.
+/// A clean 412 followed by a read that fails after the kill. A one-shot caller settles the 412 with that read and gets
+/// the `Conflict`. A loop does not settle it: the failed read is the one after its pause, which ends the call with the
+/// read's error. Neither starts a decision or a write after it.
 TEST(CASOwnerStop, KilledQuerysConflictWithFailedSettlementEndsTheLoop)
 {
     for (const bool once : {true, false})
@@ -2796,14 +2819,22 @@ TEST(CASOwnerStop, KilledQuerysConflictWithFailedSettlementEndsTheLoop)
             writes = inner->writes.load();
             reads = inner->reads.load();
         });
-        EXPECT_EQ(code, 0) << "the conflict is the answer, not the kill";
-        ASSERT_TRUE(written.has_value());
-        const auto * conflict = std::get_if<Conflict>(&*written);
-        ASSERT_NE(conflict, nullptr) << "index " << written->index();
-        EXPECT_TRUE(std::holds_alternative<NotObserved>(conflict->seen));
+        if (once)
+        {
+            EXPECT_EQ(code, 0) << "the conflict is the answer, not the kill";
+            ASSERT_TRUE(written.has_value());
+            const auto * conflict = std::get_if<Conflict>(&*written);
+            ASSERT_NE(conflict, nullptr) << "index " << written->index();
+            EXPECT_TRUE(std::holds_alternative<NotObserved>(conflict->seen));
+        }
+        else
+        {
+            EXPECT_EQ(code, ErrorCodes::QUERY_WAS_CANCELLED) << "the failed read after the pause ends the call with the kill";
+            EXPECT_FALSE(written.has_value());
+        }
         EXPECT_EQ(decisions, 1);
         EXPECT_EQ(writes, 1) << "the refused PUT only";
-        EXPECT_EQ(reads, 2) << "the base read and the failed settling read, no reread";
+        EXPECT_EQ(reads, 2) << "the base read and the one failed read after the refusal, not retried";
     }
 }
 
@@ -3038,7 +3069,84 @@ TEST(CASOwnerStop, SettledConflictAfterAFaultPermitsTheNextDecisionAfterAKill)
     EXPECT_EQ(pauses, 2);
     EXPECT_EQ(decisions, 2);
     EXPECT_EQ(writes, 3) << "the timed-out PUT, its refused resend, and the PUT of the next decision";
-    EXPECT_EQ(reads, 3) << "the base read and two settling reads";
+    EXPECT_EQ(reads, 4) << "the base read, two settling reads and the read after the conflict pause";
+}
+
+/// A clean 412 inside a retrying read-modify-write is not settled: the read after the pause replaces it. The first one
+/// is retried at once; a query killed during the pause after the second is consulted when the read after that pause
+/// fails, before it is retried, and nothing is written after.
+TEST(CASOwnerStop, AKillDuringTheConflictPauseIsObservedByTheFailedReadAfterIt)
+{
+    std::optional<WriteResult> written;
+    int code = 0;
+    int writes = 0;
+    int reads_after_write = 0;
+    int pauses = 0;
+    int pauses_at_first_read_after_write = -1;
+    bool settled_before_pause = false;
+    onThread(true, [&]
+    {
+        CasKillableQuery query(getContext().context);
+        auto inner = std::make_shared<FirstWriteFailsBackend>(STOPPABLE_KEY);
+        inner->failure = nullptr;
+        CasRequests requests(std::make_shared<CasClientLikeBackend>(inner), Fence::open(), {}, [&](uint64_t)
+        {
+            if (++pauses == 1)
+                query.kill();
+        }, nullptr, kDefaultRequestWindowMs);
+        auto competitor_requests = openRequestsForTest(inner);
+        auto competitor = competitor_requests.admit();
+        const auto created = competitor.create(STOPPABLE_KEY, "v0", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(created));
+        const Etag base = std::get<Committed>(created).etag;
+        inner->writes = 0;
+        bool competing = false;
+        int moves = 0;
+        Etag competitor_etag = base;
+        /// The competitor wins the first two races: the first loss is retried at once, the second one pauses.
+        inner->on_write = [&]
+        {
+            if (competing || moves >= 2)
+                return;
+            competing = true;
+            const auto moved = competitor.replace(STOPPABLE_KEY, "competitor" + std::to_string(moves), competitor_etag, Retry::once());
+            ASSERT_TRUE(std::holds_alternative<Committed>(moved));
+            competitor_etag = std::get<Committed>(moved).etag;
+            ++moves;
+            competing = false;
+        };
+        inner->on_read = [&]
+        {
+            if (inner->writes.load() - moves >= 2 && pauses == 0)
+                settled_before_pause = true;
+            if (pauses == 0)
+                return;
+            if (++reads_after_write == 1)
+                pauses_at_first_read_after_write = pauses;
+            throw Poco::TimeoutException("FirstWriteFailsBackend: the read timed out");
+        };
+        auto op = requests.admit();
+        try
+        {
+            written = op.readModifyWrite(STOPPABLE_KEY, [&](const std::optional<DB::Cas::Object> & current)
+            {
+                return std::optional<String>(current->bytes + "+");
+            }, Retry::standard());
+        }
+        catch (...)
+        {
+            code = codeOf(std::current_exception());
+        }
+        /// The competitor's writes pass through the same backend.
+        writes = inner->writes.load() - moves;
+    });
+    EXPECT_FALSE(written.has_value()) << "index " << (written ? written->index() : 0);
+    EXPECT_EQ(code, ErrorCodes::QUERY_WAS_CANCELLED) << "the failed read ends the call with the kill";
+    EXPECT_EQ(writes, 2) << "no write after the kill";
+    EXPECT_FALSE(settled_before_pause) << "the second 412 was not settled before the pause";
+    EXPECT_EQ(pauses_at_first_read_after_write, 1);
+    EXPECT_EQ(reads_after_write, 1) << "the stop is consulted after the failed read, which is not retried";
+    EXPECT_EQ(pauses, 1);
 }
 
 /// A genuine refused precondition stays a conflict when the owner stops while its settling read is in

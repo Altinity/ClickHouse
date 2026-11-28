@@ -715,16 +715,89 @@ private:
 
 }
 
+namespace
+{
+
+/// After this server's own birth of `ns` lands, rewrites the catalog under three successive reads: the confirming read
+/// sees a foreign `Creating` row, the reconciliation's read sees that row moved on, and the next read sees it `Live`.
+class ReplacedAfterBirthBackend final : public InMemoryBackend
+{
+public:
+    ReplacedAfterBirthBackend(String catalog_key_, RootNamespace ns_)
+        : catalog_key(std::move(catalog_key_)), ns(std::move(ns_))
+    {
+    }
+
+    int stage = 0;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == catalog_key && stage < 3)
+            rewrite(access);
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    void rewrite(DB::Cas::TransportAccess & access)
+    {
+        const std::optional<Raw> got = InMemoryBackend::read(catalog_key, access);
+        if (!got)
+            return;
+        RefCatalog catalog = decodeRefCatalog(got->bytes);
+        for (CatalogEntry & entry : catalog.entries)
+        {
+            if (entry.ns != ns)
+                continue;
+            if (stage == 0 && entry.state == NsState::Live)
+            {
+                entry.state = NsState::Creating;
+                entry.creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1};
+            }
+            else if (stage == 1)
+                ++entry.creator->fence_generation;
+            else if (stage == 2)
+            {
+                entry.state = NsState::Live;
+                entry.creator.reset();
+            }
+            else
+                return;
+            ++stage;
+            (void)InMemoryBackend::write(catalog_key, encodeRefCatalog(catalog), got->value, access);
+            return;
+        }
+    }
+
+    const String catalog_key;
+    const RootNamespace ns;
+};
+
+}
+
+/// A birth that lands and is then replaced before its confirming read is followed by one collision, the first of this
+/// call, so it is retried at once, whatever round it falls in.
+TEST(CASRefCatalogBirthWiring, TheFirstCollisionAfterAConfirmedBirthIsRetriedAtOnce)
+{
+    const RootNamespace ns{"replaced_after_birth"};
+    auto backend = std::make_shared<ReplacedAfterBirthBackend>(Layout{"p"}.refCatalogKey(), ns);
+    auto store = openPoolForBirthTest(backend);
+    std::vector<uint64_t> pauses;
+    store->setCasRetrySleepForTest([&](uint64_t ms) { pauses.push_back(ms); });
+
+    (void)store->namespaceLife(ns);
+
+    EXPECT_EQ(backend->stage, 3) << "premise: the row was replaced, moved on and completed";
+    EXPECT_TRUE(pauses.empty()) << "a pause of " << (pauses.empty() ? 0 : pauses.front()) << " ms after the first collision";
+}
+
 /// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
-/// Every re-read a competing actor forces is paced, and the loop ends after its 32 rounds. The pause
-/// before the last round carries the clock past a whole window, so the last round is sent only if each
-/// of its requests binds its own window.
+/// Every re-read a competing actor forces is paced by the count of collisions, the first collision is retried at once,
+/// the last is not paced because no re-read follows it, and the loop ends after its 32 rounds. The pause before the last
+/// round carries the clock past a whole window, so the last round is sent only if each of its requests
+/// binds its own window.
 TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsAfterItsRounds)
 {
     constexpr size_t kRounds = 32;
-    /// One attempt's reservation on a disk with default settings, and the longest `Retry::backoff` draw.
-    constexpr uint64_t kEnvelopeMs = 7'000;
-    constexpr uint64_t kMaxBackoffMs = 5'000;
 
     auto backend = std::make_shared<ChurningCatalogBackend>(Layout{"p"}.refCatalogKey());
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -743,13 +816,15 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsAft
 
     auto now_ms = std::make_shared<uint64_t>(0);
     size_t pauses = 0;
+    std::vector<uint64_t> pause_ms;
     std::optional<uint64_t> last_round_started_ms;
     size_t reads_before_last_round = 0;
     store->setCasRequestNowFnForTest([now_ms] { return *now_ms; });
     store->setCasRetrySleepForTest([&, now_ms](uint64_t ms)
     {
         *now_ms += ms;
-        if (++pauses == kRounds - 1)
+        pause_ms.push_back(ms);
+        if (++pauses == kRounds - 2)
         {
             *now_ms += DB::Cas::kDefaultRequestWindowMs;
             last_round_started_ms = *now_ms;
@@ -761,8 +836,10 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsAft
     expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, fmt::format("after {} attempts", kRounds),
         [&] { store->namespaceLife(ns); });
 
-    EXPECT_GE(pauses, kRounds - 1) << "each re-read a lost round forced is paced";
+    EXPECT_EQ(pauses, kRounds - 2) << "each re-read a lost round forced is paced, but the first and the last round are not";
+    for (size_t i = 0; i < pause_ms.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(pause_ms[i], static_cast<uint32_t>(i + 2)));
     ASSERT_TRUE(last_round_started_ms.has_value());
     EXPECT_EQ(backend->churned_reads - reads_before_last_round, 2u) << "the last round's loop read and its decision read";
-    EXPECT_LE(*now_ms - *last_round_started_ms, kEnvelopeMs + kMaxBackoffMs);
+    EXPECT_EQ(*now_ms, *last_round_started_ms) << "no pause after the last round";
 }

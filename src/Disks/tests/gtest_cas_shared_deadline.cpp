@@ -904,7 +904,7 @@ TEST(CASSharedDeadline, ReadModifyWriteSucceedsOnTheHundredthDecision)
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result)) << outcomeOf(result);
     EXPECT_EQ(decisions, kCasMaxDecisions);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
     EXPECT_EQ(rival.moves, kCasMaxDecisions - 1);
     EXPECT_EQ(std::get<Committed>(result).attempts_sent, kCasMaxDecisions);
 }
@@ -930,10 +930,12 @@ TEST(CASSharedDeadline, ReadModifyWriteEndsAfterAHundredDecisions)
     EXPECT_EQ(gave_up->why, GaveUp::Why::Attempts);
     EXPECT_EQ(gave_up->attempts_sent, kCasMaxDecisions);
     EXPECT_EQ(decisions, kCasMaxDecisions);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
-    /// Every write was settled: the plane's own reads are the first one and one per write.
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
+    /// Every loss but the last is followed by a read, after a pause from the second, and only the last refusal, which
+    /// no decision follows, is settled: the plane's own reads are the first one, one per later decision and the last
+    /// settlement.
     EXPECT_EQ(rival.moves, kCasMaxDecisions);
-    EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Read, "k") - rival.moves, 1 + kCasMaxDecisions);
+    EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Read, "k") - rival.moves, 1 + (kCasMaxDecisions - 1) + 1);
     const auto * seen = std::get_if<Object>(&gave_up->last_seen);
     ASSERT_NE(seen, nullptr);
     EXPECT_EQ(seen->bytes, plane.bytesOf("k"));
@@ -954,7 +956,7 @@ TEST(CASSharedDeadline, RemoveCurrentSucceedsOnTheHundredthDecision)
     EXPECT_EQ(removed, std::optional<Removal>(Removal::Removed)) << "error: " << orNone(failure);
     EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Head, "k"), kCasMaxDecisions);
     EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Remove, "k"), kCasMaxDecisions);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
 }
 
 TEST(CASSharedDeadline, RemoveCurrentEndsAfterAHundredDecisions)
@@ -970,7 +972,7 @@ TEST(CASSharedDeadline, RemoveCurrentEndsAfterAHundredDecisions)
         [&] { (void)plane.op.removeCurrent("k", Retry::standard()); });
     EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Head, "k"), kCasMaxDecisions);
     EXPECT_EQ(sentSince(*plane.backend, started_ms, Verb::Remove, "k"), kCasMaxDecisions);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
     EXPECT_NE(plane.bytesOf("k"), "<absent>");
 }
 
@@ -1042,8 +1044,10 @@ TEST(CASSharedDeadline, RemoveCurrentReportsAFenceTripDuringItsLastDeleteNotTheC
     run(TrippableFence::Trip::LeaseExpiry, "no lease budget");
 }
 
-/// The fence trips while the read that settles the hundredth refused submission is in flight.
-TEST(CASSharedDeadline, CasUpdateReportsAFenceTripDuringItsLastSettlementNotTheCount)
+/// The fence trips while the hundredth submission's write is in flight, and that write is refused: the call reports
+/// the lost fence, not the count. The first submission writes twice, on the lane's cached catalog and then on its
+/// resolve read, so the hundredth submission sends write `kCasMaxDecisions + 1`.
+TEST(CASSharedDeadline, CasUpdateReportsAFenceTripDuringItsLastWriteNotTheCount)
 {
     TrippableFence mount;
     CasHotKeys lane(16ULL << 20);
@@ -1054,8 +1058,9 @@ TEST(CASSharedDeadline, CasUpdateReportsAFenceTripDuringItsLastSettlementNotTheC
     CasRefCatalog::casAdmitEntry(plane.op, layout, 1, liveEntry("a", 1));
     CatalogRival rival(plane, layout, 10 * kCasMaxDecisions);
     bool tripped = false;
+    /// The rival's own read, inside the move that refuses write `kCasMaxDecisions + 1`.
     plane.backend->armWith(Verb::Read,
-        [&](const String & k) { return k == key && !rival.inside && rival.moves == kCasMaxDecisions; },
+        [&](const String & k) { return k == key && rival.inside && rival.moves == kCasMaxDecisions; },
         [&]
         {
             mount.trip(TrippableFence::Trip::Rearm);
@@ -1067,12 +1072,45 @@ TEST(CASSharedDeadline, CasUpdateReportsAFenceTripDuringItsLastSettlementNotTheC
         {
             CasRefCatalog::casUpdate(plane.op, layout, [](const RefCatalog & current) { return current; });
         });
-    EXPECT_TRUE(tripped) << "the hundredth settling read was never sent";
-    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions);
+    EXPECT_TRUE(tripped) << "the hundredth submission's write was never sent";
+    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions + 1);
+}
+
+/// The fence trips while the read that settles the hundredth submission's refused write is in flight: no
+/// submission follows it, so that write is settled, and the call reports the lost fence, not the count.
+TEST(CASSharedDeadline, CasUpdateReportsAFenceTripDuringItsLastSettlementNotTheCount)
+{
+    TrippableFence mount;
+    CasHotKeys lane(16ULL << 20);
+    Plane plane(&lane, mount.fence());
+    const Layout layout("p");
+    const String key = layout.refCatalogKey();
+    CasRefCatalog::initializeEmptyForNewPool(plane.op, layout);
+    CasRefCatalog::casAdmitEntry(plane.op, layout, 1, liveEntry("a", 1));
+    CatalogRival rival(plane, layout, 10 * kCasMaxDecisions);
+    bool tripped = false;
+    /// The plane's own read after write `kCasMaxDecisions + 1`, the hundredth submission's.
+    plane.backend->armWith(Verb::Read,
+        [&](const String & k) { return k == key && !rival.inside && rival.moves == kCasMaxDecisions + 1; },
+        [&]
+        {
+            mount.trip(TrippableFence::Trip::Rearm);
+            tripped = true;
+        });
+    const size_t journal_from = plane.backend->seenCount();
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "mount fence tripped", [&]
+        {
+            CasRefCatalog::casUpdate(plane.op, layout, [](const RefCatalog & current) { return current; });
+        });
+    EXPECT_TRUE(tripped) << "the hundredth submission's settling read was never sent";
+    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions + 1);
 }
 
 /// `casUpdate` counts submissions to the hot-key lane: one submission can run its `decide` twice on a
-/// cached catalog, so the tests count the plane's writes of the catalog, not the calls of `mutate`.
+/// cached catalog, so the tests count the plane's writes of the catalog, not the calls of `mutate`. The
+/// first submission starts from the cached catalog, loses, and writes again at once on the resolve read,
+/// so `kCasMaxDecisions` submissions send one write more than that.
 TEST(CASSharedDeadline, CasUpdateSucceedsOnTheHundredthSubmission)
 {
     CasHotKeys lane(16ULL << 20);
@@ -1081,7 +1119,7 @@ TEST(CASSharedDeadline, CasUpdateSucceedsOnTheHundredthSubmission)
     const String key = layout.refCatalogKey();
     CasRefCatalog::initializeEmptyForNewPool(plane.op, layout);
     CasRefCatalog::casAdmitEntry(plane.op, layout, 1, liveEntry("a", 1));
-    CatalogRival rival(plane, layout, kCasMaxDecisions - 1);
+    CatalogRival rival(plane, layout, kCasMaxDecisions);
     size_t pauses = 0;
     plane.countPauses(pauses);
     const size_t journal_from = plane.backend->seenCount();
@@ -1098,16 +1136,16 @@ TEST(CASSharedDeadline, CasUpdateSucceedsOnTheHundredthSubmission)
     });
 
     EXPECT_FALSE(failure.has_value()) << orNone(failure);
-    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions);
-    EXPECT_EQ(rival.moves, kCasMaxDecisions - 1);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
+    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions + 1);
+    EXPECT_EQ(rival.moves, kCasMaxDecisions);
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
     const RefCatalog durable = CasRefCatalog::read(plane.op, layout).catalog;
     EXPECT_EQ(durable.entries.size(), 1 + rival.moves);
     EXPECT_EQ(durable.entries.front().state, NsState::Removing);
 }
 
-/// Every write meets a moved precondition. The hundredth refusal ends the call without a pause after
-/// it, and the error names a clean conflict.
+/// Every write meets a moved precondition. The hundredth refused submission ends the call without a
+/// pause after it, and the error names a clean conflict. The first submission writes twice.
 TEST(CASSharedDeadline, CasUpdateEndsAfterAHundredSubmissionsOnACleanConflict)
 {
     CasHotKeys lane(16ULL << 20);
@@ -1127,9 +1165,9 @@ TEST(CASSharedDeadline, CasUpdateEndsAfterAHundredSubmissionsOnACleanConflict)
         {
             CasRefCatalog::casUpdate(plane.op, layout, [](const RefCatalog & current) { return current; });
         });
-    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions);
-    EXPECT_EQ(rival.moves, kCasMaxDecisions);
-    EXPECT_EQ(pauses, kCasMaxDecisions - 1);
+    EXPECT_EQ(plane.backend->seenSince(journal_from, Verb::Write, key) - rival.moves, kCasMaxDecisions + 1);
+    EXPECT_EQ(rival.moves, kCasMaxDecisions + 1);
+    EXPECT_EQ(pauses, kCasMaxDecisions - 2) << "the first lost race is retried at once";
 }
 
 /// Namespace-create step 1 decides again after a write whose fate is unknown. When the hundredth

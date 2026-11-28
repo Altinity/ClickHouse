@@ -2405,6 +2405,49 @@ private:
     uint64_t publish_total = 0;
 };
 
+/// Whether `ms` is a pause after the `n`-th clean lost race of one call: `base <= ms <= base + base / 4`, with
+/// `base = min(750, 40 * (n - 1))`, so the first is exactly 0.
+inline ::testing::AssertionResult isConflictPause(uint64_t ms, uint32_t n)
+{
+    const uint64_t base = std::min<uint64_t>(750, 40ull * (n - 1));
+    if (ms >= base && ms <= base + base / 4)
+        return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << ms << " ms is not the pause after clean loss " << n << ": expected ["
+                                         << base << ", " << base + base / 4 << "]";
+}
+
+/// The requests on `key` as one letter each (`R` read, `H` head, `W` write), with a mark labelled
+/// `pause` as `P`. Requests between a `rival{` mark and the next `}rival` mark are left out, so a test
+/// sees only its own caller's requests and where a competitor's commits fell among them.
+inline String renderOwnRequests(const CountingBackend & backend, const String & key)
+{
+    String out;
+    bool in_rival = false;
+    for (const JournalEntry & entry : backend.journal())
+    {
+        if (entry.verb == JournalVerb::Mark)
+        {
+            if (entry.detail == "rival{")
+                in_rival = true;
+            else if (entry.detail == "}rival")
+                in_rival = false;
+            else if (entry.detail == "pause" && !in_rival)
+                out += 'P';
+            continue;
+        }
+        if (in_rival || entry.keys != std::vector<String>{key})
+            continue;
+        switch (entry.verb)
+        {
+            case JournalVerb::Read: out += 'R'; break;
+            case JournalVerb::Head: out += 'H'; break;
+            case JournalVerb::Write: out += 'W'; break;
+            default: out += '?'; break;
+        }
+    }
+    return out;
+}
+
 /// Runs a hook once, on the first HEAD of one key after `armOnHead`, before that HEAD is served and with no
 /// backend lock held. A writer that commits there lands after the round's cut and before the redelete
 /// observes the blob.
