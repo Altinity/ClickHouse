@@ -75,6 +75,7 @@ namespace DataLakeStorageSetting
     extern const DataLakeStorageSettingsString storage_oauth_server_uri;
     extern const DataLakeStorageSettingsBool storage_oauth_server_use_request_body;
     extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
+    extern const DataLakeStorageSettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 struct FormatParserSharedResources;
@@ -481,9 +482,18 @@ public:
     {
         auto res = BaseStorageConfiguration::createArgsWithAccessData();
 
-        auto iceberg_metadata_file_path = (*settings)[DataLakeStorageSetting::iceberg_metadata_file_path];
+        /// The table's own settings that the table function on other nodes has to apply too.
+        SettingsChanges table_settings;
+        if (const auto & iceberg_metadata_file_path = (*settings)[DataLakeStorageSetting::iceberg_metadata_file_path];
+            iceberg_metadata_file_path.changed)
+            table_settings.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+        /// Only an enabled value is passed on, so a node of an older version is not sent a setting it may not know.
+        /// `StorageObjectStorageCluster` disables it in the query when the table has it disabled but the query enables it.
+        if (const auto & allow_aggregate_function_states = (*settings)[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
+            allow_aggregate_function_states.changed && allow_aggregate_function_states.value)
+            table_settings.setSetting("allow_aggregate_function_states_in_open_formats", true);
 
-        if (iceberg_metadata_file_path.changed)
+        if (!table_settings.empty())
         {
             auto * arguments = res->template as<ASTExpressionList>();
             if (!arguments)
@@ -496,7 +506,8 @@ public:
                 if (auto * settings_ast = arg->template as<ASTSetQuery>())
                 {
                     has_settings = true;
-                    settings_ast->changes.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+                    for (const auto & change : table_settings)
+                        settings_ast->changes.setSetting(change.name, change.value);
                     break;
                 }
             }
@@ -505,7 +516,7 @@ public:
             {
                 boost::intrusive_ptr<ASTSetQuery> settings_ast = make_intrusive<ASTSetQuery>();
                 settings_ast->is_standalone = false;
-                settings_ast->changes.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+                settings_ast->changes = std::move(table_settings);
                 arguments->children.push_back(settings_ast);
             }
         }

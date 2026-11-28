@@ -1,4 +1,7 @@
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/transformTypesRecursively.h>
+#include <Formats/ClickHouseTypeAnnotationUtils.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Context.h>
@@ -11,7 +14,6 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/JSON/Parser.h>
 
-#include <Common/StringUtils.h>
 #include <Common/randomSeed.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -150,99 +152,6 @@ bool checkValidSchemaEvolution(Poco::Dynamic::Var old_type, Poco::Dynamic::Var n
     return false;
 }
 
-
-String removeASCIIWhitespace(const String & s)
-{
-    String result;
-    result.reserve(s.size());
-    for (char c : s)
-    {
-        if (!isWhitespaceASCII(c))
-            result.push_back(c);
-    }
-    return result;
-}
-
-/// A missing key matches only a missing key.
-bool optionalBoolsEqual(const Poco::JSON::Object::Ptr & first, const Poco::JSON::Object::Ptr & second, const char * key)
-{
-    const bool first_has = first->has(key);
-    if (first_has != second->has(key))
-        return false;
-    return !first_has || first->getValue<bool>(key) == second->getValue<bool>(key);
-}
-
-/// Whether two Iceberg type descriptors denote the same type.
-/// Only the properties that define the type are compared. Field ids are ignored because
-/// `getIcebergType` allocates them from a running counter, so a previous attempt may have written
-/// the very same type with lower ids. Other keys (`doc`, defaults, the `required` that
-/// `getIcebergType` puts on a list) are ignored because other writers emit or omit them freely.
-bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type)
-{
-    if (old_type.isString() || new_type.isString())
-    {
-        if (!old_type.isString() || !new_type.isString())
-            return false;
-        /// Writers differ in spacing, e.g. `decimal(10,2)` and `decimal(10, 2)`.
-        return removeASCIIWhitespace(old_type.extract<String>()) == removeASCIIWhitespace(new_type.extract<String>());
-    }
-
-    if (old_type.type() != typeid(Poco::JSON::Object::Ptr) || new_type.type() != typeid(Poco::JSON::Object::Ptr))
-        return false;
-
-    auto old_object = old_type.extract<Poco::JSON::Object::Ptr>();
-    auto new_object = new_type.extract<Poco::JSON::Object::Ptr>();
-    if (!old_object || !new_object)
-        return false;
-
-    if (old_object->has("precision") || new_object->has("precision"))
-    {
-        return old_object->has("precision") && new_object->has("precision")
-            && old_object->getValue<Int32>("precision") == new_object->getValue<Int32>("precision")
-            && old_object->getValue<Int32>("scale") == new_object->getValue<Int32>("scale");
-    }
-
-    if (!old_object->has(Iceberg::f_type) || !new_object->has(Iceberg::f_type))
-        return false;
-    const auto kind = old_object->getValue<String>(Iceberg::f_type);
-    if (kind != new_object->getValue<String>(Iceberg::f_type))
-        return false;
-
-    if (kind == Iceberg::f_list)
-    {
-        return optionalBoolsEqual(old_object, new_object, Iceberg::f_element_required)
-            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_element), new_object->get(Iceberg::f_element));
-    }
-
-    if (kind == Iceberg::f_map)
-    {
-        return optionalBoolsEqual(old_object, new_object, Iceberg::f_value_required)
-            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_key), new_object->get(Iceberg::f_key))
-            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_value), new_object->get(Iceberg::f_value));
-    }
-
-    if (kind == Iceberg::f_struct)
-    {
-        auto old_fields = old_object->getArray(Iceberg::f_fields);
-        auto new_fields = new_object->getArray(Iceberg::f_fields);
-        if (!old_fields || !new_fields || old_fields->size() != new_fields->size())
-            return false;
-        for (UInt32 i = 0; i < old_fields->size(); ++i)
-        {
-            auto old_field = old_fields->getObject(i);
-            auto new_field = new_fields->getObject(i);
-            if (!old_field || !new_field
-                || old_field->getValue<String>(Iceberg::f_name) != new_field->getValue<String>(Iceberg::f_name)
-                || !optionalBoolsEqual(old_field, new_field, Iceberg::f_required)
-                || !icebergTypesEqualIgnoringIds(old_field->get(Iceberg::f_type), new_field->get(Iceberg::f_type)))
-                return false;
-        }
-        return true;
-    }
-
-    return false;
-}
-
 /// The Iceberg spec marks `snapshots`, `metadata-log` and `snapshot-log` as optional, so table
 /// metadata written by another engine may omit any of them - typically for a table that has never
 /// been written to. Return the array, creating an empty one when the field is absent, so that
@@ -267,6 +176,66 @@ Int32 getNextSchemaId(Poco::JSON::Object::Ptr metadata_object)
     for (UInt32 i = 0; i < schemas->size(); ++i)
         max_id = std::max(max_id, schemas->getObject(i)->getValue<Int32>(Iceberg::f_schema_id));
     return max_id + 1;
+}
+
+void collectFieldsById(const Poco::JSON::Array::Ptr & fields, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result);
+
+/// Collects the struct fields nested in Iceberg type `type` by their ids.
+void collectNestedFieldsById(const Poco::Dynamic::Var & type, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result)
+{
+    if (type.isString())
+        return;
+    const auto type_object = type.extract<Poco::JSON::Object::Ptr>();
+    const auto kind = type_object->getValue<String>(Iceberg::f_type);
+    if (kind == Iceberg::f_list)
+        collectNestedFieldsById(type_object->get(Iceberg::f_element), result);
+    else if (kind == Iceberg::f_map)
+    {
+        collectNestedFieldsById(type_object->get(Iceberg::f_key), result);
+        collectNestedFieldsById(type_object->get(Iceberg::f_value), result);
+    }
+    else if (kind == Iceberg::f_struct)
+        collectFieldsById(type_object->getArray(Iceberg::f_fields), result);
+}
+
+/// Collects `fields` and the struct fields nested in their types by their ids.
+void collectFieldsById(const Poco::JSON::Array::Ptr & fields, std::unordered_map<Int32, Poco::JSON::Object::Ptr> & result)
+{
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        const auto field = fields->getObject(i);
+        result.emplace(field->getValue<Int32>(Iceberg::f_id), field);
+        collectNestedFieldsById(field->get(Iceberg::f_type), result);
+    }
+}
+
+/// Appends `schema` as the current schema `schema_id`. Its fields keep the ClickHouse type annotations they had
+/// in the previous current schema, which need not be the one with the highest id. An annotation that no longer fits
+/// the Iceberg type of its field is dropped.
+void addCurrentSchema(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr schema, Int32 schema_id)
+{
+    const auto previous_annotations
+        = Iceberg::getClickHouseTypeAnnotations(metadata_object, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
+    std::unordered_map<Int32, Poco::JSON::Object::Ptr> fields_by_id;
+    collectFieldsById(schema->getArray(Iceberg::f_fields), fields_by_id);
+    schema->set(Iceberg::f_schema_id, schema_id);
+    metadata_object->set(Iceberg::f_current_schema_id, schema_id);
+    metadata_object->getArray(Iceberg::f_schemas)->add(schema);
+    for (const auto & [name, field_id] : Iceberg::IcebergSchemaProcessor::traverseSchema(schema->getArray(Iceberg::f_fields)))
+    {
+        String annotation;
+        if (const auto it = previous_annotations.find(static_cast<Int32>(field_id)); it != previous_annotations.end())
+        {
+            const auto field = fields_by_id.find(static_cast<Int32>(field_id));
+            if (field == fields_by_id.end()
+                || Iceberg::clickHouseTypeAnnotationFitsField(
+                    getAnnotatedDataType(it->second.type_name),
+                    field->second->get(Iceberg::f_type),
+                    field->second->getValue<bool>(Iceberg::f_required)))
+                annotation = it->second.type_name;
+        }
+        Iceberg::setClickHouseTypeAnnotation(metadata_object, static_cast<Int32>(field_id), schema_id, annotation);
+    }
 }
 
 /// Whether the field at `index` of `fields` satisfies the `FIRST` / `AFTER after_column` clause of an ALTER.
@@ -345,6 +314,41 @@ Poco::JSON::Object::Ptr MetadataGenerator::getCurrentSchema() const
     return current_schema;
 }
 
+/// Whether the annotation of `field` in the current schema is the one recorded for `type`.
+static bool clickHouseTypeAnnotationMatches(
+    const Poco::JSON::Object::Ptr & metadata_object, const Poco::JSON::Object::Ptr & field, const DataTypePtr & type)
+{
+    const auto annotations
+        = Iceberg::getClickHouseTypeAnnotations(metadata_object, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
+    const auto it = annotations.find(field->getValue<Int32>(Iceberg::f_id));
+    return (it == annotations.end() ? String{} : it->second.type_name) == getAggregateFunctionTypeAnnotation(type);
+}
+
+/// Whether a `MODIFY COLUMN` to `type` changes the annotation of `field`. Without allow_aggregate_function_states_in_open_formats
+/// the recorded annotations are not applied, so a type that records none leaves the one of the field as it is.
+static bool clickHouseTypeAnnotationChanges(
+    const Poco::JSON::Object::Ptr & metadata_object,
+    const Poco::JSON::Object::Ptr & field,
+    const DataTypePtr & type,
+    bool allow_aggregate_function_states)
+{
+    if (!allow_aggregate_function_states && getAggregateFunctionTypeAnnotation(type).empty())
+        return false;
+    return !clickHouseTypeAnnotationMatches(metadata_object, field, type);
+}
+
+/// The state versions of the aggregate functions nested in `type`, in traversal order.
+static std::vector<size_t> getAggregateFunctionStateVersions(DataTypePtr type)
+{
+    std::vector<size_t> versions;
+    callOnNestedSimpleTypes(type, [&versions](DataTypePtr & nested_type)
+    {
+        if (const auto * aggregate_function_type = typeid_cast<const DataTypeAggregateFunction *>(nested_type.get()))
+            versions.push_back(aggregate_function_type->getVersion());
+    });
+    return versions;
+}
+
 bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
 {
     auto current_schema = findCurrentSchema();
@@ -364,7 +368,8 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         /// The stored descriptor was produced from a lower `last-column-id` than the one we
         /// just used, so the ids of nested elements differ even for the very same type.
         return field->getValue<bool>(Iceberg::f_required) == expected_type.second
-            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && Iceberg::icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && clickHouseTypeAnnotationMatches(metadata_object, field, type)
             && isFieldAtRequestedPosition(fields, i, column_name, first, after_column);
     }
     return false;
@@ -404,7 +409,8 @@ bool MetadataGenerator::isRenameColumnApplied(const String & column_name, const 
     return found_new_name;
 }
 
-bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
+bool MetadataGenerator::isModifyColumnApplied(
+    const String & column_name, DataTypePtr type, bool first, const String & after_column, bool allow_aggregate_function_states) const
 {
     auto current_schema = findCurrentSchema();
     if (!current_schema)
@@ -424,7 +430,8 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
             auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
             auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
             if (field->getValue<bool>(Iceberg::f_required) != expected_type.second
-                || !icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first))
+                || !Iceberg::icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+                || clickHouseTypeAnnotationChanges(metadata_object, field, type, allow_aggregate_function_states))
                 return false;
         }
 
@@ -876,9 +883,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
     }
 
     current_schema->getArray(Iceberg::f_fields)->remove(index_to_drop);
-    current_schema->set(Iceberg::f_schema_id, next_schema_id);
-    metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
-    metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+    addCurrentSchema(metadata_object, current_schema, next_schema_id);
 }
 
 void MetadataGenerator::generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first, const String & after_column)
@@ -943,12 +948,17 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
         existing_fields->add(new_field);
     }
 
-    current_schema->set(Iceberg::f_schema_id, next_schema_id);
-    metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
-    metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+    addCurrentSchema(metadata_object, current_schema, next_schema_id);
+    Iceberg::setClickHouseTypeAnnotation(metadata_object, new_field_id, next_schema_id, getAggregateFunctionTypeAnnotation(type));
 }
 
-bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first, const String & after_column)
+bool MetadataGenerator::generateModifyColumnMetadata(
+    const String & column_name,
+    DataTypePtr type,
+    ContextPtr context,
+    bool first,
+    const String & after_column,
+    bool allow_aggregate_function_states)
 {
     if (type)
         Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
@@ -961,6 +971,8 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
     /// `AFTER` the column itself keeps its position, as in `ColumnsDescription::modifyColumnOrder`.
     bool needs_reposition = first || (!after_column.empty() && after_column != column_name);
     bool type_changed = false;
+    /// The Iceberg type stays, only the ClickHouse type annotation changes.
+    bool annotation_changed = false;
 
     if (type)
     {
@@ -973,11 +985,15 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                 continue;
 
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
-                && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
+                && Iceberg::icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
+                const auto annotations = Iceberg::getClickHouseTypeAnnotations(
+                    metadata_object, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
                 Iceberg::IcebergSchemaProcessor schema_processor(
-                    context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
-                auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, context);
+                    context,
+                    context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
+                    allow_aggregate_function_states);
+                const auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, annotations, context);
 
                 if (!current_ch_type->equals(*type))
                     throw Exception(
@@ -989,7 +1005,21 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                         type->getName(),
                         current_field->get(Iceberg::f_type).toString());
 
-                if (!needs_reposition)
+                /// `IDataType::equals` ignores the state version, but all data files of the schema are read with
+                /// the version of its annotation.
+                if (getAggregateFunctionStateVersions(current_ch_type) != getAggregateFunctionStateVersions(type))
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot MODIFY COLUMN '{}' from {} to {}: the aggregate function state version differs, "
+                        "so the existing data files would be read with a different state layout",
+                        column_name,
+                        current_ch_type->getName(),
+                        type->getName());
+
+                /// `IDataType::equals` ignores the custom name of `SimpleAggregateFunction`.
+                if (clickHouseTypeAnnotationChanges(metadata_object, current_field, type, allow_aggregate_function_states))
+                    annotation_changed = true;
+                else if (!needs_reposition)
                     return false;
             }
             else
@@ -1018,8 +1048,20 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
     if (target_index == schema_fields->size())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found in schema", column_name);
 
+    const auto target_field_id = schema_fields->getObject(target_index)->getValue<Int32>(Iceberg::f_id);
+
     if (!type_changed && !needs_reposition)
-        return false;
+    {
+        if (!annotation_changed)
+            return false;
+        /// The schema stays the same, so the annotation is recorded for its id, which a REST catalog keeps as well.
+        Iceberg::setClickHouseTypeAnnotation(
+            metadata_object,
+            target_field_id,
+            metadata_object->getValue<Int32>(Iceberg::f_current_schema_id),
+            getAggregateFunctionTypeAnnotation(type));
+        return true;
+    }
 
     const auto next_schema_id = getNextSchemaId(metadata_object);
     current_schema = Iceberg::deepCopy(current_schema);
@@ -1065,9 +1107,9 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
         current_schema->set(Iceberg::f_fields, new_fields);
     }
 
-    metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
-    current_schema->set(Iceberg::f_schema_id, next_schema_id);
-    metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+    addCurrentSchema(metadata_object, current_schema, next_schema_id);
+    if (type_changed || annotation_changed)
+        Iceberg::setClickHouseTypeAnnotation(metadata_object, target_field_id, next_schema_id, getAggregateFunctionTypeAnnotation(type));
     return true;
 }
 
@@ -1098,10 +1140,7 @@ void MetadataGenerator::generateRenameColumnMetadata(const String & column_name,
     if (!found)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found column {}", column_name);
 
-    const auto next_schema_id = getNextSchemaId(metadata_object);
-    metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
-    current_schema->set(Iceberg::f_schema_id, next_schema_id);
-    metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+    addCurrentSchema(metadata_object, current_schema, getNextSchemaId(metadata_object));
 }
 
 }

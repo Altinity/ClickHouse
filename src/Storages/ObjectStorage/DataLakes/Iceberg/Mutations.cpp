@@ -110,7 +110,7 @@ static Int32 getHighestFieldIdFromType(const Poco::Dynamic::Var & type_var)
 /// unknown: the catalog may have applied the update and still reported a failure, in which case
 /// re-applying the same command on the refreshed metadata would fail with "Column already exists"
 /// or "Not found column" for an ALTER that actually succeeded.
-static bool alterAlreadyApplied(const MetadataGenerator & generator, const AlterCommand & command)
+static bool alterAlreadyApplied(const MetadataGenerator & generator, const AlterCommand & command, bool allow_aggregate_function_states)
 {
     switch (command.type)
     {
@@ -121,7 +121,8 @@ static bool alterAlreadyApplied(const MetadataGenerator & generator, const Alter
         case AlterCommand::Type::RENAME_COLUMN:
             return generator.isRenameColumnApplied(command.column_name, command.rename_to);
         case AlterCommand::Type::MODIFY_COLUMN:
-            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
+            return generator.isModifyColumnApplied(
+                command.column_name, command.data_type, command.first, command.after_column, allow_aggregate_function_states);
         default:
             return false;
     }
@@ -835,6 +836,9 @@ void mutate(
             }
         }
 
+        /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations.
+        addIcebergTableSchemasFromMetadata(metadata, *persistent_table_components.schema_processor, context);
+
         /// Validate against the freshly-fetched snapshot. Bound to this exact
         /// metadata version, so a concurrent writer that commits non-Parquet
         /// data files between iterations is caught by the next retry.
@@ -943,10 +947,14 @@ void alter(
         auto metadata = deepCopy(getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid));
 
         const auto previous_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
+        Poco::JSON::Object::Ptr previous_properties = metadata->has(Iceberg::f_properties)
+            ? new Poco::JSON::Object(*metadata->getObject(Iceberg::f_properties))
+            : new Poco::JSON::Object;
 
         auto metadata_json_generator = MetadataGenerator(metadata);
 
-        if (commit_attempted && alterAlreadyApplied(metadata_json_generator, params[0]))
+        if (commit_attempted && alterAlreadyApplied(
+                metadata_json_generator, params[0], persistent_table_components.schema_processor->useClickHouseTypeAnnotations()))
         {
             LOG_WARNING(
                 log,
@@ -969,7 +977,13 @@ void alter(
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
             {
-                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context, params[0].first, params[0].after_column))
+                if (!metadata_json_generator.generateModifyColumnMetadata(
+                        params[0].column_name,
+                        params[0].data_type,
+                        context,
+                        params[0].first,
+                        params[0].after_column,
+                        persistent_table_components.schema_processor->useClickHouseTypeAnnotations()))
                 {
                     succeeded = true;
                 }
@@ -1034,7 +1048,9 @@ void alter(
                 metadata->getValue<Int32>(Iceberg::f_last_column_id),
                 getHighestFieldId(new_schema));
             commit_attempted = true;
-            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata, context->getForwardedAuthToken()))
+            if (!catalog->updateSchema(
+                    namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata,
+                    previous_properties, context->getForwardedAuthToken()))
             {
                 ++i;
                 continue;

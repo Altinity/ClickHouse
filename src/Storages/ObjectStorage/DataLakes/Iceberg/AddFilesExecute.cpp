@@ -1047,7 +1047,8 @@ AddFilesResult addFiles(
     /// created table this add_files call may be the first operation, so register the current
     /// schema ourselves first.
     if (!persistent_components.schema_processor->hasClickHouseTableSchemaById(static_cast<Int32>(original_schema_id)))
-        persistent_components.schema_processor->addIcebergTableSchema(current_schema, context);
+        persistent_components.schema_processor->addIcebergTableSchema(
+            current_schema, context, getClickHouseTypeAnnotations(metadata, static_cast<Int32>(original_schema_id)));
     auto clickhouse_schema = persistent_components.schema_processor->getClickHouseTableSchemaById(static_cast<Int32>(original_schema_id));
     Block sample_block;
     for (const auto & name_and_type : *clickhouse_schema)

@@ -27,6 +27,9 @@
 #include <DataTypes/DataTypeCustom.h>
 #include <Columns/ColumnVariant.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/Serializations/ISerialization.h>
+#include <IO/WriteBufferFromVector.h>
 
 /// This file deals with schema conversion and with repetition and definition levels.
 
@@ -66,6 +69,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace DB::Parquet
@@ -908,6 +912,28 @@ void validateIcebergFieldIds(
     }
 }
 
+void convertAggregateFunctionColumnToString(ColumnPtr & column, DataTypePtr & type)
+{
+    auto serialization = type->getDefaultSerialization();
+    auto result = ColumnString::create();
+    auto & chars = result->getChars();
+    auto & offsets = result->getOffsets();
+    offsets.reserve(column->size());
+    {
+        WriteBufferFromVector<ColumnString::Chars> buffer(chars);
+        const FormatSettings format_settings;
+        for (size_t i = 0; i < column->size(); ++i)
+        {
+            serialization->serializeBinary(*column, i, buffer, format_settings);
+            offsets.push_back(buffer.count());
+        }
+        buffer.finalize();
+    }
+
+    column = std::move(result);
+    type = std::make_shared<DataTypeString>();
+}
+
 void prepareColumnRecursive(
     ColumnPtr column, DataTypePtr type, const std::string & name, const WriteOptions & options,
     ColumnChunkWriteStates & states, SchemaElements & schemas, const std::optional<std::unordered_map<String, Int64>> & column_field_ids,
@@ -932,6 +958,25 @@ void prepareColumnRecursive(
             else
                 /// Use nested data type, but keep ColumnLowCardinality. The encoder can deal with it.
                 preparePrimitiveColumn(column, nested_type, name, options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+            break;
+        }
+        case TypeIndex::AggregateFunction:
+        {
+            if (!options.allow_aggregate_function_states)
+                throw Exception(
+                    ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Writing aggregate function states of column '{}' into Parquet data format is disabled. "
+                    "Enable setting allow_aggregate_function_states_in_open_formats to write the "
+                    "serialized states",
+                    name);
+
+            convertAggregateFunctionColumnToString(column, type);
+            /// Serialized states are binary even when Parquet strings use the UTF8 logical type.
+            WriteOptions binary_options = options;
+            binary_options.output_string_as_string = false;
+            preparePrimitiveColumn(
+                column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+            states.back().write_statistics = false;
             break;
         }
         default:
@@ -1086,6 +1131,126 @@ void prepareColumnForWrite(
 
     if (column->empty())
         states.clear();
+}
+
+
+namespace
+{
+
+bool isFixedStringOfSize(const DataTypePtr & type, size_t size)
+{
+    const auto * fixed_string = typeid_cast<const DataTypeFixedString *>(type.get());
+    return fixed_string && fixed_string->getN() == size;
+}
+
+bool isDateTime64WithScale(const DataTypePtr & type, UInt32 scale)
+{
+    const auto * date_time64 = typeid_cast<const DataTypeDateTime64 *>(type.get());
+    return date_time64 && date_time64->getScale() == scale;
+}
+
+/// The parquet writer stores some ClickHouse types as parquet types that the reader maps to a different
+/// ClickHouse type, e.g. `Date` is read back as `Date32`. Lists those pairs, so the type from
+/// `clickhouse.column_types` metadata can be checked against the parquet schema of a file we wrote.
+bool parquetWriterCouldProduce(const DataTypePtr & annotated, const DataTypePtr & derived)
+{
+    if (annotated->equals(*derived))
+        return true;
+
+    auto next_timestamp_unit = [](UInt32 scale) -> UInt32
+    {
+        if (scale <= 3)
+            return 3;
+        if (scale <= 6)
+            return 6;
+        return 9;
+    };
+
+    switch (annotated->getTypeId())
+    {
+        case TypeIndex::Date:
+            return WhichDataType(derived).isDate32() || WhichDataType(derived).isUInt16();
+        case TypeIndex::DateTime:
+            return isDateTime64WithScale(derived, 3) || WhichDataType(derived).isUInt32();
+        case TypeIndex::DateTime64:
+            return isDateTime64WithScale(
+                derived, next_timestamp_unit(assert_cast<const DataTypeDateTime64 &>(*annotated).getScale()));
+        case TypeIndex::Time:
+            return isDateTime64WithScale(derived, 6);
+        case TypeIndex::Time64:
+            return isDateTime64WithScale(
+                derived, assert_cast<const DataTypeTime64 &>(*annotated).getScale() <= 6 ? 6 : 9);
+        case TypeIndex::Enum8:
+            return isString(derived) || WhichDataType(derived).isInt8();
+        case TypeIndex::Enum16:
+            return isString(derived) || WhichDataType(derived).isInt16();
+        case TypeIndex::IPv4:
+            return WhichDataType(derived).isUInt32();
+        case TypeIndex::IPv6:
+            return isFixedStringOfSize(derived, 16);
+        case TypeIndex::UInt128:
+        case TypeIndex::Int128:
+        {
+            /// With `output_format_parquet_wide_integer_as_decimal` it is written as `DECIMAL(39, 0)`.
+            const auto * decimal = checkDecimal<Decimal256>(*derived);
+            return isFixedStringOfSize(derived, 16)
+                || (decimal && decimal->getPrecision() == 39 && decimal->getScale() == 0);
+        }
+        case TypeIndex::UInt256:
+        case TypeIndex::Int256:
+            return isFixedStringOfSize(derived, 32);
+        case TypeIndex::FixedString:
+            return isString(derived);
+        case TypeIndex::Object:
+            return isString(derived);
+        default:
+            return false;
+    }
+}
+
+}
+
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataTypePtr & derived_type)
+{
+    auto annotated = removeLowCardinalityAndNullable(annotated_type);
+    auto derived = removeLowCardinalityAndNullable(derived_type);
+
+    if (annotated->getTypeId() == TypeIndex::AggregateFunction)
+        return isString(derived);
+
+    switch (annotated->getTypeId())
+    {
+        case TypeIndex::Array:
+        {
+            const auto * derived_array = typeid_cast<const DataTypeArray *>(derived.get());
+            if (!derived_array)
+                return false;
+            return annotatedTypeMatchesDerived(
+                assert_cast<const DataTypeArray &>(*annotated).getNestedType(), derived_array->getNestedType());
+        }
+        case TypeIndex::Tuple:
+        {
+            const auto & annotated_tuple = assert_cast<const DataTypeTuple &>(*annotated);
+            const auto * derived_tuple = typeid_cast<const DataTypeTuple *>(derived.get());
+            if (!derived_tuple || derived_tuple->getElements().size() != annotated_tuple.getElements().size())
+                return false;
+            for (size_t i = 0; i < annotated_tuple.getElements().size(); ++i)
+                if (!annotatedTypeMatchesDerived(annotated_tuple.getElement(i), derived_tuple->getElement(i)))
+                    return false;
+            return true;
+        }
+        case TypeIndex::Map:
+        {
+            const auto & annotated_map = assert_cast<const DataTypeMap &>(*annotated);
+            const auto * derived_map = typeid_cast<const DataTypeMap *>(derived.get());
+            if (!derived_map)
+                return false;
+            return annotatedTypeMatchesDerived(annotated_map.getKeyType(), derived_map->getKeyType())
+                && annotatedTypeMatchesDerived(annotated_map.getValueType(), derived_map->getValueType());
+        }
+        default:
+            return parquetWriterCouldProduce(annotated, derived);
+    }
 }
 
 }

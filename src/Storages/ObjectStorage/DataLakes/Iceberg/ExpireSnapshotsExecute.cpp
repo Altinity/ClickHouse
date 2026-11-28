@@ -908,6 +908,9 @@ ExpireSnapshotsResult expireSnapshots(
 
         Int32 current_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
 
+        /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations.
+        addIcebergTableSchemasFromMetadata(metadata, *persistent_table_components.schema_processor, context);
+
         std::set<Iceberg::IcebergPathFromMetadata> retained_manifest_paths;
         std::set<Iceberg::IcebergPathFromMetadata> retained_data_file_paths;
         std::set<Iceberg::IcebergPathFromMetadata> retained_manifest_list_paths;

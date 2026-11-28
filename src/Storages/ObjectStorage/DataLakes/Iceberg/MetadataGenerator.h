@@ -75,8 +75,15 @@ public:
     /// Returns false when neither the type nor the position changed (true no-op).
     /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
-    /// type (the timestamptz timezone and whether geo types are allowed).
-    bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first = false, const String & after_column = {});
+    /// type (the timestamptz timezone and whether geo types are allowed). `allow_aggregate_function_states`
+    /// is the table's `allow_aggregate_function_states_in_open_formats`.
+    bool generateModifyColumnMetadata(
+        const String & column_name,
+        DataTypePtr type,
+        ContextPtr context,
+        bool first = false,
+        const String & after_column = {},
+        bool allow_aggregate_function_states = false);
     void generateRenameColumnMetadata(const String & column_name, const String & new_column_name);
 
     /// A commit attempt can land in the catalog even when the client observes a failure
@@ -88,7 +95,13 @@ public:
     bool isDropColumnApplied(const String & column_name) const;
     bool isRenameColumnApplied(const String & column_name, const String & new_column_name) const;
     /// `type` may be null for a position-only `MODIFY COLUMN`; `first` and `after_column` are checked against the field order.
-    bool isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
+    /// `allow_aggregate_function_states` is the table's `allow_aggregate_function_states_in_open_formats`.
+    bool isModifyColumnApplied(
+        const String & column_name,
+        DataTypePtr type,
+        bool first = false,
+        const String & after_column = {},
+        bool allow_aggregate_function_states = false) const;
 
 private:
     Poco::JSON::Object::Ptr metadata_object;

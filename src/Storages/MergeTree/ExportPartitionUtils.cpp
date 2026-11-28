@@ -306,6 +306,10 @@ namespace ExportPartitionUtils
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
 
+        if (manifest.allow_aggregate_function_states_in_open_formats)
+            context_copy->setSetting(
+                "allow_aggregate_function_states_in_open_formats", *manifest.allow_aggregate_function_states_in_open_formats);
+
         if (manifest.iceberg_partition_timezone)
         {
             context_copy->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);

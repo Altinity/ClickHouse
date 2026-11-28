@@ -63,6 +63,10 @@ using BucketSplitter = std::shared_ptr<IBucketSplitter>;
 
 FormatSettings getFormatSettings(const ContextPtr & context);
 FormatSettings getFormatSettings(const ContextPtr & context, const Settings & settings);
+/// Stores a table's `allow_aggregate_function_states_in_open_formats` in `table_format_settings`: the value its `SETTINGS`
+/// (`table_settings`) give, or the server's (`global_context`) without one. A query does not change it.
+void setTableAllowAggregateFunctionStates(
+    FormatSettings & table_format_settings, const SettingsChanges * table_settings, const ContextPtr & global_context);
 /// For the `Native` blocks of the native protocol. A secondary query carries type names in both directions,
 /// because a server-side `Connection` never takes format settings.
 FormatSettings getNativeWireFormatSettings(const ContextPtr & context);

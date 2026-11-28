@@ -6,7 +6,9 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
+#include <Common/tests/gtest_global_register.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -557,8 +559,7 @@ std::vector<String> getCurrentFieldNames(const Poco::JSON::Object::Ptr & metadat
     return {};
 }
 
-/// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
-Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
+Poco::Dynamic::Var findCurrentFieldValue(const Poco::JSON::Object::Ptr & metadata, const String & name, const String & key)
 {
     auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
     auto schemas = metadata->getArray(f_schemas);
@@ -572,10 +573,36 @@ Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata
         {
             auto field = fields->getObject(j);
             if (field->getValue<String>(f_name) == name)
-                return field->get(f_type);
+                return field->get(key);
         }
     }
     return {};
+}
+
+/// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
+Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
+{
+    return findCurrentFieldValue(metadata, name, f_type);
+}
+
+Poco::JSON::Object::Ptr makeMetadataWithAnnotatedField(
+    const String & name, const Poco::Dynamic::Var & iceberg_type, bool required, const String & annotation)
+{
+    auto metadata = makeMetadataWithField(name, iceberg_type, required);
+    auto field_id = metadata->getArray(f_schemas)->getObject(0)->getArray(f_fields)->getObject(0)->getValue<Int32>(f_id);
+    Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
+    properties->set(Iceberg::getClickHouseTypePropertyKey(field_id, /*schema_id=*/ 0), annotation);
+    metadata->set(f_properties, properties);
+    return metadata;
+}
+
+std::optional<String> findCurrentFieldAnnotation(const Poco::JSON::Object::Ptr & metadata, const String & name)
+{
+    const auto annotations = Iceberg::getClickHouseTypeAnnotations(metadata, metadata->getValue<Int32>(f_current_schema_id));
+    const auto it = annotations.find(findCurrentFieldValue(metadata, name, f_id).convert<Int32>());
+    if (it == annotations.end())
+        return std::nullopt;
+    return it->second.type_name;
 }
 
 void expectModifyRejected(
@@ -583,13 +610,15 @@ void expectModifyRejected(
     const String & column,
     const DataTypePtr & requested_type,
     bool first = false,
-    const String & after_column = {})
+    const String & after_column = {},
+    bool allow_aggregate_function_states = false)
 {
     const auto before = readSchemaState(metadata);
     MetadataGenerator gen(metadata);
     try
     {
-        gen.generateModifyColumnMetadata(column, requested_type, getContext().context, first, after_column);
+        gen.generateModifyColumnMetadata(
+            column, requested_type, getContext().context, first, after_column, allow_aggregate_function_states);
         FAIL() << "MODIFY COLUMN " << column << " " << requested_type->getName()
                << " cannot be recorded in Iceberg and must be rejected";
     }
@@ -1231,6 +1260,67 @@ TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithDocOnlyRepositions
     auto stored_fields = stored_type.extract<Poco::JSON::Object::Ptr>()->getArray(f_fields);
     ASSERT_EQ(stored_fields->size(), 1u);
     EXPECT_EQ(stored_fields->getObject(0)->getValue<String>(f_type), "int");
+}
+
+/// The Iceberg type stays, so only the ClickHouse type annotation changes and the schema is kept.
+TEST(IcebergMetadataGenerator, ModifyColumnChangingOnlyTheSimpleAggregateFunctionKeepsTheSchema)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata = makeMetadataWithField("s", "long", /* required */ true);
+    const auto before = readSchemaState(metadata);
+    auto modify = [&](const String & type, bool allow_aggregate_function_states = true)
+    {
+        return MetadataGenerator(metadata).generateModifyColumnMetadata(
+            "s", DataTypeFactory::instance().get(type), getContext().context,
+            /* first */ false, /* after_column */ {}, allow_aggregate_function_states);
+    };
+
+    EXPECT_TRUE(modify("SimpleAggregateFunction(sum, Int64)"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(sum, Int64)");
+    EXPECT_FALSE(modify("SimpleAggregateFunction(sum, Int64)"));
+    EXPECT_TRUE(modify("SimpleAggregateFunction(max, Int64)"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, Int64)");
+    /// Without the setting the column reads as `Int64`, so modifying it to `Int64` changes nothing.
+    EXPECT_FALSE(modify("Int64", /* allow_aggregate_function_states */ false));
+    EXPECT_TRUE(MetadataGenerator(metadata).isModifyColumnApplied(
+        "s", DataTypeFactory::instance().get("Int64"), /* first */ false, /* after_column */ {},
+        /* allow_aggregate_function_states */ false));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, Int64)");
+    EXPECT_TRUE(modify("Int64"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);
+    expectSchemaUnchanged(metadata, before);
+}
+
+/// The current type of a state is its annotation, not the `String` its `binary` Iceberg type reads as.
+TEST(IcebergMetadataGenerator, ModifyColumnComparesWithTheAnnotatedTypeOfAState)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata
+        = makeMetadataWithAnnotatedField("u", f_binary, /* required */ true, "AggregateFunction(uniq, UInt64)");
+    EXPECT_FALSE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "u", DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)"), getContext().context,
+        /* first */ false, /* after_column */ {}, /* allow_aggregate_function_states */ true));
+    expectModifyRejected(
+        metadata, "u", DataTypeFactory::instance().get("AggregateFunction(sum, UInt64)"),
+        /* first */ false, /* after_column */ {}, /* allow_aggregate_function_states */ true);
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "u"), "AggregateFunction(uniq, UInt64)");
+}
+
+TEST(IcebergMetadataGenerator, AddColumnRecordsAndDetectsTheClickHouseTypeAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    auto type = DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))");
+    EXPECT_FALSE(gen.isAddColumnApplied("extra", type));
+
+    gen.generateAddColumnMetadata("extra", type);
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "extra"), "SimpleAggregateFunction(anyLast, Nullable(String))");
+    EXPECT_TRUE(gen.isAddColumnApplied("extra", type));
+    EXPECT_FALSE(gen.isAddColumnApplied(
+        "extra", DataTypeFactory::instance().get("SimpleAggregateFunction(any, Nullable(String))")));
+    EXPECT_FALSE(gen.isAddColumnApplied("extra", makeNullable(std::make_shared<DataTypeString>())));
 }
 
 #endif

@@ -534,17 +534,39 @@ combinator.
         });
 }
 
-bool hasAggregateFunctionType(const DataTypePtr & type)
+namespace
+{
+
+template <typename Predicate>
+bool hasTypeMatching(const DataTypePtr & type, Predicate && predicate)
 {
     auto result = false;
     auto check = [&](const IDataType & t)
     {
-        result |= WhichDataType(t).isAggregateFunction();
+        result |= predicate(t);
     };
 
     check(*type);
     type->forEachChild(check);
     return result;
+}
+
+}
+
+bool hasAggregateFunctionType(const DataTypePtr & type)
+{
+    return hasTypeMatching(type, [](const IDataType & t) { return WhichDataType(t).isAggregateFunction(); });
+}
+
+bool hasAggregateFunctionOrSimpleAggregateFunctionType(const DataTypePtr & type)
+{
+    return hasTypeMatching(
+        type,
+        [](const IDataType & t)
+        {
+            return WhichDataType(t).isAggregateFunction()
+                || typeid_cast<const DataTypeCustomSimpleAggregateFunction *>(t.getCustomName()) != nullptr;
+        });
 }
 
 }

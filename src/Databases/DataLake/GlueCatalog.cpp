@@ -87,6 +87,7 @@ namespace DB::FailPoints
 namespace DB::Setting
 {
     extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
     extern const SettingsUInt64 s3_max_connections;
     extern const SettingsUInt64 s3_max_redirects;
     extern const SettingsUInt64 s3_retry_attempts;
@@ -724,7 +725,10 @@ bool GlueCatalog::tryGetTableMetadata(
                     auto metadata_object = getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, result);
                     const bool allow_geo_parser
                         = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
-                    auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_, allow_geo_parser);
+                    auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(
+                        context_,
+                        allow_geo_parser,
+                        context_->getSettingsRef()[DB::Setting::allow_aggregate_function_states_in_open_formats].value);
                     auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
                     auto parsed_schema = schema_processor.getClickHouseTableSchemaById(id);
                     if (parsed_schema)
@@ -1345,6 +1349,7 @@ bool GlueCatalog::updateSchema(
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
     Poco::JSON::Object::Ptr /*metadata*/,
+    Poco::JSON::Object::Ptr /*previous_properties*/,
     const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     std::vector<Aws::Glue::Model::Column> columns;

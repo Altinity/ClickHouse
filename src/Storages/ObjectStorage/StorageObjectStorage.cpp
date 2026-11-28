@@ -911,6 +911,11 @@ IStorage::ImportResult StorageObjectStorage::import(
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
+    /// The export brings its own format settings, but the table's own `allow_aggregate_function_states_in_open_formats` decides over them.
+    auto import_format_settings = format_settings_ ? format_settings_ : format_settings;
+    if (format_settings_ && format_settings)
+        import_format_settings->parquet.allow_aggregate_function_states = format_settings->parquet.allow_aggregate_function_states;
+
     if (isDataLake())
     {
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
@@ -920,7 +925,7 @@ IStorage::ImportResult StorageObjectStorage::import(
             new_file_path_callback,
             std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             *iceberg_metadata_json_string,
-            format_settings_ ? format_settings_ : format_settings,
+            import_format_settings,
             local_context));
     }
 
@@ -983,7 +988,7 @@ IStorage::ImportResult StorageObjectStorage::import(
         max_rows_per_file,
         /* overwrite_existing_data_files= */ file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::error,
         new_file_path_callback,
-        format_settings_ ? format_settings_ : format_settings,
+        import_format_settings,
         std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
         local_context));
 }

@@ -102,4 +102,7 @@ void pinCurrentStateVersionToAggregateFunctions(DataTypePtr & type);
 /// Checks type of any nested type is DataTypeAggregateFunction.
 bool hasAggregateFunctionType(const DataTypePtr & type);
 
+/// Checks type or any nested type is `AggregateFunction` or `SimpleAggregateFunction`.
+bool hasAggregateFunctionOrSimpleAggregateFunctionType(const DataTypePtr & type);
+
 }

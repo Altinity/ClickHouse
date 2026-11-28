@@ -28,6 +28,7 @@ struct WriteOptions
     bool output_date_as_uint16 = false;
     bool output_enum_as_byte_array = false;
     bool output_timestamp_adjusted_to_utc_from_timezone = false;
+    bool allow_aggregate_function_states = false;
 
     /// Note: the meaning of some compression methods here is different from
     /// wrapReadBufferWithCompressionMethod:
@@ -114,6 +115,8 @@ struct ColumnChunkWriteState
     int compression_level = 3;
     Int64 datetime_multiplier = 1; // for converting e.g. seconds to milliseconds
     bool is_bool = false; // bool vs UInt8 have the same column type but are encoded differently
+    /// False for aggregate function states: disables statistics and bloom filter.
+    bool write_statistics = true;
 
     /// Repetition and definition levels. Produced by prepareColumnForWrite().
     /// def is empty iff max_def == 0, which means no arrays or nullables.
@@ -187,6 +190,10 @@ using ColumnChunkWriteStates = std::vector<ColumnChunkWriteState>;
 /// Leaf nodes correspond to physical columns of primitive types. Inner nodes describe logical
 /// groupings of those columns, e.g. tuples or structs.
 SchemaElements convertSchema(const Block & sample, const WriteOptions & options, const std::optional<std::unordered_map<String, Int64>> & column_field_ids, const IcebergOptionality & iceberg_optionality = {});
+
+/// Whether `annotated`, a ClickHouse type recorded in the file metadata, may describe a column whose Parquet schema
+/// reads as `derived`, given the type mappings of `preparePrimitiveColumn`.
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated, const DataTypePtr & derived);
 
 /// `iceberg_optionality` must be passed identically on the schema and the data path: the reader
 /// derives its max definition level from the schema while the writer derives the level bit width
