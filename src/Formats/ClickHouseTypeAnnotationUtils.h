@@ -10,9 +10,6 @@ namespace DB
 /// the name of `type` if it has an `AggregateFunction` or `SimpleAggregateFunction`, empty otherwise.
 String getAggregateFunctionTypeAnnotation(const DataTypePtr & type);
 
-/// Whether the type named `type_name` has an `AggregateFunction`, without resolving any aggregate function.
-bool typeNameHasAggregateFunction(const String & type_name);
-
 /// The data type named `type_name`. A state without an explicit version has version 0.
 DataTypePtr getAnnotatedDataType(const String & type_name);
 

@@ -34,8 +34,6 @@ public:
     DataTypePtr get(const String & full_name) const;
     DataTypePtr get(const String & family_name, const ASTPtr & parameters) const;
     DataTypePtr get(const ASTPtr & ast) const;
-    /// Parses a type name with the nesting depth limit that `get` applies, without resolving it.
-    static ASTPtr parse(const String & full_name);
     DataTypePtr getCustom(DataTypeCustomDescPtr customization) const;
     DataTypePtr getCustom(const String & base_name, DataTypeCustomDescPtr customization) const;
 
