@@ -2,11 +2,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 #include <atomic>
 #include <filesystem>
+#include <optional>
+#include <thread>
 
 /// Task 2 of the CAS parallel-write-path plan (docs/superpowers/sdd): `promoteBuild`/`repointRef`
 /// return an exact, in-lane-derived `Cas::CommitOutcome` instead of `void`/`bool`, and
@@ -305,4 +310,155 @@ TEST(CASCommitRollback, RepointByOtherWriterSurvivesRollback)
     // T1's rollback used dropRefIfMatches(M1); M2 != M1 so it must survive.
     EXPECT_TRUE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh));
     EXPECT_EQ(fx.currentManifest(key), fx.lastRepointManifest());
+}
+
+/// A commit whose query is killed between two part publications still rolls back the ref it created:
+/// the compensation is owed to the failed commit, and it leads the ref-log queue on the killed thread.
+/// The concurrent-repoint arm proves the compensation stays conditional on the manifest it bound.
+TEST(CASPartFolderAccess, KilledCommitStillRollsBackCreatedRef)
+{
+    {
+        SCOPED_TRACE("created ref, nobody repoints it");
+        auto fx = makeCaWiringFixture();
+        const Cas::PartRefKey key{fx.ns(), "a_created_1_1_0"};
+        auto txn = fx.beginTxn();
+        fx.stageInto(txn, key, 1);
+        fx.stageInto(txn, {fx.ns(), "z_poison_1_1_0"}, 1);
+        fx.armPromoteFailure({fx.ns(), "z_poison_1_1_0"});
+        bool killed = false;
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            fx.armAfterPromoteHook(key, [&] { query.kill(); killed = true; });
+            EXPECT_ANY_THROW(txn->commit({}));
+        });
+        ASSERT_TRUE(killed) << "the query was not killed between the publications";
+        EXPECT_FALSE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh)) << "the created ref is rolled back";
+    }
+    {
+        SCOPED_TRACE("created ref, another writer repoints it before the rollback");
+        auto fx = makeCaWiringFixture();
+        const Cas::PartRefKey key{fx.ns(), "a_shared_1_1_0"};
+        auto txn = fx.beginTxn();
+        fx.stageInto(txn, key, 1);
+        fx.stageInto(txn, {fx.ns(), "z_poison_1_1_0"}, 1);
+        fx.armPromoteFailure({fx.ns(), "z_poison_1_1_0"});
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            /// The repoint stands for another, live writer, so it lands before this query is killed.
+            fx.armAfterPromoteHook(key, [&]
+            {
+                fx.repointToFreshManifest(key);
+                query.kill();
+            });
+            EXPECT_ANY_THROW(txn->commit({}));
+        });
+        EXPECT_TRUE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh));
+        EXPECT_EQ(fx.currentManifest(key), fx.lastRepointManifest()) << "another writer's binding survives";
+    }
+}
+
+/// The compensation of a killed commit stays owed when it queues behind another caller's flush: it is not
+/// withdrawn as a stopped follower would be, and the created ref is rolled back.
+TEST(CASPartFolderAccess, KilledCommitCompensationQueuedBehindLeaderStillRollsBack)
+{
+    auto fx = makeCaWiringFixture();
+    const auto pool = fx.storage->poolForTest();
+    const Cas::PartRefKey key{fx.ns(), "a_created_1_1_0"};
+    auto txn = fx.beginTxn();
+    fx.stageInto(txn, key, 1);
+    fx.stageInto(txn, {fx.ns(), "z_poison_1_1_0"}, 1);
+    fx.armPromoteFailure({fx.ns(), "z_poison_1_1_0"});
+
+    std::atomic<int> follower_evaluations{0};
+    std::atomic<bool> leader_entered{false};
+    pool->setRefFollowerWaitHookForTest([&](DB::Cas::FollowerWaitPhase) { follower_evaluations.fetch_add(1); });
+    const auto spin_until = [](auto ready)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!ready() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        return ready();
+    };
+    std::thread other_leader;
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        fx.armAfterPromoteHook(key, [&]
+        {
+            /// Armed only now: the commit's own publication has flushed already. The parked leader waits for the
+            /// compensation to queue, then for it to have either run its wait condition (owed, so it stays) or
+            /// left the queue (withdrawn).
+            pool->setRefPreCarveHookForTest([&]
+            {
+                if (leader_entered.exchange(true))
+                    return;
+                EXPECT_TRUE(spin_until([&] { return pool->refQueuePendingForTest(fx.ns()) >= 2; })) << "the compensation never queued";
+                EXPECT_TRUE(spin_until([&] { return follower_evaluations.load() >= 1 || pool->refQueuePendingForTest(fx.ns()) < 2; }));
+            });
+            other_leader = std::thread([&] { try { pool->dropRef(fx.ns(), "z_other_ref"); } catch (...) {} });
+            EXPECT_TRUE(spin_until([&] { return leader_entered.load(); })) << "the other leader never parked";
+            query.kill();
+        });
+        EXPECT_ANY_THROW(txn->commit({}));
+    });
+    other_leader.join();
+    pool->setRefPreCarveHookForTest(nullptr);
+    pool->setRefFollowerWaitHookForTest(nullptr);
+
+    EXPECT_GE(follower_evaluations.load(), 1) << "the compensation never queued behind the leader";
+    EXPECT_FALSE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh)) << "the created ref is rolled back";
+}
+
+/// `ATTACH PART` and `DROP DETACHED PART` rename a detached part to a reserved name before they act, and
+/// undo that rename with `moveFile` on failure. A query killed after the durable rename still gets its
+/// original name back, and a retry succeeds.
+TEST(CASPartFolderAccess, KilledAttachStillRestoresDetachedName)
+{
+    for (const std::string prefix : {"attaching_", "deleting_"})
+    {
+        SCOPED_TRACE(prefix);
+        auto fx = makeCaWiringFixture();
+        const std::string table = CaTxnRollbackFixture::tablePrefix();
+        const std::string part = "all_1_1_0";
+        const std::string detached = table + "/detached/" + part;
+        const std::string reserved = table + "/detached/" + prefix + part;
+        fx.commitSimplePart({fx.ns(), part}, 1);
+        {
+            auto txn = fx.beginTxn();
+            txn->moveDirectory(table + "/" + part, detached);
+            txn->commit(DB::NoCommitOptions{});
+        }
+        {
+            auto txn = fx.beginTxn();
+            txn->moveDirectory(detached, reserved);
+            txn->commit(DB::NoCommitOptions{});
+        }
+        ASSERT_TRUE(fx.storage->existsDirectory(reserved));
+
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            query.kill();
+            auto txn = fx.beginTxn();
+            EXPECT_NO_THROW({
+                txn->moveFile(reserved, detached);
+                txn->commit(DB::NoCommitOptions{});
+            });
+        });
+
+        EXPECT_TRUE(fx.storage->existsDirectory(detached)) << "the original detached name is back";
+        EXPECT_FALSE(fx.storage->existsDirectory(reserved));
+
+        {
+            auto txn = fx.beginTxn();
+            txn->moveDirectory(detached, reserved);
+            txn->commit(DB::NoCommitOptions{});
+        }
+        auto txn = fx.beginTxn();
+        if (prefix == "attaching_")
+            txn->moveDirectory(reserved, table + "/all_2_2_0");
+        else
+            txn->removeRecursive(reserved, nullptr);
+        txn->commit(DB::NoCommitOptions{});
+        EXPECT_FALSE(fx.storage->existsDirectory(reserved)) << "the retry completes";
+        EXPECT_EQ(fx.storage->existsDirectory(table + "/all_2_2_0"), prefix == "attaching_");
+    }
 }

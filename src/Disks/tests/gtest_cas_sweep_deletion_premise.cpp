@@ -4,11 +4,25 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_killable_query.h"
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
+#include <functional>
+#include <optional>
+#include <thread>
 #include <vector>
+
+namespace DB::ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+    extern const int QUERY_WAS_CANCELLED;
+    extern const int READONLY;
+}
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -142,6 +156,63 @@ TEST(CASSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
     EXPECT_EQ(deleted, 1u);
     EXPECT_FALSE(f.orphanExists());
     EXPECT_TRUE(warnings.empty()) << "nothing was retained, so nothing is warned about";
+}
+
+/// The round commits its orphan cursor before the namespace janitor runs, so the bodies that commit nominated are
+/// deleted even when the janitor then ends a killed round with its failure; a live round treats the same janitor
+/// failure as a leak and succeeds.
+TEST(CASSweepDeletionPremise, AKilledJanitorAfterTheCommitLeavesNoNominatedBody)
+{
+    for (const bool killed : {false, true})
+    {
+        SCOPED_TRACE(killed ? "killed query" : "live query");
+        OrphanFixture f(/*gc_fold_max_defer_rounds*/0);
+        const Layout & layout = f.store->layout();
+        seedCursorAt(*f.backend, layout, f.ns, RefTxnId{kBuildEpoch + 1, 1});
+        const String dead_log = layout.refLogKey(
+            NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/janitor-kill"}, UInt128{0xDB}), RefTxnId{1, 1});
+        {
+            OperationForTest op(*f.backend);
+            ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(dead_log, "dead residue", Retry::once())));
+        }
+
+        int code = 0;
+        String message;
+        uint64_t nominations_deleted = 0;
+        std::atomic<bool> fired{false};
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            f.backend->onBeforeBulkRemove([&]
+            {
+                if (fired.exchange(true))
+                    return;
+                if (killed)
+                    query.kill();
+                throw DB::Exception(DB::ErrorCodes::READONLY, "injected janitor batch delete refusal");
+            });
+            Gc gc(f.store, hexToU128("00000000000000000000000000000001"));
+            gc.setPhaseSink([&](const GcPhaseRecord & phase)
+            {
+                if (phase.phase == "orphan_sweep")
+                    nominations_deleted = phase.metrics.at("deleted");
+            });
+            try
+            {
+                ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+            f.backend->onBeforeBulkRemove({});
+        });
+
+        ASSERT_TRUE(fired.load()) << "the round sent no janitor batch delete";
+        EXPECT_EQ(code, killed ? DB::ErrorCodes::READONLY : 0) << message;
+        EXPECT_EQ(nominations_deleted, 1u);
+        EXPECT_FALSE(f.orphanExists()) << "the nominated body outlived the commit that nominated it";
+    }
 }
 
 /// Uncertainty rule, hold arm. The cursor HAS consumed epoch 1's seal, so rule (1) alone would let the
@@ -760,4 +831,169 @@ TEST(CASSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
         if ((*survive_op).head(layout.manifestKey(ManifestId{p.first, p.second}), Retry::once()).has_value())
             ++surviving;
     EXPECT_EQ(surviving, 1u) << "exactly one candidate remains -- the one whose namespace had no budget left";
+}
+
+namespace
+{
+
+/// Runs `on_read` once, before the first read of a key containing `read_substring`, and `on_remove` once, before
+/// the remove of `remove_key`. A hook that throws replaces that request's answer.
+class SweepFaultBackend final : public InMemoryBackend
+{
+public:
+    String read_substring;
+    std::function<void()> on_read;
+    String remove_key;
+    std::function<void()> on_remove;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (on_read && key.find(read_substring) != String::npos)
+            std::exchange(on_read, {})();
+        return InMemoryBackend::read(key, access);
+    }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (on_remove && key == remove_key)
+            std::exchange(on_remove, {})();
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+};
+
+/// `OrphanFixture` with three eligible, unowned manifests in build 5 and a cursor past their epoch's seal, so a live
+/// sweep deletes all three.
+struct KilledSweepFixture
+{
+    std::shared_ptr<SweepFaultBackend> backend = std::make_shared<SweepFaultBackend>();
+    PoolPtr store;
+    RootNamespace ns{"00/aa@cas@"};
+    std::vector<String> orphan_keys;
+
+    KilledSweepFixture()
+    {
+        store = openPoolForTest(backend);
+        casAdmitRecoverableEntry(*backend, store->layout(), ns);
+        for (const uint64_t ordinal : {0xABu, 0xACu, 0xADu})
+        {
+            const ManifestRef orphan = ref(5, ordinal);
+            writeManifestRaw(*backend, store->layout(), ns, orphan, {blobEntryFor("a", DB::UInt128(ordinal))});
+            orphan_keys.push_back(store->layout().manifestKey(ManifestId{ns, orphan}));
+        }
+        std::sort(orphan_keys.begin(), orphan_keys.end());
+        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
+        seedCursorAt(*backend, store->layout(), ns, RefTxnId{kBuildEpoch + 1, 1});
+    }
+
+    bool exists(const String & key) const
+    {
+        OperationForTest op(*backend);
+        return (*op).head(key, Retry::once()).has_value();
+    }
+};
+
+struct SweepRun
+{
+    int code = 0;
+    uint64_t deleted = 0;
+    std::vector<String> warnings;
+};
+
+/// The decommission drain's call, on a thread of a query; `arm` runs on that thread first.
+SweepRun sweepOnQueryThread(KilledSweepFixture & f, const std::function<void(CasKillableQuery &)> & arm)
+{
+    SweepRun out;
+    std::thread caller([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        CasKillableQuery query(getContext().context);
+        arm(query);
+        try
+        {
+            out.deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &out.warnings);
+        }
+        catch (const DB::Exception & e)
+        {
+            out.code = e.code();
+        }
+    });
+    caller.join();
+    return out;
+}
+
+}
+
+/// A killed query's sweep stops at the next key with the query's own error, also inside one build prefix: no key of
+/// the prefix is deleted after the kill.
+TEST(CASSweepDeletionPremise, KilledQueryEndsTheSweepAtTheNextKey)
+{
+    KilledSweepFixture f;
+    const SweepRun run = sweepOnQueryThread(f, [](CasKillableQuery & query) { query.kill(); });
+
+    EXPECT_EQ(run.code, DB::ErrorCodes::QUERY_WAS_CANCELLED);
+    for (const String & key : f.orphan_keys)
+        EXPECT_TRUE(f.exists(key)) << key;
+
+    const SweepRun live = sweepOnQueryThread(f, [](CasKillableQuery &) {});
+    EXPECT_EQ(live.code, 0);
+    EXPECT_EQ(live.deleted, f.orphan_keys.size()) << "positive control: a live sweep deletes every key";
+}
+
+/// A query killed while the first key's delete is in flight: that delete lands, and the sweep ends at the next key
+/// with the query's error, so the other keys of the prefix stay.
+TEST(CASSweepDeletionPremise, KilledQueryEndsTheSweepAtTheKeyAfterTheKill)
+{
+    KilledSweepFixture f;
+    const SweepRun run = sweepOnQueryThread(f, [&](CasKillableQuery & query)
+    {
+        f.backend->remove_key = f.orphan_keys.front();
+        f.backend->on_remove = [&query] { query.kill(); };
+    });
+
+    EXPECT_EQ(run.code, DB::ErrorCodes::QUERY_WAS_CANCELLED);
+    EXPECT_FALSE(f.exists(f.orphan_keys.front())) << "the delete in flight at the kill";
+    for (size_t i = 1; i < f.orphan_keys.size(); ++i)
+        EXPECT_TRUE(f.exists(f.orphan_keys[i])) << "a key after the kill was deleted: " << f.orphan_keys[i];
+}
+
+/// A delete of the last key that fails after the kill ends the sweep with that failure, not with a warning.
+TEST(CASSweepDeletionPremise, KilledQuerysFailedDeleteOfTheLastKeyPropagates)
+{
+    KilledSweepFixture f;
+    const SweepRun run = sweepOnQueryThread(f, [&](CasKillableQuery & query)
+    {
+        f.backend->remove_key = f.orphan_keys.back();
+        f.backend->on_remove = [&query]
+        {
+            query.kill();
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected delete failure");
+        };
+    });
+
+    EXPECT_EQ(run.code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_TRUE(f.exists(f.orphan_keys.back()));
+    for (size_t i = 0; i + 1 < f.orphan_keys.size(); ++i)
+        EXPECT_FALSE(f.exists(f.orphan_keys[i])) << "the keys before the kill were deleted: " << f.orphan_keys[i];
+    EXPECT_TRUE(run.warnings.empty()) << fmt::format("{}", fmt::join(run.warnings, "; "));
+}
+
+/// A protection-view read that fails after the kill ends the sweep with that failure, not with a skipped namespace.
+TEST(CASSweepDeletionPremise, KilledQuerysFailedProtectionReadPropagates)
+{
+    KilledSweepFixture f;
+    const SweepRun run = sweepOnQueryThread(f, [&](CasKillableQuery & query)
+    {
+        f.backend->read_substring = "_ckpt";
+        f.backend->on_read = [&query]
+        {
+            query.kill();
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected checkpoint read failure");
+        };
+    });
+
+    EXPECT_EQ(run.code, DB::ErrorCodes::NETWORK_ERROR);
+    for (const String & key : f.orphan_keys)
+        EXPECT_TRUE(f.exists(key)) << key;
+    EXPECT_TRUE(run.warnings.empty()) << fmt::format("{}", fmt::join(run.warnings, "; "));
 }

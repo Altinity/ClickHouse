@@ -68,9 +68,8 @@ public:
     /// re-encoding the stale candidate. `mutate` must return a canonically ordered, grammar-valid
     /// candidate; `encodeRefCatalog` (called internally) enforces that.
     ///
-    /// The engine's own policy is the bound: persistent conflict ends at the write deadline with the
-    /// typed retryable error `throwCasWriteRetryLater`, rather than spinning forever against a
-    /// pathologically busy catalog.
+    /// Persistent conflict ends after `kCasMaxDecisions` submissions with the typed retryable error
+    /// `throwCasWriteRetryLater`, rather than spinning forever against a pathologically busy catalog.
     ///
     /// A read that finds the object ABSENT is corruption, not a fresh bootstrap -- `mutate` is never
     /// offered an absent catalog to build a replacement authority from, so no mutation can replace
@@ -156,8 +155,9 @@ public:
     /// `catalog_snapshot`, and the mandatory resolution snapshot is returned in the result so a
     /// catalog-only drain can select the next row without an intervening read.
     ///
-    /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
-    /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
+    /// `refresh_authority` runs once before every attempt: before the first one's checks, and for each
+    /// later one right after its pause, before the catalog read that attempt is conditioned on, unless
+    /// a background owner stopped during that pause. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
     /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
     /// before the first erase must not authorise the rest. A caller whose liveness needs no refresh
     /// passes a no-op and says so.
@@ -193,8 +193,8 @@ public:
     /// `_ckpt` or other physical cleanup; debris belongs to the janitor.
     /// `refresh_authority` runs in every attempt, inside the catalog's hot-key lane and before `op`'s
     /// admission is checked, for a caller whose liveness is a cached flag; a caller whose liveness needs
-    /// no refresh passes a no-op. Its reads hold the lane, so it receives the cancel's own frozen policy to
-    /// bound them; a refresh that cannot finish in time must leave `op` unadmitted. The predicate runs
+    /// no refresh passes a no-op. Its reads hold the lane, so it receives the cancel's policy to bound
+    /// them; a refresh that cannot finish in time must leave `op` unadmitted. The predicate runs
     /// there too, on the catalog the attempt writes over.
     /// A cancel whose response is lost returns `Cancelled` while the catalog still holds the bytes it wrote,
     /// and `EntryChanged` once a later write replaced them.

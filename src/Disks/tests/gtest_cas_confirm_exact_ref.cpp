@@ -2442,6 +2442,9 @@ private:
     std::vector<uint64_t> read_times;
 };
 
+/// What one read reserves with default settings (`cas_attempt_timeout_ms` 5000 and a connect cap of 1000, twice).
+constexpr uint64_t kDefaultAttemptEnvelopeMs = 7000;
+
 constexpr uint64_t kSlotReadFailsForever = std::numeric_limits<uint64_t>::max();
 
 PoolPtr openPoolOnClock(const std::shared_ptr<TimingOutSlotReadBackend> & backend, tests::FakeClock & clock,
@@ -2534,24 +2537,27 @@ TEST(CASConfirmExactRef, CopyConfirmPropagatesAPersistentSlotReadFailureCountedO
     EXPECT_EQ(slotMovedCount() - moved_before, 0u) << "a failed read is not a moved slot";
 }
 
-/// The retries end at the deadline the confirm took at its start, not at a fresh window from the read: half the
-/// window is spent before the read, so a fresh window would keep reading past the caller's deadline.
-TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadAtTheCallersDeadline)
+/// The slot read binds its own window when it starts, not the poll's: half the poll's window is spent before the read,
+/// and the retries still run a full window from the read's start.
+TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadAtItsOwnWindow)
 {
     tests::FakeClock clock;
     auto backend = std::make_shared<TimingOutSlotReadBackend>();
-    /// A lease far longer than the window, so the policy deadline and not the lease ends the retries.
+    /// A lease far longer than the window, so the read's window and not the lease ends the retries.
     auto store = openPoolOnClock(backend, clock, std::chrono::minutes(10));
+    store->mountRequests().setAttemptReservationForTest(kDefaultAttemptEnvelopeMs);
     const RootNamespace ns{"srv1/confirm_copy_slot_deadline"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
     const auto pinned = store->resolveRefPinned(ns, "x");
     ASSERT_TRUE(pinned.has_value());
 
     const uint64_t window_ms = PoolConfig{}.cas_request_budget.request_window_ms;
-    const uint64_t deadline_ms = clock.now.load() + window_ms;
+    const uint64_t poll_deadline_ms = clock.now.load() + window_ms;
+    uint64_t read_started_ms = 0;
     store->setConfirmAfterLedgerSnapshotHookForTest([&]
     {
         clock.now.fetch_add(window_ms / 2);
+        read_started_ms = clock.now.load();
     });
     backend->watched_key = mountSlotKey(store);
     backend->failures_left = kSlotReadFailsForever;
@@ -2561,12 +2567,13 @@ TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadAtTheCallersDeadline
 
     EXPECT_FALSE(outcome.answer.has_value());
     EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::NETWORK_ERROR)) << outcome.error_message;
-    EXPECT_NE(outcome.error_message.find("policy deadline"), String::npos) << outcome.error_message;
     const std::vector<uint64_t> times = backend->slotReadTimes();
     ASSERT_GT(times.size(), 1u) << "the failure was retried";
-    EXPECT_LT(times.back(), deadline_ms) << "a read was sent at or after the caller's deadline";
+    const uint64_t read_deadline_ms = read_started_ms + window_ms;
+    EXPECT_GT(times.back(), poll_deadline_ms) << "the retries stopped at the poll's end instead of the read's own window";
+    EXPECT_LT(times.back(), read_deadline_ms) << "a read was sent at or after its own window's end";
     /// The loop stops only when the next pause plus attempt no longer fits; a pause is at most 5000 ms.
-    EXPECT_GE(clock.now.load() + 5000 + backend->attemptEnvelopeMs(), deadline_ms) << "the retries stopped short of the deadline";
+    EXPECT_GE(clock.now.load() + 5000 + kDefaultAttemptEnvelopeMs, read_deadline_ms) << "the retries stopped short of the window";
 }
 
 /// The confirm a peer asks for makes one attempt at the slot read: the peer times out and retries from its own queue.
@@ -2700,7 +2707,7 @@ TEST(CASConfirmExactRef, CopyConfirmReconfirmsOnceAMutationNamingTheSourceComple
 }
 
 /// The mutation stays queued: the confirm keeps asking until the deadline it took at its start and then refuses. It
-/// neither gives up while a pass still fits nor starts one that could not finish by the deadline.
+/// does not give up before the poll's end and starts no pass at or after it.
 TEST(CASConfirmExactRef, CopyConfirmRefusesAtItsDeadlineWhileAMutationNamingTheSourceStaysQueued)
 {
     tests::FakeClock clock;
@@ -2734,8 +2741,117 @@ TEST(CASConfirmExactRef, CopyConfirmRefusesAtItsDeadlineWhileAMutationNamingTheS
     ASSERT_GT(pass_times.size(), 1u) << "the confirm did not ask again";
     EXPECT_EQ(inFlightRefusals() - in_flight_before, pass_times.size()) << "every pass refused for the queued mutation";
     EXPECT_LE(answered_at, deadline_ms) << "the confirm answered after its deadline";
-    EXPECT_GE(answered_at + backend->attemptEnvelopeMs(), deadline_ms) << "the confirm gave up while a pass still fit";
-    EXPECT_LT(pass_times.back() + backend->attemptEnvelopeMs(), deadline_ms) << "a pass started that could not finish";
+    EXPECT_EQ(answered_at, deadline_ms) << "the poll stopped before its end";
+    EXPECT_LT(pass_times.back(), deadline_ms) << "a pass started at or after the poll's end";
+}
+
+/// A pass starts whenever the poll's end is still ahead, even with less than one attempt envelope left: its slot read
+/// binds its own window.
+TEST(CASConfirmExactRef, APassWithLessThanOneEnvelopeLeftStillStarts)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    store->mountRequests().setAttemptReservationForTest(kDefaultAttemptEnvelopeMs);
+    const RootNamespace ns{"srv1/confirm_copy_short_tail"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread appender([&] { appendPrecommitPairNaming(store, ns, "x"); });
+    SCOPE_EXIT({
+        latch.release();
+        appender.join();
+        store->setRefPreCarveHookForTest(nullptr);
+    });
+    latch.awaitEntered();
+
+    const uint64_t deadline_ms = clock.now.load() + store->poolConfig().cas_request_budget.request_window_ms;
+    const uint64_t left_ms = kDefaultAttemptEnvelopeMs / 2;
+    size_t pauses = 0;
+    *on_pause = [&]
+    {
+        if (++pauses == 1)
+            clock.now.store(deadline_ms - left_ms);
+    };
+    std::vector<uint64_t> pass_times;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { pass_times.push_back(clock.now.load()); });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    ASSERT_GT(pass_times.size(), 1u) << "no pass started with less than one envelope left";
+    EXPECT_EQ(pass_times[1], deadline_ms - left_ms);
+}
+
+/// The poll's end stops only new passes: a ledger check that crosses it still sends the slot read.
+TEST(CASConfirmExactRef, ALedgerCheckThatCrossesThePollEndStillSendsItsSlotRead)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock, std::chrono::minutes(10));
+    const RootNamespace ns{"srv1/confirm_copy_check_crosses_end"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    const uint64_t window_ms = PoolConfig{}.cas_request_budget.request_window_ms;
+    const uint64_t deadline_ms = clock.now.load() + window_ms;
+    store->setConfirmAfterLedgerSnapshotHookForTest([&] { clock.now.fetch_add(window_ms + 1); });
+    backend->watched_key = mountSlotKey(store);
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    const std::vector<uint64_t> times = backend->slotReadTimes();
+    ASSERT_EQ(times.size(), 1u);
+    EXPECT_GT(times.front(), deadline_ms) << "the slot read was sent before the poll's end";
+}
+
+/// A pause that reaches the poll's end starts no pass.
+TEST(CASConfirmExactRef, APauseThatReachesThePollEndStartsNoPass)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto on_pause = std::make_shared<std::function<void()>>();
+    auto store = openPoolOnFakeClock(backend, clock, on_pause);
+    const RootNamespace ns{"srv1/confirm_copy_pause_reaches_end"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread appender([&] { appendPrecommitPairNaming(store, ns, "x"); });
+    SCOPE_EXIT({
+        latch.release();
+        appender.join();
+        store->setRefPreCarveHookForTest(nullptr);
+    });
+    latch.awaitEntered();
+
+    const uint64_t deadline_ms = clock.now.load() + store->poolConfig().cas_request_budget.request_window_ms;
+    size_t passes = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++passes; });
+    /// The first pause ends exactly at the poll's end, whatever length the jitter gave it.
+    size_t pauses = 0;
+    *on_pause = [&]
+    {
+        if (++pauses == 1)
+            clock.now.store(deadline_ms);
+    };
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
+    EXPECT_EQ(passes, 1u);
+    EXPECT_EQ(clock.now.load(), deadline_ms) << "the pause was not clamped to the poll's end";
 }
 
 /// `No` says the source is no longer the binding the copy read; no later pass can change that, so it is answered at once.

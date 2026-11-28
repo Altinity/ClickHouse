@@ -189,7 +189,8 @@ struct ManifestSweepResult
 /// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
 /// nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: a
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
-/// log-only. `Gone`/`Mismatch` delete outcomes stay silently spared either way — those are the
+/// log-only. A stopped owner ends the sweep at the next key with its verdict, and a failure after the stop propagates
+/// either way. `Gone`/`Mismatch` delete outcomes stay silently spared either way — those are the
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.

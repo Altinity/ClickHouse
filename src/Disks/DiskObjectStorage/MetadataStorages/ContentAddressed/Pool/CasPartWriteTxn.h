@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Common/IThrottler.h>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -30,6 +31,8 @@ struct BlobSource
     std::optional<String> server_side_copy_from;
     std::shared_ptr<std::atomic<bool>> publication_attempted
         = std::make_shared<std::atomic<bool>>(false);
+    /// The bandwidth limit of the writer that produced the bytes; null for none.
+    ThrottlerPtr remote_throttler;
 
     /// Atomically consume the logical source's first-publication privilege -- the verbatim staged copy
     /// is available to exactly one physical publication of this source, whichever one gets here first.
@@ -177,18 +180,18 @@ public:
     /// `BlobRef` must carry an identical dep record; a conflict -- most
     /// commonly a conflicting size -- means the fan-out's one-task-per-unique-ref invariant was
     /// violated) -- BEFORE any result is applied. Application then runs against a COPY of `deps` (a
-    /// "build"), so a mid-application exception (including one raised by `setMergeHookForTest`'s hook, or
+    /// "build"), so a mid-application exception (including one raised by `setAdoptionHookForTest`'s hook, or
     /// a `bad_alloc` from map-node allocation) never touches the live `deps`; the copy is committed by a
     /// single no-throw `swap` only after every result has applied. The build is therefore either fully
     /// merged or byte-for-byte untouched -- never partially merged.
     void mergeBlobUploadResults(std::span<const BlobUploadResult> results);
 
-    /// Test-only fault-injection seam (inert in production): invoked after each result has applied to
-    /// the in-progress merge copy, with the count of results applied so far (1-based). A hook that
-    /// throws (e.g. to model a `bad_alloc` mid-merge) aborts `mergeBlobUploadResults` before its final
-    /// swap, so the live `deps` stays untouched -- the seam exists to prove that all-or-nothing property
-    /// under injected failure at every application point, not just the first or the last.
-    void setMergeHookForTest(std::function<void(size_t applied_so_far)> hook) { merge_hook_for_test = std::move(hook); }
+    /// Test-only fault-injection seam (inert in production), run before results are adopted into `deps`
+    /// with the count prepared so far (1-based): in `mergeBlobUploadResults` after each result has applied
+    /// to the merge copy, and in `putBlob` once after the upload. A hook that throws mid-merge aborts
+    /// `mergeBlobUploadResults` before its final swap, so the live `deps` stays untouched -- the seam
+    /// exists to prove that all-or-nothing property at every application point.
+    void setAdoptionHookForTest(std::function<void(size_t prepared)> hook) { adoption_hook_for_test = std::move(hook); }
 
     /// Test-only: runs in `promote` after its liveness checks and before its append. Set before `promote`.
     void setPromoteBeforeAppendHookForTest(std::function<void()> hook) { promote_before_append_hook_for_test = std::move(hook); }
@@ -362,6 +365,9 @@ private:
     /// Reject operations after `abandon`, namespace cancellation, or writer-epoch fencing. These checks happen
     /// before backend work so a stale transaction cannot publish a new owner or stage more debris.
     void requireAlive() const;
+    /// Before an upload result enters `deps`: the build is alive, its owner has not stopped, and the mount
+    /// still admits the generation the build began under.
+    void requireAdoptable(std::string_view where) const;
     /// Best-effort exact-token delete of THIS build's staged `_manifests` debris; the precommit body (if
     /// any) is SKIPPED -- left for GC's delete-after-sealed-decrements. Never throws (the namespace-scoped orphan
     /// sweep is the durable backstop). Shared by the normal and the namespace-removal-cancelled `abandon`
@@ -409,8 +415,8 @@ private:
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 
-    /// Backing state for `setMergeHookForTest`; empty (no-op) in production.
-    std::function<void(size_t)> merge_hook_for_test;
+    /// Backing state for `setAdoptionHookForTest`; empty (no-op) in production.
+    std::function<void(size_t)> adoption_hook_for_test;
     /// Backing state for `setPromoteBeforeAppendHookForTest`; empty in production.
     std::function<void()> promote_before_append_hook_for_test;
 };

@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
@@ -284,22 +285,34 @@ CasRefLedger::CasRefLedger(
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
     , recovery_pre_first_request_hook_for_test(std::move(recovery_pre_first_request_hook_for_test_))
 {
-    /// Default backoff sleep for the recovery retry loop (`ensureRefTableRecovered`): sleep in short
-    /// slices and stop early if the mount fence drops (shutdown / lease loss), so teardown never waits
-    /// out a full 30s backoff. This is deliberate, bounded backoff against external object-store I/O
-    /// failure -- NOT masking a race -- exactly like the request engine's own inter-attempt sleep; the
-    /// slice loop additionally makes it interruptible, which that one is not.
-    recovery_retry_sleep_fn = [this](uint64_t total_ms, const std::optional<DetachedStopToken> & token)
+    recovery_retry_slice_sleep_fn = [](uint64_t ms) { sleepForMilliseconds(ms); };
+}
+
+void CasRefLedger::pauseBeforeRecoveryRetry(uint64_t total_ms, const std::optional<DetachedStopToken> & token)
+{
+    /// A test's whole-pause sleep is one slice, so the checks below run before it as before every slice.
+    const uint64_t slice_ms = recovery_retry_pause_sleep_for_test ? total_ms : static_cast<uint64_t>(Cas::kOwnerStopSlice.count());
+    uint64_t slept = 0;
+    do
     {
-        constexpr uint64_t slice_ms = 200;
-        uint64_t slept = 0;
-        while (slept < total_ms && fence_ok_fn() && !(token && token->stopping()))
+        if (!fence_ok_fn() || (token && token->stopping()))
+            return;
+        /// A stopped owner ends the pause before a new walk, as it ends the pause before an S3 reissue: a
+        /// background owner with its verdict, a query by returning early to the caller's veto.
+        Cas::throwIfBackgroundStopped();
+        if (!Cas::insideOwed() && Cas::queryStopRequested())
+            return;
+        if (recovery_retry_pause_sleep_for_test)
         {
-            const uint64_t chunk = std::min(slice_ms, total_ms - slept);
-            sleepForMilliseconds(chunk);
-            slept += chunk;
+            recovery_retry_pause_sleep_for_test(total_ms, token);
+            return;
         }
-    };
+        if (total_ms == 0)
+            return;
+        const uint64_t chunk = std::min(slice_ms, total_ms - slept);
+        recovery_retry_slice_sleep_fn(chunk);
+        slept += chunk;
+    } while (slept < total_ms);
 }
 
 WriteResult CasRefLedger::stagingPutIfAbsent(const String & key, const String & bytes)
@@ -329,7 +342,7 @@ void CasRefLedger::throwNotAdmitted(std::string_view what) const
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     mount_requests.setSleepFnForTest(sleep_fn);
-    recovery_retry_sleep_fn = [recovery_sleep_fn = std::move(sleep_fn)](
+    recovery_retry_pause_sleep_for_test = [recovery_sleep_fn = std::move(sleep_fn)](
         uint64_t total_ms, const std::optional<DetachedStopToken> &)
     {
         recovery_sleep_fn(total_ms);
@@ -339,7 +352,12 @@ void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_f
 void CasRefLedger::setRefRecoveryRetrySleepForTest(
     std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn)
 {
-    recovery_retry_sleep_fn = std::move(sleep_fn);
+    recovery_retry_pause_sleep_for_test = std::move(sleep_fn);
+}
+
+void CasRefLedger::setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn)
+{
+    recovery_retry_slice_sleep_fn = std::move(sleep_fn);
 }
 
 
@@ -754,6 +772,14 @@ void CasRefLedger::cancelIdleOwnCreatingRows(
     const auto stopped = [&] { return stop_requested && stop_requested(); };
     if (stopped())
         return;
+    /// The stop also ends a cancel that keeps losing the catalog, at its next submission.
+    std::optional<Cas::OwnerScope> stop_owner;
+    if (stop_requested)
+        stop_owner.emplace(Cas::OwnerScope::background([&]
+        {
+            if (stopped())
+                throw Exception(ErrorCodes::ABORTED, "CAS cleanup of this mount's own `Creating` rows stopped by its scheduler");
+        }));
     /// The order `Pool::captureMountIncarnation` uses: a generation that holds across the epoch read dates it.
     const uint64_t generation = fence_generation_fn();
     const uint64_t epoch = live_epoch_fn();
@@ -765,7 +791,7 @@ void CasRefLedger::cancelIdleOwnCreatingRows(
     {
         LOG_ERROR(getLogger("CasRefLedger"), "CAS ref catalog '{}': mandatory catalog absent; skipping owner cleanup", key);
     };
-    const Retry policy = op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
     const std::optional<Object> got = op.read(key, policy);
     if (!got)
     {
@@ -1162,7 +1188,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
 std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
     const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
-    bool & cancelled, const std::optional<DetachedStopToken> & token)
+    bool & cancelled, bool & unresolved_sent, const std::optional<DetachedStopToken> & token)
 {
     /// One attempt. Runs with NO lock held: everything below is either read-only I/O or a conditional
     /// write at a key this namespace owns, and the replayed candidate is PRIVATE until the caller
@@ -1181,13 +1207,15 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// is the fence's. The predicate is a bool where the poll throws, so the poll still runs at the
     /// boundaries: it turns each of these facts into the right exception and LATCHES a cancellation for
     /// the caller's retry classification.
-    CasOperation op = mount_requests.resume(admitted_generation, [&rt, &token]
+    /// An admission check, not an owner: its terms hold inside an owed walk too.
+    const auto recovery_request_still_admitted = [&rt, &token]
     {
         return !(token && token->stopping())
             && !rt.recovery_cancel_requested.load(std::memory_order_acquire)
             && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt.superseded_by_remount.load(std::memory_order_acquire);
-    });
+    };
+    CasOperation op = mount_requests.resume(admitted_generation, recovery_request_still_admitted);
 
     /// ---- The checkpoint and the base ----
     /// The runtime was admitted for this exact life before entering recovery, so this walk takes no
@@ -1224,7 +1252,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
         catch (const Exception & e)
         {
-            if (!failureJudgedAgainstCkpt(e.code()))
+            /// A query's stored cause says nothing about the checkpoint, whatever its code.
+            if (!failureJudgedAgainstCkpt(e.code()) || Cas::isQueryStoredCause(std::current_exception()))
                 throw;
 
             /// A newer checkpoint may have re-anchored recovery while cleanup retired this old anchor's
@@ -1301,6 +1330,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         return true;
     };
 
+    /// Marks the error of a sent write that may still land, so a later owner stop does not replace it.
+    const auto throwUnresolved = [&unresolved_sent](bool sent_any, const String & message)
+    {
+        unresolved_sent = sent_any;
+        throwCasRequestRetryLater(message);
+    };
+
     /// The walk never re-reads `_ckpt` itself: the re-read after the last read or write of this attempt
     /// covers its end and every tombstone create.
     RefChainOrigin origin{
@@ -1359,10 +1395,15 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
             CkptStampResult stamp = stampCkptGeneration3(op, layout, life, accepted);
+            /// The 412 proves the stamp did not land; the stop ends this walk rather than starting another.
+            if (stamp.outcome == CkptStampOutcome::TokenMismatch && stamp.observed_stop)
+                throwCasRequestRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the query stopped after its refused generation 3 stamp "
+                    "of `_ckpt`; nothing is installed", ns.string()));
             if (stamp.outcome == CkptStampOutcome::TokenMismatch)
                 return std::nullopt;
             if (stamp.outcome == CkptStampOutcome::Unresolved)
-                throwCasRequestRetryLater(fmt::format(
+                throwUnresolved(stamp.sent_any, fmt::format(
                     "CAS ref-table recovery for namespace '{}': the generation 3 stamp of its `_ckpt` is "
                     "unresolved; nothing is installed", ns.string()));
             accepted = std::move(*stamp.stamped);
@@ -1436,7 +1477,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
 
         if (const auto * gave_up = std::get_if<GaveUp>(&created))
-            throwCasRequestRetryLater(fmt::format(
+            throwUnresolved(gave_up->sent_any, fmt::format(
                 "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} is UNRESOLVED ({}); the "
                 "table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence,
                 gave_up->sent_any ? "the outcome of the attempt is unknown" : "nothing was sent"));
@@ -1484,27 +1525,25 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
     const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
     bool * lifecycle_refusal)
 {
-    /// The SECONDARY bound. Wall-clock time is already bounded by the frozen policy below, which
-    /// every verb of every iteration shares; this cap exists so a sequence that somehow converges on
-    /// neither a resolution nor the deadline still ends. A duel between two openers (one creating, one
-    /// reconciling a stale creator) converges in a handful of rounds.
+    /// A duel between two openers (one creating, one reconciling a stale creator) converges in a
+    /// handful of rounds.
     static constexpr size_t kMaxResolveAttempts = 32;
     const CreatorFence our_fence{server_root_id, live_epoch, admitted_generation};
     CasOperation op = mount_requests.resume(admitted_generation);
+    const Retry policy = Retry::standard();
 
-    /// ONE bound for the whole loop, frozen before the first iteration: every read and every protocol
-    /// call below shares this deadline, so a namespace whose catalog entry keeps moving gives up
-    /// retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration. The paced re-read below is a bare sleep that does not consult the deadline, so the
-    /// loop can sleep one backoff (at most 5 s) past it before the next read refuses to start.
-    const Retry policy = op.freeze(Retry::standard());
-
+    uint32_t collisions = 0;
     for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
     {
-        /// Paces ONLY the re-reads a competing actor forced. A `Live` outcome is this open's own
-        /// success and its single confirming re-read is not contention, so it is never delayed. The
-        /// argument is the number of collisions so far, so the first one waits the shortest draw.
-        const auto paceReRead = [&] { op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1)); };
+        /// Paces ONLY the re-reads a competing actor forced, by the count of those collisions. A `Live`
+        /// outcome is this open's own success and its single confirming re-read is not contention, so it
+        /// is never delayed. The last attempt is followed by no re-read, so nothing waits for it.
+        const auto paceReRead = [&]
+        {
+            ++collisions;
+            if (const uint64_t pause_ms = Retry::conflictBackoff(collisions); pause_ms > 0 && attempt + 1 < kMaxResolveAttempts)
+                op.sleepFor(pause_ms);
+        };
 
         const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout, policy);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
@@ -1632,14 +1671,15 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
         return RefRecoveryOutcome::Recovered;
 
     /// A concurrent second caller waits here rather than racing an independent walk against the first
-    /// caller's unlocked I/O.
+    /// caller's unlocked I/O. The walk belongs to another caller, so this caller's query does not end the wait.
     while (rt.recovery_in_progress)
     {
         if (token && token->stopping())
             throw Exception(ErrorCodes::ABORTED,
                 "CAS ref recovery: teardown began while waiting for a concurrent recovery");
+        Cas::throwIfBackgroundStopped();
         ++rt.recovery_waiters_for_test;
-        rt.recovery_cv.wait_for(lock, std::chrono::milliseconds(200));
+        rt.recovery_cv.wait_for(lock, Cas::kOwnerStopSlice);
         --rt.recovery_waiters_for_test;
     }
     if (rt.recovered && !needs_rerecovery())
@@ -1667,7 +1707,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     ///
     /// Captured for the WHOLE call, not per attempt, for the same reason: the transient-retry loop below
     /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
-    /// re-drive under a moved generation (below), so the budget is never burned on a doomed retry.
+    /// re-drive under a moved generation (below), so no walk is spent on a doomed retry.
     const uint64_t admitted_generation = rt.admitted_fence_generation;
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery walk admission");
     /// Preserve this runtime's exact writer identity across the unlocked walk. The runtime stays in
@@ -1681,13 +1721,68 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     /// Outer transient-retry loop, so a blip does not fail a table load for good: a whole recovery attempt that
     /// fails with a TRANSIENT object-store transport error (`isTransientRecoveryError` -- `S3_ERROR`/
     /// socket/timeout from the direct LIST/GET backend calls, or a controller `NETWORK_ERROR`) is retried
-    /// with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of propagating
-    /// and failing this table's async load permanently. Non-transient errors (corruption, decode, a moved
-    /// fence, logic, resource limits) fail fast; so do the latched terminal cases below.
-    const uint64_t recovery_start_ms = boot_ms_now_fn();
+    /// with capped-exponential backoff until `kCasMaxRecoveryWalks` walks have started, instead of
+    /// propagating and failing this table's async load permanently. Non-transient errors (corruption,
+    /// decode, a moved fence, logic, resource limits) fail fast; so do the latched terminal cases below.
     uint64_t recovery_retry_num = 0;
+    /// Walks started so far, retried or restarted alike.
+    uint32_t walks_started = 0;
     bool vanish_brake_tripped = false;
     bool cancelled = false;
+    /// Only a walk that threw lets a stopped owner end recovery: a restart after a successful walk and the
+    /// structural exits keep their answers.
+    bool walk_failed = false;
+    std::exception_ptr unresolved_error;
+    /// After a failed walk a stopped background owner ends recovery with its verdict, an unresolved write's error first.
+    const auto rethrowIfBackgroundStoppedAfterFailedWalk = [&]
+    {
+        if (!walk_failed)
+            return;
+        if (std::exception_ptr stop = Cas::backgroundStopRequested())
+            std::rethrow_exception(unresolved_error ? unresolved_error : stop);
+    };
+    /// The same, then a stopped query ends recovery with `failure`, the error recovery already has.
+    const auto rethrowIfOwnerStoppedAfterFailedWalk = [&](const std::exception_ptr & failure)
+    {
+        rethrowIfBackgroundStoppedAfterFailedWalk();
+        if (walk_failed && Cas::queryStopRequested())
+            std::rethrow_exception(unresolved_error ? unresolved_error : failure);
+    };
+    /// Whether the catalog still names the recovering life. A failed catalog read is a third answer.
+    struct LifeCheck
+    {
+        enum class Answer : uint8_t { Exists, Removed, Unknown };
+        Answer answer;
+        std::exception_ptr failure;
+    };
+    const auto checkLifeStillCataloged = [&]() -> LifeCheck
+    {
+        try
+        {
+            if (confirmRecoveredLifeOrDetach(rt, admitted_generation))
+                return {LifeCheck::Answer::Exists, nullptr};
+            return {LifeCheck::Answer::Removed, nullptr};
+        }
+        catch (...)
+        {
+            return {LifeCheck::Answer::Unknown, std::current_exception()};
+        }
+    };
+    const auto throwIfTeardown = [&token]
+    {
+        if (token && token->stopping())
+            throw Exception(ErrorCodes::ABORTED, "CAS ref recovery: teardown began during recovery");
+    };
+    /// Throws `ABORTED` on teardown. False when the mount fence is lost, this runtime is retired or superseded by a
+    /// self-remount, or the admitting generation has moved: retrying under a stale generation can only be refused at the install.
+    const auto mayRetry = [&]
+    {
+        throwIfTeardown();
+        return fence_ok_fn()
+            && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt.superseded_by_remount.load(std::memory_order_acquire)
+            && fence_generation_fn() == admitted_generation;
+    };
     for (;;)
     {
         try
@@ -1700,7 +1795,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                     if (attempt > kRefRecoveryMaxRestarts)
                     {
                         /// Terminal, NOT a transient object-store outage: latch so the outer retry loop
-                        /// rethrows immediately instead of re-driving this brake for the whole budget.
+                        /// rethrows immediately instead of re-driving this brake for the remaining walks.
                         vanish_brake_tripped = true;
                         if (hole_detail)
                             throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -1721,16 +1816,25 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 /// selected-base vanish after the next attempt takes a different path.
                 hole_detail.reset();
 
+                if (walk_failed)
+                    Cas::throwIfBackgroundStopped();
+                walk_failed = false;
+
                 /// The whole walk runs UNLOCKED. Nothing it touches is shared: the candidate is private
                 /// and `rt` is read only through atomics the poll consults. Unlocking is what keeps a
                 /// recovery's full I/O envelope from stalling every reader of this table -- and what lets
                 /// the self-remount barrier take the lock promptly to JOIN us.
+                ++walks_started;
                 lock.unlock();
                 std::optional<RecoveryResult> walked;
+                bool unresolved_sent = false;
                 try
                 {
+                    /// Owed so that CAS's own checks do not cut a started walk. On S3 a stopped query's walk still
+                    /// fails at its first error answer, the `404` that ends every walk included.
+                    const auto owed = Cas::OwnerScope::owed();
                     walked = runRecoveryWalkOnce(
-                        ns, rt, admitted_generation, live, retained_attempt, hole_detail, cancelled, token);
+                        ns, rt, admitted_generation, live, retained_attempt, hole_detail, cancelled, unresolved_sent, token);
                     /// The admission's catalog read precedes the walk, and another server's GC may have
                     /// erased the life and deleted its objects under it.
                     if (walked)
@@ -1738,6 +1842,9 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 }
                 catch (...)
                 {
+                    walk_failed = true;
+                    if (unresolved_sent)
+                        unresolved_error = std::current_exception();
                     /// Re-acquire BEFORE letting anything propagate: the SCOPE_EXIT above mutates
                     /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with
                     /// `state_mutex` held -- unwinding through it unlocked would be a data race on the
@@ -1748,7 +1855,20 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 lock.lock();
 
                 if (!walked)
+                {
+                    /// When the structural brake also trips on the next pass, it reports the more specific cause.
+                    if (walks_started >= kCasMaxRecoveryWalks && attempt < kRefRecoveryMaxRestarts)
+                    {
+                        /// A fence lost during the last walk is the answer, not the count.
+                        refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery restart");
+                        throwCasRequestRetryLater(fmt::format(
+                            "CAS ref-table recovery for namespace '{}': did not converge after {} walks ({})",
+                            ns.string(), walks_started,
+                            hole_detail ? "last walk found: " + *hole_detail
+                                        : String("the last walk restarted because the checkpoint or its base moved")));
+                    }
                     continue;   /// restart requested (vanished base, or a hole worth one more reading)
+                }
                 if (life_removed)
                     break;
 
@@ -1792,34 +1912,37 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             /// a `catch (const Exception &)` would not even see. `getCurrentExceptionCode()` normalises
             /// every exception (DB, Poco, std) to a code so the transient classifier can decide.
             const int code = getCurrentExceptionCode();
-            /// Corruption of a life the catalog no longer names is the janitor's work, not damage.
-            if (code == ErrorCodes::CORRUPTED_DATA)
+            /// Corruption of a life the catalog no longer names is the janitor's work, not damage. The confirmation
+            /// is no retry, so a stopped query reaches it as a live one does; a query's stored cause is no corruption.
+            const bool confirm_corruption
+                = code == ErrorCodes::CORRUPTED_DATA && !Cas::isQueryStoredCause(std::current_exception());
+            if (!confirm_corruption)
+                rethrowIfOwnerStoppedAfterFailedWalk(std::current_exception());
+            else
             {
+                rethrowIfBackgroundStoppedAfterFailedWalk();
                 lock.unlock();
-                bool confirmed = true;
-                try
-                {
-                    confirmed = confirmRecoveredLifeOrDetach(rt, admitted_generation);
-                }
-                catch (...)  // NOLINT(bugprone-empty-catch)
-                {
-                    /// Without a confirmation the walk's own error is the answer.
-                }
+                const LifeCheck life = checkLifeStillCataloged();
                 lock.lock();
-                if (!confirmed)
+                if (life.answer == LifeCheck::Answer::Removed)
                 {
                     life_removed = true;
                     break;
                 }
+                /// A stop during the confirmation must not surface as corruption.
+                rethrowIfOwnerStoppedAfterFailedWalk(life.failure ? life.failure : std::current_exception());
+                /// Nor may a failed confirmation: it did not establish that the catalog still names the life.
+                if (life.answer == LifeCheck::Answer::Unknown)
+                    std::rethrow_exception(unresolved_error ? unresolved_error : life.failure);
             }
             /// `cancelled` is latched by the poll itself: a self-remount's cancellation uses the
             /// retry-later class (the caller should retry, against the FRESH incarnation), so without the
             /// latch this loop would read it as a transient blip and re-drive the very work the remount
             /// just stopped. Detached teardown is independently terminal even when the in-flight
             /// exception happened to carry a transient transport code.
-            if (vanish_brake_tripped || cancelled || (token && token->stopping())
-                || !isTransientRecoveryError(code))
+            if (vanish_brake_tripped || cancelled || !isTransientRecoveryError(code))
                 throw;   /// a latched terminal case, or a non-transient failure -- fail fast
+            throwIfTeardown();
 
             /// A cancellation now ends the walk through the operation's liveness, which refuses
             /// silently -- so the exception that arrives here carries a transport code and `cancelled`
@@ -1828,16 +1951,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             if (rt.recovery_cancel_requested.load(std::memory_order_acquire))
                 checkRecoveryStillAdmitted(ns, rt, cancelled, token);
 
-            const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
-            /// Fail closed BEFORE sleeping: budget spent, mount fence lost, this runtime superseded by a
-            /// self-remount, or the incarnation that admitted this recovery has moved (retrying under a
-            /// generation that is already stale can only ever be refused at the install).
-            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
-                || (token && token->stopping())
-                || !fence_ok_fn()
-                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-                || rt.superseded_by_remount.load(std::memory_order_acquire)
-                || fence_generation_fn() != admitted_generation)
+            /// Fail closed BEFORE sleeping.
+            if (!mayRetry())
+                throw;
+
+            /// The walk cap ends the loop without a pause; the original error propagates like the exits above.
+            if (walks_started >= kCasMaxRecoveryWalks)
                 throw;
 
             /// Saturating `initial << recovery_retry_num`: `initial > cap >> n` implies the unshifted
@@ -1852,9 +1971,9 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             ProfileEvents::increment(ProfileEvents::CASRefRecoveryRetries);
             LOG_WARNING(getLogger("CasRefLedger"),
                 "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
-                "(code {}: {}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
+                "(code {}: {}); retry #{} after {}ms backoff",
                 ns.string(), code, getCurrentExceptionMessage(/*with_stacktrace=*/false),
-                recovery_retry_num, backoff_ms, elapsed_ms, cas_request_budget.recovery_retry_budget_ms);
+                recovery_retry_num, backoff_ms);
 
             lock.unlock();
             /// Re-acquire the lock before letting any exception from the sleep unwind, so the SCOPE_EXIT
@@ -1862,24 +1981,26 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
             /// `state_mutex`) never runs unlocked -- same obligation as the walk's window above.
             try
             {
-                recovery_retry_sleep_fn(backoff_ms, token);
+                /// Only a walk that threw makes the next walk a reissue the owner may stop.
+                std::optional<Cas::OwnerScope> pause_owed;
+                if (!walk_failed)
+                    pause_owed.emplace(Cas::OwnerScope::owed());
+                pauseBeforeRecoveryRetry(backoff_ms, token);
             }
             catch (...)
             {
                 lock.lock();
+                if (unresolved_error)
+                    std::rethrow_exception(unresolved_error);
                 throw;
             }
             lock.lock();
-            /// The fence/supersession/budget can all change during the unlocked sleep -- re-check before
-            /// starting the next full attempt so we never re-drive recovery on an orphaned runtime, past
-            /// the budget, or under a lost or moved fence (the sliced sleep may have woken early on fence
-            /// loss).
-            if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
-                || (token && token->stopping())
-                || !fence_ok_fn()
-                || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-                || rt.superseded_by_remount.load(std::memory_order_acquire)
-                || fence_generation_fn() != admitted_generation)
+            /// A query stopped in the pause vetoes the next walk.
+            if (walk_failed && Cas::queryStopRequested())
+                std::rethrow_exception(unresolved_error ? unresolved_error : std::current_exception());
+            /// The fence and supersession can change during the unlocked sleep, which may also have woken
+            /// early on fence loss.
+            if (!mayRetry())
                 throw;
             /// loop: re-run recovery from a fresh checkpoint read, exact replay and walk
         }
@@ -2208,6 +2329,15 @@ RefLaneState CasRefLedger::laneStateForTest(const RootNamespace & ns)
     return rt->lane_state;
 }
 
+CasRefLedger::RemovalFlagsForTest CasRefLedger::removalFlagsForTest(const RootNamespace & ns)
+{
+    const auto rt = lookupRefTableRuntime(ns);
+    if (!rt)
+        return {};
+    std::lock_guard<std::mutex> lock(ref_queue_mutex);
+    return {.attempt_active = rt->removal_attempt_active, .admission_closed = rt->removal_admission_closed};
+}
+
 bool CasRefLedger::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
     const auto rt = lookupRefTableRuntime(ns);
@@ -2323,31 +2453,37 @@ namespace
 {
 
 /// The row may still be `Live` here, so the text must not claim `Removing`.
-[[noreturn]] void throwRemovalWriteMayLand(const RootNamespace & ns)
+String removalWriteMayLandReason(const RootNamespace & ns)
 {
-    throwCasWriteRetryLater(fmt::format(
-        "CAS namespace '{}': a removal write may still land, so positive ref mutation admission is "
-        "closed until a retried removal completes or the disk is remounted; retry later", ns.string()));
+    return fmt::format(
+        "CAS namespace '{}': a removal write may still land, so writes are refused until a retried removal "
+        "completes or the disk is remounted; retry the `DROP TABLE` or other operation that removed it", ns.string());
 }
 
 /// True whether the removal is still running, done and waiting for GC to erase the row, or stuck; the
 /// remedy for a stuck one depends on the operation that started it, so the text names none.
-[[noreturn]] void throwRemovingObserved(const RootNamespace & ns)
+String removingObservedReason(const RootNamespace & ns)
 {
-    throwCasWriteRetryLater(fmt::format(
+    return fmt::format(
         "CAS namespace '{}' is Removing in the catalog: writes are refused and reads see no data until its removal "
         "completes and GC erases the row; retry later, and if it stays Removing see the CAS troubleshooting page",
-        ns.string()));
+        ns.string());
+}
+
+/// Only for a caller that has not queued its mutation yet.
+[[noreturn]] void throwAdmissionRefused(const String & reason)
+{
+    throw RefAdmissionRefusedException(makeCasWriteRetryLaterException(reason));
 }
 
 /// Flags read under `ref_queue_mutex`.
 [[noreturn]] void throwPositiveAdmissionClosed(const RootNamespace & ns, bool removing_observed, bool write_may_land)
 {
     if (write_may_land)
-        throwRemovalWriteMayLand(ns);
+        throwAdmissionRefused(removalWriteMayLandReason(ns));
     if (removing_observed)
-        throwRemovingObserved(ns);
-    throwCasWriteRetryLater(fmt::format(
+        throwAdmissionRefused(removingObservedReason(ns));
+    throwAdmissionRefused(fmt::format(
         "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
         "terminal fold and catalog removal complete; retry later", ns.string()));
 }
@@ -2433,6 +2569,8 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             catch (...)
             {
                 std::erase(rt->pending, item);
+                /// The queue may now be drained, and a removal waits for that without a timeout.
+                rt->cv.notify_all();
                 throw;
             }
 
@@ -2461,7 +2599,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
         }
         else
         {
-            rt->cv.wait(lk);
+            waitAsFollower(rt, item, lk);
         }
     }
     lk.unlock();
@@ -2469,16 +2607,50 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     ProfileEvents::increment(ProfileEvents::CASRefQueueWaitMicroseconds,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - enqueued_at).count());
+    /// One failure can complete several items, each rethrown on its own caller's thread.
     if (item->error)
-        std::rethrow_exception(item->error);
+        rethrowOwnCopy(item->error);
     return item->committed_id;
 }
 
+
+void CasRefLedger::waitAsFollower(
+    const std::shared_ptr<RefTableRuntime> & rt, const std::shared_ptr<RefMutationItem> & item, std::unique_lock<std::mutex> & lk)
+{
+    try
+    {
+        Cas::waitStoppable(rt->cv, lk, [&]
+        {
+            runRefFollowerWaitHook(FollowerWaitPhase::Queued);
+            return item->done || !rt->leader_active;
+        });
+    }
+    catch (...)
+    {
+        /// A queued item still belongs to its caller and is withdrawn. Otherwise a leader owns it (or it is
+        /// done) and completes it, so the caller leaves only with that result; this wait has no owner check.
+        if (std::erase(rt->pending, item) > 0)
+        {
+            rt->cv.notify_all();
+            throw;
+        }
+        rt->cv.wait(lk, [&]
+        {
+            runRefFollowerWaitHook(FollowerWaitPhase::Carved);
+            return item->done;
+        });
+    }
+}
 
 void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                               const std::shared_ptr<RefMutationItem> & own,
                               std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
+    /// Captured before `shared`, which leaves no owner to ask.
+    const std::function<void()> owner_check = Cas::OwnerScope::effectiveCheck();
+    /// One caller's owner must not decide work done for several callers.
+    const auto shared = Cas::OwnerScope::shared();
+
     /// Fairness baton pass: serve flushes only until the caller's OWN item is done, then hand off to a
     /// woken waiter.
     while (true)
@@ -2488,7 +2660,9 @@ void CasRefLedger::runRefQueueLeader(const RootNamespace & ns, const std::shared
             if (own->done)
                 return;
         }
-        flushRefBatch(ns, rt, owned_items);
+        if (owner_check)
+            owner_check();
+        flushRefBatch(ns, rt, owned_items, own, owner_check);
     }
 }
 
@@ -3422,7 +3596,8 @@ bool CasRefLedger::ensureEpochOpenForAppend(const RootNamespace & ns, const std:
 }
 
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                                 std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
+                                 std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+                                 const std::shared_ptr<RefMutationItem> & own, const std::function<void()> & owner_check)
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
@@ -3446,12 +3621,18 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         }
         rt->cv.notify_all();
     };
-    auto carve_all_pending = [&]() -> std::vector<std::shared_ptr<RefMutationItem>>
+    /// Takes the error already built and allocates nothing, so no failure can leave a taken item neither queued
+    /// nor completed.
+    auto fail_all_pending = [&](const std::exception_ptr & e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
-        std::vector<std::shared_ptr<RefMutationItem>> all(rt->pending.begin(), rt->pending.end());
+        for (const auto & it : rt->pending)
+        {
+            it->error = e;
+            it->done = true;
+        }
         rt->pending.clear();
-        return all;
+        rt->cv.notify_all();
     };
 
     RefRecoveryOutcome recovery_outcome = RefRecoveryOutcome::Recovered;
@@ -3461,13 +3642,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     }
     catch (...)
     {
-        complete_error(carve_all_pending(), std::current_exception());
+        fail_all_pending(std::current_exception());
         return;
     }
     if (recovery_outcome == RefRecoveryOutcome::LifeRemoved)
     {
-        complete_error(carve_all_pending(),
-            makeCasWriteRetryLaterExceptionPtr(recoveredLifeRemovedMessage(ns, rt->life)));
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(recoveredLifeRemovedMessage(ns, rt->life)));
         return;
     }
 
@@ -3475,7 +3655,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// Fails the WHOLE queue -- every caller would have gotten the same refusal alone.
     if (!may_mutate())
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS mount lost / lease expired — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id)));
         return;
@@ -3489,7 +3669,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// reaching this AFTER passing `mayMutate` above proves the swap happened.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount — "
             "retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -3518,7 +3698,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             case WedgeResolution::Rejected:
             case WedgeResolution::StillWedged:
             case WedgeResolution::Corrupted:
-                complete_error(carve_all_pending(), resolution.survivor_error);
+                fail_all_pending(resolution.survivor_error);
                 return;
         }
     }
@@ -3558,7 +3738,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// `CORRUPTED_DATA` about a stale premise this lane was never entitled to use.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
+        fail_all_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
             "before its batch was carved — retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -3584,6 +3764,10 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
+        /// Until carved, the leader's own item is still its caller's to withdraw; the leadership exit guard
+        /// removes it from `pending`. Outside the prelude's catch, which would fail the whole queue for one caller's stop.
+        if (owner_check && std::find(rt->pending.begin(), rt->pending.end(), own) != rt->pending.end())
+            owner_check();
         const size_t cap = table_live ? kMaxRefBatch : 1;
 
         /// --- PLAN ---
@@ -5511,10 +5695,10 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
                     write_may_land = rt->removal_write_may_land;
                 }
                 if (write_may_land)
-                    throwRemovalWriteMayLand(ns);
+                    throwAdmissionRefused(removalWriteMayLandReason(ns));
                 if (removing_observed)
-                    throwRemovingObserved(ns);
-                throwCasWriteRetryLater(fmt::format(
+                    throwAdmissionRefused(removingObservedReason(ns));
+                throwAdmissionRefused(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
             }
@@ -5570,6 +5754,9 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
                     return rt->life;
                 }
                 invalidateRemovedCatalogLife(rt->life);
+                /// A stopped caller starts no work on a successor life.
+                if (recovery_error && Cas::ownerStopRequested())
+                    std::rethrow_exception(recovery_error);
             }
         }
     }
@@ -5583,7 +5770,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
-        throwRemovingObserved(ns);
+        throwAdmissionRefused(removingObservedReason(ns));
 
     const NamespaceLifeId life
         = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
@@ -5749,9 +5936,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
     ColdAdmission admission = beginColdAdmission(ns);
     CasOperation initial_op = mount_requests.admit();
-    /// One deadline for every request that leads to the removal decision. The wait for the lane to
-    /// drain and for another removal attempt counts against it but is never cut short.
-    const Retry policy = initial_op.freeze(Retry::standard());
+    const Retry policy = Retry::standard();
     const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout, policy);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -5813,7 +5998,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         return {};   /// as for a name without a row
     {
         std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
-        rt->cv.wait(queue_lock, [&]
+        Cas::waitStoppable(rt->cv, queue_lock, [&]
         {
             return !rt->removal_attempt_active;
         });
@@ -5834,22 +6019,6 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             return {};
     }
 
-    /// Close the local positive lane BEFORE publishing `Removing`. Calls already admitted ahead of
-    /// this point drain first; later positive callers observe the flag in the same queue critical
-    /// section as enqueue and receive the typed retry-later refusal. The terminal item below is the one
-    /// deliberate exception.
-    {
-        std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
-        rt->removal_admission_closed = true;
-        rt->cv.wait(queue_lock, [&]
-        {
-            return !rt->leader_active && rt->pending.empty();
-        });
-    }
-
-    if (removal_attempt_hook_for_test)
-        removal_attempt_hook_for_test();
-
     /// Admitted under the runtime this drop closed and drained, not under the current generation: after a
     /// remount another runtime of this name may be open, and `Removing` must not land under it.
     const auto runtime_live = [&rt]
@@ -5857,16 +6026,68 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt->superseded_by_remount.load(std::memory_order_acquire);
     };
-    CasOperation removal_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
     bool removing_durable = false;
     bool removal_write_outcome_unknown = false;
+
+    /// Resolves the removal state from a fresh catalog read. Returns true when the row is the durable
+    /// `Removing` of this life. Reopens the lane only when the row is exactly the observed `Live` one,
+    /// the mount fence is still admitted, and no `Removing` write may still land: that is,
+    /// `removal_write_outcome_unknown`, `rt->removal_write_may_land` and `rt->removing_observed` are all
+    /// clear. Every other case leaves the lane closed.
+    const auto resolveRemovalState = [&](CasOperation & op)
+    {
+        /// Owed to the closed lane: a stopped owner must not leave a proven `Live` lane closed.
+        const auto owed = Cas::OwnerScope::owed();
+        const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(op, layout, policy);
+        if (removal_reopen_read_hook_for_test)
+            removal_reopen_read_hook_for_test();
+        const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        if (observed_live
+            && fresh_it != fresh.catalog.entries.end()
+            && fresh_it->incarnation == observed_live->incarnation
+            && fresh_it->state == NsState::Removing)
+        {
+            return true;
+        }
+        if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
+        {
+            refuseUnlessAdmitted(op, "reopening the removal lane");
+            std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+            if (!removal_write_outcome_unknown && !rt->removal_write_may_land && !rt->removing_observed)
+            {
+                rt->removal_admission_closed = false;
+                rt->cv.notify_all();
+            }
+        }
+        return false;
+    };
+
+    std::optional<CasOperation> removal_op;
     try
     {
-        refuseUnlessAdmitted(removal_op, "beginning removal");
-        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout, policy);
+        /// Close the local positive lane BEFORE publishing `Removing`. Calls already admitted ahead of
+        /// this point drain first; later positive callers observe the flag in the same queue critical
+        /// section as enqueue and receive the typed retry-later refusal. The terminal item below is the one
+        /// deliberate exception.
+        {
+            std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
+            rt->removal_admission_closed = true;
+            Cas::waitStoppable(rt->cv, queue_lock, [&]
+            {
+                return !rt->leader_active && rt->pending.empty();
+            });
+        }
+
+        if (removal_attempt_hook_for_test)
+            removal_attempt_hook_for_test();
+
+        removal_op.emplace(mount_requests.resume(rt->admitted_fence_generation, runtime_live));
+        refuseUnlessAdmitted(*removal_op, "beginning removal");
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*removal_op, layout, policy);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
         if (entry_it == snapshot.catalog.entries.end())
@@ -5888,18 +6109,20 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         {
             observed_live = *entry_it;
             uint64_t removal_started_round = 0;
-            if (const auto got = removal_op.read(layout.gcStateKey(), policy))
+            if (const auto got = removal_op->read(layout.gcStateKey(), policy))
                 removal_started_round = decodeGcState(got->bytes).round;
 
             /// The flag turns on at the first sent attempt of the `Live -> Removing` write. Before it nothing
             /// can land, so a failure may reopen the lane. After it every exception, `FencedOut` and
-            /// `EntryChanged` may follow an attempt that can still land.
-            removal_op.observeRequests(RequestObserver{
+            /// `EntryChanged` may follow an attempt that can still land: a later refusal does not prove
+            /// that an earlier send cannot land, because the row has no revision field and, on a store
+            /// with content-derived ETags, unrelated churn can restore that send's precondition.
+            removal_op->observeRequests(RequestObserver{
                 .on_write_attempt = [&removal_write_outcome_unknown](uint32_t) { removal_write_outcome_unknown = true; },
                 .on_failure = {},
             });
             switch (CasRefCatalog::beginRemoving(
-                removal_op, layout, *observed_live, removal_started_round, policy))
+                *removal_op, layout, *observed_live, removal_started_round, policy))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
@@ -5925,35 +6148,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     }
     catch (...)
     {
-        /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
-        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row, the
-        /// same mount fence and no `Removing` observation of this runtime, which may land after the read;
-        /// every other case stays closed and propagates the original error.
+        /// An ambiguous transition is resolved before the lane may reopen; otherwise the original error propagates.
+        /// A failure before the removal operation exists sent nothing: its error propagates even if the row reads `Removing`.
         try
         {
-            /// A fresh standard window, not `policy`: an expired policy would fail this read at once and
-            /// leave a healthy table closed.
-            const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
-            if (removal_reopen_read_hook_for_test)
-                removal_reopen_read_hook_for_test();
-            const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
-                [&](const CatalogEntry & entry) { return entry.ns == ns; });
-            if (observed_live
-                && fresh_it != fresh.catalog.entries.end()
-                && fresh_it->incarnation == observed_live->incarnation
-                && fresh_it->state == NsState::Removing)
+            if (removal_op)
+                removing_durable = resolveRemovalState(*removal_op);
+            else
             {
-                removing_durable = true;
-            }
-            else if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
-            {
-                refuseUnlessAdmitted(removal_op, "reopening the removal lane");
-                std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-                if (!removal_write_outcome_unknown && !rt->removal_write_may_land && !rt->removing_observed)
-                {
-                    rt->removal_admission_closed = false;
-                    rt->cv.notify_all();
-                }
+                CasOperation reopen_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
+                resolveRemovalState(reopen_op);
             }
         }
         catch (...) // NOLINT(bugprone-empty-catch)

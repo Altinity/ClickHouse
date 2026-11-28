@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "cas_test_helpers.h"
+#include "cas_killable_query.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
@@ -4652,9 +4653,13 @@ public:
         Absent,
         Unanswered,
         Refused,
+        /// A retryable store answer, as the S3 client gives for a failed connection.
+        NetworkError,
     };
 
     std::atomic<StateHead> state_head{StateHead::Store};
+    /// Runs at every `HEAD` of `gc/state`, before its answer.
+    std::function<void()> on_state_head;
     /// Every token of `gc/state` is a weak ETag: a valid precondition with no canonical identity.
     std::atomic<bool> weak_state_tokens{false};
 
@@ -4697,6 +4702,8 @@ public:
             return meta;
         if (meta && weakened(key))
             meta->value = weak(meta->value);
+        if (on_state_head)
+            on_state_head();
         switch (state_head.load())
         {
             case StateHead::Store:
@@ -4707,6 +4714,8 @@ public:
                 throw Poco::TimeoutException("the gc/state HEAD was never answered");
             case StateHead::Refused:
                 throw std::runtime_error("the store refused the gc/state HEAD");
+            case StateHead::NetworkError:
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "the gc/state HEAD failed");
         }
         return meta;
     }
@@ -5274,6 +5283,114 @@ TEST(CASGcIntents, UnconfirmedLeasedStateSuppressesTheRound)
         report = pool.round();
         EXPECT_EQ(report.bodies_deleted, 1u) << "the confirmed round did not delete the body";
         EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 0u);
+    }
+}
+
+/// A killed round's intent delete that fails with the query's stored cause propagates it unannotated: the query
+/// rethrows that one object to every thread it stops.
+TEST(CASGcIntents, IntentDeleteLeavesTheStoredQueryExceptionUnchanged)
+{
+    IntentPool<> pool(std::make_shared<IntentBackend>());
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    pool.round();
+    ASSERT_TRUE(pool.row(1) && pool.row(1)->standing) << "the body is deleted, its intent is next";
+    const String stored_text = "the query's stored network failure";
+    const auto cause = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "{}", stored_text));
+    bool fired = false;
+    int code = 0;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        pool.backend->onBeforeBulkRemove([&]
+        {
+            if (std::exchange(fired, true))
+                return;
+            query.kill(cause);
+            std::rethrow_exception(cause);
+        });
+        try
+        {
+            pool.gc->runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+        pool.backend->onBeforeBulkRemove({});
+    });
+
+    ASSERT_TRUE(fired) << "the round sent no intent delete";
+    EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR);
+    try
+    {
+        std::rethrow_exception(cause);
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.message(), stored_text) << "the intent delete annotated the query's stored exception";
+    }
+}
+
+/// The validation read of `gc/state` fails with a retryable error. A live round retries, gives up, records
+/// `parent_unconfirmed` and commits; a killed round's retry is vetoed, so it ends with that failure and writes nothing
+/// after the read.
+TEST(CASGcIntents, AKilledRoundsFailedValidationReadEndsTheRoundBeforeItsWrites)
+{
+    for (const bool killed : {false, true})
+    {
+        SCOPED_TRACE(killed ? "killed query" : "live query");
+        IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+        ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+        std::map<String, UInt64> reduce;
+        pool.gc->setPhaseSink([&reduce](const GcPhaseRecord & record)
+        {
+            if (record.phase == "fold_reduce")
+                reduce = record.metrics;
+        });
+
+        pool.backend->state_head = StateHead::NetworkError;
+        pool.backend->clearJournal();
+        int code = 0;
+        String message;
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            pool.backend->on_state_head = [&]
+            {
+                if (killed)
+                    query.kill();
+            };
+            try
+            {
+                pool.gc->runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+            pool.backend->on_state_head = {};
+        });
+        pool.backend->state_head = StateHead::Store;
+
+        const auto journal = pool.backend->journal();
+        const std::vector<size_t> heads = stateHeadIndices(journal);
+        ASSERT_FALSE(heads.empty()) << "positive control: the round sent its validation read";
+        const size_t writes_after = static_cast<size_t>(std::count_if(journal.begin() + heads.back(), journal.end(),
+            [](const JournalEntry & entry) { return entry.verb == JournalVerb::Write; }));
+        if (killed)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+            EXPECT_NE(message.find("the gc/state HEAD failed"), String::npos) << message;
+            EXPECT_EQ(heads.size(), 1u) << "the killed round retried the read";
+            EXPECT_EQ(writes_after, 0u) << "the killed round wrote after its failed validation read";
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << message;
+            EXPECT_GT(heads.size(), 1u) << "the live round retried the read";
+            EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u);
+            EXPECT_GT(writes_after, 0u) << "the live round committed";
+        }
+        EXPECT_TRUE(pool.bodyMeta(1).has_value());
     }
 }
 

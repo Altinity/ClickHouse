@@ -7,8 +7,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 
 #include <atomic>
 #include <chrono>
@@ -19,6 +22,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -357,6 +361,42 @@ TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
         EXPECT_NE(decodeMountLease(got->bytes).min_active_build_sequence, kTerminated)
             << "an unearned clean farewell must NOT be written when the ref lanes did not drain";
     }
+}
+
+/// FORGET run by a killed query on a healthy store still drains and writes its clean farewell: every request it
+/// sends succeeds, so the kill stops none of them.
+TEST(CASForget, KilledQuerysForgetLandsTheFarewell)
+{
+    using DB::Cas::decodeMountLease;
+    constexpr uint64_t kTerminated = std::numeric_limits<uint64_t>::max();
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    const String mount_key = store->layout().mountKey(kSrid);
+
+    String failure;
+    std::thread killed([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        query.kill();
+        try
+        {
+            store->forgetDisk([] {}, kForgetReason);
+        }
+        catch (...)
+        {
+            failure = getCurrentExceptionMessage(/*with_stacktrace=*/false);
+        }
+    });
+    killed.join();
+
+    EXPECT_TRUE(failure.empty()) << failure;
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(decodeMountLease(got->bytes).min_active_build_sequence, kTerminated) << "the clean farewell did not land";
 }
 
 /// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE persistent remount worker joins it without deadlock. Here the

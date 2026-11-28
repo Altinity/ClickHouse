@@ -6,13 +6,43 @@
 namespace DB::Cas
 {
 
-/// A retry policy for one logical CAS write, expressed WITHOUT touching a clock: `window_ms` is the
-/// policy's own budget measured from the call's start (empty: the default window of the request plane),
-/// and `lease_deadline_ms` (already reduced by the caller's safety margin) is an absolute bound on
-/// whatever clock the caller's mount lease is tracked against. Binding a policy to an absolute deadline
-/// is deferred to `bind`, which takes the caller's own `now_ms` -- `CasRequests` runs on an injected clock in tests, so a `Retry` built at
-/// construction time from the real clock could never be exercised deterministically, and `GaveUp`
-/// could not tell a lease-caused deadline from a policy-caused one without recording which bound won.
+/// Caps on a hand-written loop's own iterations, independent of any clock: a loop that keeps
+/// deciding again on fresh reads must end even when every iteration is quick.
+/// An update of a shared object that keeps losing races fails at this count with `NETWORK_ERROR` "did not converge";
+/// there is no total time budget, and each request has its own window.
+inline constexpr uint32_t kCasMaxDecisions = 100;
+/// How much the pause grows with each further consecutive clean lost race of one call: enough to desynchronise competitors,
+/// short enough not to wait long when a race is brief.
+inline constexpr uint64_t kCasConflictPauseStepMs = 40;
+/// The ceiling of the pause's base: 100 lost races cost about 67 to 84 s of pauses, under the waits other parts of
+/// the server put on these loops. A pause adds up to a quarter of its base.
+inline constexpr uint64_t kCasConflictPauseCeilingMs = 750;
+/// The walk that fails at this count propagates its own error; a restart at it fails as "did not converge".
+inline constexpr uint32_t kCasMaxRecoveryWalks = 8;
+
+/// A retry policy for one logical CAS request, expressed WITHOUT touching a clock.
+///
+/// Every request gets its OWN window, measured from the entry of the engine call that sends it: `window_ms`
+/// if set, else the default window of the plane it runs on. A window bounds one request or one local wait
+/// (the hot-key queue wait), so `cas_request_window_ms` means one step.
+///
+/// A loop that runs too long gets a smaller count, an owner's stop, or a time budget that decides only whether its
+/// next pass starts (the copy-source confirm poll, the GC janitor's pages, the GC ref intake), never a deadline of its
+/// own shared between its requests: a shared one leaves a later request no time after a slow early one and can refuse
+/// the read that settles a write already sent. The only shared deadlines are absolute bounds from outside the loop,
+/// below. Accepted cost: a conflict loop on a slow store can run about 100 windows. Two have neither: a paged listing
+/// (`CasOperation::forEachListedKey`) runs until its callback stops it, and a request under `untilDefinitive` has no
+/// window.
+///
+/// Two things can end a request earlier, and `bind` takes the minimum of all three:
+///   - `lease_deadline_ms`: an absolute bound (already reduced by the caller's safety margin) on the clock
+///     the mount lease is tracked against; `GaveUp` reports it as the lease's, and an expired window or cap as the
+///     policy's.
+///   - `outside_cap_ms`: an absolute bound from a caller that has a deadline of its own (an offline tool's
+///     `--timeout`). Successive requests under it share it. Set it only through `cappedAt`, never by hand, and
+///     never to carry a loop's own budget: a cap never lengthens a window.
+/// Binding is deferred to `bind`, which takes the caller's `now_ms`: `CasRequests` runs on an injected clock
+/// in tests, and `GaveUp` must tell the lease's bound from the others.
 struct Retry
 {
     std::optional<uint64_t> window_ms;
@@ -26,14 +56,10 @@ struct Retry
     /// `GaveUp::Unresolved` so the caller decides new bytes. For namespace-create step 1, whose catalog
     /// row must differ per attempt. A clean conflict and a credential reissue are unaffected. Read
     /// paths ignore it. Clear it only in a loop that decides again on a fresh read (`casUpdateImpl`
-    /// with `CasOperation::pauseBeforeRedecide`); any other caller gets a bare `GaveUp::Unresolved`.
+    /// with `CasOperation::pauseAfterUnresolvedWrite`); any other caller gets a bare `GaveUp::Unresolved`.
     bool resend_unresolved = true;
-    /// An ABSOLUTE bound on the caller's own clock, replacing `window_ms` in `bind`. A hand-written
-    /// loop freezes one before it starts (`CasOperation::freeze`) and shares it across every call it
-    /// makes, so the loop as a whole ends when that deadline does instead of granting each of its
-    /// iterations a fresh window. Empty for a single verb, which gets its window from where it is
-    /// called.
-    std::optional<uint64_t> policy_deadline_ms = std::nullopt;
+    /// An absolute bound on the caller's clock that can only shorten the request. See `cappedAt`.
+    std::optional<uint64_t> outside_cap_ms = std::nullopt;
     /// When set, a reissue in `CasOperation`'s write and read loops waits until a draw from [0.8, 1.2]
     /// of this has passed since the failed attempt started, instead of the growing backoff. A
     /// first-attempt fuse timeout is still reissued at once.
@@ -45,23 +71,23 @@ struct Retry
     /// `attempt == 0` returns 0.
     static uint64_t backoff(uint32_t attempt);
 
-    /// The flat pause after a clean lost race: `backoff(1)`, uniform over [0, 200] ms. It does not grow
-    /// with the writer's loss count, because a settled conflict has nothing to wait for but
-    /// desynchronisation from its competitors, and growing it with the loss count made the oldest
-    /// loser the slowest and the likeliest to lose again. A conflict that settled a transport fault
-    /// keeps `backoff(attempt)`: the fault is what must pace the loop.
-    static uint64_t conflictBackoff() { return backoff(1); }
+    /// The pause after the `loss`-th consecutive clean lost race of one call (1-based): `base` plus uniform(0, base / 4),
+    /// `base = min(kCasConflictPauseCeilingMs, kCasConflictPauseStepMs * (loss - 1))`, so the first is 0. The next decision
+    /// reads after the pause, so its length does not change that decision's chance; it grows only to
+    /// lower the contention a repeated loss shows, and the jitter keeps competitors from retrying in step.
+    /// A conflict that settled a transport fault keeps `backoff(attempt)`: the fault is what must pace it.
+    static uint64_t conflictBackoff(uint32_t loss);
 
     /// A policy with `ms` milliseconds of its own budget and no lease bound.
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
     /// The default write policy: the window of the request plane it runs on.
     static Retry standard() { return {.window_ms = std::nullopt, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
-    /// A policy bound by the mount lease: `lease_deadline_ms` minus `margin`, clamped at 0 -- never
-    /// risk a write landing after this node's fence may already be gone. `window_ms` defaults to the
-    /// window of the request plane; a caller whose own budget is deliberately much smaller (the
-    /// graceful-shutdown farewell, whose window is derived from what ONE write costs, not from the
-    /// standard policy) passes its own window explicitly, and `bind` still takes whichever of the two
-    /// bounds is smaller.
+    /// A policy bound by the mount lease: an attempt starts only if its reserved time ends before
+    /// `lease_deadline_ms` minus `margin`, clamped at 0. That bounds when attempts start, not when they
+    /// land. `window_ms` defaults to the window of the request plane; a caller whose own budget is
+    /// deliberately much smaller (the graceful-shutdown farewell, whose window is derived from what ONE
+    /// write costs, not from the standard policy) passes its own window explicitly, and `bind` still
+    /// takes whichever of the two bounds is smaller.
     static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin,
                                 std::optional<uint64_t> window_ms = std::nullopt)
     {
@@ -89,35 +115,24 @@ struct Retry
         return spacedPause(drawSpacing(attempt_spacing_ms_), attempt_started_ms, now_ms);
     }
 
-    /// This policy, made single-attempt. A frozen loop policy keeps its absolute deadline through it,
-    /// which is what lets a loop send an unrepeatable request under the same bound as the rest.
-    Retry asSingleAttempt() const
-    {
-        Retry copy = *this;
-        copy.single_attempt = true;
-        return copy;
-    }
-
-    /// This policy ending no later than `deadline_ms` on the caller's clock. The deadline replaces `window_ms` as a
-    /// frozen one does; an earlier frozen deadline stays.
+    /// This policy ending no later than `deadline_ms` on the caller's clock; the window and the lease bound
+    /// still apply, and an earlier cap stays.
     Retry cappedAt(uint64_t deadline_ms) const
     {
         Retry copy = *this;
-        copy.policy_deadline_ms = policy_deadline_ms && *policy_deadline_ms < deadline_ms ? *policy_deadline_ms : deadline_ms;
+        copy.outside_cap_ms = outside_cap_ms && *outside_cap_ms < deadline_ms ? *outside_cap_ms : deadline_ms;
         return copy;
     }
 
-    /// A policy bound to an absolute deadline on the caller's own clock, plus which bound produced
-    /// it -- the caller's own budget, or the (smaller) lease bound.
+    /// A policy bound to an absolute deadline on the caller's own clock, plus which bound produced it.
     struct Bound
     {
+        enum class Source : uint8_t { RequestWindow, OutsideCap, Lease };
         uint64_t deadline_ms;
-        bool lease_bound;
+        Source source;
     };
-    /// Bind this policy to `now_ms`: `deadline_ms = min(policy_deadline_ms ?: now_ms + (window_ms ?:
-    /// default_window_ms), lease_deadline_ms)`, `lease_bound` true exactly when the lease bound was the
-    /// smaller of the two. Called once at call entry with the owner's `now_ms()`. A frozen policy therefore keeps
-    /// the lease bound honest: the smaller of the two still wins, and still says so.
+    /// `deadline_ms = min(now_ms + (window_ms ?: default_window_ms), outside_cap_ms, lease_deadline_ms)`. A bound
+    /// is the `source` only when strictly smaller than the ones before it in that order.
     Bound bind(uint64_t now_ms, uint64_t default_window_ms) const;
 };
 

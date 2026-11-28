@@ -96,10 +96,11 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
 7. `BlobSource::beginPublication` consumes the shared, monotonic `publication_attempted` state
    before backend I/O. A lost response cannot re-enable verbatim copy on a later attempt.
 8. Retryable or ambiguous failures restart at `HEAD`: up to 8 attempts, each with a fresh envelope.
-   The engine starts no new attempt after the configured request window (`cas_request_window_ms`,
-   default 120 s), but an attempt already started can run longer: each creating request waits up to
-   the disk's `request_timeout_ms`, and multipart part uploads keep their own retries. A write can
-   therefore take longer than the request window before it fails with a retryable error. No
+   Each `HEAD` and intent `GET` has its own request window (`cas_request_window_ms`, default 120 s);
+   the loop has no time limit of its own; 8 attempts are its count. An attempt already started can run longer: each creating
+   request waits up to the disk's `request_timeout_ms`, and multipart part uploads keep their own
+   retries. A write can therefore take longer than one request window before it fails with a
+   retryable error. No
    dependency proof is recorded until the body was adopted or the publication completed.
 
 **Reads go to the store.** The `HEAD` is sent after the precommit edge is durable, and the intent

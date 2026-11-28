@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasUploadGuard.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -16,6 +18,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
+#include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/getRandomASCIIString.h>
@@ -29,6 +33,7 @@
 #include <base/scope_guard.h>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -36,6 +41,11 @@ namespace ProfileEvents
 {
     extern const Event CASBlobUploadFanoutBatches;
     extern const Event CASBlobUploadFanoutTasks;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric IsServerShuttingDown;
 }
 
 namespace fs = std::filesystem;
@@ -61,6 +71,13 @@ namespace
 bool hasSuffix(std::string_view s, std::string_view suffix)
 {
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+}
+
+/// True when the removal is retried after a restart, so server shutdown may stop it: today only the catalog's drop
+/// worker removes an `Atomic` table directory without a query. A new such caller must requeue a failed removal.
+bool tableRemovalResumesAfterRestart(const std::string & path)
+{
+    return endsWithTableUuidPair(path) && !CurrentThread::tryGetQueryContext();
 }
 
 }
@@ -442,6 +459,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         Cas::BlobSource source;
         source.size = pb.size;
         source.publication_attempted = pb.publication_attempted;
+        source.remote_throttler = pb.remote_throttler;
         if (pb.backend == Cas::StagingBackend::S3)
         {
             source.server_side_copy_from = pb.staging_key;
@@ -610,8 +628,13 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "ContentAddressedTransaction: staged entries or removal marks for {}/{} without a Build", ns.string(), ref);
 
-    /// Promote is an atomic owner move that validates every blob dependency proof.
-    const Cas::ManifestId id = precommitAndUpload(ns, ref, st, pending_refs);
+    /// Promote is an atomic owner move that validates every blob dependency proof. Only the uploads of a new build may
+    /// be stopped: nothing names it yet, and the promote itself must not be cut.
+    const Cas::ManifestId id = [&]
+    {
+        Cas::UploadStopScope upload_stop(Cas::uploadStopCheck());
+        return precommitAndUpload(ns, ref, st, pending_refs);
+    }();
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
     /// before the durable promote call. A no-op in production (nothing ever arms it).
@@ -707,6 +730,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// dropped. `dropRefIfMatches` additionally guards against a concurrent repoint of the SAME ref
         /// since this call's own publish: it removes the ref only if it still names the exact
         /// `manifest_ref` this commit bound, leaving a newer binding untouched.
+        /// Owed to the failed commit: a stopped owner must not leave a ref of that commit live.
+        const auto owed = Cas::OwnerScope::owed();
         for (const auto & oc : part_outcomes)
             if (oc && oc->created)
                 metadata_storage.partAccess()->dropRefIfMatches({oc->ns, oc->ref}, oc->manifest_ref);
@@ -906,14 +931,16 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
 
 void ContentAddressedTransaction::stageBlobPartFile(
     const ContentAddressedMetadataStorage::Route & route,
-    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, Cas::StagingBackend backend)
+    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, Cas::StagingBackend backend,
+    ThrottlerPtr remote_throttler)
 {
     /// Do not upload here. Record the pending blob for post-precommit publication; dependency state
     /// remains absent until the upload succeeds and its result is merged.
     /// The staging bytes are kept (the transaction owns them) — a local temp file for
     /// `Cas::StagingBackend::Local`, or an S3 staging object for `Cas::StagingBackend::S3`.
     auto & st = stagingFor(route);
-    st.pending_blobs.push_back({ref, staging_key, size, backend});
+    st.pending_blobs.push_back(
+        {ref, staging_key, size, backend, std::make_shared<std::atomic<bool>>(false), std::move(remote_throttler)});
     (void)buildFor(route, st);
 
     Cas::ManifestEntry entry;
@@ -1115,7 +1142,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             const Cas::PoolPtr pool = metadata_storage.store();
             const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
             const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
-            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
+            /// Only the throttler travels: the caller's other settings describe its own buffer, not this upload.
+            WriteSettings sink_settings;
+            sink_settings.remote_throttler = Cas::makeUploadGuard(settings.remote_throttler, Cas::uploadStopCheck());
+            auto object_sink = metadata_storage.objectStorage()->writeObject(
+                StoredObject(staging_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, sink_settings);
             return std::make_unique<Cas::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
@@ -1124,10 +1155,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 buf_size,
                 settings.use_adaptive_write_buffer,
                 settings.adaptive_write_buffer_initial_size,
-                [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & key)
+                [this, route = *r, hash_algo, throttler = settings.remote_throttler](
+                    const std::string & hash_hex, size_t size, const std::string & key)
                 {
                     const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
-                    stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
+                    stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3, throttler);
                 },
                 [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
         }
@@ -1138,10 +1170,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             buf_size,
             settings.use_adaptive_write_buffer,
             settings.adaptive_write_buffer_initial_size,
-            [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & temp_path)
+            [this, route = *r, hash_algo, throttler = settings.remote_throttler](
+                const std::string & hash_hex, size_t size, const std::string & temp_path)
             {
                 const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
-                stageBlobPartFile(route, ref, size, temp_path, Cas::StagingBackend::Local);
+                stageBlobPartFile(route, ref, size, temp_path, Cas::StagingBackend::Local, throttler);
             });
     }
 
@@ -1149,7 +1182,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// rides the single tree object as an Inline entry (one-GET part open); an oversized
     /// candidate spills to a blob (the safety net).
     return std::make_unique<Cas::CaInlineWriteBuffer>(
-        [this, route = *r](std::string bytes)
+        [this, route = *r, throttler = settings.remote_throttler](std::string bytes)
         {
             /// Mint via the one write hash function, `Cas::poolContentHash` (algorithm, payload) -> BlobRef
             /// (`CasPartWriteTxn.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
@@ -1199,7 +1232,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// enough (a safety net, not a hot path) that S3-staging mode does not cover it.
                 bool staged = false;
                 SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, ref, bytes.size(), temp_path, Cas::StagingBackend::Local);
+                stageBlobPartFile(route, ref, bytes.size(), temp_path, Cas::StagingBackend::Local, throttler);
                 staged = true;
             }
         });
@@ -1317,6 +1350,13 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// file go in one dropNamespace.
     if (auto uuid = Cas::parseTableUuid(path))
     {
+        std::optional<Cas::OwnerScope> shutdown_owner;
+        if (Cas::tableRemovalResumesAfterRestart(path))
+            shutdown_owner.emplace(Cas::OwnerScope::background([]
+            {
+                if (CurrentMetrics::get(CurrentMetrics::IsServerShuttingDown))
+                    throw Exception(ErrorCodes::ABORTED, "CAS table namespace removal stopped by server shutdown");
+            }));
         metadata_storage.partAccess()->dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }
@@ -1768,6 +1808,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     /// attach via moveFile): delegate to moveDirectory, which owns directory shapes.
     if (src && dst && !src->ref.empty() && src->file.empty() && !dst->ref.empty() && dst->file.empty())
     {
+        /// Owed to the reserved name: only the undo reaches here, and SQL rejects a part left under it.
+        const auto owed = Cas::OwnerScope::owed();
         moveDirectory(path_from, path_to);
         return;
     }
@@ -2041,9 +2083,13 @@ void fanOutBlobUploads(
         /// `waitForAllToFinish` only waits (never throws), so it is safe on the unwinding path (the B90
         /// lesson, `threadPoolCallbackRunner.h:68`).
         SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+        /// Read on the publishing thread, so every worker is stopped, or not, as its publisher would be.
+        const std::function<void()> upload_stop = UploadStopScope::current();
         size_t idx = 0;
         for (const auto & [ref, req] : grouped)
         {
+            /// The drain guard still joins the tasks already dispatched.
+            throwIfBackgroundStopped();
             std::optional<BlobUploadResult> * slot = &result_slots[idx++];
             BlobUploadRequest task_req = req;
             const BlobUploadFanoutHooksForTest * task_hooks = hooks;
@@ -2052,8 +2098,11 @@ void fanOutBlobUploads(
             /// Schedule and track in ONE no-throw step: `enqueueAndGiveOwnership` returns the handle (the
             /// task is now runnable) and the pre-reserved `emplace_back` records it without allocating, so
             /// there is no window in which a scheduled task is untracked.
-            handles.emplace_back(runner.enqueueAndGiveOwnership([slot, txn, req_by_value = std::move(task_req), task_hooks]
+            handles.emplace_back(runner.enqueueAndGiveOwnership([slot, txn, req_by_value = std::move(task_req), task_hooks,
+                                                                 group = CurrentThread::getGroup(), upload_stop]
             {
+                UploadStopScope adopted_stop(upload_stop);
+                throwUnlessInThreadGroup(group, "CAS blob upload worker");
                 if (task_hooks && task_hooks->in_task)
                     task_hooks->in_task(req_by_value.ref);
                 *slot = txn->uploadBlobDetached(req_by_value);

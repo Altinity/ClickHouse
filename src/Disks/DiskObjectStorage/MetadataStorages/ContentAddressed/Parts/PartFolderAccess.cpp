@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
@@ -256,6 +257,9 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     if (freshness != Freshness::CachedForLoad)
         return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
 
+    /// A cold build's leader stopped: its followers build again rather than share the leader's verdict.
+    struct LeaderStopped {};
+
     const String cache_key = key.cacheKey();
     /// Readers that resolved different manifests of one ref must not share a build.
     const String build_key = cache_key + '\0' + resolved.manifest_id.root_namespace.string() + '\0'
@@ -287,11 +291,15 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
             {
                 return future.get();                          /// Rethrows the leader's exception, if any.
             }
+            catch (const LeaderStopped &)
+            {
+                continue;
+            }
             catch (const std::exception & e)
             {
                 /// The leader ran out of its own query's memory, which says nothing about this query's budget.
                 if (!isMemoryLimitExceeded(e))
-                    throw;
+                    rethrowOwnCopy(std::current_exception());
                 continue;
             }
         }
@@ -311,8 +319,9 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
         catch (...)
         {
             retire();
-            promise.set_exception(std::current_exception());
-            throw;
+            /// The followers copy the published failure, so the leader leaves it untouched and throws its own copy.
+            promise.set_exception(ownerStopRequested() ? std::make_exception_ptr(LeaderStopped{}) : std::current_exception());
+            rethrowOwnCopy(std::current_exception());
         }
         promise.set_value(view);
         retire();
@@ -813,6 +822,11 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     catch (const Exception & e)
     {
         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+            throw;
+        /// A stopped background owner's miss is its verdict. A query's stored cause is no miss; a real one is.
+        if (auto stop = backgroundStopRequested())
+            std::rethrow_exception(stop);
+        if (isQueryStoredCause(std::current_exception()))
             throw;
         eraseView(key);
         return;   /// Raced away between the gate and dropRef; nothing was actually dropped here.

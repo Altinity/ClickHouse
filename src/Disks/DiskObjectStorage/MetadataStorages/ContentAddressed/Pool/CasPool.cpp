@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
@@ -1288,7 +1289,7 @@ void Pool::cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requeste
     /// The pass keeps the mount fence but backs off on the open plane's sleep, which `beginTeardown` wakes;
     /// the mount plane's sleep would hold a scheduler join for a whole pause.
     ref_ledger.cancelIdleOwnCreatingRows(
-        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.pause(ms); }, stop_requested);
+        [this] { return !teardownBegun(); }, [this](uint64_t ms) { gc_requests.sleepFor(ms); }, stop_requested);
 }
 
 void Pool::beginTeardown() noexcept
@@ -1872,14 +1873,24 @@ bool Pool::writerCleanupDutiesPending() const
         [](const auto & item) { return !item.second.pending.empty(); });
 }
 
+bool Pool::writerCleanupDrainingForTest(const RootNamespace & ns) const
+{
+    std::lock_guard lock(writer_cleanup_mutex);
+    const auto it = writer_cleanup_queues.find(ns);
+    return it != writer_cleanup_queues.end() && it->second.draining;
+}
+
 void Pool::drainWriterCleanupDuties(const RootNamespace & ns)
 {
     {
         std::unique_lock lock(writer_cleanup_mutex);
-        writer_cleanup_cv.wait(lock, [&]
+        Cas::waitStoppable(writer_cleanup_cv, lock, [&]
         {
             const auto it = writer_cleanup_queues.find(ns);
-            return it == writer_cleanup_queues.end() || !it->second.draining;
+            const bool ready = it == writer_cleanup_queues.end() || !it->second.draining;
+            if (!ready && writer_cleanup_wait_hook_for_test)
+                writer_cleanup_wait_hook_for_test();
+            return ready;
         });
 
         const auto it = writer_cleanup_queues.find(ns);
@@ -1905,6 +1916,8 @@ void Pool::drainWriterCleanupDuties(const RootNamespace & ns)
                 }
                 duty = it->second.pending.front();
             }
+            /// Before each duty, so a stop never falls between a settled duty and its retirement.
+            Cas::throwIfBackgroundStopped();
 
             ref_ledger.appendRefOps(
                 ns,
@@ -2202,6 +2215,11 @@ void Pool::setRefRecoveryRetrySleepForTest(
     ref_ledger.setRefRecoveryRetrySleepForTest(std::move(sleep_fn));
 }
 
+void Pool::setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn)
+{
+    ref_ledger.setRefRecoveryRetrySliceSleepForTest(std::move(sleep_fn));
+}
+
 std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale, ResolveAudit audit)
 {
     return ref_ledger.resolveRef(ns, ref_name, allow_stale, audit);
@@ -2273,24 +2291,29 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
     /// Every pass repeats the ownership capture, the ledger snapshot and the slot read. The destination's reference is durable
     /// before the first pass and GC deletes a body only on an untouched zero of a complete cut, so a later full pass proves the
     /// same ownership overlap as an earlier one. An exact name and token may legitimately reappear after a move away and back.
-    const Retry slot_read_policy = Retry::standard().cappedAt(deadline_ms);
+    const Retry slot_read_policy = Retry::standard();
     for (uint32_t pass = 1;; ++pass)
     {
         throwIfConfirmTornDown(ns, ref_name);
         const ConfirmVerdict verdict = confirmUnderSlot(
             ns, ref_name, [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
             slot_read_policy);
-        if (verdict.answer != ConfirmAnswer::Unknown || verdict.refusal == ConfirmVerdict::Refusal::OneWay
-            || ref_ledger.pinnedTableRetired(table, ns))
+        if (verdict.answer != ConfirmAnswer::Unknown)
+            return verdict.answer;
+        /// A stopped background owner gets its own verdict instead of any `Unknown`, so `republishRef` never reads the
+        /// destination for it.
+        Cas::throwIfBackgroundStopped();
+        if (verdict.refusal == ConfirmVerdict::Refusal::OneWay || ref_ledger.pinnedTableRetired(table, ns))
             return verdict.answer;
         const uint64_t now_ms = bootMsNow();
         if (now_ms >= deadline_ms)
             return verdict.answer;
         throwIfConfirmTornDown(ns, ref_name);
-        /// Teardown does not wake this pause, and no query cancellation reaches this layer.
-        mount_requests.pause(std::min(Retry::backoff(pass), deadline_ms - now_ms));
-        /// A pass whose slot read could not finish by the deadline would fail on the read instead of refusing.
-        if (!mount_requests.admit().oneAttemptFitsBefore(deadline_ms))
+        /// Teardown does not wake this pause; the owner is asked before and after it.
+        mount_requests.sleepFor(std::min(Retry::backoff(pass), deadline_ms - now_ms));
+        Cas::throwIfBackgroundStopped();
+        /// A pass starts only before the poll's end; a started pass finishes, its slot read binds its own window.
+        if (bootMsNow() >= deadline_ms)
             return verdict.answer;
     }
 }
@@ -2328,7 +2351,9 @@ ConfirmVerdict Pool::confirmUnderSlot(const RootNamespace & ns, const String & r
         catch (...)
         {
             throwIfConfirmTornDown(ns, ref_name);
-            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+            /// The owner's verdict is not a slot that could not be read; the counter is diagnostic, so a race here goes uncounted.
+            if (!Cas::ownerStopRequested())
+                ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
             throw;
         }
         /// A read that finished after teardown began answers for a mount that is going away.

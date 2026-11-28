@@ -27,7 +27,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasMigratePool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
+#include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
+#include "cas_killable_query.h"
 #include "cas_test_helpers.h"
 
 #include <latch>
@@ -42,9 +44,15 @@ extern const int BAD_ARGUMENTS;
 extern const int CANNOT_SCHEDULE_TASK;
 extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
+extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int READONLY;
 extern const int UNKNOWN_FORMAT_VERSION;
+}
+
+namespace DB::FailPoints
+{
+extern const char thread_group_switcher_post_attach_failure[];
 }
 
 namespace ProfileEvents
@@ -60,6 +68,34 @@ namespace
 
 /// The in-memory store with a switchable dialect, `HEAD`s that answer a weak token, injected write and delete
 /// refusals, and hooks after a write lands and before a `HEAD`.
+/// Serves `header`, then on the next refill runs `on_refill` and the cancellation check a store client makes.
+class HeaderThenStoppedReadBuffer : public DB::ReadBuffer
+{
+public:
+    HeaderThenStoppedReadBuffer(String header_, std::function<void()> on_refill_)
+        : DB::ReadBuffer(nullptr, 0), header(std::move(header_)), on_refill(std::move(on_refill_))
+    {
+    }
+
+private:
+    bool nextImpl() override
+    {
+        if (!served)
+        {
+            served = true;
+            BufferBase::set(header.data(), header.size(), 0);
+            return true;
+        }
+        on_refill();
+        DB::CurrentThread::checkIfNotCancelled();
+        return false;
+    }
+
+    String header;
+    std::function<void()> on_refill;
+    bool served = false;
+};
+
 class MigrationBackend : public CountingBackend
 {
 public:
@@ -115,6 +151,30 @@ public:
         std::lock_guard lock(mutex);
         after_write_key = key;
         after_write = std::move(hook);
+    }
+
+    /// The stream of `key` serves its first line, then runs `hook` and fails as a stopped query's read does.
+    void stopStreamAfterHeader(const String & key, std::function<void()> hook)
+    {
+        std::lock_guard lock(mutex);
+        stopped_stream_key = key;
+        stopped_stream_hook = std::move(hook);
+    }
+
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(mutex);
+            if (key == stopped_stream_key)
+                hook = stopped_stream_hook;
+        }
+        if (!hook)
+            return CountingBackend::stream(key, access);
+        const auto raw = CountingBackend::read(key, access);
+        if (!raw)
+            return nullptr;
+        return std::make_unique<HeaderThenStoppedReadBuffer>(raw->bytes.substr(0, raw->bytes.find('\n') + 1), hook);
     }
 
     /// Runs `hook` once, before the first `HEAD` of `key` is served.
@@ -259,6 +319,8 @@ private:
     std::function<void()> before_head;
     String after_head_key;
     std::function<void()> after_head;
+    String stopped_stream_key;
+    std::function<void()> stopped_stream_hook;
 };
 
 /// A live holder's slot body declaring a 30 s lease.
@@ -2892,4 +2954,127 @@ TEST(CASBoundedRun, FailedSubmissionJoinsTheQueuedJobs)
         ASSERT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK) << attempt;
         ASSERT_EQ(finished.load(), 3u) << "a submitted job was not joined before the failure left the run";
     }
+}
+
+/// A job whose thread fails to join the submitting query's thread group does not run: outside the query its requests
+/// would not see the query's stop. The failpoint fails one switch only, so the other job may run in the query.
+TEST(CASBoundedRun, JobOutsideTheQueryDoesNotRun)
+{
+    CAS_SKIP_WITHOUT_FAILPOINTS();
+    std::mutex mutex;
+    std::vector<bool> ran_in_query;
+    int code = 0;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        /// Armed after the query's own attach, so a job's switch is the one that fails.
+        DB::FailPointInjection::enableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+        SCOPE_EXIT({ DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure); });
+        try
+        {
+            runBounded(*makeBoundedPool(2), DB::ThreadName::UNKNOWN, 2, [&](size_t)
+            {
+                const bool in_query = DB::CurrentThread::getGroup() == query.group;
+                std::lock_guard lock(mutex);
+                ran_in_query.push_back(in_query);
+            });
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+    });
+    EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
+    EXPECT_LE(ran_in_query.size(), 1u) << "both jobs ran although one could not join the query";
+    for (const bool in_query : ran_in_query)
+        EXPECT_TRUE(in_query) << "a job ran outside the query";
+}
+
+namespace
+{
+
+/// The message of the stored cause after `run` killed its query with it.
+String storedMessageAfter(const std::exception_ptr & cause)
+{
+    try
+    {
+        std::rethrow_exception(cause);
+    }
+    catch (const DB::Exception & e)
+    {
+        return e.message();
+    }
+}
+
+}
+
+/// A marker removal that fails with a killed query's stored cause reaches the caller unannotated, through the
+/// removal's own catch and the M9 page's: the query rethrows that one object to every thread it stops.
+TEST(CASMigratePool, MarkerRemovalLeavesTheStoredQueryExceptionUnchanged)
+{
+    Fixture f(3);
+    seedMixedPool(f);
+    const String stored_text = "the query's stored network failure";
+    const auto cause = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "{}", stored_text));
+    bool fired = false;
+    int code = 0;
+    std::vector<String> lines;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        f.backend->beforeHead(*f.markers().begin(), [&]
+        {
+            fired = true;
+            query.kill(cause);
+            std::rethrow_exception(cause);
+        });
+        MigratePoolOptions one_at_a_time;
+        one_at_a_time.concurrency = 1;
+        try
+        {
+            f.run(one_at_a_time, &lines);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+    });
+
+    ASSERT_TRUE(fired) << "the run never removed a marker";
+    EXPECT_TRUE(contains(lines, "M8")) << "the kill landed before the marker removal";
+    EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_EQ(storedMessageAfter(cause), stored_text) << "a marker removal annotated the query's stored exception";
+}
+
+/// An inherited run whose refill fails with a killed query's stored `CORRUPTED_DATA` reaches the caller unannotated
+/// through M3's catch, which annotates that code otherwise.
+TEST(CASMigratePool, InheritedRunReadLeavesTheStoredQueryExceptionUnchanged)
+{
+    Fixture f(3);
+    f.body(1);
+    f.rows({f.row(1, /*pending*/ true)});
+    const std::vector<String> run_keys = adoptedRunKeysOf(f);
+    ASSERT_FALSE(run_keys.empty());
+    const String stored_text = "the query's stored corruption";
+    const auto cause = std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "{}", stored_text));
+    bool fired = false;
+    int code = 0;
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        f.backend->stopStreamAfterHeader(run_keys.front(), [&]
+        {
+            fired = true;
+            query.kill(cause);
+        });
+        try
+        {
+            f.run();
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+    });
+
+    ASSERT_TRUE(fired) << "the run never refilled the inherited run";
+    EXPECT_EQ(code, DB::ErrorCodes::CORRUPTED_DATA);
+    EXPECT_EQ(storedMessageAfter(cause), stored_text) << "M3 annotated the query's stored exception";
 }

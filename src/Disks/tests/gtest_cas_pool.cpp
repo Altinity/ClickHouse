@@ -202,7 +202,7 @@ ManifestId publishPartWithEntries(
 }
 
 /// The disk's request window reaches every request plane a pool exposes, not only the one a give-up
-/// test happens to use. A plane built with the default window would freeze a 120 s deadline here.
+/// test happens to use. A plane built with the default window would bind a 120 s deadline here.
 TEST(CASPool, EveryExposedRequestPlaneTakesTheConfiguredRequestWindow)
 {
     constexpr uint64_t window_ms = 20'000;
@@ -217,9 +217,10 @@ TEST(CASPool, EveryExposedRequestPlaneTakesTheConfiguredRequestWindow)
     for (const auto & [name, plane] : planes)
     {
         DB::Cas::CasOperation op = plane->admit();
-        const DB::Cas::Retry frozen = op.freeze(DB::Cas::Retry::standard());
-        ASSERT_TRUE(frozen.policy_deadline_ms) << name;
-        EXPECT_EQ(*frozen.policy_deadline_ms, clock->nowMs() + window_ms) << name;
+        plane->setAttemptReservationForTest(window_ms - 1'000);
+        EXPECT_NO_THROW(op.head("k", DB::Cas::Retry::standard())) << name << ": sent when one envelope fits the window";
+        plane->setAttemptReservationForTest(window_ms + 1'000);
+        EXPECT_THROW(op.head("k", DB::Cas::Retry::standard()), DB::Exception) << name << ": refused unsent past the window";
     }
 }
 

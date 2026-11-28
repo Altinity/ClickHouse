@@ -2,6 +2,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/tests/cas_killable_query.h>
+#include <Common/ThreadStatus.h>
+#include <Poco/Exception.h>
+
+#include <set>
+#include <thread>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -9,6 +15,7 @@ using namespace DB::Cas::tests;
 namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
+    extern const int READONLY;
 }
 
 namespace
@@ -698,6 +705,94 @@ TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
     EXPECT_FALSE(readObj(*backend, dead).has_value());
 }
 
+namespace
+{
+
+/// The first cursor write loses its reply without landing; `on_settle` runs in the read that settles it.
+class LostCursorWriteBackend : public CountingBackend
+{
+public:
+    std::function<void()> on_settle;
+    bool write_failed = false;
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        if (key.ends_with("/gc/maintenance_state") && !write_failed)
+        {
+            write_failed = true;
+            throw Poco::TimeoutException("LostCursorWriteBackend: the cursor write timed out");
+        }
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key.ends_with("/gc/maintenance_state") && write_failed && on_settle)
+            std::exchange(on_settle, nullptr)();
+        return CountingBackend::read(key, access);
+    }
+};
+
+}
+
+/// A cursor write whose outcome stays unknown because the query stopped in its settling read ends the page with the
+/// unresolved 210 instead of an anomaly. A live owner resends the cursor and publishes it.
+TEST(CASNamespaceJanitor, UnresolvedCursorWriteOfAStoppedQueryPropagates)
+{
+    for (const bool kill : {true, false})
+    {
+        SCOPED_TRACE(kill ? "killed in the settling read" : "live");
+        auto backend = std::make_shared<LostCursorWriteBackend>();
+        CasRequests requests(backend, Fence::open(), {}, [](uint64_t) {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+        const Layout layout("p");
+        seedCatalog(*backend, layout);
+        const String dead = layout.refCkptKey(life("dead", 145));
+        createObj(*backend, dead, "bytes");
+
+        int code = 0;
+        String message;
+        std::optional<NamespaceJanitorResult> result;
+        std::thread caller([&]
+        {
+            DB::ThreadStatus thread_status;
+            CasKillableQuery query(::getContext().context);
+            if (kill)
+                backend->on_settle = [&query]
+                {
+                    query.kill();
+                    throw Poco::TimeoutException("LostCursorWriteBackend: the settling read timed out");
+                };
+            try
+            {
+                result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+        caller.join();
+
+        EXPECT_FALSE(readObj(*backend, dead).has_value());
+        if (kill)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+            EXPECT_NE(message.find("unresolved"), String::npos) << message;
+            EXPECT_FALSE(result.has_value());
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << message;
+            ASSERT_TRUE(result.has_value());
+            EXPECT_TRUE(result->anomalies.empty());
+            EXPECT_TRUE(readState(requests, layout).state.has_value()) << "the resent cursor was published";
+        }
+    }
+}
+
 /// The write inside `catch (...)` (the reset after a LIST failure) is admitted `once`: an unmodeled,
 /// unresolvable write attempt must give up after its one exact resolve read rather than looping through
 /// `Retry::standard()`'s backoff. `write_attempts == 1` is the discriminator: under `standard`, the same
@@ -717,6 +812,153 @@ TEST(CASGcMaintenanceState, CatchPathWriteIsOnce)
         [&] { (void)NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }); });
     EXPECT_EQ(backend->write_attempts, 1u)
         << "the catch-path reset settles by its one resolve read and gives up rather than reissuing";
+}
+
+namespace
+{
+
+/// Every `LIST` runs `on_list`, then fails with a transport error.
+class FailingListBackend : public CountingBackend
+{
+public:
+    std::function<void()> on_list;
+
+    DB::Cas::Backend::RawListPage list(const String &, const String &, size_t, DB::Cas::TransportAccess &) override
+    {
+        if (on_list)
+            on_list();
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "list failed");
+    }
+};
+
+}
+
+/// A stopped query's failed first `LIST` ends the page with that failure and keeps the scan's cursor: the stop vetoed
+/// the optional reset. A live owner's failed first `LIST` resets the cursor.
+TEST(CASNamespaceJanitor, StoppedQuerysFailedListKeepsTheCursor)
+{
+    for (const bool kill : {true, false})
+    {
+        SCOPED_TRACE(kill ? "killed in the LIST" : "live");
+        auto backend = std::make_shared<FailingListBackend>();
+        FakeClock clock;
+        CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+        const Layout layout("p");
+        createObj(*backend, layout.gcMaintenanceStateKey(), encodeGcMaintenanceState({.janitor_cursor = "kept"}));
+        const uint64_t writes_before = backend->writeCount(layout.gcMaintenanceStateKey());
+
+        int code = 0;
+        String message;
+        onKillableQueryThread([&](CasKillableQuery & query)
+        {
+            if (kill)
+                backend->on_list = [&query] { query.kill(); };
+            try
+            {
+                (void)NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }, /*first_page_of_pass=*/true);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+
+        EXPECT_NE(code, 0);
+        if (kill)
+        {
+            EXPECT_EQ(backend->writeCount(layout.gcMaintenanceStateKey()), writes_before) << "a reset was sent: " << message;
+            EXPECT_EQ(readState(requests, layout).state->janitor_cursor, "kept");
+        }
+        else
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+            EXPECT_TRUE(readState(requests, layout).state->janitor_cursor.empty()) << "the live owner reset the cursor";
+        }
+    }
+}
+
+/// A cursor reset after a failed `LIST` that may still land is what the caller learns, not the listing error.
+TEST(CASNamespaceJanitor, AnUnresolvedResetAfterAFailedListIsReported)
+{
+    auto backend = std::make_shared<ThrowingListAndAmbiguousWriteBackend>();
+    FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+    const Layout layout("p");
+
+    const String message = DB::Cas::tests::messageOf(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }, /*first_page_of_pass=*/true); });
+    EXPECT_NE(message.find("cursor reset after a failed LIST: the write is unresolved"), String::npos) << message;
+}
+
+namespace
+{
+
+/// The janitor's cursor write: refused as `READONLY`, after killing the query when `kill`.
+struct RefusedCursorRound
+{
+    int code = 0;
+    String message;
+    std::set<String> phases;
+};
+
+RefusedCursorRound runRoundWithARefusedCursorWrite(bool kill)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace live_namespace{"00/live@cas@"};
+    fixture::admitLive(*backend, layout, live_namespace);
+    createObj(*backend, layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 1));
+    createObj(*backend, layout.refCkptKey(life("dead", 153)), "checkpoint");
+
+    RefusedCursorRound out;
+    Gc gc(store, UInt128{154});
+    gc.setPhaseSink([&](const GcPhaseRecord & record) { out.phases.insert(record.phase); });
+    onKillableQueryThread([&](CasKillableQuery & query)
+    {
+        backend->onBeforeWrite(layout.gcMaintenanceStateKey(), [&query, kill]
+        {
+            if (kill)
+                query.kill();
+            throw DB::Exception(DB::ErrorCodes::READONLY, "the store is read-only");
+        });
+        try
+        {
+            (void)runRegularRoundReclaiming(gc);
+        }
+        catch (const DB::Exception & e)
+        {
+            out.code = e.code();
+            out.message = e.message();
+        }
+    });
+    gc.setPhaseSink({});
+    return out;
+}
+
+}
+
+/// A stopped query's refused cursor write ends the round with the refusal, before ref cleanup starts. A live owner
+/// records an anomaly and goes on to ref cleanup.
+TEST(CASNamespaceJanitorIntegration, RefusedCursorWriteOfAStoppedQueryEndsTheRound)
+{
+    {
+        SCOPED_TRACE("killed in the cursor write");
+        const auto out = runRoundWithARefusedCursorWrite(/*kill=*/true);
+        EXPECT_EQ(out.code, DB::ErrorCodes::READONLY) << out.message;
+        EXPECT_NE(out.message.find("the store is read-only"), String::npos) << out.message;
+        EXPECT_TRUE(out.phases.contains("namespace_cleanup"));
+        EXPECT_FALSE(out.phases.contains("ref_object_cleanup")) << "ref cleanup started";
+    }
+    {
+        SCOPED_TRACE("live");
+        const auto out = runRoundWithARefusedCursorWrite(/*kill=*/false);
+        EXPECT_EQ(out.code, 0) << out.message;
+        EXPECT_TRUE(out.phases.contains("ref_object_cleanup"));
+    }
 }
 
 TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)

@@ -4,6 +4,7 @@
 
 #include <base/defines.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
@@ -13,12 +14,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Disks/tests/cas_killable_query.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 
 #include <IO/S3Common.h>
 
 #include <Poco/Exception.h>
+
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +46,7 @@ extern const int LIMIT_EXCEEDED;
 extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
 extern const int LOGICAL_ERROR;
+extern const int ABORTED;
 }
 
 namespace ProfileEvents
@@ -46,6 +54,7 @@ namespace ProfileEvents
 extern const Event CASRefBatchFlushes;
 extern const Event CASRefBatchedMutations;
 extern const Event CASRefSnapshotPublishDispatched;
+extern const Event CASRefAppendWedged;
 }
 
 /// Task 8 (stage-1 §3 "Budget: counts only, chunked flush"): the counts-only admission caps --
@@ -1134,4 +1143,621 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     ASSERT_TRUE(newest.has_value()) << "at least one snapshot must have been published";
     EXPECT_FALSE(*newest < chunk2_id)
         << "settlement must re-fire the dropped chunk-2 trigger so a snapshot covers chunk 2 (no lost trigger)";
+}
+
+/// ===================================================================================
+/// A leader flushes in its caller's thread group. A killed query does not stop the shared flush, and a stopped
+/// background owner can still withdraw the leader's own item until the carve.
+/// ===================================================================================
+
+namespace
+{
+
+using DB::Cas::tests::CasClientLikeBackend;
+using DB::Cas::tests::CasKillableQuery;
+using DB::Cas::tests::StoppedBy;
+using DB::Cas::tests::backgroundOwnerStoppedBy;
+using DB::Cas::tests::nameOf;
+using DB::Cas::tests::stopperOf;
+
+constexpr auto KILL_WATCHDOG = std::chrono::seconds(30);
+
+/// Calls `before_answer` before the first ref-log create under `log_prefix` after `armed` is set, then stores it.
+class LeaderKillLogPutBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    String log_prefix;
+    std::function<void()> before_answer;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> fired{false};
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (!expected_value && key.starts_with(log_prefix) && armed.exchange(false))
+        {
+            fired = true;
+            if (before_answer)
+                before_answer();
+        }
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+struct KilledLeaderFixture
+{
+    std::shared_ptr<LeaderKillLogPutBackend> faults = std::make_shared<LeaderKillLogPutBackend>();
+    PoolPtr store;
+    std::shared_ptr<VirtualRetryClock> clock;
+    RootNamespace ns;
+
+    explicit KilledLeaderFixture(const String & ns_suffix)
+        : ns(String("srv1/") + ns_suffix)
+    {
+        store = openPoolWith(std::make_shared<CasClientLikeBackend>(faults), PoolConfig{});
+        clock = VirtualRetryClock::installOn(store);
+        publishEmptyPart(store, ns, "seed");
+        faults->log_prefix = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    }
+};
+
+int exceptionCode(const std::exception_ptr & e)
+{
+    if (!e)
+        return 0;
+    try
+    {
+        std::rethrow_exception(e);
+    }
+    catch (const DB::Exception & ex)
+    {
+        return ex.code();
+    }
+    catch (...)
+    {
+        return -1;
+    }
+}
+
+/// The leader's side of a killed-leader case, run on a raw thread with its own `ThreadStatus` and a
+/// query registered in the process list. `body` gets the query and returns the append's result.
+struct LeaderRun
+{
+    AppendResult result;
+    bool group_restored = false;
+};
+
+template <typename Body>
+std::future<LeaderRun> launchQueryLeader(std::thread & thread, Body leader_body)
+{
+    auto prom = std::make_shared<std::promise<LeaderRun>>();
+    std::future<LeaderRun> fut = prom->get_future();
+    thread = std::thread([prom, body = std::move(leader_body)]() mutable
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        LeaderRun run;
+        {
+            CasKillableQuery query(getContext().context);
+            run.result = body(query);
+            run.group_restored = DB::CurrentThread::getGroup() == query.group;
+        }
+        prom->set_value(run);
+    });
+    return fut;
+}
+
+/// The leader's item and a neighbor's share one chunk; the leader's query is killed between the carve
+/// and the chunk's first answer.
+struct KilledLeaderOutcome
+{
+    LeaderRun leader;
+    AppendResult neighbor;
+    int neighbor_builds = 0;
+};
+
+KilledLeaderOutcome runKilledLeaderChunk(KilledLeaderFixture & fx)
+{
+    auto sync = std::make_shared<CaseSync>();
+    armPreCarveBlock(fx.store, fx.ns, sync, 2);
+    auto neighbor_builds = std::make_shared<std::atomic<int>>(0);
+
+    std::thread leader_thread;
+    std::future<LeaderRun> leader = launchQueryLeader(leader_thread, [&fx](CasKillableQuery & query)
+    {
+        fx.faults->before_answer = [&query] { query.kill(); };
+        fx.faults->armed = true;
+        AppendResult r;
+        try
+        {
+            r.id = fx.store->appendRefOps(fx.ns, MutationScope::ref("item_leader"),
+                [](const RefTableState &) { return addRemovePrecommitPairs("item_leader", 1, 910000001); },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        }
+        catch (...)
+        {
+            r.err = std::current_exception();
+        }
+        return r;
+    });
+    waitEntered(sync);
+    AppendCaller neighbor = launchAppendOps(fx.store, fx.ns, MutationScope::ref("item_neighbor"),
+        addRemovePrecommitPairs("item_neighbor", 1, 910000002), neighbor_builds);
+    waitPendingAtLeast(fx.store, fx.ns, 2);
+    sync->cv.notify_all();
+
+    KilledLeaderOutcome out;
+    EXPECT_EQ(leader.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the killed leader must not hang";
+    EXPECT_EQ(neighbor.fut.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the neighbor must not hang";
+    out.leader = leader.get();
+    out.neighbor = neighbor.fut.get();
+    leader_thread.join();
+    neighbor.t.join();
+    fx.faults->before_answer = {};
+    fx.store->setRefPreCarveHookForTest(nullptr);
+    out.neighbor_builds = neighbor_builds->load();
+    return out;
+}
+
+}
+
+/// A leader's query killed after the carve, on a store that answers every request successfully: the kill does not
+/// stop the shared flush, so the chunk commits once for the leader's item and the neighbor's.
+TEST(CASRefWriterChunkedFlush, KilledLeaderOnHealthyStoreCommitsWithNeighbor)
+{
+    KilledLeaderFixture fx("killed_leader_healthy_store");
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged];
+
+    const KilledLeaderOutcome out = runKilledLeaderChunk(fx);
+
+    ASSERT_TRUE(fx.faults->fired) << "the kill never ran before the chunk's create";
+    EXPECT_EQ(exceptionCode(out.leader.result.err), 0) << "a killed query's carved item commits";
+    EXPECT_EQ(exceptionCode(out.neighbor.err), 0) << "a live neighbor must commit";
+    EXPECT_EQ(out.leader.result.id, out.neighbor.id) << "both items were in one chunk";
+    EXPECT_EQ(out.neighbor_builds, 1);
+    EXPECT_TRUE(out.leader.group_restored);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged] - wedged_before, 0u);
+    EXPECT_FALSE(fx.store->refLaneWedgedForTest(fx.ns));
+    const std::vector<RefLogTxn> logs = listLogTxns(*fx.faults, fx.store->layout(), fx.ns);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [&](const RefLogTxn & txn) { return txn.txn_id == out.neighbor.id; }), 1)
+        << "the chunk is durable exactly once";
+}
+
+/// Leaving a query's thread group finalizes the thread's counters and writes a `system.query_thread_log` row, so a
+/// leader must flush in its caller's group: the same group before the append, inside the flush and after it.
+TEST(CASRefWriterChunkedFlush, LeaderFlushesInItsCallersThreadGroup)
+{
+    KilledLeaderFixture fx("leader_keeps_thread_group");
+    DB::ThreadGroupPtr group_before;
+    DB::ThreadGroupPtr group_inside_flush;
+    DB::ThreadGroupPtr group_after;
+    bool hook_ran = false;
+
+    std::thread leader_thread;
+    std::future<LeaderRun> leader = launchQueryLeader(leader_thread, [&](CasKillableQuery &)
+    {
+        group_before = DB::CurrentThread::getGroup();
+        fx.store->setRefPreCarveHookForTest([&]
+        {
+            hook_ran = true;
+            group_inside_flush = DB::CurrentThread::getGroup();
+        });
+        AppendResult r;
+        try
+        {
+            r.id = fx.store->appendRefOps(fx.ns, MutationScope::ref("item_leader"),
+                [](const RefTableState &) { return addRemovePrecommitPairs("item_leader", 1, 945000001); },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        }
+        catch (...)
+        {
+            r.err = std::current_exception();
+        }
+        group_after = DB::CurrentThread::getGroup();
+        return r;
+    });
+    ASSERT_EQ(leader.wait_for(KILL_WATCHDOG), std::future_status::ready);
+    const LeaderRun run = leader.get();
+    leader_thread.join();
+    fx.store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_EQ(exceptionCode(run.result.err), 0);
+    ASSERT_TRUE(hook_ran) << "the hook did not run inside the flush";
+    ASSERT_NE(group_before, nullptr);
+    EXPECT_EQ(group_inside_flush, group_before) << "the flush left the caller's thread group";
+    EXPECT_EQ(group_after, group_before);
+    EXPECT_TRUE(run.group_restored);
+}
+
+namespace
+{
+
+/// The leader's owner stops during the flush prelude while a live waiter's item is queued behind it.
+void runLeaderStoppedDuringFlushPrelude(StoppedBy owner)
+{
+    KilledLeaderFixture fx("killed_leader_withdraws");
+    auto leader_builds = std::make_shared<std::atomic<int>>(0);
+    auto neighbor_builds = std::make_shared<std::atomic<int>>(0);
+    auto sync = std::make_shared<CaseSync>();
+    std::function<void()> stop_leader;
+
+    fx.store->setRefPreCarveHookForTest([&, sync]
+    {
+        std::unique_lock lk(sync->m);
+        if (sync->entered)
+            return;
+        sync->entered = true;
+        sync->cv.notify_all();
+        sync->cv.wait_for(lk, KILL_WATCHDOG, [&] { return fx.store->refQueuePendingForTest(fx.ns) >= 2; });
+        stop_leader();
+    });
+
+    std::thread leader_thread;
+    std::future<LeaderRun> leader = launchQueryLeader(leader_thread, [&](CasKillableQuery & query)
+    {
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = backgroundOwnerStoppedBy(background_stopped);
+        stop_leader = stopperOf(owner, query, background_stopped);
+        AppendResult r;
+        try
+        {
+            r.id = fx.store->appendRefOps(fx.ns, MutationScope::ref("item_leader"),
+                [leader_builds](const RefTableState &)
+                {
+                    leader_builds->fetch_add(1);
+                    return addRemovePrecommitPairs("item_leader", 1, 920000001);
+                },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        }
+        catch (...)
+        {
+            r.err = std::current_exception();
+        }
+        return r;
+    });
+    waitEntered(sync);
+    AppendCaller neighbor = launchAppendOps(fx.store, fx.ns, MutationScope::ref("item_neighbor"),
+        addRemovePrecommitPairs("item_neighbor", 1, 920000002), neighbor_builds);
+    waitPendingAtLeast(fx.store, fx.ns, 2);
+    sync->cv.notify_all();
+
+    ASSERT_EQ(leader.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the stopped leader must not hang";
+    ASSERT_EQ(neighbor.fut.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the neighbor must not hang";
+    const LeaderRun run = leader.get();
+    const AppendResult rn = neighbor.fut.get();
+    leader_thread.join();
+    neighbor.t.join();
+    fx.store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_EQ(exceptionCode(rn.err), 0) << "the live waiter commits";
+    EXPECT_EQ(neighbor_builds->load(), 1);
+    EXPECT_TRUE(run.group_restored);
+    EXPECT_EQ(fx.store->refQueuePendingForTest(fx.ns), 0u);
+    const std::vector<RefLogTxn> logs = listLogTxns(*fx.faults, fx.store->layout(), fx.ns);
+    const auto neighbor_txn = std::find_if(logs.begin(), logs.end(), [&](const RefLogTxn & txn) { return txn.txn_id == rn.id; });
+    ASSERT_NE(neighbor_txn, logs.end());
+    if (owner == StoppedBy::Background)
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(leader_builds->load(), 0) << "a withdrawn item is never built";
+        EXPECT_EQ(neighbor_txn->ops, addRemovePrecommitPairs("item_neighbor", 1, 920000002)) << "the neighbor commits alone";
+    }
+    else
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), 0) << "a killed leader's item commits";
+        EXPECT_EQ(leader_builds->load(), 1);
+        EXPECT_EQ(run.result.id, rn.id) << "both items were carved into one chunk";
+    }
+}
+
+}
+
+/// A background stop during the flush prelude withdraws the leader's own item at the carve: its `build_ops` never
+/// runs, it gets the owner's verdict, and the live waiter's item commits alone.
+TEST(CASRefWriterChunkedFlush, BackgroundStoppedLeaderWithdrawsOwnItemAtCarve)
+{
+    runLeaderStoppedDuringFlushPrelude(StoppedBy::Background);
+}
+
+/// A leader killed during the flush prelude keeps its item: it is carved with the waiter's and the chunk commits for both.
+TEST(CASRefWriterChunkedFlush, KilledLeadersItemIsCarvedAndCommitted)
+{
+    runLeaderStoppedDuringFlushPrelude(StoppedBy::Query);
+}
+
+namespace
+{
+
+/// A leader whose owner stopped before its flush, on a lane with an outstanding wedge.
+void runLeaderStoppedBeforeItsFlush(StoppedBy owner)
+{
+    KilledLeaderFixture fx("killed_leader_before_flush");
+    const std::vector<RefLogTxn> logs = listLogTxns(*fx.faults, fx.store->layout(), fx.ns);
+    ASSERT_FALSE(logs.empty());
+    RefLogTxn wedged;
+    wedged.ns = fx.ns.string();
+    wedged.txn_id = logs.back().txn_id;
+    ++wedged.txn_id.ref_sequence;
+    wedged.ops = addRemovePrecommitPairs("item_wedged", 1, 940000002);
+    fx.store->forceWedgeForTest(fx.ns, wedged.txn_id.writer_epoch, wedged.txn_id.ref_sequence,
+        fx.store->layout().refLogKey(DB::Cas::tests::fixture::fixtureLife(fx.ns), wedged.txn_id),
+        sealObject(FormatId::RefLog, encodeRefLogTxn(wedged)));
+    auto builds = std::make_shared<std::atomic<int>>(0);
+    size_t requests = 0;
+
+    std::thread leader_thread;
+    std::future<LeaderRun> leader = launchQueryLeader(leader_thread, [&](CasKillableQuery & query)
+    {
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = backgroundOwnerStoppedBy(background_stopped);
+        stopperOf(owner, query, background_stopped)();
+        const size_t before = fx.faults->journal().size();
+        AppendResult r;
+        try
+        {
+            r.id = fx.store->appendRefOps(fx.ns, MutationScope::ref("item_leader"),
+                [builds](const RefTableState &)
+                {
+                    builds->fetch_add(1);
+                    return addRemovePrecommitPairs("item_leader", 1, 940000001);
+                },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        }
+        catch (...)
+        {
+            r.err = std::current_exception();
+        }
+        requests = fx.faults->journal().size() - before;
+        return r;
+    });
+    ASSERT_EQ(leader.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the stopped leader must not hang";
+    const LeaderRun run = leader.get();
+    leader_thread.join();
+
+    EXPECT_EQ(fx.store->refQueuePendingForTest(fx.ns), 0u);
+    EXPECT_TRUE(run.group_restored);
+    if (owner == StoppedBy::Background)
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(requests, 0u) << "a stopped leader starts no flush";
+        EXPECT_EQ(builds->load(), 0);
+        EXPECT_TRUE(fx.store->refLaneWedgedForTest(fx.ns)) << "the wedge is left for a live leader";
+    }
+    else
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), 0) << "a killed query's leader flushes on a healthy store";
+        EXPECT_GT(requests, 0u);
+        EXPECT_EQ(builds->load(), 1);
+        EXPECT_FALSE(fx.store->refLaneWedgedForTest(fx.ns)) << "the leader resolved the wedge";
+    }
+}
+
+}
+
+/// A leader whose background owner stopped before its flush sends nothing: not even the read that resolves the lane's
+/// outstanding wedge. The carve check alone would let that read go out first.
+TEST(CASRefWriterChunkedFlush, BackgroundStoppedLeaderSendsNothingBeforeItsFlush)
+{
+    runLeaderStoppedBeforeItsFlush(StoppedBy::Background);
+}
+
+/// A leader whose query was killed before its flush flushes on a healthy store: it resolves the wedge and commits its
+/// item.
+TEST(CASRefWriterChunkedFlush, KilledLeaderResolvesTheWedgeAndCommits)
+{
+    runLeaderStoppedBeforeItsFlush(StoppedBy::Query);
+}
+
+namespace
+{
+
+template <typename Body>
+void waitUntil(const char * what, Body ready)
+{
+    const auto deadline = std::chrono::steady_clock::now() + KILL_WATCHDOG;
+    while (!ready() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_TRUE(ready()) << what;
+}
+
+/// A follower on its own query thread. Its `build_ops` runs `on_build` and writes into a local of the follower's
+/// own frame, so a follower that returned while its item was carved would leave the leader writing to a dead
+/// frame (ASan reports it). `returned` is set when the follower's call has returned.
+std::future<LeaderRun> launchQueryFollower(
+    std::thread & thread, KilledLeaderFixture & fx, const String & ref, std::atomic<int> & builds, int64_t seed,
+    std::function<void()> & kill, std::function<void()> on_build, std::atomic<bool> & returned, StoppedBy owner)
+{
+    return launchQueryLeader(
+        thread, [&fx, ref, &builds, seed, &kill, build_hook = std::move(on_build), &returned, owner](CasKillableQuery & query)
+    {
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = backgroundOwnerStoppedBy(background_stopped);
+        kill = stopperOf(owner, query, background_stopped);
+        int frame_slot = 0;
+        AppendResult r;
+        try
+        {
+            r.id = fx.store->appendRefOps(fx.ns, MutationScope::ref(ref),
+                [&builds, &frame_slot, build_hook, ref, seed](const RefTableState &)
+                {
+                    builds.fetch_add(1);
+                    if (build_hook)
+                        build_hook();
+                    frame_slot = 1;
+                    return addRemovePrecommitPairs(ref, 1, seed);
+                },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        }
+        catch (...)
+        {
+            r.err = std::current_exception();
+        }
+        returned = true;
+        return r;
+    });
+}
+
+}
+
+namespace
+{
+
+/// A follower's owner stops while its item is queued behind a parked leader.
+void runFollowerStoppedWhileQueued(StoppedBy owner)
+{
+    KilledLeaderFixture fx("killed_pending_follower");
+    auto sync = std::make_shared<CaseSync>();
+    bool released = false;
+    fx.store->setRefPreCarveHookForTest([sync, &released]
+    {
+        std::unique_lock lk(sync->m);
+        if (sync->entered)
+            return;
+        sync->entered = true;
+        sync->cv.notify_all();
+        sync->cv.wait_for(lk, KILL_WATCHDOG, [&] { return released; });
+    });
+    auto leader_builds = std::make_shared<std::atomic<int>>(0);
+    std::atomic<int> follower_builds{0};
+    std::atomic<bool> follower_returned{false};
+    std::function<void()> stop_follower;
+    std::atomic<int> follower_wait_checks{0};
+    fx.store->setRefFollowerWaitHookForTest([&](FollowerWaitPhase) { follower_wait_checks.fetch_add(1); });
+
+    AppendCaller leader = launchAppendOps(fx.store, fx.ns, MutationScope::ref("item_leader"),
+        addRemovePrecommitPairs("item_leader", 1, 950000001), leader_builds);
+    waitEntered(sync);
+    std::thread follower_thread;
+    std::future<LeaderRun> follower = launchQueryFollower(
+        follower_thread, fx, "item_follower", follower_builds, 950000002, stop_follower, {}, follower_returned, owner);
+    waitPendingAtLeast(fx.store, fx.ns, 2);
+    ASSERT_GE(fx.store->refQueuePendingForTest(fx.ns), 2u);
+    const int checks_before_stop = follower_wait_checks.load();
+    stop_follower();
+    /// The leader stays parked until a stopped background owner's follower has left the queue. A killed query's
+    /// follower is given two evaluations of its wait, so its owner was asked after the kill, and must still be queued.
+    if (owner == StoppedBy::Background)
+    {
+        waitUntil("the stopped follower never withdrew its item", [&] { return fx.store->refQueuePendingForTest(fx.ns) <= 1; });
+    }
+    else
+    {
+        waitUntil("the follower's wait was not re-evaluated", [&] { return follower_wait_checks.load() >= checks_before_stop + 2; });
+        EXPECT_EQ(fx.store->refQueuePendingForTest(fx.ns), 2u) << "a killed query's follower withdrew its item";
+    }
+    {
+        std::lock_guard lk(sync->m);
+        released = true;
+    }
+    sync->cv.notify_all();
+
+    ASSERT_EQ(follower.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the stopped follower must not hang";
+    ASSERT_EQ(leader.fut.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the leader must not hang";
+    const LeaderRun run = follower.get();
+    const AppendResult rl = leader.fut.get();
+    follower_thread.join();
+    leader.t.join();
+    fx.store->setRefPreCarveHookForTest(nullptr);
+    fx.store->setRefFollowerWaitHookForTest(nullptr);
+
+    EXPECT_EQ(exceptionCode(rl.err), 0);
+    EXPECT_EQ(leader_builds->load(), 1);
+    const std::vector<RefLogTxn> logs = listLogTxns(*fx.faults, fx.store->layout(), fx.ns);
+    const auto leader_txn = std::find_if(logs.begin(), logs.end(), [&](const RefLogTxn & txn) { return txn.txn_id == rl.id; });
+    ASSERT_NE(leader_txn, logs.end());
+    if (owner == StoppedBy::Background)
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(follower_builds.load(), 0) << "a withdrawn item is never built";
+        EXPECT_EQ(leader_txn->ops, addRemovePrecommitPairs("item_leader", 1, 950000001)) << "the withdrawn item is absent";
+    }
+    else
+    {
+        EXPECT_EQ(exceptionCode(run.result.err), 0) << "a killed query's queued item commits";
+        EXPECT_EQ(follower_builds.load(), 1);
+        const bool follower_committed
+            = std::any_of(logs.begin(), logs.end(), [&](const RefLogTxn & txn) { return txn.txn_id == run.result.id; });
+        EXPECT_TRUE(follower_committed);
+    }
+}
+
+}
+
+/// A follower whose background owner stopped while its item is queued withdraws it: it gets the owner's verdict, its
+/// `build_ops` never runs, nothing of it reaches the log, and the leader then commits alone.
+TEST(CASRefWriterChunkedFlush, BackgroundStoppedPendingFollowerWithdrawsWhileLeaderBlocked)
+{
+    runFollowerStoppedWhileQueued(StoppedBy::Background);
+}
+
+/// A follower whose query was killed while its item is queued stays queued and commits with the leader.
+TEST(CASRefWriterChunkedFlush, KilledPendingFollowerStaysQueuedAndCommits)
+{
+    runFollowerStoppedWhileQueued(StoppedBy::Query);
+}
+
+/// A follower whose item was carved belongs to the batch: its background owner stops after the carve and before
+/// its `build_ops` returns, and the follower sees the stop while the item is carved and not done. It still waits
+/// for the chunk and returns the committed id. A killed query's follower never sees a stop and gets the same id.
+TEST(CASRefWriterChunkedFlush, KilledCarvedFollowerWaitsForActualResult)
+{
+    for (const StoppedBy owner : {StoppedBy::Background, StoppedBy::Query})
+    {
+        SCOPED_TRACE(nameOf(owner));
+        KilledLeaderFixture fx("killed_carved_follower");
+        auto sync = std::make_shared<CaseSync>();
+        armPreCarveBlock(fx.store, fx.ns, sync, 2);
+        auto leader_builds = std::make_shared<std::atomic<int>>(0);
+        std::atomic<int> follower_builds{0};
+        std::atomic<bool> follower_returned{false};
+        std::atomic<int> carved_waits{0};
+        std::function<void()> stop_follower;
+        fx.store->setRefFollowerWaitHookForTest([&](FollowerWaitPhase phase)
+        {
+            if (phase == FollowerWaitPhase::Carved)
+                carved_waits.fetch_add(1);
+        });
+        /// Runs on the leader's thread, after the carve: stop the follower, then hold the batch until a stopped
+        /// background owner's follower has seen the stop and entered its carved wait, or has wrongly returned.
+        const auto stop_follower_while_carved = [&]
+        {
+            stop_follower();
+            if (owner == StoppedBy::Query)
+                return;
+            const auto deadline = std::chrono::steady_clock::now() + KILL_WATCHDOG;
+            while (carved_waits.load() == 0 && !follower_returned && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+        };
+
+        AppendCaller leader = launchAppendOps(fx.store, fx.ns, MutationScope::ref("item_leader"),
+            addRemovePrecommitPairs("item_leader", 1, 960000001), leader_builds);
+        waitEntered(sync);
+        std::thread follower_thread;
+        std::future<LeaderRun> follower = launchQueryFollower(
+            follower_thread, fx, "item_follower", follower_builds, 960000002, stop_follower, stop_follower_while_carved,
+            follower_returned, owner);
+        waitPendingAtLeast(fx.store, fx.ns, 2);
+        sync->cv.notify_all();
+
+        ASSERT_EQ(follower.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the carved follower must not hang";
+        ASSERT_EQ(leader.fut.wait_for(KILL_WATCHDOG), std::future_status::ready) << "the leader must not hang";
+        const LeaderRun run = follower.get();
+        const AppendResult rl = leader.fut.get();
+        follower_thread.join();
+        leader.t.join();
+        fx.store->setRefFollowerWaitHookForTest(nullptr);
+        fx.store->setRefPreCarveHookForTest(nullptr);
+
+        if (owner == StoppedBy::Background)
+            EXPECT_GE(carved_waits.load(), 1) << "the follower never saw its stop while its item was carved";
+        else
+            EXPECT_EQ(carved_waits.load(), 0) << "a killed query is not a stop for the follower's wait";
+        EXPECT_EQ(exceptionCode(run.result.err), 0) << "a carved item reports its chunk's result, not its owner's verdict";
+        EXPECT_EQ(exceptionCode(rl.err), 0);
+        EXPECT_EQ(run.result.id, rl.id) << "both items were in one chunk";
+        EXPECT_EQ(follower_builds.load(), 1);
+        const std::vector<RefLogTxn> logs = listLogTxns(*fx.faults, fx.store->layout(), fx.ns);
+        EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [&](const RefLogTxn & txn) { return txn.txn_id == rl.id; }), 1);
+    }
 }

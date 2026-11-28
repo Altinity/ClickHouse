@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweepSchedule.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
@@ -19,6 +20,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
@@ -150,6 +152,8 @@ struct WriteOnceJobResult
     uint64_t leaked = 0;
     uint64_t requests = 0;
     String error;
+    /// The failure of a job whose query had stopped: the caller propagates it rather than publishing the page.
+    std::exception_ptr stopped_query_failure;
 };
 
 /// Deletes `chunk` as one request. A storage that refuses the batch gets one request per key, each
@@ -165,7 +169,8 @@ void removeChunkWriteOnceCountingKeys(CasOperation & op, const std::vector<Write
     }
     catch (const Exception & e)
     {
-        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+        /// A query's stored cause is no batch-capability refusal, whatever its code.
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED || isQueryStoredCause(std::current_exception()))
             throw;
     }
     for (const WriteOnceKey & key : chunk)
@@ -178,6 +183,9 @@ void removeChunkWriteOnceCountingKeys(CasOperation & op, const std::vector<Write
         }
         catch (...)
         {
+            /// A stopped query sends no further delete; the job's catch accounts the rest of the chunk.
+            if (queryStopRequested())
+                throw;
             ++result.leaked;
             if (result.error.empty())
                 result.error = getCurrentExceptionMessage(false);
@@ -509,6 +517,7 @@ void Gc::runNamespaceJanitor(
     }
     catch (const std::exception & e)
     {
+        rethrowIfStoppedOwnersFailure();
         LOG_WARNING(logger, "CAS namespace janitor stopped this round: {}", e.what());
     }
     if (janitor_result.leaked)
@@ -547,8 +556,11 @@ void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceK
             }
             /// The round thread waits for every job before it refreshes `authority_held` again.
             handles.emplace_back(runner.enqueueAndGiveOwnership(
-                [this, chunk = &chunks[scheduled], result = &results[scheduled], admitted_generation = op.generation()]
+                [this, chunk = &chunks[scheduled], result = &results[scheduled], admitted_generation = op.generation(),
+                 group = CurrentThread::getGroup()]
                 {
+                    /// Outside the catch: a worker that sent nothing has no leak to count, and its failure must end the page.
+                    throwUnlessInThreadGroup(group, "CAS namespace janitor delete worker");
                     try
                     {
                         CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
@@ -558,6 +570,8 @@ void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceK
                     {
                         result->leaked = chunk->size() - result->deleted;
                         result->error = getCurrentExceptionMessage(false);
+                        if (queryStopRequested())
+                            result->stopped_query_failure = std::current_exception();
                     }
                 }));
         }
@@ -580,6 +594,9 @@ void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceK
                 "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
                 results[i].leaked, chunks[i].front().str(), results[i].error));
     }
+    for (size_t i = 0; i < scheduled; ++i)
+        if (results[i].stopped_query_failure)
+            std::rethrow_exception(results[i].stopped_query_failure);
     /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
     uint64_t unscheduled = 0;
     for (size_t i = scheduled; i < chunks.size(); ++i)
@@ -602,7 +619,8 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
     }
     catch (const Exception & e)
     {
-        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+        /// A query's stored cause is no batch-capability refusal, whatever its code.
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED || isQueryStoredCause(std::current_exception()))
             throw;
         for (const WriteOnceKey & key : chunk)
             op.removeManyWriteOnce({key}, policy);
@@ -648,7 +666,8 @@ void Gc::sendIntentDeletes(CasOperation & op, const std::vector<WriteOnceKey> & 
         catch (Exception & e)
         {
             /// A refusal carries the store's text only; the round's error must name what it failed to delete.
-            e.addMessage("while deleting {} blob intents starting at '{}'", chunk.size(), chunk.front().str());
+            addMessageUnlessQueryStoredCause(e, fmt::format("while deleting {} blob intents starting at '{}'", chunk.size(),
+                chunk.front().str()));
             throw;
         }
     }
@@ -762,8 +781,10 @@ void Gc::redeleteBlobs(
                      body_delete = entries[scheduled],
                      layout_ptr = &layout,
                      pool_store = store,
-                     admitted_generation]
+                     admitted_generation,
+                     group = CurrentThread::getGroup()]
                     {
+                        throwUnlessInThreadGroup(group, "CAS GC re-delete worker");
                         CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
                         *slot = performRedeleteIo(body_delete, *layout_ptr, job_op);
                     }));
@@ -825,6 +846,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport local_report;
     RoundReport & report = progress ? *progress : local_report;
     report = RoundReport{};
+    round_stop_observed = false;
     GcState state;
     std::optional<Etag> state_etag;
 
@@ -880,8 +902,19 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
     /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
     /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
+    const auto throw_if_round_stopped = [this]
+    {
+        if (!stop_signal || !stop_signal())
+            return;
+        round_stop_observed = true;
+        throw Exception(ErrorCodes::ABORTED, "CAS GC round stopped by its scheduler");
+    };
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
+        /// The scheduler owns the drain as a background owner: every background check in the drain throws on its stop.
+        std::optional<OwnerScope> scheduler_owner;
+        if (stop_signal)
+            scheduler_owner.emplace(OwnerScope::background(throw_if_round_stopped));
         uint64_t completed_erases = 0;
         uint64_t cancelled_creating = 0;
         /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
@@ -973,6 +1006,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         store->poolConfig().manifest_sweep_list_budget_keys, orphan_manifest_sweep_decision_at_ms);
     const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepDecision::StartSweep
         || orphan_manifest_sweep_decision == OrphanManifestSweepDecision::ContinueSweep;
+    throw_if_round_stopped();
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool row_decision_due = rowDecisionDue(state, new_round);
@@ -1466,176 +1500,156 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// a crash between the CAS and here leaks the prefix to fsck (single-crash window, no permanent leak —
     /// but note the cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop).
     ///
-    /// Phase `handoff_reclaim`.
+    /// Phase `handoff_reclaim`, then phase `manifest_deletes`, both owed: the round committed, and nothing revisits
+    /// what it handed off. A stop that skipped the manifest deletes would leave them to the orphan sweep, the only
+    /// backstop.
     {
-        GcPhaseTimer t(phase_sink, "handoff_reclaim");
-        uint64_t objects_reclaimed = 0;
-        std::set<uint64_t> new_referenced_generations;
-        for (const RunRef & r : folded.fold_seal.blob_target_runs)
-            new_referenced_generations.insert(r.key_generation);
-
-        std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
-        /// GATED like every other destructive site, and it is also the FIRST destructive site of the
-        /// post-CAS tail -- which is why the gate is read before the tail begins rather than partway
-        /// down it.
-        ///
-        /// UNLIKE EVERY OTHER GATED SITE, SUPPRESSION HERE LOSES THE WORK RATHER THAN POSTPONING IT.
-        /// The hand-off is a one-shot DIFFERENCE between the parent seal's runs and the new seal's, and
-        /// a suppressed round still FOLDS -- only the irreversible half stops -- so the ref moves off
-        /// the old generation on this very round and the next round's parent seal no longer names it.
-        /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
-        /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
-        /// already documents for a crash in this window (see the `handoff_reclaim` comment above). Bounded --
-        /// one small run per shard per occurrence of a suppressed round that also folded a delta -- and
-        /// not a correctness problem, but it is the one place where the gate costs something permanent,
-        /// so it is asserted rather than left to be discovered.
-        static const std::vector<RunRef> kNoRuns;
-        const std::vector<RunRef> & handoff_candidates =
-            suppress_destructive ? kNoRuns : parent_seal_runs;
-        for (const RunRef & old_ref : handoff_candidates)
+        const auto owed = OwnerScope::owed();
         {
-            /// Only generations the wholesale prune already passed AND that no live ref still pins.
-            if (old_ref.key_generation > state.snap_pruned_through)
-                continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
-            if (new_referenced_generations.contains(old_ref.key_generation))
-                continue;   /// still referenced by a (possibly different-shard) live ref: keep it
-            if (!handed_off.insert(old_ref.key_generation).second)
-                continue;   /// already reclaimed this round via another shard's ref
-            /// `bounded_remaining` draws from the hand-off's OWN reserve, never `UINT64_MAX` and never
-            /// `pruneSupersededGenerations`' shared remainder: this hand-off is a ONE-SHOT event (see the
-            /// `handoff_reclaim` comment above) -- a generation this call reclaims only PARTIALLY is left
-            /// exactly like a crash in this window already is -- to `fsck`, never revisited by a later
-            /// round's hand-off (the parent-seal difference that triggers it does not recur once the ref
-            /// has moved). The prune, by contrast, safely retries an under-served generation next round
-            /// via its cursor, so sharing one pool would let a prune-heavy round strand this one-shot
-            /// reclaim at zero every time; the separate reserve makes that impossible.
-            const uint64_t remaining = round_work_budget.handoffPrefixWholesaleRemaining();
-            if (remaining == 0)
-                break;
-            const uint64_t reclaimed = deletePrefixWholesale(
-                op, layout.gcGenPrefix(old_ref.key_generation), remaining);
-            round_work_budget.handoff_prefix_wholesale_objects_used += reclaimed;
-            objects_reclaimed += reclaimed;
-            LOG_TRACE(logger,
-                "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
-                "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
-                old_ref.key_generation, reclaimed);
-        }
-        t.metric("generations_reclaimed", handed_off.size());
-        t.metric("objects_reclaimed", objects_reclaimed);
-        t.metric("suppressed", suppress_destructive ? 1 : 0);
-    }
+            GcPhaseTimer t(phase_sink, "handoff_reclaim");
+            uint64_t objects_reclaimed = 0;
+            std::set<uint64_t> new_referenced_generations;
+            for (const RunRef & r : folded.fold_seal.blob_target_runs)
+                new_referenced_generations.insert(r.key_generation);
 
-    /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
-    /// ADOPTED by the round CAS (delete-after-sealed-decrements). NOT durable across rounds: the
-    /// ref-log intake cursor that discovered each `-1` edge is committed by THIS round's CAS above,
-    /// so a log already folded is never re-visited and never re-populates `mf_cleanup`. This phase is
-    /// deliberately unbudgeted: a cap would leave a declined entry unreachable from any live ref AND
-    /// never re-derived by this pipeline, converting a bounded burst into a permanent leak. It drains
-    /// the whole of `folded.mf_cleanup` every round it runs; only a crash (or the destructive-suppression
-    /// gate below) leaves an entry for the orphan-manifest sweep to reclaim later.
-    /// The bodies go in batch requests of write-once keys; see the block.
-    ///
-    /// Phase `manifest_deletes`.
-    {
-        GcPhaseTimer t(phase_sink, "manifest_deletes");
-        const uint64_t manifests_deleted_before = report.manifests_deleted;
-        /// GATED. A manifest body is content the ref graph still describes until its decrements are both
-        /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
-        /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
-        /// exactly the irreversible step the gate exists to withhold.
-        static const std::map<ManifestId, Etag> kNoManifestCleanup;
-        const std::map<ManifestId, Etag> & mf_cleanup_now =
-            suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
-
-        /// Chunks of write-once keys, one request each, with no per-key precondition: a manifest key is
-        /// never written twice, so the body at it is the one the fold observed or nothing. The engine
-        /// reissues a failed chunk whole; a chunk that exhausts its policy throws here, and the chunks
-        /// before it are already recorded below. A key that one of the exhausted chunk's own attempts
-        /// did delete is not recorded either: deletion and recording are all-or-nothing per request,
-        /// never per key, so the next round's fold sees that key as already gone. The etag the fold
-        /// observed rides the event as information only.
-        const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
-        const size_t request_keys = bulkDeleteChunkKeys();
-        uint64_t attempted = 0;
-        uint64_t requests = 0;
-        std::vector<WriteOnceKey> chunk;
-        std::vector<const std::pair<const ManifestId, Etag> *> chunk_entries;
-        const auto flush = [&]
-        {
-            if (chunk.empty())
-                return;
-            /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here;
-            /// `chunk_entries`' per-key bookkeeping below is unaffected either way -- it counts objects
-            /// that are gone after this call returns, not how many requests it took to get them there.
-            requests += removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
-            for (const auto * entry : chunk_entries)
+            std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
+            /// GATED like every other destructive site, and it is also the FIRST destructive site of the
+            /// post-CAS tail -- which is why the gate is read before the tail begins rather than partway
+            /// down it.
+            ///
+            /// UNLIKE EVERY OTHER GATED SITE, SUPPRESSION HERE LOSES THE WORK RATHER THAN POSTPONING IT.
+            /// The hand-off is a one-shot DIFFERENCE between the parent seal's runs and the new seal's, and
+            /// a suppressed round still FOLDS -- only the irreversible half stops -- so the ref moves off
+            /// the old generation on this very round and the next round's parent seal no longer names it.
+            /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
+            /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
+            /// already documents for a crash in this window (see the `handoff_reclaim` comment above). Bounded --
+            /// one small run per shard per occurrence of a suppressed round that also folded a delta -- and
+            /// not a correctness problem, but it is the one place where the gate costs something permanent,
+            /// so it is asserted rather than left to be discovered.
+            static const std::vector<RunRef> kNoRuns;
+            const std::vector<RunRef> & handoff_candidates =
+                suppress_destructive ? kNoRuns : parent_seal_runs;
+            for (const RunRef & old_ref : handoff_candidates)
             {
-                ++report.manifests_deleted;
-                EventEmitter{*store}.emit([&](CasEvent & e)
-                {
-                    e.type = CasEventType::ManifestDelete;
-                    e.namespace_ = entry->first.root_namespace.string();
-                    e.object_kind = CasEventObjectKind::Manifest;
-                    e.object_hash = manifestRefDebugString(entry->first.ref);
-                    e.token = entry->second.render();
-                    e.round = new_round;
-                    e.gen = generation;
-                    e.outcome = "deleted_or_absent";
-                    e.reason = "owner-removed manifest body; batch delete of a write-once key after decrements adopted";
-                });
+                /// Only generations the wholesale prune already passed AND that no live ref still pins.
+                if (old_ref.key_generation > state.snap_pruned_through)
+                    continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
+                if (new_referenced_generations.contains(old_ref.key_generation))
+                    continue;   /// still referenced by a (possibly different-shard) live ref: keep it
+                if (!handed_off.insert(old_ref.key_generation).second)
+                    continue;   /// already reclaimed this round via another shard's ref
+                /// `bounded_remaining` draws from the hand-off's OWN reserve, never `UINT64_MAX` and never
+                /// `pruneSupersededGenerations`' shared remainder: this hand-off is a ONE-SHOT event (see the
+                /// `handoff_reclaim` comment above) -- a generation this call reclaims only PARTIALLY is left
+                /// exactly like a crash in this window already is -- to `fsck`, never revisited by a later
+                /// round's hand-off (the parent-seal difference that triggers it does not recur once the ref
+                /// has moved). The prune, by contrast, safely retries an under-served generation next round
+                /// via its cursor, so sharing one pool would let a prune-heavy round strand this one-shot
+                /// reclaim at zero every time; the separate reserve makes that impossible.
+                const uint64_t remaining = round_work_budget.handoffPrefixWholesaleRemaining();
+                if (remaining == 0)
+                    break;
+                const uint64_t reclaimed = deletePrefixWholesale(
+                    op, layout.gcGenPrefix(old_ref.key_generation), remaining);
+                round_work_budget.handoff_prefix_wholesale_objects_used += reclaimed;
+                objects_reclaimed += reclaimed;
+                LOG_TRACE(logger,
+                    "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
+                    "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
+                    old_ref.key_generation, reclaimed);
             }
-            chunk.clear();
-            chunk_entries.clear();
-        };
-        for (const auto & entry : mf_cleanup_now)
-        {
-            ++attempted;
-            chunk.push_back(layout.writeOnceManifestKey(entry.first));
-            chunk_entries.push_back(&entry);
-            if (chunk.size() >= chunk_keys)
-                flush();
+            t.metric("generations_reclaimed", handed_off.size());
+            t.metric("objects_reclaimed", objects_reclaimed);
+            t.metric("suppressed", suppress_destructive ? 1 : 0);
         }
-        flush();
-        t.metric("attempted", attempted);
-        t.metric("accepted", report.manifests_deleted - manifests_deleted_before);
-        t.metric("requests", requests);
-        t.metric("suppressed", suppress_destructive ? 1 : 0);
+
+        /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
+        /// ADOPTED by the round CAS (delete-after-sealed-decrements). NOT durable across rounds: the
+        /// ref-log intake cursor that discovered each `-1` edge is committed by THIS round's CAS above,
+        /// so a log already folded is never re-visited and never re-populates `mf_cleanup`. This phase is
+        /// deliberately unbudgeted: a cap would leave a declined entry unreachable from any live ref AND
+        /// never re-derived by this pipeline, converting a bounded burst into a permanent leak. It drains
+        /// the whole of `folded.mf_cleanup` every round it runs; only a crash (or the destructive-suppression
+        /// gate below) leaves an entry for the orphan-manifest sweep to reclaim later.
+        /// The bodies go in batch requests of write-once keys; see the block.
+        ///
+        /// Phase `manifest_deletes`.
+        {
+            GcPhaseTimer t(phase_sink, "manifest_deletes");
+            const uint64_t manifests_deleted_before = report.manifests_deleted;
+            /// GATED. A manifest body is content the ref graph still describes until its decrements are both
+            /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
+            /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
+            /// exactly the irreversible step the gate exists to withhold.
+            static const std::map<ManifestId, Etag> kNoManifestCleanup;
+            const std::map<ManifestId, Etag> & mf_cleanup_now =
+                suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
+
+            /// Chunks of write-once keys, one request each, with no per-key precondition: a manifest key is
+            /// never written twice, so the body at it is the one the fold observed or nothing. The engine
+            /// reissues a failed chunk whole; a chunk that exhausts its policy throws here, and the chunks
+            /// before it are already recorded below. A key that one of the exhausted chunk's own attempts
+            /// did delete is not recorded either: deletion and recording are all-or-nothing per request,
+            /// never per key, so the next round's fold sees that key as already gone. The etag the fold
+            /// observed rides the event as information only.
+            const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+            const size_t request_keys = bulkDeleteChunkKeys();
+            uint64_t attempted = 0;
+            uint64_t requests = 0;
+            std::vector<WriteOnceKey> chunk;
+            std::vector<const std::pair<const ManifestId, Etag> *> chunk_entries;
+            const auto flush = [&]
+            {
+                if (chunk.empty())
+                    return;
+                /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here;
+                /// `chunk_entries`' per-key bookkeeping below is unaffected either way -- it counts objects
+                /// that are gone after this call returns, not how many requests it took to get them there.
+                requests += removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
+                for (const auto * entry : chunk_entries)
+                {
+                    ++report.manifests_deleted;
+                    EventEmitter{*store}.emit([&](CasEvent & e)
+                    {
+                        e.type = CasEventType::ManifestDelete;
+                        e.namespace_ = entry->first.root_namespace.string();
+                        e.object_kind = CasEventObjectKind::Manifest;
+                        e.object_hash = manifestRefDebugString(entry->first.ref);
+                        e.token = entry->second.render();
+                        e.round = new_round;
+                        e.gen = generation;
+                        e.outcome = "deleted_or_absent";
+                        e.reason = "owner-removed manifest body; batch delete of a write-once key after decrements adopted";
+                    });
+                }
+                chunk.clear();
+                chunk_entries.clear();
+            };
+            for (const auto & entry : mf_cleanup_now)
+            {
+                ++attempted;
+                chunk.push_back(layout.writeOnceManifestKey(entry.first));
+                chunk_entries.push_back(&entry);
+                if (chunk.size() >= chunk_keys)
+                    flush();
+            }
+            flush();
+            t.metric("attempted", attempted);
+            t.metric("accepted", report.manifests_deleted - manifests_deleted_before);
+            t.metric("requests", requests);
+            t.metric("suppressed", suppress_destructive ? 1 : 0);
+        }
     }
 
     /// Removal completion has no physical pass. The terminal fold placed positive evidence in the
     /// life row; a later invocation's catalog-only pre-fold drain owns lifecycle deletion, while the
     /// perpetual janitor owns dead-life bytes.
-    uint64_t cleanup_evidence_rows = 0;
-    for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
-        cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-    runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
-    /// Phase `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
-    /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
-    /// what a reader of a round that reclaimed nothing needs to see.
-    {
-        GcPhaseTimer t(phase_sink, "ref_object_cleanup");
-        RefCleanupPassStats cleanup_stats;
-        /// Runs before `t` emits its row, also when a delete chunk throws: the pass has then already
-        /// deleted objects that the row must account for.
-        SCOPE_EXIT_SAFE({
-            t.metric("suppressed", suppress_destructive ? 1 : 0);
-            t.metric("trim_enabled", trim_enabled ? 1 : 0);
-            t.metric("namespaces_planned", folded.ref_tables.size());
-            t.metric("objects_planned", cleanup_stats.objects_planned);
-            t.metric("objects_deleted", cleanup_stats.objects_deleted);
-            t.metric("namespaces_skipped", cleanup_stats.namespaces_skipped);
-            t.metric("stopped_lease_moved", cleanup_stats.stopped_lease_moved ? 1 : 0);
-            t.metric("stopped_authority_unverified", cleanup_stats.stopped_authority_unverified ? 1 : 0);
-            t.metric("chunks_under_catalog_change", cleanup_stats.chunks_under_catalog_change);
-        });
-        if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget, cleanup_stats);
-    }
 
     /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
     /// source edges into the adopted runs and placed cursor progress in the SAME `gc/state` CAS above.
-    /// Only this post-CAS tail may delete candidate bodies.
+    /// Only this post-CAS tail may delete candidate bodies. It runs before the janitor and the ref cleanup:
+    /// those resume next round, while the commit moved the sweep cursor past these nominations.
     /// Phase `orphan_sweep`.
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
@@ -1693,6 +1707,33 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("retained_unconsumed_seal", sweep.retained_unconsumed_seal);
         t.metric("retained_tail_removal", sweep.retained_tail_removal);
         t.metric("retained_work_budget", sweep.retained_work_budget);
+    }
+
+    uint64_t cleanup_evidence_rows = 0;
+    for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
+        cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
+    runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
+    /// Phase `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
+    /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
+    /// what a reader of a round that reclaimed nothing needs to see.
+    {
+        GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+        RefCleanupPassStats cleanup_stats;
+        /// Runs before `t` emits its row, also when a delete chunk throws: the pass has then already
+        /// deleted objects that the row must account for.
+        SCOPE_EXIT_SAFE({
+            t.metric("suppressed", suppress_destructive ? 1 : 0);
+            t.metric("trim_enabled", trim_enabled ? 1 : 0);
+            t.metric("namespaces_planned", folded.ref_tables.size());
+            t.metric("objects_planned", cleanup_stats.objects_planned);
+            t.metric("objects_deleted", cleanup_stats.objects_deleted);
+            t.metric("namespaces_skipped", cleanup_stats.namespaces_skipped);
+            t.metric("stopped_lease_moved", cleanup_stats.stopped_lease_moved ? 1 : 0);
+            t.metric("stopped_authority_unverified", cleanup_stats.stopped_authority_unverified ? 1 : 0);
+            t.metric("chunks_under_catalog_change", cleanup_stats.chunks_under_catalog_change);
+        });
+        if (trim_enabled)
+            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget, cleanup_stats);
     }
 
     return report;
@@ -4267,9 +4308,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         catch (const Exception & e)
         {
             /// A read verb that gives up throws `NETWORK_ERROR`; any other failure fails the round, as elsewhere.
-            /// A lost fence or a spent lease budget throws the same code.
+            /// A lost fence or a spent lease budget throws the same code. A stopped owner's failure was not retried,
+            /// so it says nothing about the leased version.
             if (e.code() != ErrorCodes::NETWORK_ERROR)
                 throw;
+            rethrowIfStoppedOwnersFailure();
             seen = "no answer (" + e.message() + ")";
         }
         result.parent_unconfirmed = !seen.empty();
@@ -4604,7 +4647,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         {
             /// The parent runs this merge streams are what a newer leader's retention removes. An absent run was
             /// classified by its own probe; a second probe could contradict it.
-            if (e.code() == ErrorCodes::CORRUPTED_DATA && !absence_classified)
+            if (e.code() == ErrorCodes::CORRUPTED_DATA && !absence_classified && !isQueryStoredCause(std::current_exception()))
                 throwIfStateMoved(op, state_etag, e.message());
             throw;
         }
@@ -5251,17 +5294,30 @@ bool Gc::rowDecisionDue(const GcState & state, uint64_t current_round)
     /// FAIL-CLOSED: a missing / undecodable seal, or a summary that is not TOTAL over gc_shards, is
     /// corrupt GC bookkeeping — force a FOLD so the round's own fail-closed path surfaces it, never a
     /// silent defer (matching the fold's throw-on-missing-adopted-seal treatment).
+    std::optional<Object> seal_bytes;
+    try
+    {
+        CasOperation op = store->openRequests().admit();
+        seal_bytes = op.read(store->layout().foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
+    }
+    catch (...)
+    {
+        /// A read that failed for a killed query says nothing about the seal.
+        if (queryStopRequested())
+            throw;
+        return true;
+    }
+    if (!seal_bytes)
+        return true;
     std::optional<CasFoldSeal> seal;
     try
     {
-        seal = readFoldSeal(state.snap_generation, state.snap_attempt);
+        seal = decodeFoldSeal(seal_bytes->bytes, store->layout(), store->poolConfig().gc_shards, state.snap_generation);
     }
     catch (...)
     {
         return true;   /// undecodable seal => fail-closed force-fold
     }
-    if (!seal)
-        return true;
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
     {
         const auto it = seal->condemned_summary.find(shard);
@@ -5440,6 +5496,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 }
                 catch (const Exception & e)
                 {
+                    rethrowIfStoppedOwnersFailure();
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC rebuild: the prior fold seal (generation {}, attempt {}) is UNDECODABLE "
                         "({}), so the holds it carries cannot be read. A rebuild that dropped them would "
@@ -5498,6 +5555,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 }
                 catch (const Exception & e)
                 {
+                    rethrowIfStoppedOwnersFailure();
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC rebuild: gc/state names no adopted baseline and the newest fold seal "
                         "(generation {}, attempt {}) is UNDECODABLE ({}), so the holds this pool carries "
@@ -6040,6 +6098,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation, const Retry & policy)
     }
     catch (...)
     {
+        rethrowIfStoppedOwnersFailure();
         tryLogCurrentException(logger,
             "CAS gc: the leader-authority probe failed; this round's destructive operations treat the "
             "lease as lost");
@@ -6071,9 +6130,9 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
 
-    /// What the decision that actually landed wrote. `readModifyWrite` re-decides on every conflict
-    /// against what the losing write's own resolve read observed, so the last decision is the committed
-    /// one, and a competing leader's write makes the next decision see a moved lease tuple.
+    /// What the decision that actually landed wrote. `readModifyWrite` re-decides after every conflict
+    /// on a read taken after its pause, so the last decision is the committed one, and a competing
+    /// leader's write makes the next decision see a moved lease tuple.
     GcState decided;
     bool decided_never_held = false;
     const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,

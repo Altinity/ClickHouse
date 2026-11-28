@@ -13,8 +13,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
+#include "cas_killable_query.h"
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <thread>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -28,6 +32,7 @@ namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
+extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace
@@ -1079,6 +1084,104 @@ TEST(CASGCRebuild, FailingLeaseGiveBackLeavesTheRefusalToTheCaller)
     EXPECT_EQ(capture.count("the give-back write fails"), 1u) << capture.captured();
     EXPECT_EQ(decodeGcState(readObj(*backend, layout.gcStateKey())->bytes).lease.owner, rebuild_id)
         << "a failed give-back leaves the claim in place";
+}
+
+/// A rebuild whose query is killed after its lease claim still gives the claim back: the give-back is owed
+/// to the claimed resource, so the next rebuild is not refused as a competing leader.
+TEST(CASGCRebuild, KilledRebuildGivesBackClaimedLease)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestId missing = seedLostStateWithMissingCommittedManifest(*backend, store);
+    ASSERT_FALSE(readObj(*backend, layout.gcStateKey()).has_value());
+
+    std::thread rebuild_thread([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        CasKillableQuery query(getContext().context);
+        backend->arm(layout.manifestKey(missing), 1, [&] { query.kill(); });
+        Gc killed(store, hexToU128("00000000000000000000000000000026"));
+        try
+        {
+            const RebuildReport refused = killed.rebuildBaseline(/*force*/ false);
+            EXPECT_FALSE(refused.performed);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::QUERY_WAS_CANCELLED) << e.message();
+        }
+    });
+    rebuild_thread.join();
+
+    ASSERT_TRUE(backend->didFire()) << "the query was not killed after the lease claim";
+    const auto given_back = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(given_back.has_value()) << "the claim created gc/state";
+    EXPECT_EQ(decodeGcState(given_back->bytes).lease.owner, DB::UInt128(0)) << "the claim was given back";
+
+    Gc next(store, hexToU128("00000000000000000000000000000027"));
+    const RebuildReport rep = next.rebuildBaseline(/*force*/ true);
+    EXPECT_EQ(rep.refusal.find("another GC leader holds the lease"), String::npos) << rep.refusal;
+}
+
+/// A rebuild whose query is killed while it reads a fold seal reports the read's own failure, not an undecodable
+/// seal that tells the operator to recreate the pool: for the adopted seal, and for the newest one found by
+/// listing when `gc/state` is gone.
+TEST(CASGCRebuild, KilledRebuildIsNotUndecodableSeal)
+{
+    for (const bool state_lost : {false, true})
+    {
+        SCOPED_TRACE(state_lost ? "newest listed seal" : "adopted seal");
+        auto backend = std::make_shared<SweepReadHookBackend>();
+        auto store = openPoolForTest(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/aa@cas@"};
+        writeBlobBody(*backend, layout, DB::UInt128(1));
+        writeManifestRaw(*backend, layout, ns, ref(1, 0xAA), {blobEntryFor("a", DB::UInt128(1))});
+        publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, ref(1, 0xAA));
+        Gc gc(store, kGc);
+        gc.runRegularRound();
+        const GcState st = decodeGcState(readObj(*backend, layout.gcStateKey())->bytes);
+        ASSERT_GT(st.snap_generation, 0u);
+        if (state_lost)
+        {
+            const auto state_meta = headObj(*backend, layout.gcStateKey());
+            ASSERT_TRUE(state_meta);
+            ASSERT_EQ(removeExact(*backend, layout.gcStateKey(), state_meta->etag), Removal::Removed);
+        }
+
+        std::optional<int> code;
+        String message;
+        std::thread rebuild_thread([&]
+        {
+            std::optional<DB::ThreadStatus> thread_status;
+            thread_status.emplace();
+            CasKillableQuery query(getContext().context);
+            backend->arm(layout.foldSealKey(st.snap_generation, st.snap_attempt), 1, [&]
+            {
+                query.kill();
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected fold seal read failure");
+            });
+            try
+            {
+                Gc rebuild(store, hexToU128("00000000000000000000000000000028"));
+                (void)rebuild.rebuildBaseline(/*force*/ true);
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+        rebuild_thread.join();
+
+        ASSERT_TRUE(backend->didFire()) << "the rebuild never read the fold seal";
+        ASSERT_TRUE(code) << "the killed rebuild returned normally";
+        EXPECT_EQ(*code, DB::ErrorCodes::NETWORK_ERROR) << message;
+        EXPECT_NE(message.find("injected fold seal read failure"), String::npos) << message;
+        EXPECT_EQ(message.find("UNDECODABLE"), String::npos) << message;
+    }
 }
 
 /// The refusal is a wait, not a verdict: once the manifest is readable, a rebuild with a fresh GC identity,

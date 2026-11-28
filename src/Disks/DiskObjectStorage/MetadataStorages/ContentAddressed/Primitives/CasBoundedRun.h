@@ -1,5 +1,7 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Common/ThreadPool.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <base/scope_guard.h>
@@ -57,12 +59,13 @@ void runBounded(ThreadPool & pool, ThreadName thread_name, size_t count, const J
     {
         if constexpr (HasBeforeSubmit<Job>)
             job.beforeSubmit(i);
-        handles.emplace_back(runner.enqueueAndGiveOwnership([&job, &failed, i]
+        handles.emplace_back(runner.enqueueAndGiveOwnership([&job, &failed, i, group = CurrentThread::getGroup()]
         {
             if (failed.load())
                 return;
             try
             {
+                throwUnlessInThreadGroup(group, "CAS tool worker");
                 job(i);
             }
             catch (...)

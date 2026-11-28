@@ -36,6 +36,22 @@ namespace DB::Cas
 /// re-validating anything.
 enum class ResolveAudit : uint8_t { Emit, Deferred };
 
+/// Where a queued ref-log follower evaluates its wait condition: `Queued` while it waits stoppably, `Carved` once
+/// its owner stopped and a leader owns its item, a wait it must not leave before the item is done.
+enum class FollowerWaitPhase : uint8_t { Queued, Carved };
+
+/// Thrown when a namespace's positive ref-mutation admission is closed for a removal: the call was refused
+/// before its mutation was queued, so it wrote nothing and bound nothing. Catch sites match by type; the code
+/// and text are those of `throwCasWriteRetryLater`.
+class RefAdmissionRefusedException : public Exception
+{
+public:
+    explicit RefAdmissionRefusedException(const Exception & retry_later) : Exception(retry_later) {}
+
+    RefAdmissionRefusedException * clone() const override { return new RefAdmissionRefusedException(*this); }
+    void rethrow() const override { throw *this; } // NOLINT
+};
+
 /// The complete state of one table's append lane. It is guarded by `RefTableRuntime::state_mutex`;
 /// there is no independent apply marker or durable-id floor whose combinations form a second,
 /// implicit state machine.
@@ -332,7 +348,8 @@ public:
     /// name has no cold admission in flight here; the check is repeated inside the catalog lane. One scan
     /// read per call; each cancel may add its own catalog reads and conditional writes. `pause` replaces
     /// the mount plane's retry sleep. `stop_requested` is checked before the read and before each cancel, and
-    /// ends the call when true. An absent catalog is logged and ends the call; other failures throw.
+    /// returns when true; inside a cancel it is the owner check, which throws `ABORTED`. An absent catalog is
+    /// logged and ends the call; other failures throw.
     void cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause,
                                    const std::function<bool()> & stop_requested = {});
 
@@ -401,9 +418,12 @@ public:
     /// leave it untouched.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
-    /// Replaces only ref-table recovery's token-aware retry delay seam for deterministic tests.
+    /// Replaces the sleep of a whole recovery retry pause; the pause's stop checks still run before it.
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
+
+    /// Replaces the sleep of one slice of a recovery retry pause, keeping its slicing and stop checks.
+    void setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
     /// The counters expose recovery and publication progress; wedge methods create and inspect the
@@ -442,6 +462,12 @@ public:
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
     /// Returns the append lane state of `ns` without forcing recovery.
     RefLaneState laneStateForTest(const RootNamespace & ns);
+    struct RemovalFlagsForTest
+    {
+        bool attempt_active = false;
+        bool admission_closed = false;
+    };
+    RemovalFlagsForTest removalFlagsForTest(const RootNamespace & ns);
     /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
     /// Waits until all background snapshot publications for `ns` have completed.
@@ -529,6 +555,10 @@ public:
 
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
+
+    /// Runs on a queued follower each time it evaluates its wait condition, under the queue mutex. It must not
+    /// lock anything, and it runs as `noexcept`: a throw terminates rather than unwinding out of the `Carved` wait.
+    void setRefFollowerWaitHookForTest(std::function<void(FollowerWaitPhase)> hook) { ref_follower_wait_hook_for_test = std::move(hook); }
 
     /// Pauses an ordinary append after it captured an exact runtime but before recovery or enqueue.
     void setAppendAfterRuntimeCaptureHookForTest(std::function<void()> hook)
@@ -840,10 +870,14 @@ private:
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
     std::function<void()> recovery_pre_first_request_hook_for_test;
 
-    /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
-    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops or detached teardown starts);
-    /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
-    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_sleep_fn;
+    /// The sleep of one slice of `pauseBeforeRecoveryRetry`.
+    std::function<void(uint64_t)> recovery_retry_slice_sleep_fn;
+    /// When set, `pauseBeforeRecoveryRetry` sleeps the whole pause through it, after the same checks.
+    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_pause_sleep_for_test;
+
+    /// The backoff of `ensureRefTableRecovered`'s retry loop, in `kOwnerStopSlice` slices. Returns early on fence
+    /// loss, teardown, or a stopped query outside `owed`; throws a stopped background owner's verdict.
+    void pauseBeforeRecoveryRetry(uint64_t total_ms, const std::optional<DetachedStopToken> & token);
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
     /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
@@ -1139,6 +1173,12 @@ private:
     /// idle (baton un-taken, the caller's item un-enqueued), never a permanently non-idle namespace with
     /// no live leader. Null in production. See `appendRefOps`.
     std::function<void()> ref_pre_tenure_hook_for_test;
+    std::function<void(FollowerWaitPhase)> ref_follower_wait_hook_for_test;
+    void runRefFollowerWaitHook(FollowerWaitPhase phase) const noexcept
+    {
+        if (ref_follower_wait_hook_for_test)
+            ref_follower_wait_hook_for_test(phase);
+    }
 
     /// Test-only hook fired at each carve/validation phase point (see `CarvePhaseForTest`); null in
     /// production.
@@ -1275,10 +1315,8 @@ private:
     /// Every `createNamespace`/`completeCreation`/`reconcileStaleCreator` outcome that writes nothing
     /// (`FencedOut`, `Superseded`, a reconciled entry, `EntryChanged`) re-reads the catalog and loops;
     /// `CreatorFenceStillLive` throws the retry-later class, which this function's caller (the transient
-    /// retry loop) or a higher one re-drives. One `Retry` is frozen before the loop and shared by every
-    /// read and every protocol call it makes, so the whole resolution ends within one standard window;
-    /// a re-read forced by a competing actor is paced by a jittered sleep, and an iteration cap is the
-    /// secondary bound.
+    /// retry loop) or a higher one re-drives. A re-read forced by a competing actor is paced by a
+    /// jittered sleep, and a cap on rounds ends the loop.
     NamespaceLifeId resolveNamespaceLife(
         const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
         bool * lifecycle_refusal = nullptr);
@@ -1298,10 +1336,12 @@ private:
     /// reported through the retry-later class (the caller should retry, against the FRESH incarnation),
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
+    /// `unresolved_sent` is set when the walk throws because its stamp or tombstone was sent and stays
+    /// unresolved, so the caller can keep that exit after its owner stops.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
         const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
-        bool & cancelled, const std::optional<DetachedStopToken> & token = std::nullopt);
+        bool & cancelled, bool & unresolved_sent, const std::optional<DetachedStopToken> & token = std::nullopt);
 
     /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Detached
     /// teardown, self-remount cancellation, and a runtime already detached by self-remount each
@@ -1335,9 +1375,16 @@ private:
     /// Every item this leader becomes responsible for -- its own `own` plus each item a flush removes
     /// from `pending` to form a batch -- is recorded into `owned_items`, so the caller's leadership guard
     /// can complete + de-pend any that a flush leaves unfinished on an exceptional exit.
+    /// Every leader flushes in its caller's thread group under `OwnerScope::shared`. Its own item stays withdrawable by
+    /// its background owner until carved.
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                            const std::shared_ptr<RefMutationItem> & own,
                            std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// Waits, with `lk` held on return and on throw, until `item` is done or the lane needs a leader.
+    /// A stopped follower withdraws its queued item or waits for its carved result.
+    void waitAsFollower(const std::shared_ptr<RefTableRuntime> & rt, const std::shared_ptr<RefMutationItem> & item,
+                        std::unique_lock<std::mutex> & lk);
 
     /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
     /// and apply-after-commit ordering -- the LIVE state is still only ever advanced once the object is
@@ -1348,7 +1395,8 @@ private:
     /// `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one tenure via
     /// `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
-                       std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+                       std::vector<std::shared_ptr<RefMutationItem>> & owned_items,
+                       const std::shared_ptr<RefMutationItem> & own, const std::function<void()> & owner_check);
 
     /// The lane's tombstone step, run by `flushRefBatch` before the batch copies its working state.
     /// True: the chain epoch equals the live epoch, or the stream is terminal, and the batch may proceed.

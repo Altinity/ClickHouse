@@ -9,6 +9,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -683,11 +684,15 @@ public:
     }
 
     bool churning = false;
+    size_t churned_reads = 0;
 
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (churning && key == catalog_key)
+        {
+            ++churned_reads;
             bumpEveryCreatorFence(access);
+        }
         return InMemoryBackend::read(key, access);
     }
 
@@ -710,16 +715,90 @@ private:
 
 }
 
-/// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
-/// One `Retry` frozen before the loop bounds the WHOLE resolution to a single standard window, and
-/// every re-read a competing actor forces is paced by a jittered sleep -- so a permanently churning
-/// catalog costs one window, not one fresh window per verb per iteration hammered with no wait between
-/// them.
-///
-/// What the clock bound below does NOT check: it bounds this call's own wall time, not the number of
-/// requests the loop sent, and it says nothing about the paths that converge.
-TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWithinOneWindow)
+namespace
 {
+
+/// After this server's own birth of `ns` lands, rewrites the catalog under three successive reads: the confirming read
+/// sees a foreign `Creating` row, the reconciliation's read sees that row moved on, and the next read sees it `Live`.
+class ReplacedAfterBirthBackend final : public InMemoryBackend
+{
+public:
+    ReplacedAfterBirthBackend(String catalog_key_, RootNamespace ns_)
+        : catalog_key(std::move(catalog_key_)), ns(std::move(ns_))
+    {
+    }
+
+    int stage = 0;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == catalog_key && stage < 3)
+            rewrite(access);
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    void rewrite(DB::Cas::TransportAccess & access)
+    {
+        const std::optional<Raw> got = InMemoryBackend::read(catalog_key, access);
+        if (!got)
+            return;
+        RefCatalog catalog = decodeRefCatalog(got->bytes);
+        for (CatalogEntry & entry : catalog.entries)
+        {
+            if (entry.ns != ns)
+                continue;
+            if (stage == 0 && entry.state == NsState::Live)
+            {
+                entry.state = NsState::Creating;
+                entry.creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1};
+            }
+            else if (stage == 1)
+                ++entry.creator->fence_generation;
+            else if (stage == 2)
+            {
+                entry.state = NsState::Live;
+                entry.creator.reset();
+            }
+            else
+                return;
+            ++stage;
+            (void)InMemoryBackend::write(catalog_key, encodeRefCatalog(catalog), got->value, access);
+            return;
+        }
+    }
+
+    const String catalog_key;
+    const RootNamespace ns;
+};
+
+}
+
+/// A birth that lands and is then replaced before its confirming read is followed by one collision, the first of this
+/// call, so it is retried at once, whatever round it falls in.
+TEST(CASRefCatalogBirthWiring, TheFirstCollisionAfterAConfirmedBirthIsRetriedAtOnce)
+{
+    const RootNamespace ns{"replaced_after_birth"};
+    auto backend = std::make_shared<ReplacedAfterBirthBackend>(Layout{"p"}.refCatalogKey(), ns);
+    auto store = openPoolForBirthTest(backend);
+    std::vector<uint64_t> pauses;
+    store->setCasRetrySleepForTest([&](uint64_t ms) { pauses.push_back(ms); });
+
+    (void)store->namespaceLife(ns);
+
+    EXPECT_EQ(backend->stage, 3) << "premise: the row was replaced, moved on and completed";
+    EXPECT_TRUE(pauses.empty()) << "a pause of " << (pauses.empty() ? 0 : pauses.front()) << " ms after the first collision";
+}
+
+/// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
+/// Every re-read a competing actor forces is paced by the count of collisions, the first collision is retried at once,
+/// the last is not paced because no re-read follows it, and the loop ends after its 32 rounds. The pause before the last
+/// round carries the clock past a whole window, so the last round is sent only if each of its requests
+/// binds its own window.
+TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsAfterItsRounds)
+{
+    constexpr size_t kRounds = 32;
+
     auto backend = std::make_shared<ChurningCatalogBackend>(Layout{"p"}.refCatalogKey());
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
@@ -735,18 +814,32 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWit
         .creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1}};
     CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
 
-    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    auto now_ms = std::make_shared<uint64_t>(0);
+    size_t pauses = 0;
+    std::vector<uint64_t> pause_ms;
+    std::optional<uint64_t> last_round_started_ms;
+    size_t reads_before_last_round = 0;
+    store->setCasRequestNowFnForTest([now_ms] { return *now_ms; });
+    store->setCasRetrySleepForTest([&, now_ms](uint64_t ms)
+    {
+        *now_ms += ms;
+        pause_ms.push_back(ms);
+        if (++pauses == kRounds - 2)
+        {
+            *now_ms += DB::Cas::kDefaultRequestWindowMs;
+            last_round_started_ms = *now_ms;
+            reads_before_last_round = backend->churned_reads;
+        }
+    });
     backend->churning = true;
-    const size_t pauses_before = clock->pauseCount();
-    const uint64_t now_before = clock->nowMs();
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->namespaceLife(ns); });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, fmt::format("after {} attempts", kRounds),
+        [&] { store->namespaceLife(ns); });
 
-    /// Sixteen jittered draws cannot exhaust the request window even at their ceiling, so an unpaced loop
-    /// reaches its iteration cap having slept nothing at all.
-    EXPECT_GE(clock->pauseCount() - pauses_before, 16u) << "each forced re-read is paced";
-    /// The frozen window, plus at most one backoff draw the pace does not consult the deadline for,
-    /// plus the virtual clock's one extra millisecond per pause.
-    EXPECT_LE(clock->nowMs() - now_before, DB::Cas::kDefaultRequestWindowMs + 5'000 + 100)
-        << "one standard window bounds the whole loop";
+    EXPECT_EQ(pauses, kRounds - 2) << "each re-read a lost round forced is paced, but the first and the last round are not";
+    for (size_t i = 0; i < pause_ms.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(pause_ms[i], static_cast<uint32_t>(i + 2)));
+    ASSERT_TRUE(last_round_started_ms.has_value());
+    EXPECT_EQ(backend->churned_reads - reads_before_last_round, 2u) << "the last round's loop read and its decision read";
+    EXPECT_EQ(*now_ms, *last_round_started_ms) << "no pause after the last round";
 }

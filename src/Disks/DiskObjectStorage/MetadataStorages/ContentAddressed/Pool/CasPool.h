@@ -469,7 +469,7 @@ public:
     void beginTeardown() noexcept;
     bool teardownBegun() const noexcept;
     /// The GC scheduler's per-tick cleanup of this mount's own idle `Creating` catalog rows; stops at teardown
-    /// or once `stop_requested` returns true.
+    /// or once `stop_requested` returns true, with `ABORTED` when that happens inside a cancel.
     void cancelIdleOwnCreatingRows(const std::function<bool()> & stop_requested = {});
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;
@@ -637,13 +637,15 @@ public:
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
     /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
-    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
-    /// ledger waits for a held state lock again and bounds the mount-slot read, which reissues a transient transport failure until then;
-    /// any other failure propagates at once. One wait for the lock is not bounded.
-    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the deadline, a
+    /// (`CasRefLedger::confirmPinnedRef`). The poll's end, the request window from the call's start, decides whether the
+    /// ledger waits for a held state lock again and whether another pass starts. The mount-slot read of a pass binds its own
+    /// request window when it starts, and reissues a transient transport failure until that window ends; any other failure
+    /// propagates at once.
+    /// One wait for the lock is not bounded.
+    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the poll's end, a
     /// refusal of a state the pinned runtime cannot leave, or a pin that can never confirm
-    /// (`CasRefLedger::pinnedTableRetired`). No ledger lock is held between passes. Throws `ABORTED` once the pool's
-    /// teardown has begun.
+    /// (`CasRefLedger::pinnedTableRetired`). A started pass finishes, even past the poll's end.
+    /// No ledger lock is held between passes. Throws `ABORTED` once the pool's teardown has begun.
     ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
                                    const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
@@ -1033,6 +1035,7 @@ public:
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
     /// Test seam: this table's append lane state.
     RefLaneState laneStateForTest(const RootNamespace & ns);
+    CasRefLedger::RemovalFlagsForTest removalFlagsForTest(const RootNamespace & ns) { return ref_ledger.removalFlagsForTest(ns); }
 
     /// Whether this resident table still owes a stale-precommit sweep (armed by recovery; re-armed by a
     /// failed attempt; cleared permanently only by a verified-clean sweep).
@@ -1081,6 +1084,11 @@ public:
     /// the direct signal that a settlement failure retained its duty for retry, independent of any
     /// build-floor side effect that could have the same shape for an unrelated reason.
     bool writerCleanupDutiesPendingForTest() const { return writerCleanupDutiesPending(); }
+    /// Test seam: whether a caller is draining the writer cleanup duties of `ns`.
+    bool writerCleanupDrainingForTest(const RootNamespace & ns) const;
+    /// TEST SEAM: runs under the cleanup-duty mutex each time a caller finds another drainer and waits for it.
+    /// Must not take that mutex. Set only while no drain runs.
+    void setWriterCleanupWaitHookForTest(std::function<void()> hook) { writer_cleanup_wait_hook_for_test = std::move(hook); }
 
     /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
@@ -1088,6 +1096,9 @@ public:
     /// flush performs no I/O between becoming leader and carving. A test blocks here to let a second
     /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_ledger.setRefPreCarveHookForTest(std::move(hook)); }
+
+    /// Test-only: fires on a queued ref-log follower at each evaluation of its wait condition.
+    void setRefFollowerWaitHookForTest(std::function<void(FollowerWaitPhase)> hook) { ref_ledger.setRefFollowerWaitHookForTest(std::move(hook)); }
 
     /// Test-only: pre-tenure fault seam for the append-lane leadership acquisition; forwards to
     /// `CasRefLedger::setRefPreTenureHookForTest` (see it for the baton-safety contract).
@@ -1188,6 +1199,9 @@ public:
     /// background workers start.
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
+
+    /// Test-only: replace the single-slice sleep inside the default recovery retry delay. Same rule.
+    void setRefRecoveryRetrySliceSleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
     /// `appendRefOps` callers are enqueued for `ns` right now.
@@ -1377,6 +1391,8 @@ private:
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
 
+    /// TEST SEAM for `setWriterCleanupWaitHookForTest`.
+    std::function<void()> writer_cleanup_wait_hook_for_test = {};
     /// TEST SEAM for `setConfirmAfterOwnershipCaptureHookForTest`; set only while no confirm runs.
     std::function<void()> confirm_after_ownership_capture_hook_for_test = {};
     /// TEST SEAM for `setConfirmAfterLedgerSnapshotHookForTest`; set only while no confirm runs.
