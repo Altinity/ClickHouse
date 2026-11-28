@@ -60,24 +60,6 @@ namespace DB::Cas
 namespace
 {
 
-/// Ceiling for a CAS write-buffer allocation. An extreme `max_compress_block_size` (or any other
-/// out-of-range buffer-size setting -- fuzzed or misconfigured) flows into `writeFile`'s `buf_size` /
-/// `adaptive_write_buffer_initial_size` and, unclamped, reaches `Memory::alloc` where the allocator's
-/// `checkSize` (>= 0x8000000000000000) fires a `LOGICAL_ERROR` and aborts the server in
-/// debug/sanitizer builds. The ordinary MergeTree writers clamp compress-block sizes to 256 MiB
-/// (`MergeTreeWriterSettings::MAX_COMPRESS_BLOCK_SIZE`) for exactly this reason; the CAS write path
-/// received the value unclamped. Mirror that ceiling here, at the allocation site, so no caller can
-/// pass an absurd size to the allocator. 256 MiB is duplicated (not #included) to keep the Disks layer
-/// free of a Storages/MergeTree dependency; the regression guard is
-/// `04070_no_crash_extreme_compress_block_size` run on a content-addressed storage policy.
-constexpr size_t kMaxCasWriteBufferBytes = 256ULL * 1024 * 1024;
-
-size_t clampCasWriteBufferSize(size_t size)
-{
-    /// Even an empty S3 payload writes an envelope through the sink. A zero-sized buffer cannot flush.
-    return std::clamp<size_t>(size, 1, kMaxCasWriteBufferBytes);
-}
-
 bool hasSuffix(std::string_view s, std::string_view suffix)
 {
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
@@ -126,23 +108,10 @@ namespace
         "content-addressed write path.", op);
 }
 
-/// An eligible staged file can be embedded in the manifest up to this payload size.
+/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
+/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
+/// large eager file.
 constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
-
-/// Destroy the underlying reader before releasing its source. A remote seek can start a new GET.
-struct StagingFileOwner
-{
-    std::shared_ptr<const void> source;
-};
-
-template <typename Reader>
-class ReaderWithStagingFile final : private StagingFileOwner, public Reader
-{
-public:
-    template <typename... Args>
-    ReaderWithStagingFile(std::shared_ptr<const void> source_, Args &&... args)
-        : StagingFileOwner{std::move(source_)}, Reader(std::forward<Args>(args)...) {}
-};
 
 bool hasTopLevelFile(const std::vector<Cas::ManifestEntry> & entries)
 {
@@ -161,7 +130,7 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
 {
     /// On abort this is the cleanup of local and S3 staging. After a commit it finds nothing left,
     /// except when the commit published some parts and then threw.
-    releaseStagedFiles();
+    cleanupPendingTempFiles();
 
     /// An uncommitted transaction's uploads become min_active_build_sequence-spared debris: abandon every
     /// still-open PartWriteTxn so its build_seq is retired. This replaces the former pin machinery.
@@ -229,94 +198,68 @@ ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStag
     return it == parts.end() ? nullptr : &it->second;
 }
 
-namespace
-{
-void removeStagingObject(const ObjectStoragePtr & storage, const String & key) noexcept
-{
-    try
-    {
-        storage->removeObjectIfExists(StoredObject(key));
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger("ContentAddressedTransaction"), "removing a private staging object");
-    }
-}
-}
-
-ContentAddressedTransaction::StagedPartFile::~StagedPartFile()
-{
-    if (!owns_file)
-        return;
-    if (remote_storage)
-        removeStagingObject(remote_storage, staging_path);
-    else
-    {
-        std::error_code ec;
-        fs::remove(staging_path, ec);
-    }
-}
-
-void ContentAddressedTransaction::releaseStagedFiles() noexcept
+void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
 {
     for (auto & [key, st] : parts)
-        st.staged_part_files.clear();
+    {
+        for (const auto & pb : st.pending_blobs)
+        {
+            if (pb.backend == Cas::StagingBackend::Local)
+            {
+                std::error_code ec;
+                std::filesystem::remove(pb.staging_key, ec);
+            }
+            else
+            {
+                /// The S3 staging object is private to this transaction and nothing reads
+                /// `pending_blobs` after this call, so commit and abort delete it alike. An object that
+                /// outlived an abort would stay until the next mount of this `server_root_id`.
+                try
+                {
+                    metadata_storage.objectStorage()->removeObjectIfExists(StoredObject(pb.staging_key));
+                }
+                catch (...) // NOLINT(bugprone-empty-catch)
+                {
+                    /// Best-effort (noexcept context): a stubborn delete leaves debris for the mount-start sweep.
+                }
+            }
+        }
+        st.pending_blobs.clear();
+    }
 }
 
-ContentAddressedTransaction::StagedPartFilePtr ContentAddressedTransaction::stagedFileOf(const PartStaging & st, const String & path)
+const ContentAddressedTransaction::PartStaging::PendingBlob *
+ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::BlobRef & ref) const
 {
-    const auto it = st.staged_part_files.find(path);
-    return it == st.staged_part_files.end() ? nullptr : it->second;
+    /// Locate a pending blob by ref. Returns nullptr when the blob has already been uploaded
+    /// (post-precommit, pending_blobs is cleared) or was never staged as pending.
+    for (const auto & pb : st.pending_blobs)
+        if (pb.ref == ref)
+            return &pb;
+    return nullptr;
 }
 
-void ContentAddressedTransaction::putEntry(
-    PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source, StagedPartFilePtr file)
+void ContentAddressedTransaction::putEntry(PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source)
 {
-    auto it = std::find_if(st.entries.begin(), st.entries.end(), [&](const auto & e) { return e.path == entry.path; });
-    const bool inserted = it == st.entries.end();
-    if (inserted)
-    {
-        st.entries.emplace_back();
-        it = std::prev(st.entries.end());
-    }
-    /// Install the possibly allocating map node before retiring the previous path or its source.
-    try
-    {
-        if (file)
-            st.staged_part_files.insert_or_assign(entry.path, file);
-        else if (source)
-            st.copy_sources.insert_or_assign(entry.path, source);
-    }
-    catch (...)
-    {
-        if (inserted)
-            st.entries.pop_back();
-        throw;
-    }
-    if (!file)
-        st.staged_part_files.erase(entry.path);
-    if (!source)
-        st.copy_sources.erase(entry.path);
-    *it = std::move(entry);
+    eraseEntry(st, entry.path);
+    if (source)
+        st.copy_sources.insert_or_assign(entry.path, std::move(source));
+    st.entries.push_back(std::move(entry));
 }
 
 void ContentAddressedTransaction::eraseEntry(PartStaging & st, const std::string & path)
 {
     std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == path; });
     st.copy_sources.erase(path);
-    st.staged_part_files.erase(path);
 }
 
 void ContentAddressedTransaction::rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path)
 {
-    auto file = stagedFileOf(st, entry.path);
-    auto source = copySourceOf(st, entry.path);
-    if (file)
-        st.staged_part_files.emplace(new_path, std::move(file));
-    if (source)
-        st.copy_sources.emplace(new_path, std::move(source));
-    st.copy_sources.erase(entry.path);
-    st.staged_part_files.erase(entry.path);
+    if (auto node = st.copy_sources.extract(entry.path))
+    {
+        node.key() = new_path;
+        st.copy_sources.insert(std::move(node));
+    }
     entry.path = std::move(new_path);
 }
 
@@ -324,8 +267,6 @@ void ContentAddressedTransaction::clearEntries(PartStaging & st)
 {
     st.entries.clear();
     st.copy_sources.clear();
-    st.staged_part_files.clear();
-    st.has_finalized_file_write = false;
 }
 
 void ContentAddressedTransaction::markVacatedInBase(
@@ -424,6 +365,29 @@ void ContentAddressedTransaction::retargetCopySource(const Cas::PartRefKey & fro
     copy_sources_by_part.try_emplace(to.cacheKey(), borrow);
 }
 
+void ContentAddressedTransaction::adoptStagedBlob(
+    const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
+    PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending)
+{
+    if (pb)
+    {
+        /// Pending blob (not yet uploaded): no dependency exists until publication succeeds. If
+        /// copy_pending, push a copy of the pb record into dst_st so publishStaging uploads it
+        /// for the dst part too (hardlink = copy semantics). If !copy_pending, the record is already
+        /// in dst_st (moved by caller) — skip the push.
+        if (copy_pending)
+            dst_st.pending_blobs.push_back(*pb);
+    }
+    else
+    {
+        /// Uploaded / committed: record trusted-manifest evidence — no pool HEAD/GET before precommit.
+        /// §4 manifest-trust: the publish gate (promote) TRUSTS this committed-source adopted leaf via the
+        /// durable manifest edge — it does not observe or republish it. Pending uploads establish
+        /// `Materialized` through `putBlob` before promote; a genuinely absent adopted blob is an fsck finding.
+        dst_build.adoptEvidence(entry);
+    }
+}
+
 std::optional<ContentAddressedMetadataStorage::Route>
 ContentAddressedTransaction::routeOf(const std::string & path) const
 {
@@ -433,73 +397,58 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
-std::vector<Cas::BlobUploadRequest> ContentAddressedTransaction::applyManifestInlineBudget(
-    PartStaging & st, uint64_t inline_bytes_from_unchanged_base_entries) const
+namespace
+{
+
+/// Only entries supplied by this transaction may change placement. The caller has already
+/// excluded shadowed and removed paths from the retained base.
+std::vector<Cas::BlobUploadRequest> applyManifestInlineBudget(
+    std::vector<Cas::ManifestEntry> & entries_to_add_or_replace, uint64_t inline_bytes_from_unchanged_base_entries, Cas::BlobHashAlgo algo)
 {
     if (inline_bytes_from_unchanged_base_entries > Cas::kMaxManifestInlineBytesTotal)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Retained manifest entries contain {} inline bytes, exceeding the cap of {}",
             inline_bytes_from_unchanged_base_entries, Cas::kMaxManifestInlineBytesTotal);
 
-    const auto pool = metadata_storage.store();
     uint64_t total_inline_bytes = inline_bytes_from_unchanged_base_entries;
+    for (const auto & entry : entries_to_add_or_replace)
+        if (entry.placement == Cas::EntryPlacement::Inline)
+            total_inline_bytes += entry.inline_bytes.size();
+
+    if (total_inline_bytes <= Cas::kMaxManifestInlineBytesTotal)
+        return {};
+
     std::vector<Cas::ManifestEntry *> candidates;
-
-    for (auto & entry : st.entries)
-    {
-        const auto file = stagedFileOf(st, entry.path);
-        if (entry.placement == Cas::EntryPlacement::Inline || (file && file->allow_inline_by_name && entry.blob_size <= INLINE_CAP))
-        {
+    for (auto & entry : entries_to_add_or_replace)
+        if (entry.placement == Cas::EntryPlacement::Inline && !entry.inline_bytes.empty())
             candidates.push_back(&entry);
-            total_inline_bytes += entry.size();
-        }
-    }
 
-    if (total_inline_bytes > Cas::kMaxManifestInlineBytesTotal)
-        std::sort(candidates.begin(), candidates.end(), [](const auto * lhs, const auto * rhs)
-        {
-            if (lhs->size() != rhs->size())
-                return lhs->size() > rhs->size();
-            return lhs->path < rhs->path;
-        });
+    std::sort(candidates.begin(), candidates.end(), [](const auto * lhs, const auto * rhs)
+    {
+        if (lhs->inline_bytes.size() != rhs->inline_bytes.size())
+            return lhs->inline_bytes.size() > rhs->inline_bytes.size();
+        return lhs->path < rhs->path;
+    });
 
     std::vector<Cas::BlobUploadRequest> blob_upload_requests;
-    size_t spilled = 0;
-
     for (auto * entry : candidates)
     {
-        const auto size = entry->size();
+        /// Decoded Inline entries borrowed from a committed manifest have no serialized BlobRef.
+        const size_t size = entry->inline_bytes.size();
+        entry->ref = Cas::poolContentHash(algo, entry->inline_bytes);
 
-        if (total_inline_bytes > Cas::kMaxManifestInlineBytesTotal)
-        {
-            total_inline_bytes -= size;
-            ++spilled;
-            if (entry->placement == Cas::EntryPlacement::Inline)
-            {
-                /// A borrowed Inline has no staging file. Its bytes came from the committed manifest.
-                entry->ref = Cas::poolContentHash(pool->writeAlgo(), entry->inline_bytes);
-                blob_upload_requests.push_back({entry->ref, Cas::BlobSource::fromString(std::exchange(entry->inline_bytes, {})), size});
-                entry->blob_size = size;
-                entry->placement = Cas::EntryPlacement::Blob;
-            }
-        }
-        else if (entry->placement == Cas::EntryPlacement::Blob)
-        {
-            auto input = openStagedPayload(*st.staged_part_files.at(entry->path), size, pool);
-            String bytes(size, '\0');
-            input->readStrict(bytes.data(), bytes.size());
+        blob_upload_requests.push_back({entry->ref, Cas::BlobSource::fromString(std::exchange(entry->inline_bytes, {})), size});
 
-            if (!input->eof() || Cas::poolContentHash(entry->ref.algo, bytes) != entry->ref)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "Staged inline payload does not match the size or hash of {}", entry->path);
+        entry->blob_size = size;
+        entry->placement = Cas::EntryPlacement::Blob;
+        total_inline_bytes -= size;
 
-            entry->inline_bytes = std::move(bytes);
-            entry->placement = Cas::EntryPlacement::Inline;
-            entry->blob_size = 0;
-        }
+        if (total_inline_bytes <= Cas::kMaxManifestInlineBytesTotal)
+            break;
     }
-
-    if (spilled)
-        ProfileEvents::increment(ProfileEvents::CASManifestInlineEntriesSelectedForBlob, spilled);
+    ProfileEvents::increment(ProfileEvents::CASManifestInlineEntriesSelectedForBlob, blob_upload_requests.size());
     return blob_upload_requests;
+}
+
 }
 
 Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(
@@ -517,44 +466,81 @@ Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(
     return id;
 }
 
-std::unique_ptr<ReadBuffer> ContentAddressedTransaction::openStagedPayload(const StagedPartFile & file, uint64_t size, const Cas::PoolPtr & pool)
-{
-    if (!file.remote_storage)
-        return Cas::openLocalStagedBlobPayload(file.staging_path, size);
-
-    auto op = pool->mountRequests().admit();
-    auto staged = op.stream(file.pool_staging_key, Cas::Retry::standard());
-    if (!staged)
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "CAS staging object {} disappeared before publication", file.staging_path);
-
-    const auto header_len = pool->poolMeta().blob_header_len;
-    String header(header_len, '\0');
-    staged->readStrict(header.data(), header.size());
-    const auto decoded = Cas::decodeEnvelopeHeader(header, header_len + size, Cas::ObjectKind::Blob);
-
-    if (decoded.header_len != header_len)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "Unexpected envelope length {} in staging object {}", decoded.header_len, file.staging_path);
-    return staged;
-}
-
-Cas::BlobSource ContentAddressedTransaction::stagedUploadSource(const StagedPartFilePtr & file, uint64_t size) const
-{
-    return {
-        .size = size,
-        .open = [pool = metadata_storage.store(), file, size] { return openStagedPayload(*file, size, pool); },
-        .server_side_copy_from = file->remote_storage ? std::optional(file->staging_path) : std::nullopt,
-        .publication_attempted = std::shared_ptr<std::atomic<bool>>(file, &file->publication_attempted),
-    };
-}
-
 void ContentAddressedTransaction::appendStagedBlobUploads(const PartStaging & st, std::vector<Cas::BlobUploadRequest> & blob_upload_requests) const
 {
+    if (st.pending_blobs.empty())
+        return;
+
+    /// Build the set of blob hashes actually referenced by the staged manifest. Only Blob
+    /// entries represent pending content uploads — Inline are not pending blobs. A pending_blob whose
+    /// hash is NOT in this set had its entry removed by unlinkFile/replaceFile and must not be uploaded
+    /// (it is an orphan). Its temp file is still cleaned by cleanupPendingTempFiles at commit end.
+    std::unordered_set<Cas::BlobRef, Cas::BlobRefHash> referenced_hashes;
     for (const auto & entry : st.entries)
+        if (entry.placement == Cas::EntryPlacement::Blob)
+            referenced_hashes.insert(entry.ref);
+
+    /// Build one blob upload request per referenced pending blob. Duplicate refs (staged-hardlink copies push
+    /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
+    /// duplicate-membership filter here — the fan-out launches one task per unique ref and merges one
+    /// dep. Local staging re-opens the payload file directly. S3 staging owns a complete
+    /// `[envelope][payload]` object. A record and its hardlink copies in other parts share one
+    /// `publication_attempted` flag, so at most one publication across all of them copies that object
+    /// verbatim: the first one, and only after an absent destination. Every other publication re-opens
+    /// it, validates and skips its fixed envelope, and streams only the payload under a fresh envelope.
+    blob_upload_requests.reserve(blob_upload_requests.size() + st.pending_blobs.size());
+    for (const auto & pb : st.pending_blobs)
     {
-        if (entry.placement != Cas::EntryPlacement::Blob)
-            continue;
-        if (auto file = stagedFileOf(st, entry.path))
-            blob_upload_requests.push_back({entry.ref, stagedUploadSource(file, entry.blob_size), entry.blob_size});
+        if (!referenced_hashes.contains(pb.ref))
+            continue;   /// The entry was removed by unlinkFile/replaceFile; skip this orphan.
+        Cas::BlobSource source;
+        source.size = pb.size;
+        source.publication_attempted = pb.publication_attempted;
+        if (pb.backend == Cas::StagingBackend::S3)
+        {
+            source.server_side_copy_from = pb.staging_key;
+            const Cas::PoolPtr store = metadata_storage.store();
+            const std::string staging_key = pb.staging_key;
+            const uint64_t header_len = store->poolMeta().blob_header_len;
+            const uint64_t payload_size = pb.size;
+            source.open = [store, staging_key, header_len, payload_size]() -> std::unique_ptr<ReadBuffer>
+            {
+                Cas::CasOperation op = store->mountRequests().admit();
+                auto staged = op.stream(staging_key, Cas::Retry::standard());
+                if (!staged)
+                    throw Exception(
+                        ErrorCodes::FILE_DOESNT_EXIST,
+                        "CAS staging object {} disappeared before retagged blob publication",
+                        staging_key);
+
+                String encoded_header(header_len, '\0');
+                staged->readStrict(encoded_header.data(), encoded_header.size());
+                const Cas::EnvelopeHeader decoded = Cas::decodeEnvelopeHeader(
+                    encoded_header,
+                    header_len + payload_size,
+                    Cas::ObjectKind::Blob);
+                if (decoded.header_len != header_len)
+                    throw Exception(
+                        ErrorCodes::CORRUPTED_DATA,
+                        "CAS staging object {} uses envelope length {}, expected {}",
+                        staging_key,
+                        decoded.header_len,
+                        header_len);
+                return staged;
+            };
+        }
+        else
+        {
+            const std::string staging_key = pb.staging_key;
+            const uint64_t payload_size = pb.size;
+            source.open = [staging_key, payload_size]() -> std::unique_ptr<ReadBuffer>
+            {
+                return Cas::openLocalStagedBlobPayload(staging_key, payload_size);
+            };
+        }
+        /// `declared_size` mirrors `source.size` (both are `pb.size`); the fan-out fail-closes if they
+        /// ever diverge, so build them together from the one authority.
+        blob_upload_requests.push_back(Cas::BlobUploadRequest{pb.ref, std::move(source), pb.size});
     }
 }
 
@@ -590,8 +576,8 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// A merge can use two disk transactions under `tmp_merge_<part>`. The first publishes the `text_index_tmp/` segments.
     /// Once the merge has read them and written the final index files, the part transaction can drop the ref to the
     /// segment manifest and publish the complete part manifest under the same name.
-    /// A hardlink or move can open a build solely for the destination. Such a transfer must preserve its base.
-    const bool should_drop_existing_ref = existing_ref_view && st.has_finalized_file_write
+    /// Check `st.build` before `buildFor` below so a staged move that needs a build only for uploads keeps its base manifest.
+    const bool should_drop_existing_ref = existing_ref_view && st.build
         && (!st.base_manifest_ref || *st.base_manifest_ref == existing_ref_view->manifestId().ref)
         && !hasTopLevelFile(existing_ref_view->manifest()->entries)
         && hasTopLevelFile(st.entries);
@@ -626,7 +612,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         }
     }
 
-    auto blob_upload_requests = applyManifestInlineBudget(st, inline_bytes_from_unchanged_base_entries);
+    auto blob_upload_requests = applyManifestInlineBudget(st.entries, inline_bytes_from_unchanged_base_entries, metadata_storage.store()->writeAlgo());
     if (!blob_upload_requests.empty() && !st.build)
         buildFor({.ns = ns, .ref = ref, .file = {}}, st);
 
@@ -731,7 +717,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// staged parts to publish and no local staging to keep; run the same idempotent epilogue a
         /// normal empty commit runs.
         committed = true;
-        releaseStagedFiles();
+        cleanupPendingTempFiles();
         force_fresh_validated_refs.clear();
         return;
     }
@@ -797,8 +783,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     copy_sources_by_part.clear();
     for (auto & [key, st] : parts)
         st.copy_sources.clear();
-    /// Uploads are complete. Readers opened during the transaction can still own their staging files.
-    releaseStagedFiles();
+    /// All pending blobs have been uploaded in publishStaging; remove their staging resources now.
+    cleanupPendingTempFiles();
     /// This transaction's unlinkFile ForceFresh-proof memoization is scoped to this transaction only;
     /// clear it alongside the other per-transaction state resets above.
     force_fresh_validated_refs.clear();
@@ -852,8 +838,8 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
         if (entry->placement == Cas::EntryPlacement::Blob)
         {
             /// A pending blob has not been uploaded yet — its storage object does not exist in
-            /// the pool. Return empty so the caller reads the private staging file through tryReadFileInFlight.
-            if (stagedFileOf(it->second, entry->path))
+            /// the pool. Return empty so the caller falls back to tryReadFileInFlight (local temp read).
+            if (findPendingBlob(it->second, entry->ref))
                 return {};
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
@@ -883,16 +869,30 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
             return std::make_unique<ReadBufferFromOwnMemoryFile>(path, entry->inline_bytes);
         if (entry->placement == Cas::EntryPlacement::Blob)
         {
-            if (auto file = stagedFileOf(it->second, entry->path))
+            /// A pending blob has not been uploaded yet — serve reads from the staging area (the
+            /// same bytes that will be promoted to the pool in publishStaging post-precommit): a local
+            /// temp file for `Cas::StagingBackend::Local`, or the S3 staging object for `Cas::StagingBackend::S3`
+            /// (`staging_key` is a remote object key there, never a
+            /// local path, so `ReadBufferFromFile` would misinterpret it as a filesystem path).
+            if (const auto * pb = findPendingBlob(it->second, entry->ref))
             {
-                if (file->remote_storage)
+                if (pb->backend == Cas::StagingBackend::S3)
                 {
-                    const auto offset = metadata_storage.store()->poolMeta().blob_header_len;
-                    const auto end = offset + entry->blob_size;
-                    auto input = file->remote_storage->readObject(StoredObject(file->staging_path, path, end), settings);
-                    return std::make_unique<ReaderWithStagingFile<ReadBufferFromFileView>>(file, std::move(input), path, offset, end);
+                    /// The staging object holds `[header][payload]`
+                    /// (the fixed-length `blob_header_len` CABL envelope, so the promote can stay a
+                    /// verbatim server-side copy). Read-your-writes must serve the PAYLOAD ONLY — wrap the
+                    /// object read in a `ReadBufferFromFileView` windowed to `[header_len, header_len+size)`
+                    /// so position 0 is the payload start, else the reader would see 256 bytes of header
+                    /// prepended to the payload (corruption). The LOCAL staging temp file holds the payload
+                    /// verbatim (no header), so its path is unchanged.
+                    const uint64_t header_len = metadata_storage.store()->poolMeta().blob_header_len;
+                    const uint64_t payload_end = header_len + pb->size;
+                    auto impl = metadata_storage.objectStorage()->readObject(
+                        StoredObject(pb->staging_key, path, payload_end), settings);
+                    return std::make_unique<ReadBufferFromFileView>(
+                        std::move(impl), path, header_len, payload_end);
                 }
-                return std::make_unique<ReaderWithStagingFile<ReadBufferFromFile>>(file, file->staging_path);
+                return std::make_unique<ReadBufferFromFile>(pb->staging_key);
             }
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
         }
@@ -972,42 +972,22 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
 
 void ContentAddressedTransaction::stageBlobPartFile(
     const ContentAddressedMetadataStorage::Route & route,
-    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, ObjectStoragePtr remote_storage, const String & pool_key)
+    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, Cas::StagingBackend backend)
 {
-    /// Until registration succeeds the local writer still owns its file. The S3 sink has
-    /// already finalized its object, so release it here if registration throws.
-    try
-    {
-        auto file = std::make_shared<StagedPartFile>();
-        file->staging_path = staging_key;
-        file->remote_storage = remote_storage;
-        file->pool_staging_key = pool_key;
-        file->allow_inline_by_name = !Cas::partFileMustStayBlob(route.file);
+    /// Do not upload here. Record the pending blob for post-precommit publication; dependency state
+    /// remains absent until the upload succeeds and its result is merged.
+    /// The staging bytes are kept (the transaction owns them) — a local temp file for
+    /// `Cas::StagingBackend::Local`, or an S3 staging object for `Cas::StagingBackend::S3`.
+    auto & st = stagingFor(route);
+    st.pending_blobs.push_back({ref, staging_key, size, backend});
+    (void)buildFor(route, st);
 
-        auto & st = stagingFor(route);
-        const bool had_build = bool(st.build);
-        buildFor(route, st);
-
-        SCOPE_EXIT({
-            if (!had_build && !file->owns_file)
-                st.build.reset();
-        });
-
-        if (std::exchange(fail_next_file_registration, false))
-            throw Exception(ErrorCodes::ABORTED, "Injected failure registering staged file {}", route.file);
-
-        Cas::ManifestEntry entry{.path = route.file, .placement = Cas::EntryPlacement::Blob, .ref = ref, .blob_size = size, .inline_bytes = {}};
-        putEntry(st, std::move(entry), nullptr, file);
-
-        file->owns_file = true;
-        st.has_finalized_file_write = true;
-    }
-    catch (...)
-    {
-        if (remote_storage)
-            removeStagingObject(remote_storage, staging_key);
-        throw;
-    }
+    Cas::ManifestEntry entry;
+    entry.path = route.file;
+    entry.placement = Cas::EntryPlacement::Blob;
+    entry.ref = ref;
+    entry.blob_size = size;
+    putEntry(st, std::move(entry), nullptr);
 }
 
 void ContentAddressedTransaction::stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size)
@@ -1064,7 +1044,6 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
     const std::string & path, size_t buf_size, WriteMode mode,
     const WriteSettings & settings, bool autocommit)
 {
-    buf_size = Cas::clampCasWriteBufferSize(buf_size);
     /// This transaction owns the write because the blob key is known only after hashing the payload.
     /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file
     /// (handled inside writeFile). A part file is a content blob or a whole-rewritten inline entry, so
@@ -1160,9 +1139,18 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "ContentAddressedTransaction::writeFile: not a part file path: {}", path);
 
+    /// The former
+    /// mutable-per-part-file branch (uuid.txt/metadata_version.txt/txn_version.txt staging directly
+    /// into a separate mutable payload) is DELETED here — these three names fall through to the
+    /// ordinary content path below like any other tree file. There is no filename left to special-case:
+    /// `kMutablePerPartFiles`/`isMutablePerPartFile` predicate itself is gone too — there is no
+    /// filename left to special-case. During part build these files land in the initial manifest with
+    /// every other staged file; a standalone write on an already-committed part repoints.
+
+    const bool must_stay_blob = Cas::partFileMustStayBlob(r->file);
     const auto hash_algo = metadata_storage.store()->writeAlgo();
-    const auto remote_storage = metadata_storage.stagingBackend() == Cas::StagingBackend::S3 ? metadata_storage.objectStorage() : nullptr;
-    if (remote_storage)
+
+    if (must_stay_blob && metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
     {
         /// Build the fixed-length CABL envelope header now (before
         /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
@@ -1177,14 +1165,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// one capture, so a remount between them cannot stage new-generation bytes under an old epoch.
         const Cas::PoolPtr pool = metadata_storage.store();
         const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
-        const auto leaf = getRandomASCIIString(32) + ".tmp";
-        const auto pool_key = pool->layout().stagingKey(metadata_storage.serverRootId(), incarnation.writer_epoch, leaf);
-        const auto staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, leaf);
+        const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
 
-        auto staging_settings = settings;
-        staging_settings.adaptive_write_buffer_initial_size = Cas::clampCasWriteBufferSize(settings.adaptive_write_buffer_initial_size);
-        auto object_sink = remote_storage->writeObject(
-            StoredObject(staging_key), WriteMode::Rewrite, {}, Cas::clampCasWriteBufferSize(buf_size), staging_settings);
+        auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
 
         return std::make_unique<Cas::CaContentWriteBuffer>(
             std::move(object_sink),
@@ -1194,20 +1177,52 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             buf_size,
             settings.use_adaptive_write_buffer,
             settings.adaptive_write_buffer_initial_size,
-            [this, route = *r, hash_algo, remote_storage, pool_key](const String & hash, size_t size, const String & key)
+            [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & key)
             {
-                stageBlobPartFile(route, {hash_algo, Cas::codecFor(hash_algo).fromHex(hash)}, size, key, remote_storage, pool_key);
+                const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
+                stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
             },
             [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
     }
 
-    return std::make_unique<Cas::CaContentWriteBuffer>(
-        metadata_storage.scratchPath(), hash_algo, buf_size, settings.use_adaptive_write_buffer,
-        settings.adaptive_write_buffer_initial_size,
-        [this, route = *r, hash_algo](const String & hash, size_t size, const String & key)
+    /// Oversized inline candidates use local staging even on disks with S3 staging enabled.
+    auto create_local_blob_writer = [this, route = *r, hash_algo, buf_size,
+                                     adaptive = settings.use_adaptive_write_buffer, initial_size = settings.adaptive_write_buffer_initial_size]
+    {
+        return std::make_unique<Cas::CaContentWriteBuffer>(
+            metadata_storage.scratchPath(),
+            hash_algo,
+            buf_size,
+            adaptive,
+            initial_size,
+            [this, route, hash_algo](const std::string & hash_hex, size_t size, const std::string & temp_path)
+            {
+                const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
+                stageBlobPartFile(route, ref, size, temp_path, Cas::StagingBackend::Local);
+            });
+    };
+
+    if (must_stay_blob)
+        return create_local_blob_writer();
+
+    return std::make_unique<WriteBufferInlineOrBlob>(
+        path, INLINE_CAP, /*create_blob_if_empty=*/false, std::move(create_local_blob_writer),
+        [this, route = std::move(*r), hash_algo](FinalizeResult result)
         {
-            stageBlobPartFile(route, {hash_algo, Cas::codecFor(hash_algo).fromHex(hash)}, size, key, nullptr, {});
-        });
+            auto * inlined = std::get_if<InlineData>(&result);
+            if (!inlined)
+                return; /// The local writer already registered the pending blob.
+
+            auto & st = stagingFor(route);
+            buildFor(route, st);
+            Cas::ManifestEntry entry;
+            entry.path = route.file;
+            entry.placement = Cas::EntryPlacement::Inline;
+            entry.ref = Cas::poolContentHash(hash_algo, inlined->data);
+            entry.inline_bytes = std::move(inlined->data);
+            putEntry(st, std::move(entry), nullptr);
+        },
+        buf_size);
 }
 
 void ContentAddressedTransaction::createDirectory(const std::string &)
@@ -1399,13 +1414,23 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         if (it != src_st->entries.end())
         {
             entry = *it;
-            auto file = stagedFileOf(*src_st, src->file);
-            auto source = copySourceOf(*src_st, src->file);
-            auto & build = buildFor(*dst, dst_st);
-            if (!file)
-                build.adoptEvidence(entry);
+            /// A copy of an adopted entry confirms the committed part the entry came from.
+            std::shared_ptr<Cas::CopySource> source;
+            if (entry.placement == Cas::EntryPlacement::Blob)
+            {
+                /// Unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
+                /// blob record is copied into dst_st only when the destination is a different part
+                /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
+                const auto * pb = findPendingBlob(*src_st, entry.ref);
+                if (!pb)
+                    source = copySourceOf(*src_st, src->file);
+                adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
+            }
+            else if (entry.placement != Cas::EntryPlacement::Inline)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
             entry.path = dst->file;
-            putEntry(dst_st, std::move(entry), std::move(source), std::move(file));
+            putEntry(dst_st, std::move(entry), std::move(source));
             return;
         }
     }
@@ -1572,49 +1597,40 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         /// The committed manifest the source staging was based on (a rename of a committed part with
         /// staged edits, e.g. a rollback's `delete_tmp_`); the re-key below drops it from the overlay.
         std::optional<Cas::ManifestRef> staged_source_base;
-        bool replacing_source_segments = false;
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
             had_staged_source = true;
             PartStaging & dst_st = parts[dst_key];
             PartStaging & src_st = src_it->second;
             staged_source_base = src_st.base_manifest_ref;
-            replacing_source_segments = src_st.has_finalized_file_write && hasTopLevelFile(src_st.entries);
-            /// A written file still has provisional Blob placement. A borrowed Inline can
-            /// represent the same bytes, so compare its payload to the staged file's full hash.
-            /// Check every collision before moving ownership out of the source.
-            for (const auto & entry : src_st.entries)
-            {
-                const auto existing = std::find_if(dst_st.entries.begin(), dst_st.entries.end(),
-                    [&](const Cas::ManifestEntry & other) { return other.path == entry.path; });
-                if (existing == dst_st.entries.end() || *existing == entry)
-                    continue;
-                if (existing->placement != entry.placement && existing->size() == entry.size())
-                {
-                    const bool source_is_blob = entry.placement == Cas::EntryPlacement::Blob;
-                    const auto & blob = source_is_blob ? entry : *existing;
-                    const auto & inlined = source_is_blob ? *existing : entry;
-                    const auto staged = stagedFileOf(source_is_blob ? src_st : dst_st, blob.path);
-                    if (staged && staged->allow_inline_by_name && blob.blob_size <= INLINE_CAP
-                        && Cas::poolContentHash(blob.ref.algo, inlined.inline_bytes) == blob.ref)
-                        continue;
-                }
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "ContentAddressed: moveDirectory file collision on '{}' ({} -> {}): "
-                    "source and destination staged different entries for the same file",
-                    entry.path, src->ref, dst->ref);
-            }
             for (auto & entry : src_st.entries)
             {
+                /// A genuine collision (both src and dst independently
+                /// staged DIFFERING bytes for the SAME path) is a fail-loud LOGICAL_ERROR rather than a
+                /// silent lost-update — the same defensive rule this loop used to apply only to the
+                /// three legacy mutable names now applies uniformly to every entry (that scoping was
+                /// itself a leftover of the mutable-file/entry split; there is only one kind of staged
+                /// file left). Identical bytes are a benign idempotent re-key; distinct paths are the
+                /// ordinary source-wins merge (a genuine collision is not expected in normal operation
+                /// — only some future op-order re-keying the same file under both stagings).
+                if (const auto existing = std::find_if(dst_st.entries.begin(), dst_st.entries.end(),
+                        [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
+                    existing != dst_st.entries.end() && !(*existing == entry))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "ContentAddressed: moveDirectory file collision on '{}' ({} -> {}): "
+                        "source and destination staged different bytes for the same file",
+                        entry.path, src->ref, dst->ref);
                 auto source = copySourceOf(src_st, entry.path);
-                auto file = stagedFileOf(src_st, entry.path);
-                putEntry(dst_st, std::move(entry), std::move(source), std::move(file));
+                putEntry(dst_st, std::move(entry), std::move(source));
             }
             /// Carry any staged removal marks forward too — a re-key of the
             /// staging key must not silently drop them.
             for (const auto & file : src_st.content_removed)
                 dst_st.content_removed.insert(file);
-            dst_st.has_finalized_file_write |= src_st.has_finalized_file_write;
+            /// Move pending blobs from src to dst — they will be uploaded in dst's publishStaging.
+            for (auto & pb : src_st.pending_blobs)
+                dst_st.pending_blobs.push_back(std::move(pb));
+            src_st.pending_blobs.clear();
             if (!dst_st.build)
             {
                 dst_st.build = std::move(src_st.build);
@@ -1626,14 +1642,18 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// time is unnecessary - entries staged via putBlob/adopt carry deps in the SOURCE
                 /// build... merge conservatively by abandoning nothing and re-observing):
                 for (const auto & entry : dst_st.entries)
-                    if (entry.placement == Cas::EntryPlacement::Blob && !stagedFileOf(dst_st, entry.path))
-                        dst_st.build->adoptEvidence(entry);
+                    if (entry.placement == Cas::EntryPlacement::Blob)
+                    {
+                        /// Unified adopt dispatch. Pending blob records were already moved
+                        /// to dst_st.pending_blobs above (MOVE semantics), so copy_pending=false.
+                        adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
+                    }
                 src_st.build->abandon();
             }
             parts.erase(src_it);
 
             /// A freshly-written part finalized tmp->final is re-keyed in the
-            /// overlay above (entries, removal marks, staging sources and build moved src->dst). The durable publish
+            /// overlay above (entries/marks/pending blobs/build moved src->dst). The durable publish
             /// happens only in this transaction's commit (the existing publishStaging loop), not in
             /// this method. `MergeTree` commits a part right after `finalize` and renames it afterwards,
             /// so this re-key serves a rename staged before any commit. No early-published ref to
@@ -1657,7 +1677,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 const Cas::ManifestRef committed_ref = committed_at_src->manifestId().ref;
                 const auto & base_entries = committed_at_src->manifest()->entries;
                 const bool ours = staged_source_base && *staged_source_base == committed_ref;
-                if (!ours && (!replacing_source_segments || hasTopLevelFile(base_entries)))
+                if (!ours && hasTopLevelFile(base_entries))
                     Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was published as a part by another writer while a staged part is renamed from it",
                         path_from);
                 /// Our staged edits ride on their base: rename the committed ref now (durable at this call, like
@@ -1665,7 +1685,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// `publishStaging` merges the delta into it under the new name the way it does for an edit in
                 /// place; files neither removed nor rewritten survive. The rename is conditional on the manifest
                 /// the ownership check read.
-                if (ours && (!replacing_source_segments || hasTopLevelFile(base_entries)))
+                if (ours && hasTopLevelFile(base_entries))
                 {
                     const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey(), committed_ref);
                     if (!renamed)
@@ -1789,21 +1809,28 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         [&](const Cas::ManifestEntry & e) { return e.path == src->file; });
     if (it != src_st.entries.end())
     {
-        if (&src_st == &dst_st && src->file == dst->file)
-            return;
         auto entry = *it;
         auto source = copySourceOf(src_st, src->file);
-        auto file = stagedFileOf(src_st, src->file);
-        if (&src_st != &dst_st)
-        {
-            auto & build = buildFor(*dst, dst_st);
-            if (!file)
-                build.adoptEvidence(entry);
-        }
-        entry.path = dst->file;
         markVacatedInBase(*src, src_st, {src->file});
-        putEntry(dst_st, std::move(entry), std::move(source), std::move(file));
         eraseEntry(src_st, src->file);
+        entry.path = dst->file;
+        if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
+        {
+            /// The record of a pending upload follows the entry. A hardlink left in the source still names the blob,
+            /// so the source keeps a copy: each part publishes every body it names, and may publish first.
+            auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
+                [&](const PartStaging::PendingBlob & pb) { return pb.ref == entry.ref; });
+            if (pb_it != src_st.pending_blobs.end())
+            {
+                const bool still_named_in_source = std::any_of(src_st.entries.begin(), src_st.entries.end(),
+                    [&](const Cas::ManifestEntry & e) { return e.placement == Cas::EntryPlacement::Blob && e.ref == entry.ref; });
+                dst_st.pending_blobs.push_back(*pb_it);
+                if (!still_named_in_source)
+                    src_st.pending_blobs.erase(pb_it);
+            }
+            adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
+        }
+        putEntry(dst_st, std::move(entry), std::move(source));
         return;
     }
     /// Source not staged in this transaction: this would cover a standalone one-shot rename of a
@@ -1818,6 +1845,17 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
 {
     /// Write gate (rev.7 §1): refuse before dropping staged destination state on a Vanished/uncertain disk.
     metadata_storage.checkOpAdmitted(CasOpClass::Write);
+    /// replaceFile = moveFile that overwrites the destination. Drop any staged destination state
+    /// first, then delegate (the verbatim branch's putNamespaceFile already overwrites).
+    if (auto dst = routeOf(path_to); dst && !dst->file.empty())
+    {
+        auto & dst_st = stagingFor(*dst);
+        /// A matching pending_blobs record (if any) is left in place — its temp file is cleaned by
+        /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
+        /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
+        /// eagerly because the same hash may still be referenced by another staged entry.
+        eraseEntry(dst_st, dst->file);
+    }
     moveFile(path_from, path_to);
 }
 
@@ -1854,6 +1892,10 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         auto & st = stagingFor(*r);
         const bool staged_here = std::any_of(st.entries.begin(), st.entries.end(),
                            [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
+        /// A matching pending_blobs record (if any) is left in place — its temp file is cleaned by
+        /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
+        /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
+        /// eagerly because the same hash may still be referenced by another staged entry.
         if (staged_here)
             markVacatedInBase(*r, st, {r->file});
         eraseEntry(st, r->file);
@@ -1928,6 +1970,26 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 
 namespace DB::Cas
 {
+
+namespace
+{
+/// Ceiling for a CAS write-buffer allocation. An extreme `max_compress_block_size` (or any other
+/// out-of-range buffer-size setting -- fuzzed or misconfigured) flows into `writeFile`'s `buf_size` /
+/// `adaptive_write_buffer_initial_size` and, unclamped, reaches `Memory::alloc` where the allocator's
+/// `checkSize` (>= 0x8000000000000000) fires a `LOGICAL_ERROR` and aborts the server in
+/// debug/sanitizer builds. The ordinary MergeTree writers clamp compress-block sizes to 256 MiB
+/// (`MergeTreeWriterSettings::MAX_COMPRESS_BLOCK_SIZE`) for exactly this reason; the CAS write path
+/// received the value unclamped. Mirror that ceiling here, at the allocation site, so no caller can
+/// pass an absurd size to the allocator. 256 MiB is duplicated (not #included) to keep the Disks layer
+/// free of a Storages/MergeTree dependency; the regression guard is
+/// `04070_no_crash_extreme_compress_block_size` run on a content-addressed storage policy.
+constexpr size_t kMaxCasWriteBufferBytes = 256ULL * 1024 * 1024;
+
+size_t clampCasWriteBufferSize(size_t size)
+{
+    return std::min(size, kMaxCasWriteBufferBytes);
+}
+}
 
 void fanOutBlobUploads(
     PartWriteTxn & build,

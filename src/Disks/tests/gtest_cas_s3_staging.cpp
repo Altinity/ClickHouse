@@ -15,8 +15,6 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <Common/SipHash.h>
-#include <Common/MemoryTracker.h>
-#include <Common/ThreadStatus.h>
 #include <base/hex.h>
 
 #include <Poco/AutoPtr.h>
@@ -26,8 +24,6 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <future>
-#include <sys/resource.h>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -92,50 +88,15 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> configWithDiskSection(const std::str
     return new Poco::Util::XMLConfiguration(xml_stream);
 }
 
-/// Resolve the key again on every range read, as S3 does. A permanently open local
-/// descriptor would keep serving bytes even if the key had already been deleted.
-class StagingRangeReader final : public DB::ReadBufferFromFileBase
-{
-public:
-    using Open = std::function<std::unique_ptr<DB::ReadBufferFromFileBase>()>;
-    StagingRangeReader(String name_, Open open_) : ReadBufferFromFileBase(4096, nullptr, 0), name(std::move(name_)), open(std::move(open_)) {}
-
-    String getFileName() const override { return name; }
-    off_t getPosition() override { return end_offset - available(); }
-    off_t seek(off_t offset, int whence) override
-    {
-        end_offset = whence == SEEK_SET ? offset : getPosition() + offset;
-        working_buffer.resize(0);
-        pos = working_buffer.begin();
-        return end_offset;
-    }
-
-private:
-    bool nextImpl() override
-    {
-        auto input = open();
-        input->seek(end_offset, SEEK_SET);
-        const size_t count = input->read(internal_buffer.begin(), internal_buffer.size());
-        working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + count);
-        end_offset += count;
-        return count != 0;
-    }
-
-    String name;
-    Open open;
-    off_t end_offset = 0;
-};
-
 /// A local test store whose copy-mode capability is configurable. Its ordinary `copyObject`
 /// implementation remains the real local implementation; only the advertised transport capability
 /// differs so mount selection can be tested independently of a live S3 service.
 class FakeNativeCopyObjectStorage final : public DB::LocalObjectStorage
 {
 public:
-    FakeNativeCopyObjectStorage(DB::LocalObjectStorageSettings settings_, bool native_only_copy_supported_, bool observe_staging_ranges_)
+    FakeNativeCopyObjectStorage(DB::LocalObjectStorageSettings settings_, bool native_only_copy_supported_)
         : DB::LocalObjectStorage(std::move(settings_))
         , native_only_copy_supported(native_only_copy_supported_)
-        , observe_staging_ranges(observe_staging_ranges_)
     {
     }
 
@@ -145,26 +106,8 @@ public:
             || (mode == DB::ObjectStorageCopyMode::NativeOnly && native_only_copy_supported);
     }
 
-    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
-        const DB::StoredObject & object, const DB::ReadSettings & settings, std::optional<size_t> hint,
-        bool external, bool restrict_seek) const override
-    {
-        if (observe_staging_ranges && object.remote_path.contains("/staging/"))
-            return std::make_unique<StagingRangeReader>(object.remote_path, [this, object, settings, hint, external, restrict_seek]
-            {
-                ++staging_range_reads;
-                return DB::LocalObjectStorage::readObject(object, settings, hint, external, restrict_seek);
-            });
-        return DB::LocalObjectStorage::readObject(object, settings, hint, external, restrict_seek);
-    }
-
-    mutable std::atomic<size_t> staging_range_reads{0};
-    std::atomic<size_t> staging_deletes{0};
-
     void removeObjectIfExists(const DB::StoredObject & object) override
     {
-        if (observe_staging_ranges && object.remote_path.contains("/staging/"))
-            ++staging_deletes;
         if (throw_on_remove.load())
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected delete failure for {}", object.remote_path);
         DB::LocalObjectStorage::removeObjectIfExists(object);
@@ -174,10 +117,9 @@ public:
 
 private:
     const bool native_only_copy_supported;
-    const bool observe_staging_ranges;
 };
 
-std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool native_only_copy_supported, bool observe_staging_ranges = false)
+std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool native_only_copy_supported)
 {
     static std::atomic<uint64_t> counter{0};
     const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
@@ -189,7 +131,7 @@ std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool nati
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
     return DB::Cas::tests::ownedByDirectory(
-        std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported, observe_staging_ranges), root);
+        std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported), root);
 }
 
 /// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::Cas::CaContentWriteBuffer`'s
@@ -883,7 +825,9 @@ TEST(CASS3Staging, UnsupportedNativeOnlyCopyDoesNotFallBackToLocal)
 }
 
 /// (a) A successful commit removes the S3 staging object of a pending blob it staged. Uses the B189
-/// orphan shape. An unlinked staged file and a file ultimately placed Inline must both be reclaimed.
+/// orphan shape (the pending blob's entry is unlinked before commit) so `publishStaging` never calls
+/// `putBlob` for it — only `cleanupPendingTempFiles`'s Task 6 branch ever touches this staging object,
+/// which is exactly the seam this test targets.
 TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 {
     auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
@@ -903,7 +847,7 @@ TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 
     DB::RelativePathsWithMetadata staged_before;
     object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged_before, /*max_keys=*/0);
-    ASSERT_EQ(staged_before.size(), 2u);
+    ASSERT_EQ(staged_before.size(), 1u) << "exactly orphan.bin's S3 staging object should exist pre-commit";
 
     tx->unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin", false, false);
 
@@ -911,7 +855,8 @@ TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 
     DB::RelativePathsWithMetadata staged_after;
     object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged_after, /*max_keys=*/0);
-    EXPECT_TRUE(staged_after.empty());
+    EXPECT_TRUE(staged_after.empty())
+        << "cleanupPendingTempFiles must remove the orphaned S3 staging object after a successful commit";
 }
 
 /// (b) Read-your-writes over an S3 pending blob (before commit) returns the staged bytes from the S3
@@ -936,189 +881,27 @@ TEST(CASS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
     EXPECT_EQ(got, payload);
 }
 
-TEST(CASS3Staging, InlineCandidateUsesConfiguredStaging)
+TEST(CASS3Staging, OversizedInlineCandidateKeepsLocalStaging)
 {
     auto objects = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
     auto storage = makeS3StagingMetadataStorageForTest(objects, "mountInlineOverflow");
     storage->startup();
     auto tx = storage->createTransaction();
     const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/skip.dct.idx";
-    for (const size_t size : {0u, 1024u})
-    {
-        SCOPED_TRACE(size);
-        const std::string bytes(size, 'x');
-        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        auto writer = ca_tx.writeFile(path, size, DB::WriteMode::Rewrite, {});
-        writer->write(bytes.data(), bytes.size());
-        writer->finalize();
+    const std::string bytes(1024 * 1024 + 1, 'x');
+    writeThroughS3Transaction(dynamic_cast<DB::ContentAddressedTransaction &>(*tx), path, bytes);
 
-        DB::RelativePathsWithMetadata staged;
-        objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-        ASSERT_EQ(staged.size(), 1u);
-        EXPECT_EQ(objects->getObjectMetadata(staged.front()->relative_path, false).size_bytes, storage->store()->poolMeta().blob_header_len + size);
-        auto reader = tx->tryReadFileInFlight(path, DB::ReadSettings{}, {});
-        ASSERT_NE(reader, nullptr);
-        std::string actual;
-        DB::readStringUntilEOF(actual, *reader);
-        EXPECT_TRUE(actual == bytes);
-        reader.reset();
-        tx->commit(DB::NoCommitOptions{});
-        EXPECT_EQ(storage->tryGetInManifestBytes(path), bytes);
-        tx = storage->createTransaction();
-    }
-}
-
-TEST(CASS3Staging, OpenReaderKeepsPrivateObjectThroughCommitOrAbort)
-{
-    for (const bool commit : {false, true})
-    {
-        SCOPED_TRACE(commit);
-        auto objects = makeFakeNativeCopyStorage(true, /*observe_staging_ranges=*/true);
-        auto storage = makeS3StagingMetadataStorageForTest(objects, "mountReaderLifetime");
-        storage->startup();
-        const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/skip.dct.idx";
-        auto tx = storage->createTransaction();
-        std::string bytes(64 * 1024, 'x');
-        bytes.back() = 'z';
-        writeThroughS3Transaction(dynamic_cast<DB::ContentAddressedTransaction &>(*tx), path, bytes);
-
-        DB::RelativePathsWithMetadata staged;
-        objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-        ASSERT_EQ(staged.size(), 1u);
-        auto reader = tx->tryReadFileInFlight(path, DB::ReadSettings{}, {});
-        ASSERT_NE(reader, nullptr);
-        char byte;
-        reader->readStrict(&byte, 1);
-        ASSERT_EQ(byte, 'x');
-        if (commit)
-            tx->commit(DB::NoCommitOptions{});
-        tx.reset();
-
-        const size_t reads_before_seek = objects->staging_range_reads.load();
-        staged.clear();
-        objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-        ASSERT_EQ(staged.size(), 1u);
-        reader->seek(bytes.size() - 1, SEEK_SET);
-        reader->readStrict(&byte, 1);
-        EXPECT_EQ(byte, 'z');
-        EXPECT_GT(objects->staging_range_reads.load(), reads_before_seek);
-        EXPECT_EQ(objects->staging_deletes.load(), 0u);
-        reader.reset();
-        EXPECT_EQ(objects->staging_deletes.load(), 1u);
-        staged.clear();
-        objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-        EXPECT_TRUE(staged.empty());
-    }
-}
-
-/// Run explicitly on both revisions with --gtest_also_run_disabled_tests and a descriptor
-/// limit above 5,000. Record the observed peaks instead of imposing a backend-independent limit.
-TEST(CASInlineCandidateMemory, DISABLED_FiveThousandOpenWriters)
-{
-    constexpr size_t num_writers = 5000;
-    constexpr size_t buffer_size = 64 * 1024;
-    struct rlimit limit{};
-    const int status = getrlimit(RLIMIT_NOFILE, &limit);
-    ASSERT_EQ(status, 0);
-    if (limit.rlim_cur < num_writers + 128)
-        GTEST_SKIP() << "requires at least " << num_writers + 128 << " descriptors";
-    ::testing::Test::RecordProperty("fd_limit", std::to_string(limit.rlim_cur));
-    ::testing::Test::RecordProperty("buffer_bytes", buffer_size);
-
-    for (bool remote : {false, true})
-    {
-        auto objects = makeFakeNativeCopyStorage(true);
-        auto settings = DB::Cas::tests::makeSettingsForTest(
-            "mountManyWriters", std::filesystem::path(objects->getCommonKeyPrefix()) / "scratch");
-        if (remote)
-        {
-            settings[DB::ContentAddressedSetting::staging_backend] = "s3";
-            settings.validate();
-        }
-        auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(objects, "pool", "srv1", "", nullptr, settings);
-        storage->startup();
-        std::async(std::launch::async, [&]
-        {
-            MemoryTracker tracker(&total_memory_tracker, VariableContext::Process, false);
-            DB::ThreadStatus thread_status;
-            thread_status.memory_tracker.setParent(&tracker);
-            thread_status.untracked_memory_limit = 0;
-            const String prefix = remote ? "s3_adapter_" : "local_";
-            auto record = [&](const String & field, auto value)
-            {
-                ::testing::Test::RecordProperty(prefix + field, std::to_string(value));
-            };
-            DB::WriteSettings write_settings;
-            write_settings.use_adaptive_write_buffer = true;
-            write_settings.adaptive_write_buffer_initial_size = 4096;
-            record("adaptive_initial_bytes", write_settings.adaptive_write_buffer_initial_size);
-            auto tx = storage->createTransaction();
-            auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-            const String dir = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/";
-            std::vector<std::unique_ptr<DB::WriteBufferFromFileBase>> writers;
-            for (size_t i = 0; i < num_writers; ++i)
-            {
-                auto out = ca_tx.writeFile(dir + std::to_string(i) + ".idx", buffer_size, DB::WriteMode::Rewrite, write_settings);
-                out->write("prefix", 6);
-                if (i % 2 == 0)
-                    out->next();
-                writers.push_back(std::move(out));
-            }
-            record("open_bytes", tracker.get());
-#if defined(OS_LINUX)
-            record("open_fds", std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
-#endif
-            for (size_t i = 0; i < num_writers; ++i)
-            {
-                if (i % 2 == 0)
-                    writers[i]->finalize();
-                else
-                    writers[i]->cancel();
-                writers[i].reset();
-            }
-            record("closed_bytes", tracker.get());
-            tx->commit(DB::NoCommitOptions{});
-            record("committed_bytes", tracker.get());
-            EXPECT_EQ(storage->tryGetInManifestBytes(dir + "0.idx"), "prefix");
-            EXPECT_FALSE(storage->existsFile(dir + "1.idx"));
-            record("peak_bytes", tracker.getPeak());
-        }).get();
-    }
-}
-
-TEST(CASS3Staging, FailedReplacementLeavesThePreviousSourceReadable)
-{
-    for (const bool remote : {false, true})
-    {
-        SCOPED_TRACE(remote);
-        auto objects = makeFakeNativeCopyStorage(true);
-        auto settings = DB::Cas::tests::makeSettingsForTest(
-            "mountRegistration", std::filesystem::path(objects->getCommonKeyPrefix()) / "scratch");
-        if (remote)
-        {
-            settings[DB::ContentAddressedSetting::staging_backend] = "s3";
-            settings.validate();
-        }
-        auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(objects, "pool", "srv1", "", nullptr, settings);
-        storage->startup();
-        auto tx = storage->createTransaction();
-        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/a.idx";
-        writeThroughS3Transaction(ca_tx, path, "old");
-        ca_tx.failNextFileRegistrationForTest();
-        EXPECT_THROW(writeThroughS3Transaction(ca_tx, path, "new"), DB::Exception);
-
-        if (remote)
-        {
-            DB::RelativePathsWithMetadata staged;
-            objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-            EXPECT_EQ(staged.size(), 1u);
-        }
-        else
-            EXPECT_EQ(std::distance(std::filesystem::directory_iterator(storage->scratchPath()), std::filesystem::directory_iterator{}), 1);
-        tx->commit(DB::NoCommitOptions{});
-        EXPECT_EQ(storage->tryGetInManifestBytes(path), "old");
-    }
+    DB::RelativePathsWithMetadata staged;
+    objects->listObjects(storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_TRUE(staged.empty());
+    auto reader = tx->tryReadFileInFlight(path, DB::ReadSettings{}, {});
+    ASSERT_NE(reader, nullptr);
+    std::string actual;
+    DB::readStringUntilEOF(actual, *reader);
+    EXPECT_TRUE(actual == bytes);
+    reader.reset();
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_FALSE(storage->tryGetInManifestBytes(path).has_value());
 }
 
 /// An aborted transaction deletes its own S3 staging object instead of leaving it for the next mount.
@@ -1715,36 +1498,6 @@ std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForT
     return DB::Cas::tests::ownedByDirectory(std::make_shared<FakeGenerationObjectStorage>(std::move(settings)), root);
 }
 
-}
-
-TEST(CASS3Staging, OversizedCandidatePublishesFromConfiguredPrivateObject)
-{
-    auto objects = makeFakeGenerationObjectStorageForTest();
-    auto storage = makeS3StagingMetadataStorageForTest(objects, "mountLargeIndex");
-    storage->startup();
-    auto tx = storage->createTransaction();
-    const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/skip.dct.idx";
-    const String bytes(1024 * 1024 + 1, 'x');
-    writeThroughS3Transaction(dynamic_cast<DB::ContentAddressedTransaction &>(*tx), path, bytes);
-    DB::RelativePathsWithMetadata staged;
-    objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-    ASSERT_EQ(staged.size(), 1u);
-    EXPECT_TRUE(!std::filesystem::exists(storage->scratchPath()) || std::filesystem::is_empty(storage->scratchPath()));
-    tx->commit(DB::NoCommitOptions{});
-    EXPECT_FALSE(storage->tryGetInManifestBytes(path).has_value());
-    const auto copies = objects->copiesByDestination();
-    ASSERT_EQ(copies.size(), 1u);
-    EXPECT_EQ(copies.begin()->second, 1u);
-    const auto published = storage->getStorageObjects(path);
-    ASSERT_EQ(published.size(), 1u);
-    auto reader = storage->readBlobPayload({.key = published[0].remote_path,
-        .offset = storage->store()->poolMeta().blob_header_len, .length = bytes.size()}, path, {});
-    String got;
-    DB::readStringUntilEOF(got, *reader);
-    EXPECT_TRUE(got == bytes);
-    staged.clear();
-    objects->listObjects(storage->stagingKeyPrefix(), staged, 0);
-    EXPECT_TRUE(staged.empty());
 }
 
 /// A store whose iterator does not page (the fallback `IObjectStorage::iterate` lists `max_keys` keys

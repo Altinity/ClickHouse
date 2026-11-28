@@ -33,8 +33,10 @@ namespace DB
 /// `Cas::PartWriteTxn`, created lazily before the first staged dependency, so the durable manifest
 /// edge is established before the pool observes or uploads a new blob.
 ///
-/// File writers stream to private staging. Commit chooses placement using the final paths and
-/// sizes. Open readers and uploads can retain a staging file beyond the transaction lifetime.
+/// File writes stage blobs locally or on S3. During publication the transaction also moves
+/// excess inline entries into blobs, uploading them directly from their buffered bytes. The
+/// destructor removes the transaction's local and S3 staging and abandons any open part builds;
+/// it never publishes an uncommitted ref.
 class ContentAddressedTransaction : public IMetadataTransaction
 {
 public:
@@ -84,7 +86,8 @@ public:
         const std::string & path, size_t buf_size, WriteMode mode,
         const WriteSettings & settings, bool autocommit) override;
 
-    /// Creates a streaming staging writer for a part file. Its payload is hashed as it is written, and
+    /// Creates the inner buffer for a content-addressed path. Inline candidates that outgrow
+    /// the per-file limit stream to local staging. Part blobs are hashed as they are written, and
     /// verbatim namespace or mountpoint files are read-modify-written when append is requested.
     std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const std::string & path,
@@ -124,7 +127,6 @@ public:
     /// Test-only: stages the part file `path` as a blob entry naming `ref` with no pending upload and no copy
     /// source, a shape no operation produces.
     void stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size);
-    void failNextFileRegistrationForTest() { fail_next_file_registration = true; }
     /// Test-only: the copy source shared by this transaction's borrows from the committed part `part_path`, or null.
     std::shared_ptr<const Cas::CopySource> borrowedSourceForTest(const std::string & part_path) const;
 
@@ -135,22 +137,9 @@ protected:
     ContentAddressedMetadataStorage & metadata_storage;
 
 private:
-    /// The local file or private S3 object of one successful write. Paths and readers can
-    /// share it across renames, replacement and transaction teardown.
-    struct StagedPartFile
-    {
-        String staging_path;  /// Local filesystem path or the S3 key used by IObjectStorage.
-        ObjectStoragePtr remote_storage;
-        String pool_staging_key;  /// Pool-relative address for reads through the request engine.
-        bool allow_inline_by_name = false;  /// Set from the original write path, before any hardlink or rename.
-        bool owns_file = false;
-        mutable std::atomic<bool> publication_attempted{false};
-
-        ~StagedPartFile();
-    };
-    using StagedPartFilePtr = std::shared_ptr<const StagedPartFile>;
-
-    /// State for one routed part. The build records its manifest dependencies at publication.
+    /// State for one routed part. The build is opened lazily at the first staged write so every
+    /// manifest dependency is recorded by the same `Cas::PartWriteTxn`; pending blobs remain in
+    /// staging until publication.
     struct PartStaging
     {
         /// Created lazily when a staged blob, inline entry, or adopted entry first needs publication.
@@ -174,9 +163,21 @@ private:
         bool published = false;                    /// set by publishStaging during commit(); the commit
                                                    /// loop is idempotent (never re-publishes a staging).
 
-        /// Each newly written path and its hardlinks retain the original staging source.
-        std::map<String, StagedPartFilePtr> staged_part_files;
-        bool has_finalized_file_write = false;  /// A build opened only for a transfer cannot replace the temporary segment ref.
+        /// `staging_key` is either a private local temp path or an S3 staging object key returned by
+        /// `CaContentWriteBuffer` at finalize. The backend selects the read-your-writes source; both
+        /// kinds are removed by this transaction on commit and on abort.
+        struct PendingBlob
+        {
+            Cas::BlobRef ref;
+            std::string staging_key;
+            uint64_t size = 0;
+            Cas::StagingBackend backend = Cas::StagingBackend::Local;
+            /// The once-only verbatim-copy privilege of the staging object. A hardlink copies this
+            /// record into another part, and the copy shares the flag, so the parts together copy
+            /// the staged envelope at most once.
+            std::shared_ptr<std::atomic<bool>> publication_attempted = std::make_shared<std::atomic<bool>>(false);
+        };
+        std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
 
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
@@ -187,7 +188,6 @@ private:
     std::unordered_map<String, std::shared_ptr<Cas::CopySource>> copy_sources_by_part;
     bool committed = false;
     bool failed = false;
-    bool fail_next_file_registration = false;
 
     /// Memoizes, per (this transaction, ref), whether `unlinkFile` has already resolved a committed
     /// ref `ForceFresh`. The MergeTree fast-removal path unlinks every file of a part through ONE
@@ -198,10 +198,11 @@ private:
 
     /// Stage a content part file as a blob without recording a dependency proof, and add/replace its
     /// manifest entry. Successful post-precommit publication later records `Materialized`. Shared by
-    /// writers on both staging backends.
+    /// the streaming-blob path
+    /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
-                           ObjectStoragePtr remote_storage, const String & pool_key);
+                           Cas::StagingBackend backend);
 
     /// Builds the fixed-length CABL envelope header for a staging blob, with a fresh `incarnation_tag`,
     /// so the S3 staging object holds `[header][payload]` and the promote
@@ -209,8 +210,8 @@ private:
     std::string buildS3StagingBlobHeader(const ContentAddressedMetadataStorage::Route & route) const;
 
     /// Replaces the staged entry at `entry.path`; `source` is its committed source when it was adopted from
-    /// another part without its bytes, and null when this transaction owns the bytes.
-    static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source, StagedPartFilePtr file = {});
+    /// another part without its bytes, and nullopt when this transaction uploads or inlines the bytes.
+    static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source);
     static void eraseEntry(PartStaging & st, const std::string & path);
     /// Renames `entry`, an element of `st.entries`, in place; `new_path` must not be staged.
     static void rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path);
@@ -236,21 +237,17 @@ private:
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     /// Finds the staged manifest entry for a routed file without consulting committed storage.
     const Cas::ManifestEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
-
-    static StagedPartFilePtr stagedFileOf(const PartStaging & st, const String & path);
-
-    static std::unique_ptr<ReadBuffer> openStagedPayload(const StagedPartFile & file, uint64_t size, const Cas::PoolPtr & pool);
-
-    Cas::BlobSource stagedUploadSource(const StagedPartFilePtr & file, uint64_t size) const;
-
-    std::vector<Cas::BlobUploadRequest> applyManifestInlineBudget(PartStaging & st, uint64_t inline_bytes_from_unchanged_base_entries) const;
+    /// Returns the pending (staged but not yet uploaded) blob for `ref`, or nullptr when it has
+    /// already been uploaded or was never staged.
+    const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const Cas::BlobRef & ref) const;
     /// Returns the part build, creating it lazily with the routed ref as its intended destination.
     Cas::PartWriteTxn & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     /// Parses a disk path and maps a part-file path to its namespace/ref/file route.
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
 
-    /// Release this transaction's ownership. Readers and pending uploads retain their own handles.
-    void releaseStagedFiles() noexcept;
+    /// Removes the transaction's staging after commit or abort: local files and S3 staging objects
+    /// alike. S3 deletes are best-effort; a lost delete leaves debris for the mount-start sweep.
+    void cleanupPendingTempFiles() noexcept;
 
     /// Append sources from local or S3 staging only for blob refs still named by the staged entries.
     void appendStagedBlobUploads(const PartStaging & st, std::vector<Cas::BlobUploadRequest> & blob_upload_requests) const;
@@ -258,6 +255,21 @@ private:
     /// Stage the manifest and precommit its blob refs before confirming copied files and uploading payloads.
     Cas::ManifestId precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
                                        const PendingRefs & blob_refs_with_upload_requests, const std::vector<Cas::BlobUploadRequest> & blob_upload_requests);
+
+    /// Adopts a manifest entry into another part while preserving its storage state. For a pending
+    /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or
+    /// has already been moved by the caller; no dependency exists until its upload succeeds. For
+    /// an uploaded or committed blob, the destination records trusted-manifest evidence and does not
+    /// perform a pool read before precommit.
+    ///
+    /// `pb != nullptr` (pending, not yet uploaded):
+    ///   - `copy_pending=true`  → push a copy of *pb into dst_st.pending_blobs (hardlink semantics:
+    ///     both src and dst upload independently; src's copy is left in place by the caller).
+    ///   - `copy_pending=false` → the pb record is already in dst_st (moved or already there).
+    ///   In both cases the later successful upload records `Materialized` in the destination build.
+    ///
+    void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
+                         PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending);
 
     /// Publishes one staged part, either by promoting a newly staged manifest or by repointing an
     /// existing ref after carrying its unchanged entries forward. It is idempotent within the commit
