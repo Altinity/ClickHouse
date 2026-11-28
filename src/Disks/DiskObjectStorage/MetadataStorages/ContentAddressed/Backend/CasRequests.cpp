@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <ctime>
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 namespace ProfileEvents
@@ -519,6 +520,20 @@ CasOperation::Gate CasOperation::gate(uint64_t needed_ms) const
     return Gate::Ok;
 }
 
+std::optional<CasOperation::ReadStop> CasOperation::refusedReadAttempt(const Retry::Bound & bound) const
+{
+    const uint64_t reservation = reservedFor(0, 1);
+    switch (gate(reservation))
+    {
+        case Gate::FenceLost: return ReadStop::FenceLost;
+        case Gate::NoBudget:  return ReadStop::NoBudgetLease;
+        case Gate::Ok: break;
+    }
+    if (!fits(reservation, bound))
+        return ReadStop::PolicyExhausted;
+    return std::nullopt;
+}
+
 uint64_t CasOperation::reservedFor(uint64_t sleep_ms, uint32_t envelopes) const
 {
     uint64_t total = sleep_ms;
@@ -547,7 +562,7 @@ std::optional<GaveUp> CasOperation::pauseAfterUnresolvedWrite(uint64_t ms, const
 }
 
 std::optional<CasOperation::PauseStop> CasOperation::pauseUnderPolicy(uint64_t ms, const Retry & policy, PauseAfter after,
-                                                                      void (*record)())
+                                                                      void (*record)(), bool zero_is_no_pause)
 {
     /// Admission for `needed_ms` of pause, so a pause never outlives the mount lease. A window belongs to
     /// one request and the next request binds its own when it is sent, so only the policy's absolute limits
@@ -571,6 +586,8 @@ std::optional<CasOperation::PauseStop> CasOperation::pauseUnderPolicy(uint64_t m
     };
     if (auto stop = check_pause(ms))
         return stop;
+    if (ms == 0 && zero_is_no_pause)
+        return std::nullopt;
     record();
     /// A query cut short here is reported by the check below, after the typed bounds.
     if (after == PauseAfter::Failure)
@@ -582,9 +599,9 @@ std::optional<CasOperation::PauseStop> CasOperation::pauseUnderPolicy(uint64_t m
 }
 
 std::optional<GaveUp> CasOperation::pauseBetweenDecisions(uint64_t ms, WriteState & state, const Retry & policy,
-                                                               PauseAfter after, void (*record)())
+                                                               PauseAfter after, void (*record)(), bool zero_is_no_pause)
 {
-    const std::optional<PauseStop> stop = pauseUnderPolicy(ms, policy, after, record);
+    const std::optional<PauseStop> stop = pauseUnderPolicy(ms, policy, after, record, zero_is_no_pause);
     if (!stop)
         return std::nullopt;
     switch (*stop)
@@ -802,10 +819,11 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
             throwDidNotConverge(fmt::format("CAS remove of '{}'", key), kCasMaxDecisions, "decisions");
         }
 
-        /// Another incarnation became current between the observation and the delete. Re-observe, paced
-        /// like every other reissue; the next `head` and `remove` bind their own windows.
+        /// Another incarnation became current between the observation and the delete: a lost race. Re-observe
+        /// after the conflict pause; the next `head` and `remove` bind their own windows.
         if (const std::optional<PauseStop> stop
-            = pauseUnderPolicy(Retry::backoff(attempt), policy, PauseAfter::Conflict, detail::recordReissue))
+            = pauseUnderPolicy(Retry::conflictBackoff(attempt), policy, PauseAfter::Conflict, detail::recordReissue,
+                               /*zero_is_no_pause=*/true))
         {
             switch (*stop)
             {
@@ -1032,17 +1050,27 @@ WriteResult CasOperation::gaveUpAfterDecisionCap(WriteState & state, const Retry
     return gaveUp(GaveUp::Why::Attempts, GaveUp::Source::Policy, state);
 }
 
+CasOperation::OnCleanRefusal CasOperation::onCleanRefusalBefore(uint32_t decisions, const Retry & policy)
+{
+    /// A decision that another follows after a conflict pause reads again after that pause; the last
+    /// one, and a single attempt, report what the settling read saw.
+    return policy.single_attempt || decisions == kCasMaxDecisions ? OnCleanRefusal::Settle : OnCleanRefusal::ReturnUnobserved;
+}
+
 std::optional<WriteResult> CasOperation::pauseAfterConflict(uint32_t decisions, WriteState & state, const Retry & policy)
 {
     if (decisions == kCasMaxDecisions)
         return gaveUpAfterDecisionCap(state, policy);
-    /// A clean lost race is settled: the resolve read holds the fresh object and the next
-    /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
-    /// growing schedule. Either way the conflict is an answer, so the pause does not consult the query.
-    return state.any_ambiguous
-        ? pauseBetweenDecisions(reissuePause(state, Retry::backoff(++state.reissues)), state, policy, PauseAfter::Conflict)
-        : pauseBetweenDecisions(reissuePause(state, Retry::conflictBackoff()), state, policy, PauseAfter::Conflict,
-                                detail::recordConflictPause);
+    /// A clean conflict is paced by the call's run of consecutive clean ones, which a conflict that settled a
+    /// transport fault ends; that one is paced by the fault schedule. Either way the conflict is an answer, so the
+    /// pause does not consult the query. The first clean conflict of a run is retried at once, after the same checks.
+    if (state.any_ambiguous)
+    {
+        state.clean_conflicts = 0;
+        return pauseBetweenDecisions(reissuePause(state, Retry::backoff(++state.reissues)), state, policy, PauseAfter::Conflict);
+    }
+    return pauseBetweenDecisions(reissuePause(state, Retry::conflictBackoff(++state.clean_conflicts)), state, policy,
+                                 PauseAfter::Conflict, detail::recordConflictPause, /*zero_is_no_pause=*/true);
 }
 
 WriteResult CasOperation::postCommit(Etag inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound)
@@ -1256,7 +1284,8 @@ void reportWriteFailure(const RequestObserver & observer, const String & key, co
 }
 
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
-                                    const Retry & policy, WriteState & state, ResolveWith resolve_refusal_with)
+                                    const Retry & policy, WriteState & state, ResolveWith resolve_refusal_with,
+                                    OnCleanRefusal on_clean_refusal)
 {
     const Retry::Bound bound = owner.bindPolicy(policy);
     std::optional<String> expected_value;
@@ -1407,8 +1436,20 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             continue;
         }
 
-        /// One exact read settles every refused precondition and every ambiguity, under every policy: a refused
-        /// precondition does not say WHO holds the key. A presence-only caller settles a refusal with a HEAD; proving
+        if (attempt.kind == AttemptKind::Conflict && !earlier_attempt_unanswered
+            && on_clean_refusal == OnCleanRefusal::ReturnUnobserved)
+        {
+            state.last_seen = NotObserved{};
+            /// The skipped read would have bound its own window and been refused by these, before any pause the
+            /// caller takes; they are reported as that read reports them.
+            const Retry::Bound read_bound = owner.bindPolicy(policy);
+            if (const std::optional<ReadStop> read_refused = refusedReadAttempt(read_bound))
+                return gaveUpForReadStop(*read_refused, sourceFor(read_bound), state);
+            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous, state.observed_stop};
+        }
+
+        /// One exact read settles every other refused precondition and every ambiguity: a refused precondition does
+        /// not say WHO holds the key. A presence-only caller settles a refusal with a HEAD; proving
         /// an ambiguous attempt landed needs the bytes.
         if (auto settled = adjudicate(settlingRead(key, policy, state, resolve_refusal_with), bytes, expected, state, bound))
             return *settled;
@@ -1442,20 +1483,38 @@ WriteResult CasOperation::replace(const String & key, const String & bytes, cons
     return writeLoop(key, bytes, seen, policy, state, ResolveWith::Body);
 }
 
-WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
+template <typename Seen>
+WriteResult CasOperation::readModifyWriteImpl(
+    const String & key, const std::function<std::optional<String>(const std::optional<Seen> &)> & decide, const Retry & policy)
 {
+    constexpr bool presence_only = std::is_same_v<Seen, Meta>;
+    constexpr ResolveWith observe_with = presence_only ? ResolveWith::Presence : ResolveWith::Body;
+    /// Proving an ambiguous attempt landed needs the bytes even here; a presence-only verb reports metadata only.
+    const auto reported = [](auto value)
+    {
+        if constexpr (presence_only)
+            return withoutBody(std::move(value));
+        else
+            return value;
+    };
+
     WriteState state;
-
-    Resolved resolved = observe(key, policy);
-    state.last_seen = resolved.seen;
-    std::optional<Object> current;
-    if (const auto * obj = std::get_if<Object>(&state.last_seen))
-        current = *obj;
-    else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(resolved, state);
-
     for (uint32_t decisions = 1;; ++decisions)
     {
+        /// A decision after the first is reached only through the conflict pause, and reads after it: a write
+        /// landing during the pause would refuse a decision taken on any read before it.
+        if (decisions > 1)
+            if (const std::optional<WriteResult> given_up = pauseAfterConflict(decisions - 1, state, policy))
+                return *given_up;
+
+        const Resolved resolved = observe(key, policy, observe_with);
+        state.last_seen = resolved.seen;
+        std::optional<Seen> current;
+        if (const auto * seen = std::get_if<Seen>(&state.last_seen))
+            current = *seen;
+        else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
+            return gaveUpAfterFailedObservation(resolved, state);
+
         throwIfBackgroundStopped();
         /// Outside every classification: `decide` is the caller's own control flow, and an exception
         /// from it is theirs to see unchanged.
@@ -1463,90 +1522,22 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
         if (!next)
             return Declined{state.last_seen};
 
-        WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, state,
-            ResolveWith::Body);
-        if (!std::holds_alternative<Conflict>(result))
-            return result;
-
-        /// The write's own resolve read IS this iteration's read: a hot key never costs a second GET
-        /// per conflict.
-        if (const auto * obj = std::get_if<Object>(&state.last_seen))
-            current = *obj;
-        else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
-            current.reset();
-
-        if (policy.single_attempt || state.observed_stop)
-            return result;
-        if (const std::optional<WriteResult> given_up = pauseAfterConflict(decisions, state, policy))
-            return *given_up;
-
-        /// Only when the resolve settled nothing is a fresh read owed; otherwise `current` already is
-        /// what the store held.
-        if (std::holds_alternative<NotObserved>(state.last_seen))
-        {
-            resolved = observe(key, policy);
-            state.last_seen = resolved.seen;
-            if (const auto * obj = std::get_if<Object>(&state.last_seen))
-                current = *obj;
-            else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
-                current.reset();
-            else
-                return gaveUpAfterFailedObservation(resolved, state);
-        }
+        WriteResult result = writeLoop(key, *next, current ? std::optional<Etag>(current->etag) : std::nullopt, policy, state,
+            observe_with, onCleanRefusalBefore(decisions, policy));
+        state.last_seen = reported(std::move(state.last_seen));
+        if (!std::holds_alternative<Conflict>(result) || policy.single_attempt || state.observed_stop)
+            return reported(std::move(result));
     }
+}
+
+WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
+{
+    return readModifyWriteImpl<Object>(key, decide, policy);
 }
 
 WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy)
 {
-    WriteState state;
-
-    Resolved resolved = observe(key, policy, ResolveWith::Presence);
-    state.last_seen = resolved.seen;
-    std::optional<Meta> current;
-    if (const auto * meta = std::get_if<Meta>(&state.last_seen))
-        current = *meta;
-    else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(resolved, state);
-
-    for (uint32_t decisions = 1;; ++decisions)
-    {
-        throwIfBackgroundStopped();
-        const std::optional<String> next = decide(current);
-        if (!next)
-            return Declined{state.last_seen};
-
-        WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, state,
-            ResolveWith::Presence);
-        /// A refused precondition was settled by a HEAD, but proving an ambiguous attempt landed needs
-        /// the bytes; this loop is presence-only by contract, so that body stops here.
-        state.last_seen = withoutBody(std::move(state.last_seen));
-        if (!std::holds_alternative<Conflict>(result))
-            return withoutBody(std::move(result));
-
-        if (const auto * meta = std::get_if<Meta>(&state.last_seen))
-            current = *meta;
-        else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
-            current.reset();
-
-        if (policy.single_attempt || state.observed_stop)
-            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous, state.observed_stop};
-        if (const std::optional<WriteResult> given_up = pauseAfterConflict(decisions, state, policy))
-            return *given_up;
-
-        if (std::holds_alternative<NotObserved>(state.last_seen))
-        {
-            resolved = observe(key, policy, ResolveWith::Presence);
-            state.last_seen = resolved.seen;
-            if (const auto * meta = std::get_if<Meta>(&state.last_seen))
-                current = *meta;
-            else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
-                current.reset();
-            else
-                return gaveUpAfterFailedObservation(resolved, state);
-        }
-    }
+    return readModifyWriteImpl<Meta>(key, decide, policy);
 }
 
 }

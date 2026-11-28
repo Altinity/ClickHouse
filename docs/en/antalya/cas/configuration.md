@@ -146,10 +146,17 @@ An update of a shared object that keeps losing races to other writers is retried
 `CREATE` and `DROP` statements, and a hot ref. There is no total time budget for this loop: each attempt has its own
 request window.
 
-- **One lost race** on a healthy store costs one conditional write, the read that settles it when one is needed, and
-  a pause drawn uniformly from 0 to 200 ms.
-- **Typical total:** 100 lost races cost 100 conditional writes, up to 100 reads, and about 10 s of pauses (at most
-  20 s). On a store that answers in tens of milliseconds the whole loop takes about 10 to 20 s.
+- **One lost race** on a healthy store costs one conditional write, a pause, and one read before the next attempt.
+  The first lost race is retried at once. After that the pause grows by 40 ms with each race the same update loses in
+  a row, up to a base of 750 ms, plus a random addition of up to a quarter of the base, so one pause lasts at most 937 ms.
+  Five lost races in a row cost 400 to 500 ms of pauses. A race lost on a transport fault is paced like a fault
+  instead, and the next lost race counts as a first one again.
+- **A loss on a cached value:** an update may start from the last catalog this server knows, without a read. When
+  that value is out of date, its write is refused and the update reads and writes again at once, with no pause and
+  without counting it as a lost race. So 100 attempts can send 101 conditional writes.
+- **Total at the limit:** 100 lost races cost about 100 conditional writes, about 100 reads, and 98 pauses (the first
+  retry is not paced) of 66.8 s to 83.5 s in all, about 75.2 s on average. While lease renewals succeed, the count of 100 ends the loop, not the
+  mount lease.
 - **Worst case:** 100 slow answers, each inside its own window: about 100 request windows, more than 3 hours at the
   default `cas_request_window_ms`.
 - **Earlier exits:** `KILL QUERY` or `max_execution_time` ends the loop at the next failed answer from the store.

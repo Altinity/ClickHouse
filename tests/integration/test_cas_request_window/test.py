@@ -358,8 +358,8 @@ def _removing_body(life):
 
 @pytest.mark.parametrize("stop", ["kill", "timeout"])
 def test_stop_after_accepted_conflicts_permits_next_put(node_stop, stop):
-    """Three `PUT`s of a catalog write meet 412; the read that settles the third is parked while the query stops and
-    then succeeds. An accepted conflict is an answer, not a failure, so the fourth `PUT` is sent and lands."""
+    """Three `PUT`s of a catalog write meet 412; the read before the fourth is parked while the query stops and then
+    succeeds. An accepted conflict is an answer, not a failure, so the fourth `PUT` is sent and lands."""
     rules = []
     for action in ("forward", "forward", "hold"):
         rules += [_rule("PUT", STOP_CATALOG, "412"), _rule("GET", STOP_CATALOG, action)]
@@ -381,23 +381,38 @@ def test_stop_after_accepted_conflicts_permits_next_put(node_stop, stop):
 
 
 @pytest.mark.parametrize("stop", ["kill", "timeout"])
-def test_failed_settlement_after_stop_starts_no_further_put(node_stop, stop):
-    """A catalog write meets 412 and its settling read is parked while the query stops, then answered with 503. That
-    read failed after the stop, so the write ends with its conflict and no further `PUT` is sent."""
-    _arm_rules([_rule("PUT", STOP_CATALOG, "412"), _rule("GET", STOP_CATALOG, "hold"),
-                _rule("PUT", STOP_CATALOG, "412", count=1000)])
-    query_id = "failed_settlement_" + stop
-    request = node_stop.get_query_request(
-        _create_sql(query_id), query_id=query_id, settings=_stop_settings(stop), timeout=120)
-    released_ms = _stop_and_release(node_stop, query_id, STOP_CATALOG, respond="503", kill=(stop == "kill"))
-    _wait_until(lambda: request.process.poll() is not None, timeout=60)
-    trace = _stats()["trace"]
-    assert [r["status"] for r in _catalog_puts(trace)] == [412], trace
-    assert not [r for r in _catalog_puts(trace) if r["t_mono_ms"] > released_ms], trace
-    error = request.get_error()
+def test_failed_read_after_a_lost_race_and_stop_starts_no_further_put(node_stop, stop):
+    """A catalog write meets 412, and the next catalog read is parked while the query stops, then answered with 503.
+    No further `PUT` is sent. A write decided on the lane's cached catalog has its 412 settled by that read, and the
+    call ends with the conflict the read could not resolve. A write decided on a fresh read is retried at once without
+    settling, so the parked read is the one before the next attempt, and the call ends with that read's error: the
+    query's own stop."""
+
+    def lose_race_then_fail_the_read(suffix):
+        _control(cluster.proxy_url, "/config", {"reset": True})
+        _arm_rules([_rule("PUT", STOP_CATALOG, "412"), _rule("GET", STOP_CATALOG, "hold"),
+                    _rule("PUT", STOP_CATALOG, "412", count=1000)])
+        query_id = "failed_read_{}_{}".format(suffix, stop)
+        request = node_stop.get_query_request(
+            _create_sql(query_id), query_id=query_id, settings=_stop_settings(stop), timeout=120)
+        released_ms = _stop_and_release(node_stop, query_id, STOP_CATALOG, respond="503", kill=(stop == "kill"))
+        _wait_until(lambda: request.process.poll() is not None, timeout=60)
+        trace = _stats()["trace"]
+        assert [r["status"] for r in _catalog_puts(trace)] == [412], trace
+        assert not [r for r in _catalog_puts(trace) if r["t_mono_ms"] > released_ms], trace
+        assert _remaining_counts() == [0, 0, 1000]
+        return request.get_error()
+
+    # A table created without faults leaves the lane holding the catalog it wrote.
+    _control(cluster.proxy_url, "/config", {"reset": True})
+    node_stop.query(_create_sql("failed_read_warm_" + stop), timeout=120)
+    error = lose_race_then_fail_the_read("cached")
     # `ABORTED`: the conflict the settling read could not resolve.
     assert re.search(r"Code: 236\b", error) and "conflict" in error, error
-    assert _remaining_counts() == [0, 0, 1000]
+
+    # That conflict observed nothing, so the lane keeps no catalog and the next write starts from a read.
+    error = lose_race_then_fail_the_read("fresh")
+    assert re.search(r"Code: {}\b".format(394 if stop == "kill" else 159), error), error
 
 
 def test_kill_after_ambiguous_create_keeps_unresolved_exit(node_stop):

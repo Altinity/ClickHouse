@@ -20,6 +20,7 @@
 #include <chrono>
 #include <future>
 #include <deque>
+#include <expected>
 #include <latch>
 #include <mutex>
 #include <optional>
@@ -223,13 +224,23 @@ TEST(CASHotKeys, ResultsAreTheEnginesOwn)
         ASSERT_TRUE(std::holds_alternative<Refused>(result));
     }
 #endif
-    /// A clean refused precondition with the store unchanged: `Conflict` carrying the occupant.
+    /// A clean refused precondition with the store unchanged, under a single attempt: `Conflict` carrying the occupant.
     backend->refuseNextWrite("k");
     {
-        WriteResult result = hot_keys.submit("k", op, Retry::standard(), appendTicket(3));
+        WriteResult result = hot_keys.submit("k", op, Retry::once(), appendTicket(3));
         const auto * conflict = std::get_if<Conflict>(&result);
         ASSERT_NE(conflict, nullptr);
         EXPECT_TRUE(std::holds_alternative<Object>(conflict->seen));
+        EXPECT_FALSE(conflict->any_ambiguous);
+    }
+    /// The same refusal of a write decided on a fresh read, for a caller that retries: it pauses and reads before its
+    /// next decision, so the refusal is returned unsettled.
+    backend->refuseNextWrite("k");
+    {
+        WriteResult result = hot_keys.submit("k", op, Retry::standard(), appendTicket(3), CasHotKeys::Start::Read);
+        const auto * conflict = std::get_if<Conflict>(&result);
+        ASSERT_NE(conflict, nullptr);
+        EXPECT_TRUE(std::holds_alternative<NotObserved>(conflict->seen));
         EXPECT_FALSE(conflict->any_ambiguous);
     }
     /// The resolve read fails at the transport under `once`: nothing observed. The failure is armed
@@ -515,13 +526,13 @@ TEST(CASHotKeys, AnExternalWriterCostsOneResolveReadAndOneRetry)
     const uint64_t gets_before = backend->getCount("k");
     const uint64_t writes_before = backend->writeCount("k");
 
-    /// The caller's loop: submit, and on a conflict submit again after the flat pause.
+    /// The caller's loop: submit, and on a conflict submit again after the conflict pause.
     std::optional<WriteResult> result;
-    for (int i = 0; i < 3 && !result; ++i)
+    for (uint32_t i = 0; i < 3 && !result; ++i)
     {
         WriteResult attempt = hot_keys.submit("k", op, Retry::standard(), appendTicket(2));
         if (std::holds_alternative<Conflict>(attempt))
-            op.sleepFor(Retry::conflictBackoff());
+            op.sleepFor(Retry::conflictBackoff(i + 1));
         else
             result = std::move(attempt);
     }
@@ -533,6 +544,153 @@ TEST(CASHotKeys, AnExternalWriterCostsOneResolveReadAndOneRetry)
     EXPECT_EQ(backend->getCount("k") - gets_before, 1u);
     /// `expectBytes` issues its own read, so it comes after every count assertion, not between them.
     DB::Cas::tests::expectBytes(*backend, "k", "E,2,3");
+}
+
+namespace
+{
+
+/// Records the physical attempt number the engine hands the transport for each write of `key`.
+struct AttemptNumberingBackend : CountingBackend
+{
+    std::vector<size_t> write_attempts;
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        if (key == "k")
+            write_attempts.push_back(access.attemptNo());
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+}
+
+/// The refused write on a hint and the write on its resolve read are attempts of one submission: they are
+/// counted and numbered together, and a give-up between them reports the first.
+TEST(CASHotKeys, BothWritesOfOneHoldAreAttemptsOfOneSubmission)
+{
+    SyncClock clock;
+    auto backend = std::make_shared<AttemptNumberingBackend>();
+    CasHotKeys hot_keys(16ULL << 20);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
+    auto external = external_requests.admit();
+    const auto move_externally = [&](const String & bytes)
+    {
+        const auto current = external.read("k", Retry::standard());
+        (void)orThrow(external.replace("k", bytes, current->etag, Retry::standard()), "external");
+    };
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, Retry::standard(), appendTicket(1))));
+    move_externally("E");
+    backend->write_attempts.clear();
+    {
+        WriteResult result = hot_keys.submit("k", op, Retry::standard(), appendTicket(2));
+        const auto * committed = std::get_if<Committed>(&result);
+        ASSERT_NE(committed, nullptr);
+        EXPECT_EQ(committed->attempts_sent, 2u);
+        EXPECT_EQ(backend->write_attempts, (std::vector<size_t>{1, 2}));
+    }
+
+    /// The fence trips in the decision on the resolve read, so the second write is never sent.
+    move_externally("F");
+    bool alive = true;
+    auto fenced = requests.admit([&] { return alive; });
+    int decisions = 0;
+    WriteResult result = hot_keys.submit("k", fenced, Retry::standard(),
+        [&](const std::optional<Object> & current) -> std::optional<String>
+        {
+            if (++decisions == 2)
+                alive = false;
+            return current->bytes + ",3";
+        });
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_EQ(gave_up->attempts_sent, 1u);
+    const auto * seen = std::get_if<Object>(&gave_up->last_seen);
+    ASSERT_NE(seen, nullptr) << "the resolve read of the refused write";
+    EXPECT_EQ(seen->bytes, "F");
+}
+
+/// A retrying caller's refusal on a fresh read is returned unsettled, but only when the read it skips would
+/// have been admitted: the same lease budget and the same bounds decide, and report what that read would.
+TEST(CASHotKeys, AnUnsettledRefusalStillMeetsTheBoundsOfTheReadItSkips)
+{
+    {
+        SCOPED_TRACE("the lease has room for less than one more request");
+        SyncClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        uint64_t lease_left_ms = 10'000;
+        Fence fence = Fence::open();
+        fence.admit = [&lease_left_ms](uint64_t, uint64_t needed_ms)
+        {
+            return needed_ms <= lease_left_ms ? Fence::Admit::Ok : Fence::Admit::NoBudget;
+        };
+        CasHotKeys hot_keys(0);
+        CasRequests requests(backend, fence, clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+        requests.setAttemptReservationForTest(1'000);
+        auto op = requests.admit();
+        (void)orThrow(op.create("k", "1", Retry::standard()), "seed");
+        backend->refuseNextWrite("k");
+        backend->onBeforeWrite("k", [&] { lease_left_ms = 500; });
+
+        WriteResult result = hot_keys.submit("k", op, Retry::standard(), appendTicket(2), CasHotKeys::Start::Read);
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr) << "index " << result.index();
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(clock.sleepCount(), 0u);
+    }
+    {
+        SCOPED_TRACE("an absolute cap leaves less than one request envelope once the write returns");
+        SyncClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        CasHotKeys hot_keys(0);
+        CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+        requests.setAttemptReservationForTest(1'000);
+        auto op = requests.admit();
+        (void)orThrow(op.create("k", "1", Retry::standard()), "seed");
+        const Retry capped = Retry::standard().cappedAt(clock.nowFn()() + 10'000);
+        backend->refuseNextWrite("k");
+        backend->onBeforeWrite("k", [&] { clock.advance(9'500); });
+
+        WriteResult result = hot_keys.submit("k", op, capped, appendTicket(2), CasHotKeys::Start::Read);
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr) << "index " << result.index();
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Policy);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(clock.sleepCount(), 0u);
+    }
+}
+
+/// A loss on a cached body says only that the cache was old: the hold decides again on the resolve
+/// read and writes at once, with no pause, in the same submission.
+TEST(CASHotKeys, ALossOnACachedBodyRetriesAtOnce)
+{
+    SyncClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    CasHotKeys hot_keys(16ULL << 20);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
+    auto external = external_requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, Retry::standard(), appendTicket(1))));
+    const auto current = external.read("k", Retry::standard());
+    (void)orThrow(external.replace("k", "E", current->etag, Retry::standard()), "external");
+    backend->clearJournal();
+
+    WriteResult result = hot_keys.submit("k", op, Retry::standard(), appendTicket(2));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*backend, "k"), "WRW") << "refused on the cache, the resolve read, the write on it";
+    EXPECT_EQ(clock.sleepCount(), 0u);
+    DB::Cas::tests::expectBytes(*backend, "k", "E,2");
 }
 
 TEST(CASHotKeys, MalformedBytesRepairedExternallyRaiseNoCorruptionVerdict)
@@ -553,23 +711,29 @@ TEST(CASHotKeys, MalformedBytesRepairedExternallyRaiseNoCorruptionVerdict)
     };
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, Retry::standard(), strict)));
 
-    auto current = external.read("k", Retry::standard());
-    const Etag garbage = *orThrow(external.replace("k", "garbage", current->etag, Retry::standard()), "break");
-    /// The lane's next hold starts from its cache, loses to the garbage, and remembers the garbage
-    /// its resolve read saw; the caller pauses and submits again.
-    WriteResult first = hot_keys.submit("k", op, Retry::standard(), strict);
+    /// A single-attempt hold reads, and the garbage lands between that read and its write: the write
+    /// loses, and the lane remembers the garbage its resolve read saw, as nobody retries that conflict.
+    std::optional<Etag> garbage;
+    backend->onBeforeWrite("k", [&]
+    {
+        backend->onBeforeWrite("k", [] {});
+        auto current = external.read("k", Retry::standard());
+        garbage = *orThrow(external.replace("k", "garbage", current->etag, Retry::standard()), "break");
+    });
+    WriteResult first = hot_keys.submit("k", op, Retry::once(), strict);
     ASSERT_TRUE(std::holds_alternative<Conflict>(first));
-    (void)orThrow(external.replace("k", "9", garbage, Retry::standard()), "repair");
+    ASSERT_TRUE(garbage.has_value());
+    (void)orThrow(external.replace("k", "9", *garbage, Retry::standard()), "repair");
     const auto reread_before = counter(ProfileEvents::CASHotKeyCacheVerdictsReread);
     /// The verdict on the cached garbage is not delivered: one read, and the decide lands on the repair.
     WriteResult second = hot_keys.submit("k", op, Retry::standard(), strict);
     ASSERT_TRUE(std::holds_alternative<Committed>(second));
     EXPECT_EQ(counter(ProfileEvents::CASHotKeyCacheVerdictsReread) - reread_before, 1u);
     DB::Cas::tests::expectBytes(*backend, "k", "9,9");
-    /// And when the read is garbage too, that is the real corruption.
-    current = external.read("k", Retry::standard());
+    /// And when the read is garbage too, that is the real corruption: the hold loses on its cache and
+    /// decides again on a resolve read that is garbage.
+    const auto current = external.read("k", Retry::standard());
     (void)orThrow(external.replace("k", "garbage", current->etag, Retry::standard()), "break again");
-    (void)hot_keys.submit("k", op, Retry::standard(), strict);   /// conflict: the cache now holds garbage
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)hot_keys.submit("k", op, Retry::standard(), strict); });
 }

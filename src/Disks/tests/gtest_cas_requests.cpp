@@ -13,6 +13,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 #include <Common/ProfileEvents.h>
+#include <Common/thread_local_rng.h>
 #include <Common/RemoteHostFilter.h>
 
 #include <IO/ReadHelpers.h>
@@ -115,8 +116,36 @@ TEST(CASIncarnation, GrammarRefusesTheNineWays)
     EXPECT_FALSE(isIncarnationValue(Dialect::Emulated, ""));
 }
 
+TEST(CASRetry, TheConflictPauseGrowsToItsCeilingWithUpToAQuarterOfJitter)
+{
+    thread_local_rng.seed(2026);   /// a fixed sequence, so the spread checks below cannot fail on an unlucky draw
+    EXPECT_EQ(Retry::conflictBackoff(1), 0u) << "the first loss is retried at once";
+    const std::vector<uint64_t> bases{0, 40, 80, 120, 160, 400, 720, 750, 750, 750};
+    const std::vector<uint32_t> losses{1, 2, 3, 4, 5, 11, 19, 20, 21, 100};
+    for (size_t step = 1; step < losses.size(); ++step)
+    {
+        const uint32_t loss = losses[step];
+        const uint64_t base = bases[step];
+        uint64_t low = std::numeric_limits<uint64_t>::max();
+        uint64_t high = 0;
+        for (int i = 0; i < 1000; ++i)
+        {
+            const uint64_t pause = Retry::conflictBackoff(loss);
+            ASSERT_GE(pause, base) << "loss " << loss;
+            ASSERT_LE(pause, base + base / 4) << "loss " << loss;
+            low = std::min(low, pause);
+            high = std::max(high, pause);
+        }
+        /// The bounds alone cannot tell jitter from a constant, so the spread is asserted too.
+        EXPECT_LT(low, base + base / 16) << "loss " << loss;
+        EXPECT_GT(high, base + base * 3 / 16) << "loss " << loss;
+    }
+    EXPECT_LE(Retry::conflictBackoff(std::numeric_limits<uint32_t>::max()), 750u + 750u / 4) << "the ceiling holds for any count";
+}
+
 TEST(CASRetry, BackoffIsFullJitterUnderTheCap)
 {
+    thread_local_rng.seed(2026);   /// a fixed sequence, so the spread checks below cannot fail on an unlucky draw
     for (uint32_t attempt = 1; attempt <= 12; ++attempt)
     {
         const uint64_t ceiling = std::min<uint64_t>(5000, 200ull << (attempt - 1));
@@ -481,7 +510,7 @@ TEST(CASRequests, PauseBeforeRedecideEndingOnTheExplicitLeaseEndsTheCall)
 namespace
 {
 
-/// One lost race, then a pause that sleeps 10 s past what it asked for. `policy_ending_at` builds the
+/// Two lost races, the first retried at once, then a pause that sleeps 10 s past what it asked for. `policy_ending_at` builds the
 /// policy from the instant the room for one write and one conflict pause ends. Returns the result and
 /// how many times `decide` ran.
 std::pair<WriteResult, int> raceThenOversleep(const std::function<Retry(uint64_t)> & policy_ending_at)
@@ -492,13 +521,20 @@ std::pair<WriteResult, int> raceThenOversleep(const std::function<Retry(uint64_t
     auto rival_requests = makeRequests(backend, clock);
     auto rival = rival_requests.admit();
     requests.setSleepFnForTest([&](uint64_t ms) { clock.sleepFn()(ms + 10'000); });
-    bool staged = false;
+    /// The rival wins the first two races: the first is retried at once, the second pauses.
+    int staged = 0;
+    bool staging = false;
     backend->onBeforeWrite("k", [&]
     {
-        if (staged)
+        if (staging || staged >= 2)
             return;
-        staged = true;
-        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        staging = true;
+        if (const auto current = rival.read("k", Retry::once()))
+            orThrow(rival.replace("k", "theirs again", current->etag, Retry::once()), "rival");
+        else
+            orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        ++staged;
+        staging = false;
     });
 
     int decisions = 0;
@@ -519,7 +555,7 @@ std::pair<WriteResult, int> raceThenOversleep(const std::function<Retry(uint64_t
 TEST(CASRequests, ReadModifyWriteWakingPastTheOutsideCapRunsNoSecondDecide)
 {
     const auto [result, decisions] = raceThenOversleep([](uint64_t end) { return Retry::standard().cappedAt(end); });
-    EXPECT_EQ(decisions, 1);
+    EXPECT_EQ(decisions, 2);
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
     EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
@@ -529,7 +565,7 @@ TEST(CASRequests, ReadModifyWriteWakingPastTheOutsideCapRunsNoSecondDecide)
 TEST(CASRequests, ReadModifyWriteWakingPastTheExplicitLeaseRunsNoSecondDecide)
 {
     const auto [result, decisions] = raceThenOversleep([](uint64_t end) { return Retry::untilLeaseSafe(end, /*margin=*/0); });
-    EXPECT_EQ(decisions, 1);
+    EXPECT_EQ(decisions, 2);
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
     EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
@@ -1341,7 +1377,7 @@ TEST(CASRequests, OnPresenceSettlesARefusedPreconditionWithAHead)
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
     /// A refused precondition needs only to know WHAT is at the key, so this loop never fetches a body.
     EXPECT_EQ(backend->getTotal(), 0u);
-    EXPECT_EQ(backend->headTotal(), 2u);
+    EXPECT_EQ(backend->headTotal(), 2u) << "the base and the read after the pause; the refusal itself is not settled";
     EXPECT_EQ(backend->writeTotal(), 2u);
 }
 
@@ -1388,11 +1424,11 @@ TEST(CASRequests, RemoveCurrentReObservesAMismatchAndRefusesUnderOnce)
         orThrow(op.create("k", "v", Retry::standard()), "create");
 
         EXPECT_EQ(op.removeCurrent("k", Retry::standard()), Removal::Removed);
-        /// Another incarnation became current between the observation and the delete: observe again,
-        /// paced like every other reissue, and delete what the second look saw.
+        /// Another incarnation became current between the observation and the delete: a lost race, the first of
+        /// the call, so it observes again at once and deletes what the second look saw.
         EXPECT_EQ(backend->heads, 2u);
         EXPECT_EQ(backend->removes, 2u);
-        EXPECT_EQ(clock.sleeps.size(), 1u);
+        EXPECT_TRUE(clock.sleeps.empty());
     }
     {
         FakeClock clock;
@@ -1790,13 +1826,20 @@ TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecide)
         lost = true;
     });
 
-    bool staged = false;
+    /// The rival wins the first two races: the first is retried at once, the second pauses.
+    int staged = 0;
+    bool staging = false;
     backend->onBeforeWrite("k", [&]
     {
-        if (staged)
+        if (staging || staged >= 2)
             return;
-        staged = true;
-        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        staging = true;
+        if (const auto current = rival.read("k", Retry::once()))
+            orThrow(rival.replace("k", "theirs again", current->etag, Retry::once()), "rival");
+        else
+            orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        ++staged;
+        staging = false;
     });
 
     int decisions = 0;
@@ -1809,8 +1852,8 @@ TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecide)
         },
         Retry::standard());
 
-    /// The conflict was informative, so the loop would decide again; the fence moved in the pause.
-    EXPECT_EQ(decisions, 1);
+    /// The conflicts were informative, so the loop would decide again; the fence moved in the pause after the second.
+    EXPECT_EQ(decisions, 2);
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
     EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
@@ -1834,13 +1877,20 @@ TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecideOnPresence)
         lost = true;
     });
 
-    bool staged = false;
+    /// The rival wins the first two races: the first is retried at once, the second pauses.
+    int staged = 0;
+    bool staging = false;
     backend->onBeforeWrite("k", [&]
     {
-        if (staged)
+        if (staging || staged >= 2)
             return;
-        staged = true;
-        orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        staging = true;
+        if (const auto current = rival.read("k", Retry::once()))
+            orThrow(rival.replace("k", "theirs again", current->etag, Retry::once()), "rival");
+        else
+            orThrow(rival.create("k", "theirs", Retry::once()), "rival");
+        ++staged;
+        staging = false;
     });
 
     int decisions = 0;
@@ -1853,8 +1903,8 @@ TEST(CASRequests, AFenceLostDuringThePauseRunsNoSecondDecideOnPresence)
         },
         Retry::standard());
 
-    /// The conflict was informative, so the loop would decide again; the fence moved in the pause.
-    EXPECT_EQ(decisions, 1);
+    /// The conflicts were informative, so the loop would decide again; the fence moved in the pause after the second.
+    EXPECT_EQ(decisions, 2);
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
     EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
@@ -2255,7 +2305,7 @@ DecideOnObject appendX()
 
 }
 
-TEST(CASRequests, CleanConflictsArePacedFlatAndDoNotAdvanceTheReissueCounter)
+TEST(CASRequests, CleanConflictsArePacedByTheirLossCountAndDoNotAdvanceTheReissueCounter)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
@@ -2270,12 +2320,21 @@ TEST(CASRequests, CleanConflictsArePacedFlatAndDoNotAdvanceTheReissueCounter)
     WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause] - pauses_before, K);
+    /// The first loss is retried at once: no pause is slept or counted for it.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause] - pauses_before, K - 1);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 0u);
-    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
-    for (uint64_t s : clock.sleeps)
-        EXPECT_LE(s, 200u);   /// flat: every pause is one `backoff(1)` draw, whatever the loss count
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K - 1));
+    for (size_t i = 0; i < clock.sleeps.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps[i], static_cast<uint32_t>(i + 2)));
     EXPECT_EQ(backend->writeCount("k"), 1u + K + 1u + K);   /// seed, K refused, K rival moves, the one that landed
+
+    /// A new call starts its own count.
+    clock.sleeps.clear();
+    RaceMaker again(backend, clock, "k", 3, /*ambiguous=*/false);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.readModifyWrite("k", appendX(), Retry::standard())));
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps[0], 2));
+    EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps[1], 3));
 }
 
 TEST(CASRequests, AConflictThatSettledAFaultKeepsTheGrowingSchedule)
@@ -2298,6 +2357,183 @@ TEST(CASRequests, AConflictThatSettledAFaultKeepsTheGrowingSchedule)
     ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
     for (size_t i = 0; i < clock.sleeps.size(); ++i)
         EXPECT_LE(clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i)) << "reissue " << i;
+}
+
+namespace
+{
+
+/// Another writer of `key` that commits on demand. Its requests are bracketed by marks, so
+/// `renderOwnRequests` shows only the caller's own requests.
+struct MarkedRival
+{
+    MarkedRival(std::shared_ptr<CountingBackend> backend_, FakeClock & clock, String key_)
+        : backend(std::move(backend_)), key(std::move(key_))
+        , rival_requests(makeRequests(backend, clock)), rival(rival_requests.admit())
+    {
+    }
+
+    void commit()
+    {
+        inside = true;
+        backend->mark("rival{");
+        const auto current = rival.read(key, Retry::once());
+        (void)orThrow(rival.replace(key, current->bytes + "r", current->etag, Retry::once()), "rival");
+        backend->mark("}rival");
+        ++commits;
+        inside = false;
+    }
+
+    std::shared_ptr<CountingBackend> backend;
+    String key;
+    int commits = 0;
+    bool inside = false;
+    CasRequests rival_requests;
+    CasOperation rival;
+};
+
+String repeated(std::string_view unit, size_t times)
+{
+    String out;
+    for (size_t i = 0; i < times; ++i)
+        out += unit;
+    return out;
+}
+
+}
+
+/// A conflict that settled a transport fault ends the run of clean losses: the clean loss after it starts a new run and
+/// is retried at once, so only the fault-settled conflict pauses.
+TEST(CASRequests, AFaultSettledConflictRestartsTheCleanLossCount)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    MarkedRival rival(backend, clock, "k");
+    int moves = 0;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (rival.inside || moves >= 3)
+            return;
+        ++moves;
+        rival.commit();
+        if (moves == 2)
+            backend->injectAmbiguousWrite("k");
+    });
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.readModifyWrite("k", appendX(), Retry::standard())));
+    EXPECT_EQ(moves, 3) << "premise: clean, fault-settled, clean";
+    EXPECT_EQ(clock.sleeps.size(), 1u) << "the clean losses around the fault are each the first of their run";
+}
+
+/// The rival lands right before the first two writes and during every pause. The first loss is retried at once; the
+/// write after the pause that follows the second is decided on a read taken after it, so it lands.
+TEST(CASRequests, AReadModifyWriteIsNotStarvedByAWriterThatCommitsDuringEveryPause)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    MarkedRival rival(backend, clock, "k");
+    int collisions = 0;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (rival.inside || collisions >= 2)
+            return;
+        ++collisions;
+        rival.commit();
+    });
+    auto sleep = clock.sleepFn();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        backend->mark("pause");
+        rival.commit();
+    });
+    backend->clearJournal();
+
+    WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*backend, "k"), "RWRWPRW")
+        << "read, refused write, read, refused write, pause, read, the write on it";
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+    EXPECT_EQ(rival.commits, 3);
+    expectBytes(*backend, "k", "vrrrx");
+}
+
+TEST(CASRequests, AnOnPresenceWriteIsNotStarvedByAWriterThatCommitsDuringEveryPause)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    MarkedRival rival(backend, clock, "k");
+    int collisions = 0;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (rival.inside || collisions >= 2)
+            return;
+        ++collisions;
+        rival.commit();
+    });
+    auto sleep = clock.sleepFn();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        backend->mark("pause");
+        rival.commit();
+    });
+    backend->clearJournal();
+
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> &) -> std::optional<String> { return String("w"); }, Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*backend, "k"), "HWHWPHW");
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+    expectBytes(*backend, "k", "w");
+}
+
+/// A rival that lands between every read and the write on it still ends the loop on the decision
+/// cap, and every write after the first is decided on a read taken after its pause.
+TEST(CASRequests, AReadModifyWriteAgainstAWriterBeforeEveryWriteEndsOnTheCount)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    MarkedRival rival(backend, clock, "k");
+    backend->onBeforeWrite("k", [&]
+    {
+        if (!rival.inside)
+            rival.commit();
+    });
+    auto sleep = clock.sleepFn();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        backend->mark("pause");
+    });
+    backend->clearJournal();
+
+    WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
+
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Attempts);
+    EXPECT_EQ(clock.sleeps.size(), kCasMaxDecisions - 2) << "no pause after the first refusal, retried at once, nor the last";
+    for (size_t i = 0; i < clock.sleeps.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps[i], static_cast<uint32_t>(i + 2)));
+    /// Only the last refusal is settled: no decision follows it, and its read is what the give-up reports.
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*backend, "k"), "RWRW" + repeated("PRW", kCasMaxDecisions - 3) + "PRWR");
+    const auto * seen = std::get_if<Object>(&gave_up->last_seen);
+    ASSERT_NE(seen, nullptr);
+    expectBytes(*backend, "k", seen->bytes);
 }
 
 TEST(CASRequests, ReplaceReportsWhetherAConflictSettledAFault)
@@ -2379,8 +2615,9 @@ TEST(CASRequests, CleanConflictsBeforeAFaultDoNotInflateTheFaultsFirstBackoff)
     WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
-    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K + 1));
-    EXPECT_LE(clock.sleeps[K], 200u) << "the first transport reissue sleeps within backoff(1)";
+    /// The first clean loss is retried at once, so K - 1 conflict pauses precede the reissue's.
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    EXPECT_LE(clock.sleeps[K - 1], 200u) << "the first transport reissue sleeps within backoff(1)";
 }
 
 TEST(CASRequests, ADeterministicLocalFailureSurfacesUnchangedWithoutAReissue)
@@ -2787,7 +3024,7 @@ TEST(CASRequests, ANameOnlyAccessDenialOnAReadPropagatesWhenNoRefreshIsAvailable
     EXPECT_TRUE(clock.sleeps.empty());
 }
 
-TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpUnresolved)
+TEST(CASRequests, ReadModifyWriteWhoseReadAfterTheConflictPauseFailsGivesUpUnresolved)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
@@ -2796,9 +3033,10 @@ TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpU
     orThrow(op.create("k", "v0", Retry::standard()), "create");
     backend->resetCounts();
 
-    /// The store refuses the precondition, and both reads that would settle what happened answer with
-    /// a store refusal the read loop surfaces at once rather than reissuing. They are armed from inside
-    /// the write so the loop's OWN first read still succeeds and `decide` sees the object.
+    /// The store refuses the precondition, and the read after the conflict pause answers with a store
+    /// refusal the read loop surfaces at once rather than reissuing; the refusal itself is not settled, as
+    /// that read replaces what settling it would see. Armed from inside the write so the loop's OWN first
+    /// read still succeeds and `decide` sees the object.
     backend->refuseNextWrite("k");
     bool armed = false;
     backend->onBeforeWrite("k", [&]
@@ -2807,14 +3045,13 @@ TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpU
             return;
         armed = true;
         backend->failNextReadWith("k", s3Error(Aws::S3::S3Errors::UNKNOWN, "MalformedXML"));
-        backend->failNextReadWith("k", s3Error(Aws::S3::S3Errors::UNKNOWN, "MalformedXML"));
     });
 
     WriteResult result = op.readModifyWrite("k",
         [](const std::optional<Object> &) -> std::optional<String> { return String("v1"); }, Retry::standard());
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
-    /// No BOUND refused either read -- the reads themselves failed -- so naming a deadline the clock
+    /// No BOUND refused the read -- the read itself failed -- so naming a deadline the clock
     /// never reached would send its reader to widen the wrong thing, and nothing was observed to
     /// report as a conflict.
     EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
@@ -2822,8 +3059,8 @@ TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpU
     EXPECT_TRUE(std::holds_alternative<NotObserved>(gave_up->last_seen));
     /// The write count is unchanged after the first attempt: nothing ever said another one was safe.
     EXPECT_EQ(backend->writeTotal(), 1u);
-    EXPECT_EQ(backend->getTotal(), 3u);
-    EXPECT_EQ(clock.sleeps.size(), 1u);
+    EXPECT_EQ(backend->getTotal(), 2u);
+    EXPECT_TRUE(clock.sleeps.empty()) << "the first conflict is retried at once";
 }
 
 /// A missing bucket is an ANSWER the store gave, but not an answer about the object: an S3-compatible

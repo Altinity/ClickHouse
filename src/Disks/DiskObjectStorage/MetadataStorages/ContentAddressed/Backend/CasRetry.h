@@ -11,6 +11,12 @@ namespace DB::Cas
 /// An update of a shared object that keeps losing races fails at this count with `NETWORK_ERROR` "did not converge";
 /// there is no total time budget, and each request has its own window.
 inline constexpr uint32_t kCasMaxDecisions = 100;
+/// How much the pause grows with each further consecutive clean lost race of one call: enough to desynchronise competitors,
+/// short enough not to wait long when a race is brief.
+inline constexpr uint64_t kCasConflictPauseStepMs = 40;
+/// The ceiling of the pause's base: 100 lost races cost about 67 to 84 s of pauses, under the waits other parts of
+/// the server put on these loops. A pause adds up to a quarter of its base.
+inline constexpr uint64_t kCasConflictPauseCeilingMs = 750;
 /// The walk that fails at this count propagates its own error; a restart at it fails as "did not converge".
 inline constexpr uint32_t kCasMaxRecoveryWalks = 8;
 
@@ -65,12 +71,12 @@ struct Retry
     /// `attempt == 0` returns 0.
     static uint64_t backoff(uint32_t attempt);
 
-    /// The flat pause after a clean lost race: `backoff(1)`, uniform over [0, 200] ms. It does not grow
-    /// with the writer's loss count, because a settled conflict has nothing to wait for but
-    /// desynchronisation from its competitors, and growing it with the loss count made the oldest
-    /// loser the slowest and the likeliest to lose again. A conflict that settled a transport fault
-    /// keeps `backoff(attempt)`: the fault is what must pace the loop.
-    static uint64_t conflictBackoff() { return backoff(1); }
+    /// The pause after the `loss`-th consecutive clean lost race of one call (1-based): `base` plus uniform(0, base / 4),
+    /// `base = min(kCasConflictPauseCeilingMs, kCasConflictPauseStepMs * (loss - 1))`, so the first is 0. The next decision
+    /// reads after the pause, so its length does not change that decision's chance; it grows only to
+    /// lower the contention a repeated loss shows, and the jitter keeps competitors from retrying in step.
+    /// A conflict that settled a transport fault keeps `backoff(attempt)`: the fault is what must pace it.
+    static uint64_t conflictBackoff(uint32_t loss);
 
     /// A policy with `ms` milliseconds of its own budget and no lease bound.
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }

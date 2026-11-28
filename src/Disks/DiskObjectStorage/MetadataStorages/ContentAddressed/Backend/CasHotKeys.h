@@ -26,16 +26,18 @@ class CasOperation;
 /// growing sleep. `submit` takes a FIFO ticket for the key, waits its turn re-checking the caller's
 /// own fence, lease and deadline, obtains a base (the cache's object, else the engine's own read),
 /// runs the caller's `decide` on it, lands the candidate through the engine's `replace` or `create`
-/// on the caller's own operation and thread, and returns the engine's result unchanged. The caller
-/// keeps the retry loop: a `Conflict` is a lost race against another server, and the caller submits
-/// again after `Retry::conflictBackoff`.
+/// on the caller's own operation and thread, and returns the engine's result. The caller keeps the
+/// retry loop: a `Conflict` is a lost race against another server, and the caller submits again after
+/// `Retry::conflictBackoff` with `Start::Read`. Such a `Conflict` on a fresh read is returned unsettled
+/// (`NotObserved`) and leaves no cached body, since the read after the pause replaces both.
 ///
 /// The cache is a hint and never a source of truth: every write against it is conditional on its
-/// etag, so a stale entry costs one 412 and one resolve read; and a verdict a `decide` renders on it
+/// etag, so a stale entry costs one 412 and one resolve read, on which the hold decides and writes
+/// again at once (unless the 412 settled a transport fault); and a verdict a `decide` renders on it
 /// (a refusal by exception, or "nothing to write") is never delivered, because a refusal without a
 /// write is the one thing a 412 cannot correct -- the entry is dropped, the key is read, and the
-/// `decide` runs again on the read. The store's answer to a write decided on a hint is delivered
-/// whatever it is: it is a fact about the store, and the caller's ordinary retry learns the rest.
+/// `decide` runs again on the read. Any other answer to a write decided on a hint is delivered as it
+/// is: it is a fact about the store, and the caller's ordinary retry learns the rest.
 ///
 /// One instance per pool, shared by its three request planes; a `CasRequests` built without one owns
 /// a private instance with no cache. Every callback (`decide`, a `Liveness` closure, a backend hook)
@@ -56,11 +58,21 @@ public:
     /// its reads go through `op`; it reads `base->bytes` and never `base->etag`.
     using Decide = std::function<std::optional<String>(const std::optional<Object> &)>;
 
-    /// One hold on `key`: wait for the turn, obtain a base, run `decide`, one engine write, remember.
+    /// One hold on `key`: wait for the turn, obtain a base, run `decide`, one engine write, remember; a
+    /// clean `Conflict` on a cached base adds one more `decide` and write on the resolve read.
     /// The wait ends at the window of `policy`, or its earlier lease, taken at entry; the base read and
-    /// the write each bind their own. Returns the engine's own result for that write, in class and
-    /// content, and propagates a `decide`'s exception as `readModifyWrite` does, never from a cached base.
-    WriteResult submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
+    /// the write each bind their own. Returns the engine's own result for that write, except that a clean
+    /// `Conflict` on a fresh read that the caller retries (`OnLoss::SubmitAgain`, not a single attempt) is not
+    /// settled and carries `NotObserved`; it
+    /// propagates a `decide`'s exception as `readModifyWrite` does, never from a cached base.
+    /// `Start::Read` skips the cache: a caller that paused since its last submission must not write on a
+    /// body another holder remembered during that pause.
+    enum class Start : uint8_t { CacheOrRead, Read };
+    /// `OnLoss::End`: the caller will not submit again after a lost race, so a refusal is settled, as under a
+    /// single attempt, and the caller learns what won.
+    enum class OnLoss : uint8_t { SubmitAgain, End };
+    WriteResult submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide,
+                       Start start = Start::CacheOrRead, OnLoss on_loss = OnLoss::SubmitAgain);
 
     /// Items in the key's queue, the holder included; 0 for a key with no lane.
     size_t queueDepthForTest(const String & key) const;
@@ -104,7 +116,7 @@ private:
     };
     using Cache = CacheBase<String, Remembered, std::hash<String>, RememberedWeight>;
 
-    WriteResult hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
+    WriteResult hold(const String & key, CasOperation & op, const Retry & policy, const Decide & decide, Start start, OnLoss on_loss);
     void leave(const String & key, Item & item, bool entered_hold, uint64_t entered_ms, CasOperation & op) noexcept;
 
     std::optional<Object> cached(const String & key) const;
