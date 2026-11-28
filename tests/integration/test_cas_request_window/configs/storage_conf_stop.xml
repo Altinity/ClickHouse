@@ -1,0 +1,38 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_stop>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>itest-cas-stop</cas_server_root_id>
+                <endpoint>http://s3proxy:11121/test/cas_request_stop/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>false</cas_gc_enabled>
+                <!-- A parked request is released after a kill handshake, so it must outlive that handshake.
+                     Without adaptive timeouts a first attempt gets the full attempt timeout, not a short
+                     first-byte limit. Envelope = 8000 + 2 * min(500, 8000) = 9000 ms; the window (19000)
+                     exceeds two envelopes, and renew period + two envelopes + margin = 20500 < lease TTL. -->
+                <use_adaptive_timeouts>false</use_adaptive_timeouts>
+                <connect_timeout_ms>500</connect_timeout_ms>
+                <cas_attempt_timeout_ms>8000</cas_attempt_timeout_ms>
+                <cas_request_window_ms>19000</cas_request_window_ms>
+                <cas_mount_lease_ttl_ms>21000</cas_mount_lease_ttl_ms>
+                <cas_mount_renew_period_ms>2000</cas_mount_renew_period_ms>
+                <cas_lease_safety_margin_ms>500</cas_lease_safety_margin_ms>
+            </disk_cas_stop>
+        </disks>
+        <policies>
+            <cas_stop>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_stop</disk>
+                    </main>
+                </volumes>
+            </cas_stop>
+        </policies>
+    </storage_configuration>
+</clickhouse>

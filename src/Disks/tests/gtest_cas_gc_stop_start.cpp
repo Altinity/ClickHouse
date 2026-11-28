@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
@@ -373,6 +374,7 @@ TEST(CASGCStopStart, StopClearsLeadershipAfterManualRoundWithoutStart)
 
 TEST(CASGCStopStart, StartFailureRollsBackAndCanBeRetried)
 {
+    CAS_SKIP_WITHOUT_FAILPOINTS();
     for (const char * failpoint :
         {FailPoints::cas_gc_scheduler_fail_before_heartbeat_worker_start,
          FailPoints::cas_gc_scheduler_fail_before_worker_start})

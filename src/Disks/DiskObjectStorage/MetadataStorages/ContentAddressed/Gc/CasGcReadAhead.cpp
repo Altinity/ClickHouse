@@ -1,7 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 
+#include <Common/CurrentThread.h>
+#include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadGroupSwitcher.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
 
@@ -16,6 +20,21 @@ namespace ProfileEvents
 
 namespace DB::Cas
 {
+
+namespace
+{
+
+/// Runs `fn` in `group` and leaves it on return or unwind, before the caller publishes the answer: the round may end its
+/// query once it takes the answer.
+template <typename Fn>
+auto runInGroup(const ThreadGroupPtr & group, Fn && fn)
+{
+    ThreadGroupSwitcher switcher(group, ThreadName::UNKNOWN);
+    throwUnlessInThreadGroup(group, "CAS GC read-ahead worker");
+    return fn();
+}
+
+}
 
 GcReadAhead::GcReadAhead(CasOperation & op_, CasRequests & requests_, ThreadPool & pool_, size_t concurrency_)
     : op(op_), requests(requests_), pool(pool_), concurrency(concurrency_), generation(op_.generation())
@@ -54,18 +73,25 @@ void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request, Re
     slots.emplace(key, slot);
     try
     {
-        pool.scheduleOrThrowOnError([slot, key, requests_ptr = &requests, gen = generation, request]
+        /// The worker joins a manual round's query, so the query's stop vetoes the worker's retry of a failed request.
+        /// A scheduled round has no query group, and the switch does nothing.
+        pool.scheduleOrThrowOnError([slot, key, requests_ptr = &requests, gen = generation, request,
+                                     group = CurrentThread::getGroup()]
         {
             try
             {
-                CasOperation worker = requests_ptr->resume(gen);
-                slot->result = request(worker, key);
-                slot->promise.set_value();
+                slot->result = runInGroup(group, [&]
+                {
+                    CasOperation worker = requests_ptr->resume(gen);
+                    return request(worker, key);
+                });
             }
             catch (...)
             {
                 slot->promise.set_exception(std::current_exception());
+                return;
             }
+            slot->promise.set_value();
         });
     }
     catch (...)
@@ -193,7 +219,8 @@ std::function<IntentCreateResult()> GcReadAhead::startCreate(std::function<Inten
     }
 
     auto promise = std::make_shared<std::promise<IntentCreateResult>>();
-    auto job = [promise, fn = std::move(request), requests_ptr = &requests, gen = generation, failure = create_failure]
+    auto job = [promise, fn = std::move(request), requests_ptr = &requests, gen = generation, failure = create_failure,
+                group = CurrentThread::getGroup()]
     {
         if (failure->failed.load())
         {
@@ -201,21 +228,28 @@ std::function<IntentCreateResult()> GcReadAhead::startCreate(std::function<Inten
             promise->set_exception(failure->first);
             return;
         }
+        IntentCreateResult answer;
         try
         {
-            CasOperation worker = requests_ptr->resume(gen);
-            promise->set_value(fn(worker));
+            answer = runInGroup(group, [&]
+            {
+                CasOperation worker = requests_ptr->resume(gen);
+                return fn(worker);
+            });
         }
         catch (...)
         {
+            const auto error = std::current_exception();
             {
                 std::lock_guard lock(failure->mutex);
                 if (!failure->first)
-                    failure->first = std::current_exception();
+                    failure->first = error;
             }
             failure->failed.store(true);
-            promise->set_exception(std::current_exception());
+            promise->set_exception(error);
+            return;
         }
+        promise->set_value(std::move(answer));
     };
     const uint64_t id = next_create++;
     /// Registered before the worker exists, so the destructor waits for every worker that was scheduled.

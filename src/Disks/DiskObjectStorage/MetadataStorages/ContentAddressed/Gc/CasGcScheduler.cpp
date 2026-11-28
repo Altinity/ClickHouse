@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/CurrentThread.h>
@@ -20,6 +21,7 @@ namespace DB::ErrorCodes
     extern const int NETWORK_ERROR;
     extern const int ABORTED;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int QUERY_WAS_CANCELLED;
     extern const int SOCKET_TIMEOUT;
     extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int FAULT_INJECTED;
@@ -344,11 +346,16 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     catch (...)
     {
         fin.error_code = getCurrentExceptionCode();
-        /// Non-transient first, so a bug that coincides with a restart is never masked; then the
-        /// teardown flag, the only witness of a refused teardown fence (see `Outcome::Stopped`).
-        fin.outcome = !isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Failed
-                    : store->teardownBegun()                    ? Rec::Outcome::Stopped
-                                                                : Rec::Outcome::Aborted;
+        /// A stopped query ends a manual round with its verdict or with a transient code it caused, such as a
+        /// sent write left unresolved. Scheduler stops use the round's recorded observation. Non-transient before
+        /// the stop and teardown flags, so a bug that coincides with a stop or restart is never masked; the
+        /// teardown flag is the only witness of a refused teardown fence (see `Outcome::Stopped`).
+        const bool query_stopped = fin.error_code == ErrorCodes::QUERY_WAS_CANCELLED
+            || (isTransientGcRoundError(fin.error_code) && Cas::queryStopRequested());
+        fin.outcome = query_stopped                                                ? Rec::Outcome::Stopped
+                    : !isTransientGcRoundError(fin.error_code)                  ? Rec::Outcome::Failed
+                    : store->teardownBegun() || round_gc.roundStopObserved() ? Rec::Outcome::Stopped
+                                                                             : Rec::Outcome::Aborted;
         fin.error = getCurrentExceptionMessage(false);
         fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -415,6 +422,8 @@ void CasGcScheduler::loop()
             return;
         if (before_tick_lock_hook_for_test)
             before_tick_lock_hook_for_test();
+        /// Read under the round mutex: a manual round resets the observation as soon as the mutex is free.
+        bool round_stopped_by_scheduler = false;
         try
         {
             /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
@@ -445,6 +454,9 @@ void CasGcScheduler::loop()
                     if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
                         LOG_INFO(log, "CA GC cleanup of this mount's own `Creating` rows stopped by the disk's teardown: {}",
                             getCurrentExceptionMessage(false));
+                    else if (stopRequested() && isTransientGcRoundError(getCurrentExceptionCode()))
+                        LOG_INFO(log, "CA GC cleanup of this mount's own `Creating` rows stopped by the scheduler's stop: {}",
+                            getCurrentExceptionMessage(false));
                     else
                         tryLogCurrentException(log, "CA GC cleanup of this mount's own `Creating` rows failed (will retry next tick)");
                 }
@@ -467,7 +479,18 @@ void CasGcScheduler::loop()
             /// Only the background round: a manual round runs on a stopped scheduler too.
             gc.setStopSignal(stop_requested);
             SCOPE_EXIT({ gc.setStopSignal({}); });
-            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
+            const Cas::RoundReport report = [&]
+            {
+                try
+                {
+                    return runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
+                }
+                catch (...)
+                {
+                    round_stopped_by_scheduler = gc.roundStopObserved();
+                    throw;
+                }
+            }();
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)
             {
@@ -503,11 +526,19 @@ void CasGcScheduler::loop()
         }
         catch (...)
         {
+            if (tick_failure_hook_for_test)
+                tick_failure_hook_for_test();
             if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
             {
                 /// The disk is being torn down and the round was cut at its next request: expected,
                 /// recorded as `Stopped` by `runRoundLogged`, not an error to raise.
                 LOG_INFO(log, "CA GC round stopped by the disk's teardown: {}", getCurrentExceptionMessage(false));
+                continue;
+            }
+            if (round_stopped_by_scheduler && isTransientGcRoundError(getCurrentExceptionCode()))
+            {
+                /// `SYSTEM CAS GC STOP` ended the round, as asked; `runRoundLogged` recorded it as `Stopped`.
+                LOG_INFO(log, "CA GC round stopped by the scheduler's stop: {}", getCurrentExceptionMessage(false));
                 continue;
             }
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.

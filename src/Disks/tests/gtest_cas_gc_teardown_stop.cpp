@@ -278,14 +278,14 @@ TEST(CASGCTeardownStop, OpenPlaneSleepReturnsAtOnceOnceTeardownBegan)
     auto store = openPlainPool(backend);
     store->beginTeardown();
 
-    auto paused = std::async(std::launch::async, [&store] { store->openRequests().pause(60'000); });
+    auto paused = std::async(std::launch::async, [&store] { store->openRequests().sleepFor(60'000); });
     ASSERT_EQ(paused.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the open plane's sleep must observe the arm; a plain sleep holds for the full minute";
 
     /// Clearing the seam must put the interruptible sleep back, not the engine's plain one.
     store->setCasRetrySleepForTest([](uint64_t) {});
     store->setCasRetrySleepForTest({});
-    auto paused_again = std::async(std::launch::async, [&store] { store->openRequests().pause(60'000); });
+    auto paused_again = std::async(std::launch::async, [&store] { store->openRequests().sleepFor(60'000); });
     EXPECT_EQ(paused_again.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "resetting the retry-sleep seam left the open plane on the plain sleep";
 }

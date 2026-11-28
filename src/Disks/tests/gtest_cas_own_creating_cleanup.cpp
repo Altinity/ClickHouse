@@ -7,8 +7,14 @@
 
 #include <fmt/format.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+
+namespace DB::ErrorCodes
+{
+extern const int ABORTED;
+}
 
 namespace ProfileEvents
 {
@@ -107,5 +113,45 @@ TEST(CASOwnCreatingCleanup, AStopRequestBeforeThePassSendsNothing)
     const uint64_t before = requestTotal(*backend);
     store->cancelIdleOwnCreatingRows([] { return true; });
     EXPECT_EQ(requestTotal(*backend) - before, 0u);
+    EXPECT_EQ(ownCreatingRows(op, store), 3u);
+}
+
+/// A stop request that lands while the first row's cancel loses the catalog to another writer ends the pass at
+/// that cancel's next submission, before any further catalog write.
+TEST(CASOwnCreatingCleanup, AStopRequestDuringARowsConflictEndsThePass)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0};
+    config.mount_renew_period = std::chrono::milliseconds{3'600'000};
+    config.retry_sleep_fn = [](uint64_t) {};
+    PoolPtr store = Pool::open(backend, config);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    seedThreeOwnRows(op, store);
+    const String key = store->layout().refCatalogKey();
+
+    std::atomic<bool> stop = false;
+    size_t catalog_writes = 0;
+    bool in_hook = false;
+    /// Every catalog write of the pass meets an incarnation another writer just moved, as on a hot catalog.
+    backend->onBeforeWrite(key, [&]
+    {
+        if (in_hook)
+            return;
+        in_hook = true;
+        ++catalog_writes;
+        CasRequests other_requests = openRequestsForTest(backend);
+        CasOperation other = other_requests.admit();
+        const auto current = other.read(key, Retry::once());
+        EXPECT_TRUE(current && std::holds_alternative<Committed>(other.replace(key, current->bytes, current->etag, Retry::once())));
+        in_hook = false;
+        stop = true;
+    });
+
+    const uint64_t cancels = ownCancels();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->cancelIdleOwnCreatingRows([&] { return stop.load(); }); });
+    backend->onBeforeWrite(key, {});
+    EXPECT_EQ(catalog_writes, 1u) << "the stopped cancel submitted again";
+    EXPECT_EQ(ownCancels() - cancels, 0u);
     EXPECT_EQ(ownCreatingRows(op, store), 3u);
 }

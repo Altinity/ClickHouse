@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
 #include <Common/Exception.h>
@@ -39,6 +40,7 @@ bool CatalogLifecycleReconciler::isCreatorTerminal(const CreatorFence & creator)
     const auto [it, inserted] = creator_slots.try_emplace({creator.server_root_id, creator.writer_epoch});
     if (!inserted)
         return it->second == CreatorSlotStatus::Terminal;
+    throwIfBackgroundStopped();
     try
     {
         it->second = probe_creator_slot(creator);
@@ -47,6 +49,7 @@ bool CatalogLifecycleReconciler::isCreatorTerminal(const CreatorFence & creator)
     {
         if (e.code() == ErrorCodes::LOGICAL_ERROR)
             throw;
+        rethrowIfStoppedOwnersFailure();
         /// A deposed leader's read fails too; the drain's own verdict reports that, not this creator.
         if (op.admitted())
             LOG_WARNING(getLogger("CatalogLifecycleReconciler"),
@@ -91,6 +94,7 @@ std::optional<CatalogEntry> CatalogLifecycleReconciler::selectEligible(
 {
     for (const CatalogEntry & entry : catalog.catalog.entries)
     {
+        throwIfQueryStopped();
         if (entry.state == NsState::Creating)
         {
             /// The probe reads the creator's mount slot, which a deposed leader may not do; the verdict
@@ -141,6 +145,8 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
 
     for (;;)
     {
+        throwIfQueryStopped();
+        throwIfBackgroundStopped();
         const std::optional<CatalogEntry> eligible = selectEligible(catalog);
         if (!eligible)
         {

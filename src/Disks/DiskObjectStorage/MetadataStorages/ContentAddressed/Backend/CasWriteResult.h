@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 
@@ -48,10 +49,12 @@ struct Declined  { Observation seen; };
 /// carry: an operator's attempt counters sum over ALL the endings of a write, and losing the key is
 /// one an operator wants counted rather than dropped. `any_ambiguous` is true when an attempt of the
 /// inner write ended without proof of whether it applied before the resolve read settled the race: a
-/// caller outside the engine paces such a conflict on the growing schedule, as the engine's own
-/// loops do, and a clean lost race on the flat one. `attempts_sent` cannot stand in for it: a
+/// caller outside the engine paces such a conflict on the fault schedule (`Retry::backoff`), as the
+/// engine's own loops do, and a clean lost race on `Retry::conflictBackoff`. `attempts_sent` cannot stand in for it: a
 /// throttled first attempt whose resolve read finds the key moved is one attempt, ambiguous.
-struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; };
+/// `observed_stop` is true when an operation of the call failed and saw its query stopped: a loop takes the
+/// conflict as the answer and starts no further decision.
+struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; bool observed_stop = false; };
 /// The store itself refused the request (not a lost precondition) -- `store_error` is a ClickHouse
 /// error code and `message` explains it. `attempts_sent` is the same count `Conflict` carries, for
 /// the same reason.
@@ -59,7 +62,7 @@ struct Refused   { int store_error; String message; uint32_t attempts_sent = 0; 
 /// No attempt landed and none can be proven safe to keep making.
 struct GaveUp
 {
-    enum class Why : uint8_t { Deadline, FenceLost, Unresolved };
+    enum class Why : uint8_t { Deadline, FenceLost, Unresolved, Attempts };
     enum class Source : uint8_t { Policy, Lease };
     Why why; Source deadline_source; bool sent_any; Observation last_seen;
     /// The HTTP attempts this call made, the same count `Committed` carries. Operator counters -- the
@@ -120,6 +123,8 @@ inline std::optional<Etag> orThrow(WriteResult && result, std::string_view what)
                     throwCasTransientUnavailable(String(what), "mount fence tripped: the durable write is refused because this node no longer holds the mount incarnation it was admitted under");
                 case GaveUp::Why::Deadline:
                     throwCasWriteRetryLater(fmt::format("{}: gave up at the {} deadline after {} attempt(s)", what, g.deadline_source == GaveUp::Source::Lease ? "lease" : "policy", g.sent_any ? "one or more" : "zero"));
+                case GaveUp::Why::Attempts:
+                    throwCasWriteRetryLater(fmt::format("{}: did not converge after {} decisions", what, kCasMaxDecisions));
                 case GaveUp::Why::Unresolved:
                     throwCasWriteRetryLater(g.sent_any
                         ? fmt::format("{}: the write is unresolved (sent, resolve read found {})", what, renderObservation(g.last_seen))

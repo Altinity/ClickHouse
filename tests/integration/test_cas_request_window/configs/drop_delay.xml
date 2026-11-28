@@ -1,0 +1,4 @@
+<clickhouse>
+    <!-- A plain `DROP TABLE` reaches the background removal at once, not after the default eight minutes. -->
+    <database_atomic_delay_before_drop_table_sec>0</database_atomic_delay_before_drop_table_sec>
+</clickhouse>

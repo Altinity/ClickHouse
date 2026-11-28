@@ -17,6 +17,13 @@ uint64_t Retry::backoff(uint32_t attempt)
     return thread_local_rng() % (ceiling + 1);     /// full jitter: uniform(0, ceiling)
 }
 
+uint64_t Retry::conflictBackoff(uint32_t loss)
+{
+    const uint64_t steps = loss > 0 ? loss - 1 : 0;
+    const uint64_t base = std::min<uint64_t>(kCasConflictPauseCeilingMs, kCasConflictPauseStepMs * steps);
+    return base + thread_local_rng() % (base / 4 + 1);
+}
+
 uint64_t Retry::spacedPause(uint64_t spacing_draw_ms, uint64_t attempt_started_ms, uint64_t now_ms)
 {
     const uint64_t taken_ms = now_ms > attempt_started_ms ? now_ms - attempt_started_ms : 0;
@@ -36,14 +43,16 @@ uint64_t Retry::drawSpacing(uint64_t attempt_spacing_ms_)
 Retry::Bound Retry::bind(uint64_t now_ms, uint64_t default_window_ms) const
 {
     const uint64_t effective_window_ms = window_ms.value_or(default_window_ms);
-    const uint64_t own_deadline_ms = policy_deadline_ms
-        ? *policy_deadline_ms
-        : (now_ms > std::numeric_limits<uint64_t>::max() - effective_window_ms
-               ? std::numeric_limits<uint64_t>::max()
-               : now_ms + effective_window_ms);
-    if (lease_deadline_ms && *lease_deadline_ms < own_deadline_ms)
-        return {*lease_deadline_ms, true};
-    return {own_deadline_ms, false};
+    Bound bound{
+        .deadline_ms = now_ms > std::numeric_limits<uint64_t>::max() - effective_window_ms
+            ? std::numeric_limits<uint64_t>::max()
+            : now_ms + effective_window_ms,
+        .source = Bound::Source::RequestWindow};
+    if (outside_cap_ms && *outside_cap_ms < bound.deadline_ms)
+        bound = {*outside_cap_ms, Bound::Source::OutsideCap};
+    if (lease_deadline_ms && *lease_deadline_ms < bound.deadline_ms)
+        bound = {*lease_deadline_ms, Bound::Source::Lease};
+    return bound;
 }
 
 }

@@ -1,27 +1,41 @@
 #include <gtest/gtest.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
+#include <base/scope_guard.h>
 
 #include <Poco/Exception.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
 using DB::Cas::tests::SharedWaitLog;
+using DB::Cas::tests::StoppedBy;
+using DB::Cas::tests::exceptionCodeOf;
 
 namespace
 {
@@ -276,6 +290,18 @@ TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
 /// Removing `mutateRefsAfterWriterCleanup` from the `dropRef` delegate leaves the rejected build at
 /// `minActive` even though the ref removal succeeds. The observable floor proves the direct API
 /// serviced the inherited cleanup duty before performing its own mutation.
+/// A precommit append refused after admission may already be on its way, so it keeps its cleanup duty and the build
+/// floor. Only a closed removal lane refuses before the append is queued, and that refusal owes nothing.
+TEST(CASWriterDuties, PrecommitRefusedAfterAdmissionKeepsItsDuty)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = openFrozenSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_refused_after_admission"};
+    publishEmptyRef(store, ns, "target");
+    leaveRejectedCleanupDuty(store, ns);
+    EXPECT_TRUE(store->writerCleanupDutiesPendingForTest());
+}
+
 TEST(CASWriterDuties, DropRefServicesPendingDutyBeforeRemovingTheRef)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
@@ -643,4 +669,207 @@ TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
     EXPECT_FALSE(store->resolveRef(ns, "target").has_value());
     EXPECT_EQ(store->minActive(), store->peekNextBuildSeq())
         << "the retried drain settles the retained duty and lets the mutation proceed";
+}
+
+namespace
+{
+
+constexpr auto STOP_WATCHDOG = std::chrono::seconds(30);
+
+/// Leaves one duty per ref, each owing a real `OwnerTransition` removal: durable precommits destroyed
+/// unsettled. Every precommit lands before the first destruction, since a precommit drains pending duties.
+std::vector<uint64_t> leaveDurableCleanupDuties(const PoolPtr & store, const RootNamespace & ns, const std::vector<String> & ref_names)
+{
+    std::vector<PartWriteTxnPtr> builds;
+    std::vector<uint64_t> seqs;
+    for (const auto & ref_name : ref_names)
+    {
+        ManifestId id;
+        builds.push_back(stageEmptyManifest(store, ns, ref_name, id));
+        seqs.push_back(builds.back()->buildSeq());
+        builds.back()->precommitAdd(ns, ref_name, id);
+    }
+    for (auto & build : builds)
+        build.reset();
+    return seqs;
+}
+
+/// Runs `call` on a thread with a killable query and a background owner; `arm` gets the stop of `owner` before
+/// `call` runs.
+int runAsStoppable(StoppedBy owner, const std::function<void(const std::function<void()> &)> & arm, const std::function<void()> & call)
+{
+    int code = 0;
+    DB::Cas::tests::onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = DB::Cas::tests::backgroundOwnerStoppedBy(background_stopped);
+        arm(DB::Cas::tests::stopperOf(owner, query, background_stopped));
+        code = exceptionCodeOf(call);
+    });
+    return code;
+}
+
+void updateLater(const PoolPtr & store, const RootNamespace & ns)
+{
+    store->updateRefPublishedAt(ns, "later", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+}
+
+}
+
+namespace
+{
+
+/// A caller's owner stops in the cleanup-duty drain: once while it waits behind another drainer, once while it drains
+/// itself between two duties.
+void runCleanupDrainWithStoppedCaller(StoppedBy owner)
+{
+    {
+        SCOPED_TRACE("waiting behind another drainer");
+        auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+        auto store = openFrozenSingleAttemptPool(backend);
+        const RootNamespace ns{"srv1/writer_duty_stopped_waiter"};
+        publishEmptyRef(store, ns, "target");
+        publishEmptyRef(store, ns, "later");
+        const uint64_t duty_seq = leaveDurableCleanupDuties(store, ns, {"durable"}).front();
+        ASSERT_TRUE(store->writerCleanupDutiesPendingForTest());
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool drainer_parked = false;
+        bool release_drainer = false;
+        bool drainer_left = false;
+        std::atomic<bool> entered{false};
+        store->setRefPreCarveHookForTest([&]
+        {
+            if (entered.exchange(true))
+                return;
+            std::unique_lock lock(mutex);
+            drainer_parked = true;
+            cv.notify_all();
+            cv.wait_for(lock, STOP_WATCHDOG, [&] { return release_drainer; });
+            drainer_left = true;
+        });
+        SCOPE_EXIT({ store->setRefPreCarveHookForTest(nullptr); });
+        /// A killed query keeps waiting, so the parked drainer is released once that caller is seen waiting.
+        store->setWriterCleanupWaitHookForTest([&]
+        {
+            if (owner != StoppedBy::Query)
+                return;
+            std::lock_guard lock(mutex);
+            release_drainer = true;
+            cv.notify_all();
+        });
+        SCOPE_EXIT({ store->setWriterCleanupWaitHookForTest(nullptr); });
+        std::future<int> drainer
+            = std::async(std::launch::async, [&] { return exceptionCodeOf([&] { store->dropRef(ns, "target"); }); });
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, STOP_WATCHDOG, [&] { return drainer_parked; }));
+        }
+
+        bool returned_while_drainer_parked = false;
+        bool draining_on_return = false;
+        bool pending_on_return = false;
+        uint64_t floor_on_return = 0;
+        const int code = runAsStoppable(owner, [](const std::function<void()> & stop) { stop(); }, [&]
+        {
+            SCOPE_EXIT({
+                draining_on_return = store->writerCleanupDrainingForTest(ns);
+                pending_on_return = store->writerCleanupDutiesPendingForTest();
+                floor_on_return = store->minActive();
+                std::lock_guard lock(mutex);
+                returned_while_drainer_parked = !drainer_left;
+                release_drainer = true;
+                cv.notify_all();
+            });
+            updateLater(store, ns);
+        });
+        ASSERT_EQ(drainer.wait_for(STOP_WATCHDOG), std::future_status::ready);
+
+        if (owner == StoppedBy::Background)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::ABORTED);
+            EXPECT_TRUE(returned_while_drainer_parked) << "the stopped caller waited for the other drainer";
+            EXPECT_TRUE(draining_on_return) << "the other drainer's claim must stay";
+            EXPECT_TRUE(pending_on_return);
+            EXPECT_EQ(floor_on_return, duty_seq);
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << "a killed query waits for the other drainer and proceeds";
+            EXPECT_FALSE(returned_while_drainer_parked) << "the killed query returned before the drainer was released";
+            EXPECT_FALSE(draining_on_return);
+            EXPECT_FALSE(pending_on_return);
+        }
+        EXPECT_EQ(drainer.get(), 0);
+        EXPECT_FALSE(store->writerCleanupDutiesPendingForTest());
+        EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+        EXPECT_NO_THROW(updateLater(store, ns)) << "a later caller is admitted";
+    }
+
+    {
+        SCOPED_TRACE("draining, stopped between duties");
+        auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+        auto store = openFrozenSingleAttemptPool(backend);
+        const RootNamespace ns{"srv1/writer_duty_stopped_drainer"};
+        publishEmptyRef(store, ns, "later");
+        const uint64_t next_seq = leaveDurableCleanupDuties(store, ns, {"settled", "next"}).back();
+
+        std::atomic<bool> stopped{false};
+        std::atomic<int> tenures_after_stop{0};
+        const int code = runAsStoppable(owner, [&](const std::function<void()> & stop)
+        {
+            /// The first duty's append is installed when the owner stops; it completes as shared work.
+            store->setCarveHookForTest([&, stop](CasRefLedger::CarvePhaseForTest phase)
+            {
+                if (phase == CasRefLedger::CarvePhaseForTest::PostInstallPreAck && !stopped.exchange(true))
+                    stop();
+            });
+            store->setRefPreTenureHookForTest([&]
+            {
+                if (stopped.load())
+                    ++tenures_after_stop;
+            });
+        }, [&] { updateLater(store, ns); });
+        store->setCarveHookForTest(nullptr);
+        store->setRefPreTenureHookForTest(nullptr);
+
+        EXPECT_TRUE(stopped.load());
+        EXPECT_FALSE(store->writerCleanupDrainingForTest(ns));
+        if (owner == StoppedBy::Background)
+        {
+            EXPECT_EQ(code, DB::ErrorCodes::ABORTED);
+            EXPECT_EQ(tenures_after_stop.load(), 0) << "a stopped drainer starts no append for the next duty";
+            EXPECT_TRUE(store->writerCleanupDutiesPendingForTest());
+            EXPECT_EQ(store->minActive(), next_seq) << "the settled duty is retired, the next one is not";
+            const auto live = store->livePrecommitsForTest(ns);
+            ASSERT_EQ(live.size(), 1u);
+            EXPECT_EQ(live.begin()->first, "next");
+            EXPECT_NO_THROW(updateLater(store, ns)) << "a later caller drains the next duty";
+        }
+        else
+        {
+            EXPECT_EQ(code, 0) << "a killed query drains every duty and runs its own mutation";
+            EXPECT_GT(tenures_after_stop.load(), 0) << "the next duty's append ran after the kill";
+            EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+        }
+        EXPECT_FALSE(store->writerCleanupDutiesPendingForTest());
+        EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+    }
+}
+
+}
+
+/// A caller whose background owner stops leaves the cleanup-duty drain without changing it: waiting behind another
+/// drainer, it leaves that drainer's claim, the queued duty and the build floor; draining itself, it stops between
+/// duties only after the settled one is retired and popped, and starts no append for the next one.
+TEST(CASWriterDuties, BackgroundStoppedCleanupDrainerLeavesDutyAndFloor)
+{
+    runCleanupDrainWithStoppedCaller(StoppedBy::Background);
+}
+
+/// A killed query is not a background owner: it waits for the other drainer, and drains every duty itself.
+TEST(CASWriterDuties, KilledQueryWaitsForTheDrainerAndDrainsEveryDuty)
+{
+    runCleanupDrainWithStoppedCaller(StoppedBy::Query);
 }

@@ -444,7 +444,7 @@ TEST(CASUploadDetached, MergeFailureLeavesBuildUntouched)
     const auto pre_merge_snapshot = build->depsSnapshotForTest();
     ASSERT_EQ(pre_merge_snapshot.size(), 1u);   /// only the pre-existing dep; the detached uploads folded nothing
 
-    build->setMergeHookForTest([](size_t applied_so_far)
+    build->setAdoptionHookForTest([](size_t applied_so_far)
     {
         if (applied_so_far == 1)
             throw std::bad_alloc();

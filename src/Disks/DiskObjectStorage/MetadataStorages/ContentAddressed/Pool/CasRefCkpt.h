@@ -90,6 +90,10 @@ struct CkptStampResult
     CkptStampOutcome outcome;
     /// Set iff `Stamped`: the body now durable and the token it was written under.
     std::optional<CkptSample> stamped;
+    /// True only for an `Unresolved` write that was sent and may still land; false when nothing that may land was sent.
+    bool sent_any = false;
+    /// For `TokenMismatch`: the query stopped and cut short the read that settles the refusal.
+    bool observed_stop = false;
 };
 
 /// One conditional replace on `accepted.etag` with `{life_epoch, checkpoint_snapshot_id}` at generation 3.

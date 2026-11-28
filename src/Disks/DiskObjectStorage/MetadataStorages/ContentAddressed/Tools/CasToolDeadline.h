@@ -66,8 +66,8 @@ public:
         check(phase);
         if (!requests)
             return Retry::standard();
-        const Retry chosen = op.freeze(Retry::standard()).cappedAt(deadline_ms);
-        if (!op.oneAttemptFitsBefore(*chosen.policy_deadline_ms))
+        const Retry chosen = Retry::standard().cappedAt(deadline_ms);
+        if (!op.oneAttemptFits(chosen))
             throwExceeded(phase);
         return chosen;
     }

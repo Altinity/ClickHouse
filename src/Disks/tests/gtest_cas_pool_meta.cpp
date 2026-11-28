@@ -34,7 +34,7 @@ CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fe
 
 }
 
-TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
+TEST(CASPoolMeta, AdmitOrValidateEndsAfterAHundredDecisionsUnderPerpetualConflict)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
@@ -53,10 +53,12 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     const String key = layout.poolMetaKey();
     EXPECT_TRUE(clock.sleeps.empty());   /// nothing paced yet -- the trailing check below is about THIS call
     bool inside_hook = false;
+    size_t decisions = 0;
     backend->onBeforeWrite(key, [&]
     {
         if (inside_hook)
             return;
+        ++decisions;
         inside_hook = true;
         auto hook_requests = DB::Cas::tests::openRequestsForTest(BackendPtr(backend));
         auto hook_op = hook_requests.admit();
@@ -65,18 +67,17 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
         inside_hook = false;
     });
 
-    /// `orThrow`'s `GaveUp{Deadline}` arm throws exactly `NETWORK_ERROR` (`throwCasWriteRetryLater`),
-    /// pinning the deadline outcome apart from the two failures a wrong migration could also throw as
-    /// a `DB::Exception` here: `LOGICAL_ERROR` (the absence branch) or `BAD_ARGUMENTS` (`allow_new`
-    /// plumbing regressed).
+    /// The cap text sets this apart from the two failures a wrong migration could also throw here:
+    /// `LOGICAL_ERROR` (the absence branch) or `BAD_ARGUMENTS` (`allow_new` plumbing regressed).
     auto admit_op = requests.admit();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 decisions", [&]
     {
         (void)PoolMeta::createOrValidate(
             admit_op, layout, 256, /*gc_shards=*/1,
             BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
     });
-    /// Bounded by the deadline, not a live-lock: it paced its retries rather than spinning.
+    EXPECT_EQ(decisions, kCasMaxDecisions);
+    /// It paced its decisions rather than spinning.
     EXPECT_FALSE(clock.sleeps.empty());
 }
 

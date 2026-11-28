@@ -535,13 +535,14 @@ public:
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
 
-    /// Install (or clear) the stop signal of the rounds that follow. Planning asks it before each read, the walk
-    /// before each step, and the intake once more after its last walk. Once it answers true, the intake reads no
-    /// further ref log, every namespace it has not finished stays unproven, and the round deletes nothing; the
-    /// reduce and the commit still run. A stop after the final intake poll does not affect the round. Not asked:
-    /// the pre-fold drain of catalog rows, the checkpoint reads before planning, and a cold cursor's resolution,
-    /// which may follow one backlink per epoch. Installed and cleared like `setPhaseSink`.
+    /// Install (or clear) the stop signal of the rounds that follow, like `setPhaseSink`. The drain and pre-listing
+    /// poll throw `ABORTED` and set `roundStopObserved`. During intake, a stop ends reads and suppresses deletion.
+    /// Reduce and commit still run. Checkpoint reads and cold cursor resolution do not poll. The callback may run
+    /// under a CAS mutex, so it must be lock-free or take only a leaf lock.
     void setStopSignal(std::function<bool()> signal) { stop_signal = std::move(signal); }
+
+    /// Whether the current or last `runRegularRound` found the stop signal true before its hot listing.
+    bool roundStopObserved() const { return round_stop_observed; }
 
     /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
@@ -1091,6 +1092,7 @@ private:
     GcPhaseSink phase_sink;
     /// See `setStopSignal`. Empty: the intake is never stopped.
     std::function<bool()> stop_signal;
+    bool round_stop_observed = false;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     /// Every round-engine log line goes through this logger (see the constructor's `log_` doc
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.

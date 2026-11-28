@@ -1,12 +1,16 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -14,6 +18,7 @@
 #include <functional>
 #include <mutex>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -31,6 +36,8 @@ namespace DB::ErrorCodes
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int NETWORK_ERROR;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 using namespace DB;
@@ -1607,6 +1614,249 @@ TEST_F(CASDecommission, ResumesOverItsOwnTombstone)
         EXPECT_TRUE(rerun.member_retired);
         expectOwner(die_at == DieAt::AfterMark ? 5 : 4, true, true);
         EXPECT_FALSE(exists("p/roots/victim/loose_file"));
+    }
+}
+
+namespace
+{
+
+/// Runs `on_first_staging_delete` before the first delete under the victim's staging prefix, and counts the
+/// listings of each prefix.
+class StopOnFirstStagingDeleteBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::list;
+
+    std::function<void()> on_first_staging_delete;
+
+    size_t listingsOf(const String & prefix) const
+    {
+        std::lock_guard lock(mutex);
+        return static_cast<size_t>(std::count(listed_prefixes.begin(), listed_prefixes.end(), prefix));
+    }
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(mutex);
+            listed_prefixes.push_back(prefix);
+        }
+        return InMemoryBackend::list(prefix, cursor, limit, access);
+    }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (on_first_staging_delete && key.starts_with("p/staging/victim/"))
+            std::exchange(on_first_staging_delete, {})();
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::vector<String> listed_prefixes;
+};
+
+}
+
+/// A decommission whose owner stops during the staging drain deletes nothing more and lists no further prefix:
+/// the stop ends the run instead of becoming a warning per remaining object.
+TEST_F(CASDecommission, OwnerStopDuringTheDrainEndsTheRun)
+{
+    auto backend = startVictim(std::make_shared<StopOnFirstStagingDeleteBackend>());
+    seed("p/staging/victim/a_first.tmp");
+    seed("p/staging/victim/b_second.tmp");
+    seed("p/roots/victim/c_third");
+    std::atomic<bool> stopped = false;
+    size_t roots_listings_at_stop = 0;
+    backend->on_first_staging_delete = [&]
+    {
+        roots_listings_at_stop = backend->listingsOf("p/roots/victim/");
+        stopped = true;
+    };
+
+    {
+        const auto owner = OwnerScope::background([&stopped]
+        {
+            if (stopped)
+                throw Exception(ErrorCodes::ABORTED, "background owner stopped");
+        });
+        expectThrowsCode(ErrorCodes::ABORTED, [&] { (void)run("admin"); });
+    }
+
+    ASSERT_TRUE(stopped) << "premise: the drain reached the staging prefix";
+    EXPECT_FALSE(exists("p/staging/victim/a_first.tmp")) << "the delete the stop landed in";
+    EXPECT_TRUE(exists("p/staging/victim/b_second.tmp"));
+    EXPECT_TRUE(exists("p/roots/victim/c_third"));
+    EXPECT_EQ(backend->listingsOf("p/roots/victim/"), roots_listings_at_stop) << "the stopped drain listed the roots";
+}
+
+/// A killed query ends the key drain at the next key with its own error, and a delete that failed after the kill ends
+/// it with that delete's error, not with a warning: the next staging key and the roots stay.
+TEST_F(CASDecommission, KilledQueryEndsTheKeyDrainAtTheNextKey)
+{
+    for (const bool delete_fails : {false, true})
+    {
+        SCOPED_TRACE(delete_fails ? "the delete fails after the kill" : "the delete succeeds after the kill");
+        auto backend = startVictim(std::make_shared<StopOnFirstStagingDeleteBackend>());
+        seed("p/staging/victim/a_first.tmp");
+        seed("p/staging/victim/b_second.tmp");
+        seed("p/roots/victim/c_third");
+        size_t roots_listings_at_kill = 0;
+        int code = 0;
+        String message;
+        std::thread killed([&]
+        {
+            std::optional<DB::ThreadStatus> thread_status;
+            thread_status.emplace();
+            CasKillableQuery query(getContext().context);
+            backend->on_first_staging_delete = [&]
+            {
+                roots_listings_at_kill = backend->listingsOf("p/roots/victim/");
+                query.kill();
+                if (delete_fails)
+                    throw Exception(ErrorCodes::NETWORK_ERROR, "injected staging delete failure");
+            };
+            try
+            {
+                (void)run("admin");
+            }
+            catch (const Exception & e)
+            {
+                code = e.code();
+                message = e.message();
+            }
+        });
+        killed.join();
+
+        EXPECT_EQ(code, delete_fails ? ErrorCodes::NETWORK_ERROR : ErrorCodes::QUERY_WAS_CANCELLED) << message;
+        EXPECT_EQ(exists("p/staging/victim/a_first.tmp"), delete_fails) << "the delete the kill landed in";
+        EXPECT_TRUE(exists("p/staging/victim/b_second.tmp")) << "the drain deleted a key after the kill";
+        EXPECT_TRUE(exists("p/roots/victim/c_third"));
+        EXPECT_EQ(backend->listingsOf("p/roots/victim/"), roots_listings_at_kill) << "the killed drain listed the roots";
+    }
+}
+
+namespace
+{
+
+/// Runs `on_list` once, before the first listing whose prefix `matches` accepts, and records every listed prefix.
+class HookFirstListingBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::list;
+
+    std::function<bool(const String &)> matches;
+    std::function<void()> on_list;
+    /// When set, a page holds at most this many keys, as a store with a small `list_object_keys_size` answers.
+    size_t page_cap = 0;
+
+    size_t listingsOf(const String & prefix) const
+    {
+        std::lock_guard lock(mutex);
+        return static_cast<size_t>(std::count(listed_prefixes.begin(), listed_prefixes.end(), prefix));
+    }
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(mutex);
+            listed_prefixes.push_back(prefix);
+            if (on_list && matches && matches(prefix))
+                hook = std::exchange(on_list, {});
+        }
+        if (hook)
+            hook();
+        return InMemoryBackend::list(prefix, cursor, page_cap ? std::min(limit, page_cap) : limit, access);
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::vector<String> listed_prefixes;
+};
+
+/// Staged manifests of one build no ref names: several keys in one manifest group of `ns_str`. Returns their keys.
+std::vector<String> seedOrphanManifestGroup(Pool & victim, const String & ns_str, uint32_t keys)
+{
+    std::vector<String> out;
+    for (uint32_t ordinal = 1; ordinal <= keys; ++ordinal)
+    {
+        const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = ordinal};
+        const ManifestId id = writeManifestRaw(*victim.poolBackendPtr(), victim.layout(), RootNamespace(ns_str), ref, {});
+        out.push_back(victim.layout().manifestKey(id));
+    }
+    return out;
+}
+
+}
+
+/// A killed query ends the drain at the next scan head with its own error: before the first namespace, at the
+/// next page of the manifest listing, or at the next key of a group that holds several. The tombstone stays, and a rerun resumes.
+TEST_F(CASDecommission, KilledQueryEndsTheDrainAtTheNextScanHead)
+{
+    enum class KillAt : uint8_t { BeforeTheRun, DebrisListing, GroupListing };
+    for (const KillAt kill_at : {KillAt::BeforeTheRun, KillAt::DebrisListing, KillAt::GroupListing})
+    {
+        SCOPED_TRACE(kill_at == KillAt::BeforeTheRun ? "before the run"
+                     : kill_at == KillAt::DebrisListing ? "at the debris listing" : "at the group's key listing");
+        std::vector<String> group_keys;
+        auto backend = startVictim(std::make_shared<HookFirstListingBackend>(), [&](Pool & victim)
+        {
+            oneTable(victim);
+            group_keys = seedOrphanManifestGroup(victim, "victim/db/t1", 3);
+        });
+        const String group_prefix = group_keys.front().substr(0, group_keys.front().rfind('/') + 1);
+        const String debris_prefix = layout.casManifestsServerPrefix("victim");
+
+        int code = 0;
+        size_t listings_at_kill = 0;
+        std::thread killed([&]
+        {
+            std::optional<DB::ThreadStatus> thread_status;
+            thread_status.emplace();
+            CasKillableQuery query(getContext().context);
+            if (kill_at == KillAt::BeforeTheRun)
+                query.kill();
+            else
+            {
+                if (kill_at == KillAt::DebrisListing)
+                    backend->page_cap = 1;
+                const String watched = kill_at == KillAt::DebrisListing ? debris_prefix : group_prefix;
+                backend->matches = [watched](const String & prefix) { return prefix == watched; };
+                backend->on_list = [&query, &listings_at_kill, watched, &backend]
+                {
+                    listings_at_kill = backend->listingsOf(watched);
+                    query.kill();
+                };
+            }
+            try
+            {
+                (void)run("admin");
+            }
+            catch (const Exception & e)
+            {
+                code = e.code();
+            }
+        });
+        killed.join();
+
+        EXPECT_EQ(code, ErrorCodes::QUERY_WAS_CANCELLED);
+        EXPECT_EQ(backend->listingsOf("p/staging/victim/"), 0u) << "the stopped drain went on to the staging area";
+        OperationForTest op(*victim_backend);
+        const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(*op, layout);
+        ASSERT_EQ(catalog.catalog.entries.size(), 1u);
+        EXPECT_EQ(catalog.catalog.entries.front().state, kill_at == KillAt::BeforeTheRun ? NsState::Live : NsState::Removing);
+        EXPECT_EQ(backend->listingsOf(group_prefix), kill_at == KillAt::GroupListing ? 1u : 0u);
+        if (kill_at == KillAt::DebrisListing)
+        {
+            ASSERT_GT(listings_at_kill, 0u) << "premise: the kill landed in the debris listing";
+            EXPECT_EQ(backend->listingsOf(debris_prefix), listings_at_kill) << "the killed listing requested another page";
+        }
+        expectOwner(2, true, false);
+
+        const auto rerun = run("admin");
+        EXPECT_EQ(rerun.namespaces_removed + rerun.namespaces_already_removed, 1u);
+        EXPECT_GT(backend->listingsOf("p/staging/victim/"), 0u) << "the rerun drained the staging area";
     }
 }
 

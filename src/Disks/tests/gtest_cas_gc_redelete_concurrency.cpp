@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
 #include <base/scope_guard.h>
@@ -25,6 +26,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_killable_query.h"
 #include "cas_test_helpers.h"
 
 namespace ProfileEvents
@@ -35,6 +37,11 @@ extern const Event CASGCRetiredBodyDeleteFailed;
 namespace DB::ErrorCodes
 {
 extern const int CANNOT_SCHEDULE_TASK;
+}
+
+namespace DB::FailPoints
+{
+extern const char thread_group_switcher_post_attach_failure[];
 }
 
 using namespace DB::Cas;
@@ -853,6 +860,61 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
     EXPECT_EQ(next.bodies_deleted, kBlobs);
     EXPECT_EQ(next.deleted, kBlobs);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
+/// A re-delete worker that fails to join the manual round's query deletes nothing: outside the query its request would
+/// not see the query's stop. Its job fails and the round fails before its commit. The failpoint fails one switch only,
+/// so the other jobs run in the query and delete.
+TEST(CASGCRedeleteConcurrency, WorkerOutsideTheRoundsQueryDeletesNothing)
+{
+    CAS_SKIP_WITHOUT_FAILPOINTS();
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolWithIoConcurrency(backend, 4);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+
+    SCOPE_EXIT({ DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure); });
+    std::atomic<bool> armed{false};
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        /// Armed after the round's own attach and its read-ahead, so a re-delete worker's switch is the one that fails.
+        if (rec.phase == "fold_seal_write")
+        {
+            DB::FailPointInjection::enableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+            armed = true;
+        }
+        else if (rec.phase == "pending_deletes")
+        {
+            DB::FailPointInjection::disableFailPoint(DB::FailPoints::thread_group_switcher_post_attach_failure);
+        }
+    });
+
+    RoundReport progress;
+    int code = 0;
+    String message;
+    onKillableQueryThread([&](CasKillableQuery &)
+    {
+        try
+        {
+            gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+            message = e.message();
+        }
+    });
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(armed.load()) << "the round never reached its fold seal";
+    EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK) << message;
+    EXPECT_EQ(progress.body_delete_failed, 1u);
+    EXPECT_EQ(progress.bodies_deleted, kBlobs - 1);
+    size_t present = 0;
+    for (uint64_t blob = 1; blob <= kBlobs; ++blob)
+        present += blobAbsent(*backend, store->layout(), numberedBlobHash(blob)) ? 0 : 1;
+    EXPECT_EQ(present, 1u) << "the worker outside the query deleted its blob";
 }
 
 TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)

@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
@@ -139,7 +140,9 @@ bool failureJudgedAgainstCkpt(int error_code)
 bool restartsOnMovedBase(int error_code, CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
                          const Etag & token)
 {
-    return failureJudgedAgainstCkpt(error_code) && ckptTokenMoved(op, layout, life, token);
+    /// A query's stored cause says nothing about the chain, whatever its code.
+    return failureJudgedAgainstCkpt(error_code) && !isQueryStoredCause(std::current_exception())
+        && ckptTokenMoved(op, layout, life, token);
 }
 
 RefTxnId RefTableState::chainNextId(uint64_t life_epoch) const

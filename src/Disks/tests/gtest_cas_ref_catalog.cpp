@@ -1,6 +1,7 @@
 #include "cas_format_test_battery.h"
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/ProfileEvents.h>
@@ -13,6 +14,7 @@
 #include <Poco/StreamChannel.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <atomic>
 #include <expected>
 #include <functional>
 #include <latch>
@@ -64,6 +66,7 @@ public:
 
 namespace DB::ErrorCodes
 {
+    extern const int ABORTED;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int LIMIT_EXCEEDED;
@@ -185,6 +188,20 @@ String renderJournal(const std::vector<WriteCountingBackend::Verb> & journal)
     for (const auto verb : journal)
         rendered += verb == WriteCountingBackend::Verb::Read ? 'R' : 'W';
     return rendered;
+}
+
+/// The next `count` writes of `key` are refused as lost races, with the store unchanged. The first lost race of a call
+/// is retried at once, so a test that needs a pause refuses two.
+void refuseNextWrites(InMemoryBackend & backend, const String & key, int count)
+{
+    auto left = std::make_shared<int>(count);
+    backend.onBeforeWrite(key, [&backend, key, left]
+    {
+        if (*left == 0)
+            return;
+        --*left;
+        backend.refuseNextWrite(key);
+    });
 }
 
 /// Lands a competing catalog body under the erase's own attempt and withdraws this actor's admission
@@ -1115,13 +1132,12 @@ TEST(CASRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
 }
 #endif
 
-/// Persistent contention ends at the write policy's DEADLINE, with the typed retryable error -- not
-/// after a fixed number of unslept iterations, and not in an infinite spin. `mutate` re-arms the
-/// one-shot conflict injection on every call, so every attempt is refused; the injected clock reaches
-/// the deadline without the test sleeping at all.
-TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
+/// Persistent contention ends after 100 submissions, each refusal but the last followed by a pause,
+/// with the typed retryable error. `mutate` re-arms the one-shot conflict injection on every call, so
+/// every write is refused.
+TEST(CASRefCatalog, CasUpdateEndsAfterAHundredPacedSubmissions)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<WriteCountingBackend>();
     DB::Cas::tests::FakeClock clock;
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     requests.setNowFnForTest(clock.nowFn());
@@ -1129,24 +1145,19 @@ TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    const uint64_t started_at = clock.now;
+    const uint64_t writes_before = backend->writes(layout.refCatalogKey());
 
-    int mutate_calls = 0;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 submissions)", [&]
     {
         CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & cur)
         {
-            ++mutate_calls;
             backend->refuseNextWrite(layout.refCatalogKey());
             RefCatalog next = cur;
             return next;
         });
     });
-    EXPECT_GT(mutate_calls, 1);   /// genuinely retried, not a single-shot failure
-    EXPECT_FALSE(clock.sleeps.empty()) << "every retry must back off; an unslept loop would burn the "
-                                          "deadline on requests instead of waiting out the contention";
-    EXPECT_GE(clock.now - started_at, kDefaultRequestWindowMs - 5000)
-        << "the loop ended at the policy's own deadline, not at an iteration count";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_before, 100u);
+    EXPECT_EQ(clock.sleeps.size(), 98u) << "every refusal but the first, retried at once, and the last is paced";
 }
 
 TEST(CASRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
@@ -1487,14 +1498,14 @@ TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
-    backend->refuseNextWrite(layout.refCatalogKey());
+    refuseNextWrites(*backend, layout.refCatalogKey(), 2);
 
     EXPECT_EQ(deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-    ASSERT_EQ(clock.sleeps.size(), 1u) << "one refusal, so exactly one paced retry";
-    EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
-        << "the seed, the refused erase, and the retry that landed";
+    ASSERT_EQ(clock.sleeps.size(), 1u) << "the first refusal is retried at once, the second after a pause";
+    EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps.front(), 2)) << "the pause after the second lost race";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 4u)
+        << "the seed, the two refused erases, and the retry that landed";
 }
 
 /// A writer that lands during every backoff must not starve the erase: the next erase write is
@@ -1533,10 +1544,10 @@ TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
             ++external_writes;
         });
 
-        backend->refuseNextWrite(layout.refCatalogKey());
+        refuseNextWrites(*backend, layout.refCatalogKey(), 2);
         EXPECT_EQ(deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh),
             CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-        EXPECT_EQ(clock.sleeps.size(), 1u) << "one refusal, one pause, and the erase after it lands";
+        EXPECT_EQ(clock.sleeps.size(), 1u) << "two refusals, the first retried at once, one pause, and the erase after it lands";
         EXPECT_EQ(external_writes, 1u);
 
         const RefCatalog current = CasRefCatalog::read(op, layout).catalog;
@@ -1544,7 +1555,7 @@ TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
         EXPECT_EQ(current.entries.front().ns, RootNamespace{"b0"}) << "the writer's row stays, the erased row is gone";
     }
 
-    /// A pause that itself runs past the window is followed by no erase write.
+    /// A pause that runs past a whole window is followed by the next erase: it binds its own window.
     {
         auto backend = std::make_shared<WriteCountingBackend>();
         DB::Cas::tests::FakeClock clock;
@@ -1553,24 +1564,17 @@ TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
         auto pause = clock.sleepFn();
         requests.setSleepFnForTest([&](uint64_t ms) { pause(ms + 200'000); });
         CasOperation op = requests.admit();
-        const Layout layout("erase-pause-past-deadline");
+        const Layout layout("erase-pause-past-a-window");
         seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
         const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
 
-        backend->refuseNextWrite(layout.refCatalogKey());
-        try
-        {
-            (void)deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh);
-            ADD_FAILURE() << "a pause that crosses the window must end the call";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-            EXPECT_NE(e.message().find("deadline"), String::npos) << e.message();
-        }
-        EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
-            << "only the refused erase; nothing is sent after the pause crossed the deadline";
-        EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
+        refuseNextWrites(*backend, layout.refCatalogKey(), 2);
+        EXPECT_EQ(deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh),
+            CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+        EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 3u)
+            << "the two refused erases and the erase after the pause";
+        EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     }
 }
 
@@ -1605,7 +1609,7 @@ TEST(CASRefCatalogRemoval, AConflictedEraseSendsTheNextWriteFromAReadTakenAfterT
 
     const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, layout);
     const size_t journal_before = backend->journalFor(layout.refCatalogKey()).size();
-    backend->refuseNextWrite(layout.refCatalogKey());
+    refuseNextWrites(*backend, layout.refCatalogKey(), 2);
 
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(
         op, layout, snapshot, removing, ready_parent, noAuthorityRefresh, noRetirementRecord, noRetirementRecord).outcome,
@@ -1626,10 +1630,76 @@ TEST(CASRefCatalogRemoval, AConflictedEraseSendsTheNextWriteFromAReadTakenAfterT
         << "and the next erase write comes from that read: " << renderJournal(journal_since);
 }
 
+/// The authority refresh before a retried erase runs right after the pause (none after the first refusal), before the
+/// catalog read the erase is conditioned on, so no request of its own sits between that read and the erase.
+TEST(CASRefCatalogRemoval, TheAuthorityRefreshBeforeARetriedEraseComesBeforeItsCatalogRead)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    const Layout layout("erase-refresh-before-read");
+    std::vector<size_t> journal_sizes_at_pause;
+    std::vector<size_t> journal_sizes_at_refresh;
+    String timeline;
+    auto pause = clock.sleepFn();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        pause(ms);
+        timeline += 'P';
+        journal_sizes_at_pause.push_back(backend->journalFor(layout.refCatalogKey()).size());
+    });
+    CasOperation op = requests.admit();
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, layout);
+    const size_t journal_before = backend->journalFor(layout.refCatalogKey()).size();
+    refuseNextWrites(*backend, layout.refCatalogKey(), 2);
+
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        op, layout, snapshot, removing, ready_parent,
+        [&]
+        {
+            timeline += 'F';
+            journal_sizes_at_refresh.push_back(backend->journalFor(layout.refCatalogKey()).size());
+        },
+        noRetirementRecord, noRetirementRecord).outcome,
+        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    EXPECT_EQ(timeline, "FFPF")
+        << "a refresh before the first erase, one before the second, retried at once, and one after the pause before the third";
+    ASSERT_EQ(journal_sizes_at_pause.size(), 1u);
+    ASSERT_EQ(journal_sizes_at_refresh.size(), 3u) << "one refresh per attempt";
+    EXPECT_EQ(journal_sizes_at_refresh.front(), journal_before) << "before the first erase";
+    EXPECT_EQ(journal_sizes_at_refresh.back(), journal_sizes_at_pause.front())
+        << "the second refresh follows the pause with no catalog request between them";
+    const std::vector<WriteCountingBackend::Verb> journal = backend->journalFor(layout.refCatalogKey());
+    const size_t refreshed_at = journal_sizes_at_refresh.back();
+    ASSERT_EQ(journal.size(), refreshed_at + 3) << renderJournal(journal);
+    using Verb = WriteCountingBackend::Verb;
+    /// The retry after the first refusal is not paced, and its refresh still comes right before its catalog read.
+    const size_t first_retry_refreshed_at = journal_sizes_at_refresh[1];
+    ASSERT_LT(first_retry_refreshed_at + 1, journal.size()) << renderJournal(journal);
+    EXPECT_EQ(journal[first_retry_refreshed_at], Verb::Read) << "the first retry's catalog read: " << renderJournal(journal);
+    EXPECT_EQ(journal[first_retry_refreshed_at + 1], Verb::Write) << "and the erase on it: " << renderJournal(journal);
+    EXPECT_EQ(journal[refreshed_at], Verb::Read) << "the catalog read after the refresh: " << renderJournal(journal);
+    EXPECT_EQ(journal[refreshed_at + 1], Verb::Write) << "the erase on it: " << renderJournal(journal);
+    EXPECT_EQ(journal[refreshed_at + 2], Verb::Read) << "the read that resolves the erase: " << renderJournal(journal);
+}
+
 /// A caller's liveness need not be a fact this loop can read. The GC drain's is a cached
 /// leader-authority flag its owner refreshes by re-reading `gc/state`, so a leader deposed while an
 /// erase is in flight leaves that flag stale -- and on an unrecoverable delete path one reading taken
-/// before the first erase must not authorise the rest. Hence the refresh hook, run at the top of every
+/// before the first erase must not authorise the rest. Hence the refresh hook, run before every
 /// attempt.
 ///
 /// The winner here writes the SAME row back: the incarnation moves, so the erase is refused, and the
@@ -1712,12 +1782,12 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
         << "nothing changed under an authority failure that reached no attempt";
 }
 
-/// The counterpart to the case above: the hook fails AFTER the loop has already sent one erase and
-/// resolved it (a refusal, so the row is provably unchanged), on the refresh that would gate the next
+/// The counterpart to the case above: the hook fails AFTER the loop has already sent one erase and the
+/// store refused it (so the row is provably unchanged), on the refresh that would gate the next
 /// attempt. The failure must still escape rather than be read as the fenced-out liveness answer this
 /// class's default `admitted()` would otherwise report, and -- exactly as when it fails up front -- no
 /// further erase may reach the store on an authority this call could not evaluate.
-TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
+TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterARefusedErase)
 {
     auto backend = std::make_shared<WriteCountingBackend>();
     DB::Cas::tests::FakeClock clock;
@@ -1746,7 +1816,7 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolut
         {
             ++refreshes;
             if (refreshes > 1)
-                throw std::runtime_error("injected authority-refresh failure after the erase resolved");
+                throw std::runtime_error("injected authority-refresh failure after the erase was refused");
         }),
         std::runtime_error);
     EXPECT_EQ(refreshes, 2u) << "once before the refused attempt, once before the retry it never sent";
@@ -1855,13 +1925,9 @@ TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterIns
         << "the message must name the life still observed: " << message;
 }
 
-/// The loop captures ONE bound before it starts and every call it makes shares it, so a permanently
-/// contended catalog gives up "retry later" inside one request window rather than spending a fresh
-/// window per verb across a hundred paced iterations -- which is hours against a document that
-/// promises one window. Every erase is refused and the injected clock absorbs every paced retry,
-/// so what ends the call is visible in the virtual time it took. The attempt cap stays as the
-/// secondary bound; it is not what ends this call.
-TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemptCap)
+/// Every erase is refused. Each request binds its own window, so the attempt cap ends the call: 100
+/// erases, a pause after each refusal but the last, and the resolution read after every erase.
+TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpAfterAHundredErases)
 {
     class AlwaysRefusesCatalogWrites final : public WriteCountingBackend
     {
@@ -1911,7 +1977,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemp
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     backend->refused_key = layout.refCatalogKey();
 
-    const uint64_t start = clock.now;
+    const size_t sleeps_before = clock.sleeps.size();
     String message;
     try
     {
@@ -1923,14 +1989,133 @@ TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemp
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         message = e.message();
     }
-    EXPECT_NE(message.find("deadline"), String::npos)
-        << "the shared bound, not the attempt cap, is what ended this call: " << message;
-    /// Two windows, so the assertion survives the jitter of the paced retries while still failing a
-    /// loop that binds a fresh window per iteration -- that one spends minutes here.
-    EXPECT_LT(clock.now - start, 2 * kDefaultRequestWindowMs) << "the loop outlived the window it captured";
-    EXPECT_LT(backend->refusedAttempts(), 100u) << "the attempt cap must not be what ends this call";
-    /// Greater than one is what proves the loop iterated rather than failing on its first attempt.
-    EXPECT_GT(backend->refusedAttempts(), 1u);
+    EXPECT_NE(message.find("did not converge after 100 attempts"), String::npos) << message;
+    EXPECT_EQ(backend->refusedAttempts(), 100u);
+    EXPECT_EQ(clock.sleeps.size() - sleeps_before, 98u) << "no pause after the first refusal, retried at once, nor the last";
+    for (size_t i = sleeps_before; i < clock.sleeps.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(clock.sleeps[i], static_cast<uint32_t>(i - sleeps_before + 2)));
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
+}
+
+namespace
+{
+
+CatalogEntry removingEntryForStopTests()
+{
+    return CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Removing, .incarnation = UInt128{7}, .removal_started_round = 13};
+}
+
+CasFoldSeal readyParentForStopTests()
+{
+    CasFoldSeal parent;
+    parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    return parent;
+}
+
+/// Loses the reply of the next catalog write, running `on_lost` first; every catalog read after it fails.
+class LostEraseUnreadableCatalogBackend final : public WriteCountingBackend
+{
+public:
+    String catalog_key;
+    std::function<void()> on_lost;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (lost && key == catalog_key)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected catalog read failure");
+        return WriteCountingBackend::read(key, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        if (key != catalog_key || !on_lost || lost)
+            return WriteCountingBackend::write(key, bytes, expected_value, access);
+        lost = true;
+        on_lost();
+        throw Poco::TimeoutException("injected lost catalog erase reply");
+    }
+
+private:
+    bool lost = false;
+};
+
+}
+
+/// An erase whose reply was lost, whose owner stopped, and whose resolution read cannot complete ends with the
+/// erase's "outcome unknown" exit: the erase may still land.
+TEST(CASRefCatalogRemoval, UnresolvedEraseOfAStoppedOwnerKeepsItsExit)
+{
+    auto backend = std::make_shared<LostEraseUnreadableCatalogBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout("erase-unresolved-stop");
+    const CatalogEntry removing = removingEntryForStopTests();
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    std::atomic<bool> stopped = false;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->on_lost = [&stopped] { stopped = true; };
+
+    String message;
+    {
+        const auto owner = OwnerScope::background([&stopped]
+        {
+            if (stopped)
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+        });
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+        {
+            try
+            {
+                (void)deleteCompletedRemovingForTest(op, layout, removing, readyParentForStopTests(), noAuthorityRefresh);
+            }
+            catch (const DB::Exception & e)
+            {
+                message = e.message();
+                throw;
+            }
+        });
+    }
+    EXPECT_NE(message.find("unresolved"), String::npos) << message;
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 1u) << "only the seed: the lost erase bypasses the count, and nothing was resent";
+}
+
+/// An owner that stops while a conflicted erase is resolved starts no second decision: no authority refresh
+/// and no erase follow the resolution read.
+TEST(CASRefCatalogRemoval, StopDuringAConflictedErasesResolutionStartsNoNextDecision)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    FakeClock clock;
+    std::atomic<bool> stopped = false;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    /// The conflict's pause comes before the resolution read.
+    requests.setSleepFnForTest([&stopped](uint64_t) { stopped = true; });
+    CasOperation op = requests.admit();
+    const Layout layout("erase-conflict-stop");
+    const CatalogEntry removing = removingEntryForStopTests();
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    /// The first refusal is retried at once; the second pauses.
+    refuseNextWrites(*backend, layout.refCatalogKey(), 2);
+
+    size_t refreshes = 0;
+    {
+        const auto owner = OwnerScope::background([&stopped]
+        {
+            if (stopped)
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "background owner stopped");
+        });
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+        {
+            (void)deleteCompletedRemovingForTest(op, layout, removing, readyParentForStopTests(), [&refreshes] { ++refreshes; });
+        });
+    }
+    ASSERT_TRUE(stopped) << "premise: the erase conflicted and paused";
+    EXPECT_EQ(refreshes, 2u) << "one for each erase sent, none for a third decision";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u) << "the seed and the two conflicted erases";
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
 }
 
@@ -2667,20 +2852,62 @@ TEST(CASRefCatalog, CreateNamespaceStep1FailsAtOnceWhenItsCatalogReadIsRefused)
 }
 #endif
 
-/// The pause before a new decision is gated like the engine's own reissue pause: with no room left
-/// for the pause and one attempt, the call ends without sleeping.
-TEST(CASRefCatalog, CreateNamespaceStep1DoesNotPausePastItsDeadline)
+/// The first step-1 write takes more than a window and its response is lost. The next decision's read
+/// and write each bind their own window, so the row is created.
+TEST(CASRefCatalog, CreateNamespaceStep1PausesThenDecidesAgainInItsOwnWindow)
 {
     Step1Fixture t;
     t.f.pool.setAttemptReservationForTest(1'000);
     t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
-    /// Leaves 1.5 s of the window: enough for the settle read, too little for a pause plus two envelopes.
+    bool slowed = false;
+    uint64_t first_write_ended_ms = 0;
+    t.backend->on_write = [&]
+    {
+        if (std::exchange(slowed, true))
+            return;
+        t.f.clock.now.fetch_add(kDefaultRequestWindowMs + 1);
+        first_write_ended_ms = t.f.clock.now.load();
+    };
+    const size_t sleeps_before = t.f.clock.sleeps.size();
+
+    ASSERT_EQ(t.createA(), CasRefCatalog::NamespaceCreationOutcome::Live);
+    t.expectDistinctIncarnationsAndTheLastOneLive();
+    EXPECT_EQ(t.step1Incarnations().size(), 2u);
+    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 1u);
+    /// Only pauses move the clock after the slow write, so the call ends well inside the next window.
+    EXPECT_LE(t.f.clock.now.load() - first_write_ended_ms, kDefaultRequestWindowMs + 1'000 + 5'000);
+}
+
+/// The same with an explicit lease that leaves 1.5 s: the pause fits under the lease, the next write's
+/// two envelopes do not, so no second write is sent.
+TEST(CASRefCatalog, CreateNamespaceStep1PausesThenSendsNoWriteWithoutRoomUnderItsLease)
+{
+    Step1Fixture t;
+    t.f.pool.setAttemptReservationForTest(1'000);
+    t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
+    const Retry policy = Retry::untilLeaseSafe(t.f.clock.now.load() + kDefaultRequestWindowMs, 0);
     t.backend->on_write = [&] { t.f.clock.now.fetch_add(kDefaultRequestWindowMs - 1'500); };
     const size_t sleeps_before = t.f.clock.sleeps.size();
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)t.createA(); });
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)CasRefCatalog::createNamespace(t.pool_op, t.layout, 1, RootNamespace{"a"}, t.creator, policy); });
     EXPECT_EQ(t.backend->bodies.size(), 1u);
-    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 0u);
+    EXPECT_EQ(t.f.clock.sleeps.size() - sleeps_before, 1u);
+}
+
+/// The smallest window a write accepts is two envelopes and 1 ms. After a lost step-1 write the next
+/// decision's write gets a whole such window of its own, so the row is created.
+TEST(CASRefCatalog, CreateNamespaceStep1DecidesAgainWithTheSmallestValidWindow)
+{
+    Step1Fixture t;
+    t.f.pool.setAttemptReservationForTest(1'000);
+    t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
+    /// Each catalog write takes 2 ms, so no window that started before a write has room for another.
+    t.backend->on_write = [&] { t.f.clock.now.fetch_add(2); };
+
+    ASSERT_EQ(CasRefCatalog::createNamespace(t.pool_op, t.layout, 1, RootNamespace{"a"}, t.creator, Retry::within(2'001)),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+    t.expectDistinctIncarnationsAndTheLastOneLive();
 }
 
 /// The step-1 write lands and its response is lost; before the next decision a sibling completes the
@@ -3117,12 +3344,6 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
     /// are still on the catalog when the second starts, and re-admitting the same namespace would
     /// duplicate it rather than race it.
     constexpr int K = 3;
-    /// The settled-fault scenario draws 8, not 3: an upper-bound-only check on `backoff`'s draws
-    /// cannot tell the growing schedule from the flat one (both stay under 200 ms plenty often at
-    /// small K), so that scenario also needs a floor. With `backoff(attempt) = uniform(0, min(5000,
-    /// 200 << (attempt-1)))`, the flat schedule can NEVER draw over 200 ms, so a single draw over
-    /// 200 ms is proof by itself that the schedule grew; drawing 8 times keeps the growing schedule's
-    /// own chance of missing that floor purely by bad luck around 2^-28.
     constexpr int K2 = 8;
     int moved = 0;
     int limit = K;
@@ -3149,15 +3370,14 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
             if (e.ns.string() == "a") { e.state = NsState::Removing; e.removal_started_round = 1; }
         return next;
     });
-    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K));
-    for (uint64_t s : f.clock.sleeps)
-        EXPECT_LE(s, 200u);
+    /// The first loss is on the lane's cached catalog and is retried at once, without counting; the first counted loss
+    /// is retried at once too, so only the later ones pause.
+    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K - 2));
+    for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(f.clock.sleeps[i], static_cast<uint32_t>(i + 2)));
     EXPECT_EQ(eventCount(ProfileEvents::CASRequestConflictPause) - pauses_before, 0u) << "the lane's caller pauses itself; the engine's counter is for its own loops";
 
-    /// K2 conflicts that each settled a fault: the growing schedule, on the loop's own count. An
-    /// upper-bound check alone is satisfied by the flat schedule too (its draws are a subset of the
-    /// growing schedule's early-attempt range), so this also asserts a floor: at least one draw over
-    /// 200 ms, which the flat schedule can never produce.
+    /// K2 conflicts that each settled a fault: the fault schedule, on the loop's own count of them.
     f.clock.sleeps.clear();
     moved = 0;
     limit = K2;
@@ -3167,10 +3387,304 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
     CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
     ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K2));
     for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
-        EXPECT_LE(f.clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i));
-    EXPECT_TRUE(std::any_of(f.clock.sleeps.begin(), f.clock.sleeps.end(), [](uint64_t s) { return s > 200u; }))
-        << "the flat schedule can never draw over 200 ms; a growing schedule almost certainly does "
-           "somewhere in 8 draws, so this is what tells the two schedules apart";
+        EXPECT_LE(f.clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i)) << "fault pause " << i + 1;
+    /// Every clean pause lies in its own step's range. A full-jitter draw lands in that range with probability at
+    /// most 1/10 at each of these steps, so all 8 do with probability below 1e-9.
+    size_t outside_clean = 0;
+    for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
+        outside_clean += DB::Cas::tests::isConflictPause(f.clock.sleeps[i], static_cast<uint32_t>(i + 1)) ? 0 : 1;
+    EXPECT_GT(outside_clean, 0u) << "a fault paced by the clean schedule";
+}
+
+namespace
+{
+
+/// Another server's catalog writer that commits on demand. Its requests are bracketed by marks, so
+/// `renderOwnRequests` shows only the pool's own requests.
+struct CatalogRival
+{
+    PoolAndExternal & f;
+    Layout layout;
+    CasOperation op;
+    uint64_t commits = 0;
+    bool inside = false;
+
+    void commit()
+    {
+        inside = true;
+        f.backend->mark("rival{");
+        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry(fmt::format("r{:03}", commits), 1000 + commits));
+        f.backend->mark("}rival");
+        ++commits;
+        inside = false;
+    }
+};
+
+RefCatalog markARemoving(const RefCatalog & cur)
+{
+    RefCatalog next = cur;
+    for (auto & e : next.entries)
+        if (e.ns.string() == "a")
+        {
+            e.state = NsState::Removing;
+            e.removal_started_round = 1;
+        }
+    return next;
+}
+
+}
+
+/// The rival lands right before the pool's first three writes and during every pause. The first loss is on the lane's
+/// cached catalog and is retried at once on the resolve read; the second, the first on a fresh read, is retried at once
+/// too; the third is paced; the write after the pause is decided on a read taken after it, so it lands.
+TEST(CASRefCatalog, ACatalogUpdateIsNotStarvedByAWriterThatCommitsDuringEveryPause)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 1));   /// the lane caches the catalog
+    CatalogRival rival{f, layout, f.external.admit()};
+    const String key = layout.refCatalogKey();
+    int collisions = 0;
+    f.backend->onBeforeWrite(key, [&]
+    {
+        if (rival.inside || collisions >= 3)
+            return;
+        ++collisions;
+        rival.commit();
+    });
+    auto sleep = f.clock.sleepFn();
+    f.pool.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        f.backend->mark("pause");
+        rival.commit();
+    });
+    f.backend->clearJournal();
+
+    int decided = 0;
+    CasRefCatalog::casUpdate(pool_op, layout, [&](const RefCatalog & cur) { ++decided; return markARemoving(cur); });
+
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*f.backend, key), "WRWRWPRW")
+        << "cached write refused, resolve read, write refused, read, write refused, pause, read, the write on it";
+    EXPECT_EQ(decided, 4);
+    EXPECT_EQ(f.clock.sleeps.size(), 1u);
+    EXPECT_EQ(rival.commits, 4u);
+    const RefCatalog landed = CasRefCatalog::read(pool_op, layout).catalog;
+    ASSERT_EQ(landed.entries.size(), 5u);
+    EXPECT_EQ(landed.entries.front().state, NsState::Removing);
+}
+
+/// A rival that lands right before every write still ends the loop on the submission cap, with a
+/// pause between submissions and every write after a pause decided on a read taken after it.
+TEST(CASRefCatalog, ACatalogUpdateAgainstAWriterBeforeEveryWriteEndsOnTheCount)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 1));   /// the lane caches the catalog
+    CatalogRival rival{f, layout, f.external.admit()};
+    const String key = layout.refCatalogKey();
+    f.backend->onBeforeWrite(key, [&]
+    {
+        if (!rival.inside)
+            rival.commit();
+    });
+    auto sleep = f.clock.sleepFn();
+    f.pool.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        f.backend->mark("pause");
+    });
+    f.backend->clearJournal();
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 submissions", [&]
+    {
+        CasRefCatalog::casUpdate(pool_op, layout, markARemoving);
+    });
+
+    EXPECT_EQ(f.clock.sleeps.size(), kCasMaxDecisions - 2) << "no pause after the first lost race, nor the last";
+    for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
+        EXPECT_TRUE(DB::Cas::tests::isConflictPause(f.clock.sleeps[i], static_cast<uint32_t>(i + 2)));
+    /// The loss on the cached catalog is settled and retried at once. A loss on a fresh read is not settled when a
+    /// read follows it, at once after the first and after a pause from the second; the last submission's loss, which
+    /// nothing follows, is.
+    String expected = "WRW" "RW";
+    for (uint32_t i = 2; i < kCasMaxDecisions - 1; ++i)
+        expected += "PRW";
+    expected += "PRWR";
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*f.backend, key), expected);
+}
+
+/// A conflict that settled a transport fault ends the run of clean losses, in the catalog update and in the erase loop:
+/// the clean loss after it starts a new run and is retried at once, so only the fault-settled conflict pauses.
+TEST(CASRefCatalog, AFaultSettledConflictRestartsTheCleanLossCount)
+{
+    {
+        SCOPED_TRACE("catalog update");
+        PoolAndExternal f(std::make_shared<CountingBackend>());
+        const Layout layout("p");
+        CasOperation setup = f.external.admit();
+        CasRefCatalog::initializeEmptyForNewPool(setup, layout);
+        CasRefCatalog::casAdmitEntry(setup, layout, 1, liveEntry("a", 1));
+        CatalogRival rival{f, layout, f.external.admit()};
+        const String key = layout.refCatalogKey();
+        int moves = 0;
+        f.backend->onBeforeWrite(key, [&]
+        {
+            if (rival.inside || moves >= 3)
+                return;
+            ++moves;
+            rival.commit();
+            if (moves == 2)
+                f.backend->injectAmbiguousWrite(key);
+        });
+        CasOperation pool_op = f.pool.admit();
+        CasRefCatalog::casUpdate(pool_op, layout, markARemoving);
+        EXPECT_EQ(moves, 3) << "premise: clean, fault-settled, clean";
+        EXPECT_EQ(f.clock.sleeps.size(), 1u);
+    }
+    {
+        SCOPED_TRACE("catalog erase");
+        auto backend = std::make_shared<WriteCountingBackend>();
+        DB::Cas::tests::FakeClock clock;
+        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+        requests.setNowFnForTest(clock.nowFn());
+        requests.setSleepFnForTest(clock.sleepFn());
+        CasOperation op = requests.admit();
+        CasOperation writer = requests.admit();
+        const Layout layout("erase-fault-between");
+        const CatalogEntry removing{
+            .ns = RootNamespace{"a"},
+            .state = NsState::Removing,
+            .incarnation = UInt128{7},
+            .removal_started_round = 13};
+        seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+        CasFoldSeal ready_parent;
+        ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+        int moves = 0;
+        bool inside = false;
+        backend->onBeforeWrite(layout.refCatalogKey(), [&]
+        {
+            if (inside || moves >= 3)
+                return;
+            inside = true;
+            ++moves;
+            CasRefCatalog::casAdmitEntry(writer, layout, 1, liveEntry(fmt::format("w{}", moves), 100 + moves));
+            if (moves == 2)
+                backend->injectAmbiguousWrite(layout.refCatalogKey());
+            inside = false;
+        });
+        EXPECT_EQ(deleteCompletedRemovingForTest(op, layout, removing, ready_parent, noAuthorityRefresh),
+            CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+        EXPECT_EQ(moves, 3) << "premise: clean, fault-settled, clean";
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+    }
+}
+
+/// The catalog disappears between the last submission's read and its write. That write's refusal is settled,
+/// as no submission follows it, so the caller that takes absence as an answer gets it rather than the count.
+TEST(CASRefCatalog, AnAbsenceAtTheLastSubmissionIsReportedNotTheCount)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation setup = f.external.admit();
+    CasRefCatalog::initializeEmptyForNewPool(setup, layout);
+    const CatalogEntry creating{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Creating,
+        .incarnation = UInt128{5},
+        .creator = CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(setup, layout, 1, creating);
+    CatalogRival rival{f, layout, f.external.admit()};
+    const String key = layout.refCatalogKey();
+    CasOperation remover = f.external.admit();
+    uint32_t pool_writes = 0;
+    bool removing = false;
+    f.backend->onBeforeWrite(key, [&]
+    {
+        if (rival.inside || removing)
+            return;
+        if (++pool_writes < kCasMaxDecisions)
+        {
+            rival.commit();
+            return;
+        }
+        removing = true;
+        ASSERT_EQ(remover.removeCurrent(key, Retry::standard()), Removal::Removed);
+        removing = false;
+    });
+
+    CasOperation pool_op = f.pool.admit();
+    bool absent = false;
+    const auto outcome = CasRefCatalog::cancelStalledCreating(pool_op, layout, creating,
+        [](const CreatorFence &) { return true; }, [](const Retry &) {}, Retry::standard(), &absent);
+
+    EXPECT_EQ(outcome, CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
+    EXPECT_TRUE(absent);
+    EXPECT_EQ(pool_writes, kCasMaxDecisions);
+}
+
+/// While the caller pauses after a lost race (its second on a fresh read: the first is retried at once), another
+/// holder in the same pool commits and the lane caches that commit, then another server moves the catalog on. The submission after the pause reads instead of
+/// starting from that cached body, which is older than the pause's end.
+TEST(CASRefCatalog, ASubmissionAfterAPauseReadsInsteadOfStartingFromTheCache)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasOperation neighbour = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("n", 2));
+    CatalogRival rival{f, layout, f.external.admit()};
+    const String key = layout.refCatalogKey();
+    bool in_pause = false;
+    int collisions = 0;
+    f.backend->onBeforeWrite(key, [&]
+    {
+        if (rival.inside || in_pause || collisions >= 3)
+            return;
+        ++collisions;
+        rival.commit();
+    });
+    auto sleep = f.clock.sleepFn();
+    f.pool.setSleepFnForTest([&](uint64_t ms)
+    {
+        sleep(ms);
+        f.backend->mark("pause");
+        in_pause = true;
+        f.backend->mark("rival{");
+        CasRefCatalog::casUpdate(neighbour, layout, [](const RefCatalog & cur)
+        {
+            RefCatalog next = cur;
+            for (auto & e : next.entries)
+                if (e.ns.string() == "n")
+                {
+                    e.state = NsState::Removing;
+                    e.removal_started_round = 2;
+                }
+            return next;
+        });
+        f.backend->mark("}rival");
+        rival.commit();
+        in_pause = false;
+    });
+    f.backend->clearJournal();
+
+    CasRefCatalog::casUpdate(pool_op, layout, markARemoving);
+
+    EXPECT_EQ(DB::Cas::tests::renderOwnRequests(*f.backend, key), "WRWRWPRW")
+        << "after the pause: a read, then the write on it, not a write on the neighbour's cached commit";
+    EXPECT_EQ(f.clock.sleeps.size(), 1u);
+    const RefCatalog landed = CasRefCatalog::read(pool_op, layout).catalog;
+    for (const auto & e : landed.entries)
+        if (e.ns.string() == "a" || e.ns.string() == "n")
+            EXPECT_EQ(e.state, NsState::Removing) << e.ns.string();
 }
 
 TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)

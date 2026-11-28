@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
@@ -13,9 +14,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Storages/MergeTree/checkDataPart.h>
+#include <Disks/tests/cas_killable_query.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
+#include <Common/tests/gtest_global_context.h>
 #include <base/scope_guard.h>
 
 #include <Poco/Exception.h>
@@ -28,6 +33,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -46,7 +52,10 @@ extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int LOGICAL_ERROR;
 extern const int NETWORK_ERROR;
+extern const int QUERY_WAS_CANCELLED;
+extern const int READONLY;
 extern const int S3_ERROR;
+extern const int TIMEOUT_EXCEEDED;
 }
 
 namespace ProfileEvents
@@ -67,6 +76,9 @@ extern const Event CASGCStuckRemovals;
 
 using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
+using DB::Cas::tests::exceptionCodeOf;
+using DB::Cas::tests::onKillableQueryThread;
+using DB::Cas::tests::StoppedBy;
 using DB::Cas::tests::committedRow;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::expectThrowsCodeWithMessage;
@@ -5327,6 +5339,200 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingKeepsTheWriteLaneClosed
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }
 
+/// A failure after the lane closed but before the removal's error handler is armed sent nothing,
+/// so it must not leave a `Live` lane closed.
+TEST(CASRefWriterNamespaceRemoval, ThrowDuringRemovalSetupCannotStrandLiveLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/throw_during_removal_setup"};
+    publishEmptyPart(store, ns, "owned");
+
+    store->setRemovalAttemptHookForTest([] { throw std::runtime_error("setup failed"); });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    store->setRemovalAttemptHookForTest({});
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns)) << "the lane of a Live namespace must be open again";
+    EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+namespace
+{
+
+struct StoppedRemovalRun
+{
+    int failed_catalog_reads = 0;
+    int catalog_reads_after_failure = 0;
+};
+
+/// A removal that fails before it sends anything, whose reopen proof's first catalog read fails. The owner
+/// stops in the backoff after that failure, where `in_backoff` runs as well.
+StoppedRemovalRun runStoppedRemovalBeforeSend(const std::shared_ptr<RefWriterTestBackend> & backend, const PoolPtr & store,
+                                              const RootNamespace & ns, const std::function<void()> & in_backoff = {})
+{
+    const String catalog_key = store->layout().refCatalogKey();
+    std::atomic<bool> fail_next_catalog_read{false};
+    std::atomic<int> failed_catalog_reads{0};
+    std::atomic<int> catalog_reads_after_failure{0};
+    backend->read_observer = [&](const String & key)
+    {
+        if (key != catalog_key)
+            return;
+        if (fail_next_catalog_read.exchange(false))
+        {
+            ++failed_catalog_reads;
+            throw Poco::TimeoutException("the reopen proof's first catalog read is lost");
+        }
+        if (failed_catalog_reads.load() > 0)
+            ++catalog_reads_after_failure;
+    };
+    SCOPE_EXIT({ backend->read_observer = {}; });
+
+    std::thread owner_thread([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        store->setCasRetrySleepForTest([&](uint64_t)
+        {
+            if (failed_catalog_reads.load() > 0 && !query.status->isKilled())
+            {
+                query.kill();
+                if (in_backoff)
+                    in_backoff();
+            }
+        });
+        store->setRemovalAttemptHookForTest([&]
+        {
+            fail_next_catalog_read = true;
+            throw std::runtime_error("removal setup failed before any send");
+        });
+        EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+        EXPECT_TRUE(query.status->isKilled()) << "the owner stopped during the reopen proof";
+        store->setRemovalAttemptHookForTest({});
+        store->setCasRetrySleepForTest({});
+    });
+    owner_thread.join();
+    return {failed_catalog_reads.load(), catalog_reads_after_failure.load()};
+}
+
+}
+
+/// The guard's reopen proof is owed to the closed lane: a removal that fails before it sends anything
+/// reopens a proven `Live` lane even when its owner stops during the backoff after a failed first read.
+/// Owed work does not widen the reopen: a possible late write or a lost lease still keeps the lane closed.
+TEST(CASRefWriterNamespaceRemoval, StoppedRemovalBeforeSendReopensProvenLiveLane)
+{
+    {
+        SCOPED_TRACE("exact Live");
+        auto backend = std::make_shared<RefWriterTestBackend>();
+        auto store = openPool(backend, wedgeTestBudget());
+        const RootNamespace ns{"srv1/stopped_removal_before_send"};
+        publishEmptyPart(store, ns, "owned");
+
+        const StoppedRemovalRun run = runStoppedRemovalBeforeSend(backend, store, ns);
+
+        EXPECT_EQ(run.failed_catalog_reads, 1);
+        EXPECT_EQ(run.catalog_reads_after_failure, 1) << "the failed proof read was reissued once";
+        EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+        EXPECT_NO_THROW(updatePublishedAt(store, ns)) << "the proven Live lane must be open again";
+    }
+    {
+        SCOPED_TRACE("possible late write");
+        auto backend = std::make_shared<RefWriterTestBackend>();
+        auto store = openPool(backend, wedgeTestBudget());
+        auto clock = VirtualRetryClock::installOn(store);
+        const RootNamespace ns{"srv1/stopped_removal_after_ambiguous_write"};
+        publishEmptyPart(store, ns, "owned");
+        dropWithAmbiguousCatalogWrite(backend, store, ns);
+
+        const StoppedRemovalRun run = runStoppedRemovalBeforeSend(backend, store, ns);
+
+        EXPECT_EQ(run.failed_catalog_reads, 1);
+        EXPECT_EQ(run.catalog_reads_after_failure, 1) << "the owed proof read was reissued";
+        EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+        expectPositiveLaneClosed(store, ns);
+    }
+    {
+        SCOPED_TRACE("lease loss");
+        auto backend = std::make_shared<RefWriterTestBackend>();
+        /// Moves the mount's clock past its lease deadline and back, so the lane stays observable afterwards.
+        auto lease_clock_offset = std::make_shared<std::atomic<uint64_t>>(0);
+        PoolConfig config;
+        config.cas_request_budget = wedgeTestBudget();
+        config.boot_ms_fn = [lease_clock_offset] { return Pool::bootMs() + lease_clock_offset->load(); };
+        auto store = openPoolWithConfig(backend, config);
+        const RootNamespace ns{"srv1/stopped_removal_lease_loss"};
+        publishEmptyPart(store, ns, "owned");
+        const uint64_t past_the_lease = 10 * static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+
+        const StoppedRemovalRun run = runStoppedRemovalBeforeSend(backend, store, ns, [&]
+        {
+            lease_clock_offset->store(past_the_lease);
+        });
+        lease_clock_offset->store(0);
+
+        EXPECT_EQ(run.failed_catalog_reads, 1);
+        EXPECT_EQ(run.catalog_reads_after_failure, 0) << "the expired lease refused the reissue";
+        EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+        /// The refusal of a closed lane with no possible late write and no observed `Removing` row.
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing: creation waits",
+            [&] { updatePublishedAt(store, ns); });
+    }
+}
+
+/// Warm `namespaceLife` checks admission first: with an expired generation it reports the fence verdict
+/// and leaves the lane unchanged, also when its owner stopped.
+TEST(CASRefWriter, WarmNamespaceLifeExpiredGenerationReturnsFenceVerdict)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/warm_life_expired_generation"};
+    publishEmptyPart(store, ns, "owned");
+    const uint64_t runtime = store->refTableRuntimeIdentityForTest(ns);
+    const RefLaneState lane = store->laneStateForTest(ns);
+    DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "no longer admitted", [&] { (void)store->namespaceLife(ns); });
+
+    std::thread stopped_owner([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        query.kill();
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "no longer admitted", [&] { (void)store->namespaceLife(ns); });
+    });
+    stopped_owner.join();
+
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime);
+    EXPECT_EQ(store->laneStateForTest(ns), lane);
+}
+
+/// The guard must not reopen after an earlier ambiguous `Live -> Removing` send: that write may still land.
+TEST(CASRefWriterNamespaceRemoval, ThrowDuringRemovalSetupAfterAmbiguousWriteKeepsTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/throw_in_setup_after_ambiguous_write"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns);
+
+    store->setRemovalAttemptHookForTest([] { throw std::runtime_error("setup failed"); });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    store->setRemovalAttemptHookForTest({});
+    expectPositiveLaneClosed(store, ns);
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
 /// The uncertainty outlives the call that created it: a retried removal that fails before it sends
 /// anything, then sees an unchanged `Live` row, must not reopen the lane.
 TEST(CASRefWriterNamespaceRemoval, FailedRetryAfterAmbiguousBeginRemovingDoesNotReopenTheLane)
@@ -5375,9 +5581,9 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingSurvivesRefTableEvictio
     EXPECT_NO_THROW(store->dropNamespace(ns));
 }
 
-/// Upper bound on the virtual time one drop may spend: the window frozen at its entry, one backoff draw
-/// the pace does not consult the deadline for (the cap of `Retry::backoff`), and slack for
-/// the virtual clock's extra millisecond per pause.
+/// Upper bound on the virtual time a request may spend after it starts: its own window, one backoff draw
+/// the pace does not consult the deadline for (the cap of `Retry::backoff`), and slack for the virtual
+/// clock's extra millisecond per pause.
 const uint64_t kMaxBackoffDrawMs = 5000;
 const uint64_t kVirtualClockPauseSlackMs = 100;
 const uint64_t kOneWindowPlusBackoffMs
@@ -5426,8 +5632,9 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
 
     ASSERT_TRUE(applied_by_resolve_read) << "the kept write was never applied before the resolve read";
     ASSERT_TRUE(released_at_ms.has_value());
-    /// The loop gives up once the next pause plus the room `CasOperation::pauseBeforeRedecide` reserves for the
-    /// next decision's read and write no longer fits in the window. An earlier release came from a read inside the loop.
+    /// The loop keeps deciding until its window is nearly spent: the last decision's read and write each need an
+    /// envelope, so the release lands no earlier than that much before the window's end. An earlier release came
+    /// from a read inside the loop.
     const uint64_t next_decision_reservation_ms = 2 * store->mountRequests().attemptReservationMs();
     EXPECT_GE(*released_at_ms - drop_started_ms,
               kDefaultRequestWindowMs - kMaxBackoffDrawMs - next_decision_reservation_ms)
@@ -5556,6 +5763,316 @@ TEST(CASRefWriterNamespaceRemoval, ConcurrentRemovalAttemptsDoNotOverlapAndKeepT
     EXPECT_FALSE(overlapped) << "two removal attempts were inside the close-to-resolve window at once";
     expectPositiveLaneClosed(store, ns);
     EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+namespace
+{
+
+constexpr auto STOP_WATCHDOG = std::chrono::seconds(30);
+
+/// Keeps a blocker parked until the stopped caller has returned, or until the watchdog fires.
+struct StoppedCallerSync
+{
+    void parkBlocker()
+    {
+        std::unique_lock lock(mutex);
+        blocker_parked = true;
+        cv.notify_all();
+        cv.wait_for(lock, STOP_WATCHDOG, [&] { return stopped_returned; });
+        blocker_left = true;
+    }
+
+    bool waitBlockerParked()
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, STOP_WATCHDOG, [&] { return blocker_parked; });
+    }
+
+    /// True when the blocker was still parked.
+    bool stoppedCallerReturned()
+    {
+        std::lock_guard lock(mutex);
+        stopped_returned = true;
+        cv.notify_all();
+        return !blocker_left;
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_parked = false;
+    bool stopped_returned = false;
+    bool blocker_left = false;
+};
+
+template <typename Ready>
+bool spinUntil(Ready ready)
+{
+    const auto deadline = std::chrono::steady_clock::now() + STOP_WATCHDOG;
+    while (!ready() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    return ready();
+}
+
+}
+
+namespace
+{
+
+/// A removal's owner stops while it waits for another removal's attempt.
+void runRemovalFollowerStoppedWhileWaiting(StoppedBy owner)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/stopped_removal_follower"};
+    publishEmptyPart(store, ns, "owned");
+
+    StoppedCallerSync sync;
+    std::atomic<bool> holder_entered{false};
+    store->setRemovalAttemptHookForTest([&]
+    {
+        if (!holder_entered.exchange(true))
+            sync.parkBlocker();
+    });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+
+    std::future<int> holder = std::async(std::launch::async, [&] { return exceptionCodeOf([&] { store->dropNamespace(ns); }); });
+    ASSERT_TRUE(sync.waitBlockerParked());
+
+    int follower_code = 0;
+    bool returned_while_holder_parked = false;
+    CasRefLedger::RemovalFlagsForTest flags_on_return;
+    std::thread follower([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+        const auto background = DB::Cas::tests::backgroundOwnerStoppedBy(background_stopped);
+        const auto stop = DB::Cas::tests::stopperOf(owner, query, background_stopped);
+        /// The holder passed this hook before it parked, so only the follower stops here. A killed query
+        /// keeps waiting, so the holder is released from here; the follower has not claimed the attempt yet.
+        store->setRemovalRuntimeAcquiredHookForTest([&]
+        {
+            stop();
+            if (owner == StoppedBy::Query)
+                sync.stoppedCallerReturned();
+        });
+        follower_code = exceptionCodeOf([&] { store->dropNamespace(ns); });
+        store->setRemovalRuntimeAcquiredHookForTest(nullptr);
+        flags_on_return = store->removalFlagsForTest(ns);
+        returned_while_holder_parked = sync.stoppedCallerReturned();
+    });
+    follower.join();
+    ASSERT_EQ(holder.wait_for(STOP_WATCHDOG), std::future_status::ready);
+
+    if (owner == StoppedBy::Background)
+    {
+        EXPECT_EQ(follower_code, DB::ErrorCodes::ABORTED);
+        EXPECT_TRUE(returned_while_holder_parked) << "the stopped follower waited for the holder's attempt";
+        EXPECT_TRUE(flags_on_return.attempt_active) << "the holder's attempt must stay claimed";
+        EXPECT_TRUE(flags_on_return.admission_closed) << "the holder's closed lane must stay closed";
+    }
+    else
+    {
+        EXPECT_EQ(follower_code, 0) << "a killed query's removal completes after the holder's";
+        EXPECT_FALSE(returned_while_holder_parked);
+        EXPECT_FALSE(flags_on_return.attempt_active);
+    }
+    EXPECT_EQ(holder.get(), 0);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+}
+
+/// A removal whose background owner stops leaves; the attempt stays claimed by the removal that holds it, which then
+/// completes.
+TEST(CASRefWriterNamespaceRemoval, BackgroundStoppedRemovalFollowerLeavesOwnerClaimed)
+{
+    runRemovalFollowerStoppedWhileWaiting(StoppedBy::Background);
+}
+
+/// A removal whose query is killed keeps waiting and completes after the holder.
+TEST(CASRefWriterNamespaceRemoval, KilledRemovalFollowerCompletesAfterTheHolder)
+{
+    runRemovalFollowerStoppedWhileWaiting(StoppedBy::Query);
+}
+
+/// A namespace removal run by a killed query on a healthy store completes: every request it needs is sent.
+TEST(CASRefWriterNamespaceRemoval, KilledQuerysRemovalCompletesOnAHealthyStore)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    const RootNamespace ns{"srv1/killed_removal"};
+    publishEmptyPart(store, ns, "owned");
+
+    int code = -1;
+    std::thread killed([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        query.kill();
+        code = exceptionCodeOf([&] { store->dropNamespace(ns); });
+    });
+    killed.join();
+
+    EXPECT_EQ(code, 0);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+namespace
+{
+
+/// A removal's owner stops while it waits for appends admitted before its closure, with the catalog row left
+/// `Live` or turned `Removing` meanwhile.
+void runRemovalStoppedDuringPositiveDrain(StoppedBy owner)
+{
+    for (const bool row_turns_removing : {false, true})
+    {
+        SCOPED_TRACE(row_turns_removing ? "row turned Removing" : "exact Live");
+        auto backend = std::make_shared<RefWriterTestBackend>();
+        auto store = openPool(backend, wedgeTestBudget());
+        auto clock = VirtualRetryClock::installOn(store);
+        const RootNamespace ns{row_turns_removing ? "srv1/stopped_drain_removing" : "srv1/stopped_drain_live"};
+        publishEmptyPart(store, ns, "owned");
+        const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, store->layout(), ns);
+
+        StoppedCallerSync sync;
+        std::atomic<bool> leader_entered{false};
+        store->setRefPreCarveHookForTest([&]
+        {
+            if (!leader_entered.exchange(true))
+                sync.parkBlocker();
+        });
+        SCOPE_EXIT({ store->setRefPreCarveHookForTest(nullptr); });
+
+        std::future<int> leader = std::async(std::launch::async, [&] { return exceptionCodeOf([&] { updatePublishedAt(store, ns); }); });
+        ASSERT_TRUE(sync.waitBlockerParked());
+
+        int removal_code = 0;
+        bool returned_while_leader_parked = false;
+        CasRefLedger::RemovalFlagsForTest flags_on_return;
+        std::function<void()> stop_removal;
+        std::atomic<bool> removal_query_ready{false};
+        std::thread removal([&]
+        {
+            std::optional<DB::ThreadStatus> thread_status;
+            thread_status.emplace();
+            DB::Cas::tests::CasKillableQuery query(getContext().context);
+            auto background_stopped = std::make_shared<std::atomic<bool>>(false);
+            const auto background = DB::Cas::tests::backgroundOwnerStoppedBy(background_stopped);
+            stop_removal = DB::Cas::tests::stopperOf(owner, query, background_stopped);
+            removal_query_ready = true;
+            removal_code = exceptionCodeOf([&] { store->dropNamespace(ns); });
+            flags_on_return = store->removalFlagsForTest(ns);
+            returned_while_leader_parked = sync.stoppedCallerReturned();
+        });
+        /// Only the drain wait follows the closure, so a closed lane means the removal is in, or entering, that wait.
+        const bool closed = spinUntil([&] { return store->removalFlagsForTest(ns).admission_closed; });
+        EXPECT_TRUE(closed);
+        if (row_turns_removing)
+            rewriteCatalogRow(backend, store->layout(), ns, CatalogEntry{
+                .ns = ns, .state = NsState::Removing, .incarnation = life.incarnation, .removal_started_round = 0});
+        ASSERT_TRUE(removal_query_ready.load());
+        stop_removal();
+        /// A killed query keeps waiting, so the parked leader is released independently.
+        if (owner == StoppedBy::Query)
+            sync.stoppedCallerReturned();
+        removal.join();
+        ASSERT_EQ(leader.wait_for(STOP_WATCHDOG), std::future_status::ready);
+
+        EXPECT_EQ(leader.get(), 0) << "the append admitted before the closure commits";
+        if (owner == StoppedBy::Query)
+        {
+            EXPECT_EQ(removal_code, 0) << "a killed query's removal completes once the admitted append committed";
+            EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+            continue;
+        }
+        EXPECT_EQ(removal_code, DB::ErrorCodes::ABORTED);
+        EXPECT_TRUE(returned_while_leader_parked) << "the stopped removal waited for the admitted append";
+        EXPECT_FALSE(flags_on_return.attempt_active);
+        EXPECT_EQ(flags_on_return.admission_closed, row_turns_removing);
+        if (row_turns_removing)
+        {
+            expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { updatePublishedAt(store, ns); });
+        }
+        else
+        {
+            EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+            EXPECT_NO_THROW(updatePublishedAt(store, ns)) << "the proven Live lane must be open again";
+        }
+    }
+}
+
+}
+
+/// A removal whose background owner stops while it waits for appends admitted before its closure sent nothing.
+/// It reopens the lane only when a fresh read proves the exact `Live` row; a row turned `Removing` meanwhile keeps
+/// it closed. The admitted append commits either way.
+TEST(CASRefWriterNamespaceRemoval, BackgroundStoppedPositiveDrainReopensOnlyItsProvenLiveLane)
+{
+    runRemovalStoppedDuringPositiveDrain(StoppedBy::Background);
+}
+
+/// A removal whose query is killed while it waits for an admitted append keeps waiting and removes the namespace
+/// once the append has committed.
+TEST(CASRefWriterNamespaceRemoval, KilledQuerysRemovalWaitsForTheAdmittedAppendAndCompletes)
+{
+    runRemovalStoppedDuringPositiveDrain(StoppedBy::Query);
+}
+
+/// The `Live -> Removing` reply is lost and the owner stops while the write's settling read is in flight. The
+/// read is owed and cannot prove the outcome, so the write is not resent, the caller gets the unresolved
+/// retry-later exit, and the lane stays closed against the write that may still land.
+TEST(CASRefWriterNamespaceRemoval, StopDuringRemovingSettlementKeepsUnresolvedExit)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/stop_during_removing_settlement"};
+    publishEmptyPart(store, ns, "owned");
+    const String catalog_key = store->layout().refCatalogKey();
+    const size_t catalog_writes_before = catalogWritesInJournal(backend, store->layout());
+
+    StoppedCallerSync sync;
+    std::atomic<bool> parked_once{false};
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == catalog_key && backend->catalog_cas_fault_fired && !parked_once.exchange(true))
+            sync.parkBlocker();
+    };
+    SCOPE_EXIT({ backend->read_observer = {}; });
+    backend->catalog_fault_key = catalog_key;
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted;
+
+    int removal_code = 0;
+    std::function<void()> kill_removal;
+    std::thread removal([&]
+    {
+        std::optional<DB::ThreadStatus> thread_status;
+        thread_status.emplace();
+        DB::Cas::tests::CasKillableQuery query(getContext().context);
+        kill_removal = [&query] { query.kill(); };
+        removal_code = exceptionCodeOf([&] { store->dropNamespace(ns); });
+        sync.stoppedCallerReturned();
+    });
+    const bool parked = sync.waitBlockerParked();
+    EXPECT_TRUE(parked) << "the lost write was never settled by a read";
+    if (parked)
+        kill_removal();
+    {
+        std::lock_guard lock(sync.mutex);
+        sync.stopped_returned = true;
+    }
+    sync.cv.notify_all();
+    removal.join();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+
+    EXPECT_EQ(removal_code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_EQ(catalogWritesInJournal(backend, store->layout()) - catalog_writes_before, 1u) << "a stopped owner resends nothing";
+    EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+    expectPositiveLaneClosed(store, ns);
 }
 
 /// A refusal at the admission check inside `beginRemoving` comes before any write is sent, so nothing can
@@ -5880,9 +6397,9 @@ TEST(CASRefWriterNamespaceRemoval, EntryChangedAfterASentAttemptKeepsTheLaneClos
     expectPositiveLaneClosed(store, ns);
 }
 
-/// A creator-fence read made while the drop decides must draw on the drop's one frozen window: a slow
-/// first read plus a failing fence read must not exceed that window.
-TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDeadline)
+/// A slow first catalog read carries the clock past a whole window; the creator-fence read after it is
+/// sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsCreatorFenceReadAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
@@ -5898,14 +6415,14 @@ TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDe
     creating.creator = CreatorFence{.server_root_id = foreign_creator, .writer_epoch = 7, .fence_generation = 1};
     casAdmitEntryForTest(backend, layout, 1, creating);
 
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     size_t fence_reads = 0;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
         if (key == layout.mountKey(foreign_creator))
         {
@@ -5915,33 +6432,32 @@ TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDe
     };
     SCOPE_EXIT({ backend->read_observer = nullptr; });
 
-    const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
-    ASSERT_TRUE(first_catalog_read_done);
+    ASSERT_TRUE(first_read_ended_ms.has_value());
     EXPECT_GT(fence_reads, 0U) << "the creator fence was never read";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the creator-fence read outlived its own window";
 }
 
-/// The `gc/state` read is part of the removal decision, so it draws on the same window as the catalog read
-/// that came before it.
-TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsReads)
+/// A slow first catalog read carries the clock past a whole window; the `gc/state` read of the removal
+/// decision is sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsGcStateReadAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/one_window_across_reads"};
+    const RootNamespace ns{"srv1/gc_state_read_after_slow_read"};
     publishEmptyPart(store, ns, "owned");
 
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     size_t gc_state_reads = 0;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
         if (key == layout.gcStateKey())
         {
@@ -5951,64 +6467,212 @@ TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsReads)
     };
     SCOPE_EXIT({ backend->read_observer = nullptr; });
 
-    const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
-    ASSERT_TRUE(first_catalog_read_done);
-    EXPECT_GT(gc_state_reads, 0U) << "the gc/state read was never reached";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    ASSERT_TRUE(first_read_ended_ms.has_value());
+    EXPECT_GT(gc_state_reads, 0U) << "the gc/state read was never sent";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the gc/state read outlived its own window";
 }
 
-/// The `Live -> Removing` catalog update draws on the drop's one frozen window too: a slow first read
-/// plus catalog writes that never land must not exceed that window.
-TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsCatalogUpdate)
+/// A slow first catalog read carries the clock past a whole window; the `Live -> Removing` catalog
+/// update is sent and ends at its own window.
+TEST(CASRefWriterNamespaceRemoval, DropSendsItsCatalogUpdateAfterASlowFirstRead)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/one_window_across_catalog_update"};
+    const RootNamespace ns{"srv1/catalog_update_after_slow_read"};
     publishEmptyPart(store, ns, "owned");
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted;
-    bool first_catalog_read_done = false;
+    std::optional<uint64_t> first_read_ended_ms;
     backend->read_observer = [&](const String & key)
     {
-        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        if (key == layout.refCatalogKey() && !first_read_ended_ms)
         {
-            first_catalog_read_done = true;
-            clock->advance(60'000);
+            clock->advance(kDefaultRequestWindowMs + 10'000);
+            first_read_ended_ms = clock->nowMs();
         }
     };
     SCOPE_EXIT({ backend->read_observer = nullptr; });
 
-    const uint64_t now_before = clock->nowMs();
     EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
-    ASSERT_TRUE(first_catalog_read_done);
-    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "no catalog write was attempted";
-    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
-        << "the drop spent more than the one window frozen at its entry";
+    ASSERT_TRUE(first_read_ended_ms.has_value());
+    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "no catalog write was sent";
+    EXPECT_LE(clock->nowMs() - *first_read_ended_ms, kOneWindowPlusBackoffMs)
+        << "the catalog update outlived its own window";
 }
 
-/// A local wait that outlasts the window is not cut short. The next read gives up at once with nothing
-/// sent, the catch-side read has its own window and finds the row `Live`, and the lane reopens.
-TEST(CASRefWriterNamespaceRemoval, AWaitLongerThanTheWindowEndsTheDropAndLeavesTheLaneOpen)
+/// A gap longer than the window between two requests of the removal does not end it: the reads after
+/// the gap are sent.
+/// The `gc/state` read then fails before any write is sent, the catch-side read finds the row `Live`, and
+/// the lane reopens.
+TEST(CASRefWriterNamespaceRemoval, AReadFailingAfterAGapLongerThanTheWindowLeavesTheLaneOpen)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
     auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/wait_longer_than_window"};
+    const RootNamespace ns{"srv1/gap_longer_than_window"};
     publishEmptyPart(store, ns, "owned");
 
-    store->setRemovalAttemptHookForTest([&] { clock->advance(kDefaultRequestWindowMs + 10'000); });
+    std::optional<uint64_t> gap_ended_ms;
+    store->setRemovalAttemptHookForTest([&]
+    {
+        clock->advance(kDefaultRequestWindowMs + 10'000);
+        gap_ended_ms = clock->nowMs();
+    });
     SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    size_t gc_state_reads = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.gcStateKey() && gap_ended_ms)
+        {
+            ++gc_state_reads;
+            throw DB::Exception(DB::ErrorCodes::S3_ERROR, "simulated transient GET failure");
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+    const size_t catalog_writes_before = catalogWritesInJournal(backend, layout);
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "gave up at the policy deadline", [&] { store->dropNamespace(ns); });
+    ASSERT_TRUE(gap_ended_ms.has_value());
+    EXPECT_GT(gc_state_reads, 0U) << "the removal's reads after the gap were never sent";
+    EXPECT_LE(clock->nowMs() - *gap_ended_ms, kOneWindowPlusBackoffMs)
+        << "the gc/state read outlived its own window";
+    EXPECT_EQ(catalogWritesInJournal(backend, layout), catalog_writes_before) << "a catalog write was sent";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
     EXPECT_NO_THROW(updatePublishedAt(store, ns));
+}
+
+/// Another server lands an unrelated catalog row inside every `Live -> Removing` write, so each write is
+/// refused and the update ends at its submission cap. A write was sent, so the lane stays closed even
+/// though the row still reads `Live`. An insert is refused before it sends anything, so it leaves no cleanup
+/// duty and does not pin the build floor, and a retried removal completes.
+TEST(CASRefWriterNamespaceRemoval, ACapExitAfterSendsLeavesTheLaneClosedAndARetriedDropCompletes)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    /// Pauses take no time, so the submission cap and not a window ends the update.
+    store->setCasRetrySleepForTest([](uint64_t) {});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/cap_exit_after_sends"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    bool racing = false;
+    bool in_observer = false;
+    size_t rival_rows = 0;
+    store->setRemovalAttemptHookForTest([&] { racing = true; });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    backend->read_observer = [&](const String & key)
+    {
+        if (!racing || in_observer || key != layout.refCatalogKey())
+            return;
+        in_observer = true;
+        SCOPE_EXIT({ in_observer = false; });
+        /// Zero-padded, so each appended row sorts after the ones before it.
+        RefCatalog rival = readCatalogForTest(backend, layout).catalog;
+        rival.entries.push_back(CatalogEntry{
+            .ns = RootNamespace{fmt::format("srv2/rival_{:03}", rival_rows)}, .state = NsState::Live,
+            .incarnation = UInt128(0xa000 + rival_rows)});
+        ++rival_rows;
+        backend->catalog_replacement_bytes = encodeRefCatalog(rival);
+        backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::OtherWriterReplacement;
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+    const size_t catalog_writes_before = catalogWritesInJournal(backend, layout);
+
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 submissions", [&] { store->dropNamespace(ns); });
+    store->setRemovalAttemptHookForTest({});
+    racing = false;
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+    EXPECT_EQ(catalogWritesInJournal(backend, layout) - catalog_writes_before, 100U);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+    expectPositiveLaneClosed(store, ns);
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "retry the `DROP TABLE`",
+        [&] { (void)publishEmptyPart(store, ns, "inserted_after_the_failed_drop"); });
+    EXPECT_FALSE(store->writerCleanupDutiesPendingForTest()) << "the refused insert left a cleanup duty";
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq()) << "the refused insert pins the build floor";
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// A transaction whose precommit landed calls `precommitAdd` again after the lane closed. The refusal of
+/// that second call must keep the first call's duty, so `abandon` neither forgets the binding nor deletes
+/// the manifest body it names.
+TEST(CASRefWriterNamespaceRemoval, ARefusedSecondPrecommitKeepsTheDurableDuty)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    store->setCasRetrySleepForTest([](uint64_t) {});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/refused_second_precommit"};
+    publishEmptyPart(store, ns, "owned");
+
+    auto build = startBuildFor(store, ns, "held");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "held", id);
+    ASSERT_EQ(build->precommitState(), PartWriteTxn::PrecommitState::Durable);
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    bool racing = false;
+    bool in_observer = false;
+    size_t rival_rows = 0;
+    store->setRemovalAttemptHookForTest([&] { racing = true; });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    backend->read_observer = [&](const String & key)
+    {
+        if (!racing || in_observer || key != layout.refCatalogKey())
+            return;
+        in_observer = true;
+        SCOPE_EXIT({ in_observer = false; });
+        RefCatalog rival = readCatalogForTest(backend, layout).catalog;
+        rival.entries.push_back(CatalogEntry{
+            .ns = RootNamespace{fmt::format("srv2/rival_{:03}", rival_rows)}, .state = NsState::Live,
+            .incarnation = UInt128(0xb000 + rival_rows)});
+        ++rival_rows;
+        backend->catalog_replacement_bytes = encodeRefCatalog(rival);
+        backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::OtherWriterReplacement;
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "did not converge after 100 submissions", [&] { store->dropNamespace(ns); });
+    store->setRemovalAttemptHookForTest({});
+    racing = false;
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+    expectPositiveLaneClosed(store, ns);
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "retry the `DROP TABLE`",
+        [&] { build->precommitAdd(ns, "held", id); });
+    EXPECT_EQ(build->precommitState(), PartWriteTxn::PrecommitState::Durable)
+        << "the refused second call erased the first call's duty";
+
+    bool abandoned = false;
+    try
+    {
+        build->abandon();
+        abandoned = true;
+    }
+    catch (const DB::Exception &) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    build.reset();
+    const bool bound = independentFullReplayForTest(*backend, layout, ns).getPrecommits().contains({"held", id.ref});
+    if (abandoned)
+        EXPECT_FALSE(bound) << "abandon returned without removing the binding";
+    else
+        EXPECT_TRUE(store->writerCleanupDutiesPendingForTest()) << "a failed abandon left the binding without a cleanup duty";
+    if (bound)
+        EXPECT_TRUE(readOf(backend, layout.manifestKey(id))) << "the body a precommit binding names was deleted";
 }
 
 /// A remount replaces the runtime, and the new one starts with the lane open.
@@ -7753,7 +8417,7 @@ CasRequestBudget sealTestTinyBudget()
 
 /// ===================================================================================
 /// Layer 1 of the stuck-table-load fix: `ensureRefTableRecovered` retries a whole recovery attempt
-/// after a TRANSIENT object-store NETWORK_ERROR (bounded by `recovery_retry_budget_ms`), instead of
+/// after a TRANSIENT object-store NETWORK_ERROR (bounded by `kCasMaxRecoveryWalks`), instead of
 /// failing the table's async load permanently. Non-transient errors and the terminal vanish-race
 /// brake still fail fast.
 /// ===================================================================================
@@ -7773,7 +8437,6 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     config.server_id = UInt128(1);
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
-    config.cas_request_budget.recovery_retry_budget_ms = 120000;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
     /// Captured by value: `fake_now` stays frozen for the whole test (see below), and the Pool can
@@ -7829,7 +8492,6 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
     config.server_id = UInt128(1);
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
-    config.cas_request_budget.recovery_retry_budget_ms = 120000;
     /// Captured by value: `fake_now` is never mutated in this test, and the Pool can outlive this
     /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture would
     /// dangle.
@@ -7857,11 +8519,13 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
         << "the chain is closed by one tombstone without enumerating the stream";
 }
 
-TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
+/// A transient failure that never clears ends recovery after `kCasMaxRecoveryWalks` walks, however much
+/// time the pauses take: seven 60 s pauses pass and no elapsed-time check ends the loop.
+TEST(CASRefWriterRecoveryRetry, TransientFailureThatNeverClearsPropagatesAfterTheWalkCap)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
-    const RootNamespace ns{"srv1/retry_budget"};
+    const RootNamespace ns{"srv1/retry_cap"};
 
     seedSealFixtureDeadEpochs(backend, layout, ns);
     seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
@@ -7873,13 +8537,11 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
 
     PoolConfig config;
     config.server_id = UInt128(1);
-    /// Lease TTL >> the recovery budget so the CLOCK-advancing backoff below trips the budget check,
-    /// not the mount fence -- this test specifically exercises the budget-exhaustion path.
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(600000);
+    /// Lease TTL far above the total pause time, so the fence never ends the loop before the cap does.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(3'600'000);
     config.cas_request_budget = sealTestTinyBudget();
-    config.cas_request_budget.recovery_retry_budget_ms = 5000;   /// small, deterministic
-    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
-    config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 60'000;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 60'000;
     config.boot_ms_fn = [fake_now] { return fake_now->load(); };
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
@@ -7889,9 +8551,16 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     /// The tombstone at `{2,2}`, the slot after the chain's last record, is the first log the walk writes.
     const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
-    backend->fault_count = 1000;   /// never stops failing within the budget
+    backend->fault_latched = true;
 
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries];
+    const uint64_t clock_before = fake_now->load();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
+
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before + (kCasMaxRecoveryWalks - 1))
+        << "eight walks mean seven pauses";
+    EXPECT_GE(fake_now->load() - clock_before, uint64_t{7} * 60'000) << "420 s of pauses passed, so no elapsed-time check ended the loop";
 }
 
 TEST(CASRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
@@ -7992,7 +8661,6 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     config.server_id = UInt128(1);
     config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
     config.cas_request_budget = sealTestTinyBudget();
-    config.cas_request_budget.recovery_retry_budget_ms = 120000;
     config.wait_sleep_fn = [](uint64_t) {};
     auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
@@ -8018,6 +8686,602 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     /// concurrent-safe second recovery would deadlock or mis-behave.
     sleep_should_throw->store(false);
     EXPECT_EQ(store->listRefs(ns).size(), 2u) << "a second touch must recover; the retry lane is not wedged";
+}
+
+/// ===================================================================================
+/// The recovery loop ends after `kCasMaxRecoveryWalks` walks in total, whichever mix of transient
+/// failures and structural restarts spent them. Pauses are no-ops, so only the cap can end the loop.
+/// ===================================================================================
+
+namespace
+{
+
+enum class WalkFate : uint8_t
+{
+    Succeed,
+    FailTransiently,
+    /// The walk ends by finding `_ckpt` replaced, which asks for a restart.
+    Restart,
+    Corrupt,
+};
+
+/// Decides each walk's fate from its position; a walk past the end of the script succeeds.
+struct RecoveryWalkScript
+{
+    std::vector<WalkFate> fates;
+    int transient_code = DB::ErrorCodes::S3_ERROR;
+    /// Set before the recovery starts; run on the recovering thread.
+    std::function<void(uint32_t walk)> before_walk;
+    std::function<void()> on_pause;
+    std::function<void(const String & key)> on_read;
+    std::atomic<bool> armed{false};
+    std::atomic<uint32_t> walks{0};
+    std::atomic<uint32_t> pauses{0};
+    std::atomic<uint32_t> ckpt_reads_in_walk{0};
+    std::atomic<bool> replacing_ckpt{false};
+
+    WalkFate current() const
+    {
+        const uint32_t n = walks.load();
+        return n >= 1 && n <= fates.size() ? fates[n - 1] : WalkFate::Succeed;
+    }
+};
+
+struct ScriptedRecovery
+{
+    std::shared_ptr<RefWriterTestBackend> backend;
+    std::shared_ptr<RecoveryWalkScript> script;
+    PoolPtr store;
+    RootNamespace ns;
+};
+
+/// With `production_backoff_ms`, the pool keeps its own backoff and pauses that long after a failed walk.
+ScriptedRecovery openScriptedRecovery(std::vector<WalkFate> fates, std::optional<uint64_t> production_backoff_ms = std::nullopt)
+{
+    ScriptedRecovery scripted;
+    scripted.backend = std::make_shared<RefWriterTestBackend>();
+    scripted.script = std::make_shared<RecoveryWalkScript>();
+    scripted.script->fates = std::move(fates);
+    scripted.ns = RootNamespace{"srv1/walk_cap"};
+    const Layout layout("p");
+
+    seedSealFixtureDeadEpochs(scripted.backend, layout, scripted.ns);
+    seedUncleanPredecessorMount(scripted.backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.boot_ms_fn = [] { return uint64_t{1'000'000}; };
+    config.wait_sleep_fn = [](uint64_t) {};
+    if (production_backoff_ms)
+    {
+        config.cas_request_budget.recovery_retry_initial_backoff_ms = *production_backoff_ms;
+        config.cas_request_budget.recovery_retry_max_backoff_ms = *production_backoff_ms;
+    }
+    config.recovery_pre_first_request_hook_for_test = [script = scripted.script]
+    {
+        if (!script->armed)
+            return;
+        const uint32_t walk = ++script->walks;
+        script->ckpt_reads_in_walk = 0;
+        if (script->before_walk)
+            script->before_walk(walk);
+        if (script->current() == WalkFate::FailTransiently)
+            throw DB::Exception(script->transient_code, "scripted walk failure");
+        if (script->current() == WalkFate::Corrupt)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "scripted walk corruption");
+    };
+    scripted.store = openPoolWithConfig(scripted.backend, config);
+    if (!production_backoff_ms)
+    {
+        scripted.store->setCasRetrySleepForTest([](uint64_t) {});
+        scripted.store->setRefRecoveryRetrySleepForTest([script = scripted.script](uint64_t, const auto &)
+        {
+            ++script->pauses;
+            if (script->on_pause)
+                script->on_pause();
+        });
+    }
+
+    /// A walk reads `_ckpt` first and last; replacing it between the two makes the last read disagree.
+    const NamespaceLifeId life = lifeIfCatalogedForTest(scripted.backend, layout, scripted.ns).value();
+    const String ckpt_key = layout.refCkptKey(life);
+    scripted.backend->read_observer = [script = scripted.script, ckpt_key, layout, life,
+                                       weak_backend = std::weak_ptr<RefWriterTestBackend>(scripted.backend)](const String & key)
+    {
+        if (script->armed && script->on_read)
+            script->on_read(key);
+        if (!script->armed || key != ckpt_key || script->replacing_ckpt)
+            return;
+        if (++script->ckpt_reads_in_walk != 2 || script->current() != WalkFate::Restart)
+            return;
+        script->replacing_ckpt = true;
+        SCOPE_EXIT({ script->replacing_ckpt = false; });
+        const BackendPtr backend_ptr = weak_backend.lock();
+        ASSERT_TRUE(backend_ptr);
+        const auto sampled = readCkptForTest(backend_ptr, layout, life);
+        ASSERT_TRUE(sampled);
+        ASSERT_TRUE(replaceForTest(backend_ptr, ckpt_key, encodeRefCkptAtGeneration(sampled->ckpt, 3), sampled->etag));
+    };
+    scripted.script->armed = true;
+    return scripted;
+}
+
+}
+
+TEST(CASRefWriterRecoveryRetry, SuccessOnTheEighthWalkInstalls)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(7, WalkFate::FailTransiently));
+
+    EXPECT_EQ(scripted.store->listRefs(scripted.ns).size(), 2u);
+    EXPECT_EQ(scripted.script->walks.load(), 8u);
+}
+
+TEST(CASRefWriterRecoveryRetry, ATransientFailureOnTheEighthWalkRethrows)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(8, WalkFate::FailTransiently));
+
+    /// The failure of the last walk propagates unchanged, not recoded as a retry-later error.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 7u) << "a pause follows every failed walk except the last";
+}
+
+TEST(CASRefWriterRecoveryRetry, AStructuralRestartOnTheEighthWalkReportsExhaustion)
+{
+    std::vector<WalkFate> fates(5, WalkFate::FailTransiently);
+    fates.insert(fates.end(), 3, WalkFate::Restart);
+    auto scripted = openScriptedRecovery(std::move(fates));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the last walk restarted because the checkpoint or its base moved",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 5u);
+}
+
+TEST(CASRefWriterRecoveryRetry, MixedFailuresEndAtEightWalks)
+{
+    using enum WalkFate;
+    auto scripted = openScriptedRecovery({Restart, FailTransiently, Restart, Restart, FailTransiently, Restart,
+                                          FailTransiently, FailTransiently});
+
+    /// Transient failures end at walks 2, 5, 7 and 8; the last one is not followed by a pause.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u) << "no ninth walk after the cap";
+    EXPECT_EQ(scripted.script->pauses.load(), 3u);
+}
+
+/// The eighth walk is also the fourth restart in a row, so the structural brake reports it.
+TEST(CASRefWriterRecoveryRetry, TheEighthWalkAsTheFourthConsecutiveRestartHitsTheBrake)
+{
+    std::vector<WalkFate> fates(4, WalkFate::FailTransiently);
+    fates.insert(fates.end(), 4, WalkFate::Restart);
+    auto scripted = openScriptedRecovery(std::move(fates));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "restarted 3 times",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 8u);
+}
+
+/// Guard: restarts alone stop at the structural brake (the initial walk plus three restarts), well
+/// before the cap.
+TEST(CASRefWriterRecoveryRetry, TheStructuralBrakeEndsBeforeEightWalks)
+{
+    auto scripted = openScriptedRecovery(std::vector<WalkFate>(20, WalkFate::Restart));
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "restarted 3 times",
+        [&] { scripted.store->listRefs(scripted.ns); });
+    EXPECT_EQ(scripted.script->walks.load(), 4u);
+}
+
+/// ===================================================================================
+/// A stopped owner: no new walk after a failed walk; a restart after a successful walk, a structural exit
+/// and a follower keep their plain answers.
+/// ===================================================================================
+
+namespace
+{
+
+std::exception_ptr queryTimeout()
+{
+    return std::make_exception_ptr(DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "test: the query timed out"));
+}
+
+}
+
+TEST(CASRefWriterRecoveryRetry, OwnerTimeoutEndsAfterFailedWalkTransportTimeoutCanRecover)
+{
+    {
+        SCOPED_TRACE("the owner timed out during a failed walk");
+        auto scripted = openScriptedRecovery({WalkFate::FailTransiently});
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            scripted.script->before_walk = [&query](uint32_t) { query.kill(queryTimeout()); };
+            expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+                [&] { scripted.store->listRefs(scripted.ns); });
+            scripted.script->before_walk = {};
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 1u) << "no walk after the owner's timeout";
+        EXPECT_EQ(scripted.script->pauses.load(), 0u);
+    }
+    {
+        SCOPED_TRACE("control: a transport timeout under a live owner");
+        auto scripted = openScriptedRecovery({WalkFate::FailTransiently});
+        scripted.script->transient_code = DB::ErrorCodes::TIMEOUT_EXCEEDED;
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery &)
+        {
+            size_t refs = 0;
+            EXPECT_NO_THROW(refs = scripted.store->listRefs(scripted.ns).size());
+            EXPECT_EQ(refs, 2u);
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 2u);
+    }
+}
+
+TEST(CASRefWriterRecoveryRetry, StopAfterTransientFailureStartsNoNewWalk)
+{
+    for (const bool stop_in_backoff : {false, true})
+    {
+        SCOPED_TRACE(stop_in_backoff ? "stop in the backoff" : "stop during the failed walk");
+        auto scripted = openScriptedRecovery({WalkFate::FailTransiently});
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            if (stop_in_backoff)
+                scripted.script->on_pause = [&query] { query.kill(); };
+            else
+                scripted.script->before_walk = [&query](uint32_t) { query.kill(); };
+            expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+                [&] { scripted.store->listRefs(scripted.ns); });
+            scripted.script->on_pause = {};
+            scripted.script->before_walk = {};
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 1u);
+        EXPECT_EQ(scripted.script->pauses.load(), stop_in_backoff ? 1u : 0u);
+    }
+}
+
+/// The pool's own backoff, ten seconds long, sleeps in owner-stop slices: a kill during a slice ends recovery when that
+/// slice ends, with no further slice and no new walk.
+TEST(CASRefWriterRecoveryRetry, StopDuringBackoffEndsWithinASlice)
+{
+    auto scripted = openScriptedRecovery({WalkFate::FailTransiently}, /*production_backoff_ms=*/10'000);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool sleeping = false;
+    bool killed = false;
+    std::vector<uint64_t> slices;
+    scripted.store->setRefRecoveryRetrySliceSleepForTest([&](uint64_t ms)
+    {
+        std::unique_lock lock(mutex);
+        slices.push_back(ms);
+        sleeping = true;
+        cv.notify_all();
+        cv.wait_for(lock, STOP_WATCHDOG, [&] { return killed; });
+    });
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        std::thread killer([&]
+        {
+            std::unique_lock lock(mutex);
+            cv.wait_for(lock, STOP_WATCHDOG, [&] { return sleeping; });
+            query.kill();
+            killed = true;
+            cv.notify_all();
+        });
+        expectThrowsCodeWithMessage(DB::ErrorCodes::S3_ERROR, "scripted walk failure",
+            [&] { scripted.store->listRefs(scripted.ns); });
+        killer.join();
+    });
+    ASSERT_EQ(slices.size(), 1u) << "a slice started after the kill";
+    EXPECT_EQ(*std::max_element(slices.begin(), slices.end()), static_cast<uint64_t>(DB::Cas::kOwnerStopSlice.count()))
+        << "the backoff is not sliced at the owner-stop slice";
+    EXPECT_EQ(scripted.script->walks.load(), 1u);
+}
+
+TEST(CASRefWriterRecoveryRetry, StopDuringCorruptionConfirmationIsNotCorruption)
+{
+    auto scripted = openScriptedRecovery({WalkFate::Corrupt});
+    const String catalog_key = scripted.store->layout().refCatalogKey();
+    /// The walk fails before its first request, so the next catalog read is the confirmation's.
+    std::atomic<bool> walk_failed{false};
+    std::atomic<bool> confirmation_read_lost{false};
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        scripted.script->before_walk = [&](uint32_t) { walk_failed = true; };
+        scripted.script->on_read = [&](const String & key)
+        {
+            if (key != catalog_key || !walk_failed.exchange(false))
+                return;
+            confirmation_read_lost = true;
+            query.kill();
+            throw Poco::TimeoutException("test: the confirmation's catalog read is lost");
+        };
+        String error;
+        try
+        {
+            scripted.store->listRefs(scripted.ns);
+        }
+        catch (const Poco::TimeoutException & e)
+        {
+            error = e.message();
+        }
+        catch (...)
+        {
+            error = "unexpected: " + DB::getCurrentExceptionMessage(false);
+        }
+        EXPECT_EQ(error, "test: the confirmation's catalog read is lost") << "the confirmation's own failure";
+        scripted.script->before_walk = {};
+        scripted.script->on_read = {};
+    });
+    EXPECT_TRUE(confirmation_read_lost.load()) << "the owner stopped during the corruption confirmation";
+    EXPECT_EQ(scripted.script->walks.load(), 1u);
+
+    /// The failure released the recovery and `state_mutex`, so the next recovery of the table proceeds. A wedged one
+    /// keeps its own references to the pool, so its thread is left behind.
+    auto next_recovery = std::make_shared<std::promise<size_t>>();
+    auto recovered = next_recovery->get_future();
+    std::thread next([store = scripted.store, ns = scripted.ns, next_recovery]
+    {
+        try
+        {
+            next_recovery->set_value(store->listRefs(ns).size());
+        }
+        catch (...)
+        {
+            next_recovery->set_exception(std::current_exception());
+        }
+    });
+    if (recovered.wait_for(STOP_WATCHDOG) != std::future_status::ready)
+    {
+        next.detach();
+        FAIL() << "the next recovery of the table did not return";
+    }
+    next.join();
+    EXPECT_EQ(recovered.get(), 2u);
+    EXPECT_EQ(scripted.script->walks.load(), 2u);
+}
+
+/// A confirmation that fails under a live owner did not establish that the catalog still names the life, so its own
+/// failure is the answer, never the walk's corruption.
+TEST(CASRefWriterRecoveryRetry, FailedCorruptionConfirmationUnderALiveOwnerIsNotCorruption)
+{
+    auto scripted = openScriptedRecovery({WalkFate::Corrupt});
+    const String catalog_key = scripted.store->layout().refCatalogKey();
+    /// The walk fails before its first request, so the next catalog read is the confirmation's.
+    std::atomic<bool> walk_failed{false};
+    std::atomic<bool> confirmation_read_refused{false};
+    int code = 0;
+    String message;
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery &)
+    {
+        scripted.script->before_walk = [&](uint32_t) { walk_failed = true; };
+        scripted.script->on_read = [&](const String & key)
+        {
+            if (key != catalog_key || !walk_failed.exchange(false))
+                return;
+            confirmation_read_refused = true;
+            throw DB::Exception(DB::ErrorCodes::READONLY, "test: the confirmation's catalog read is refused");
+        };
+        try
+        {
+            scripted.store->listRefs(scripted.ns);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+            message = e.message();
+        }
+        scripted.script->before_walk = {};
+        scripted.script->on_read = {};
+    });
+    EXPECT_TRUE(confirmation_read_refused.load());
+    EXPECT_EQ(code, DB::ErrorCodes::READONLY) << message;
+    EXPECT_NE(message.find("the confirmation's catalog read is refused"), String::npos) << message;
+    EXPECT_EQ(scripted.script->walks.load(), 1u);
+}
+
+/// A kill in the backoff after a network failure vetoes the next walk and keeps the network error, which the part
+/// loader's classifier reads as retryable rather than as damage.
+TEST(CASRefWriterRecoveryRetry, KillInBackoffAfterNetworkFailureKeepsTheNetworkError)
+{
+    auto scripted = openScriptedRecovery({WalkFate::FailTransiently});
+    scripted.script->transient_code = DB::ErrorCodes::NETWORK_ERROR;
+    std::exception_ptr error;
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        scripted.script->on_pause = [&query] { query.kill(); };
+        try
+        {
+            scripted.store->listRefs(scripted.ns);
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        scripted.script->on_pause = {};
+    });
+    ASSERT_TRUE(error);
+    EXPECT_EQ(DB::getExceptionMessage(error, false).find("scripted walk failure") != String::npos, true)
+        << DB::getExceptionMessage(error, false);
+    EXPECT_TRUE(DB::isRetryableException(error)) << "a vetoed retry must not read as part damage";
+    EXPECT_EQ(scripted.script->walks.load(), 1u);
+    EXPECT_EQ(scripted.script->pauses.load(), 1u);
+}
+
+/// A walk that fails with real corruption of a life the catalog no longer names ends the same for a killed query as
+/// for a live one: the confirmation is no retry, so it runs and finds the life removed.
+TEST(CASRefWriterRecoveryRetry, KilledQuerysCorruptionOfARemovedLifeIsConfirmed)
+{
+    const auto run = [](bool kill)
+    {
+        auto scripted = openScriptedRecovery({WalkFate::Corrupt});
+        const Layout layout("p");
+        const NamespaceLifeId life = lifeIfCatalogedForTest(scripted.backend, layout, scripted.ns).value();
+        std::pair<int, String> outcome{0, ""};
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            scripted.script->before_walk = [&](uint32_t)
+            {
+                eraseLifeForTest(scripted.backend, layout, life);
+                if (kill)
+                    query.kill();
+            };
+            try
+            {
+                outcome.second = std::to_string(scripted.store->listRefs(scripted.ns).size());
+            }
+            catch (const DB::Exception & e)
+            {
+                outcome = {e.code(), e.message()};
+            }
+            scripted.script->before_walk = {};
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 1u);
+        return outcome;
+    };
+    const auto live = run(false);
+    const auto killed = run(true);
+    EXPECT_NE(live.first, DB::ErrorCodes::CORRUPTED_DATA) << live.second;
+    EXPECT_EQ(killed.first, live.first) << killed.second;
+    EXPECT_EQ(killed.second, live.second);
+}
+
+/// A query's stored cause with the `CORRUPTED_DATA` code says nothing about the checkpoint: the failed base read
+/// starts no checkpoint reread and no restart, and the stored cause propagates.
+TEST(CASRefWriterRecoveryRetry, StoredCorruptedDataStartsNoCheckpointReread)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/stored_corruption"};
+    const ManifestRef ma = manifestRef(1, 1, 1);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    const RefTxnId snap{1, 10};
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = snap,
+        .ops = publishCommittedOps("a", ma),
+        .prev_epoch_seal = std::nullopt});
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap, {committedRow("a", ma)}));
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = snap,
+        .checkpoint_snapshot_id = snap,
+        .last_epoch_seal = std::nullopt}, 1)));
+    auto store = openPool(backend);
+    const String snapshot_key = layout.refSnapshotKey(life, snap);
+    const String ckpt_key = layout.refCkptKey(life);
+    uint64_t ckpt_reads_before = 0;
+    std::exception_ptr error;
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        /// The store fails the base read the way the S3 client does for a killed query: with the query's cause.
+        backend->read_observer = [&](const String & key)
+        {
+            if (key != snapshot_key)
+                return;
+            query.kill(std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "the query's stored cause")));
+            DB::CurrentThread::checkIfNotCancelled();
+        };
+        ckpt_reads_before = backend->getCount(ckpt_key);
+        try
+        {
+            (void)store->resolveRef(ns, "a");
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        backend->read_observer = {};
+    });
+    ASSERT_TRUE(error);
+    EXPECT_NE(DB::getExceptionMessage(error, false).find("the query's stored cause"), String::npos)
+        << DB::getExceptionMessage(error, false);
+    EXPECT_EQ(backend->getCount(ckpt_key) - ckpt_reads_before, 1u) << "the walk's own checkpoint read, no reread";
+    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+}
+
+/// Guard: a follower waits read-only, so a killed follower takes the leader's successful recovery.
+TEST(CASRefWriterRecoveryRetry, KilledFollowerConsumesSuccessfulRecovery)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/killed_follower"});
+    const auto park = std::make_shared<ParkedRecovery>();
+    auto store = openPoolWithConfig(backend, ParkedRecovery::config(park));
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+
+    std::atomic<int> calls{0};
+    auto [leader, follower] = runWithAWaiter(park, store, life.ns,
+        [&]() -> std::optional<Resolved>
+        {
+            if (calls.fetch_add(1) == 0)
+                return store->resolveRef(life.ns, "part_1");
+            std::optional<DB::ThreadStatus> thread_status;
+            thread_status.emplace();
+            DB::Cas::tests::CasKillableQuery query(getContext().context);
+            query.kill();
+            return store->resolveRef(life.ns, "part_1");
+        },
+        [] {});
+    EXPECT_TRUE(leader.get().has_value());
+    std::optional<Resolved> follower_answer;
+    EXPECT_NO_THROW(follower_answer = follower.get());
+    EXPECT_TRUE(follower_answer.has_value());
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before + 1) << "the follower ran no walk of its own";
+}
+
+/// Guard: a walk that succeeds but finds the checkpoint moved restarts for a stopped reader too.
+TEST(CASRefWriterRecoveryRetry, CheckpointMovedRestartRunsForStoppedReader)
+{
+    auto scripted = openScriptedRecovery({WalkFate::Restart});
+    onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+    {
+        query.kill();
+        size_t refs = 0;
+        EXPECT_NO_THROW(refs = scripted.store->listRefs(scripted.ns).size());
+        EXPECT_EQ(refs, 2u);
+    });
+    EXPECT_EQ(scripted.script->walks.load(), 2u) << "the restart walk ran";
+    EXPECT_TRUE(scripted.store->refTableRecoveredForTest(scripted.ns));
+}
+
+/// Guard: the structural brake and the walk cap answer a stopped reader with their retryable error.
+TEST(CASRefWriterRecoveryRetry, StoppedReaderAtStructuralBrakeAndWalkCapGets210)
+{
+    {
+        SCOPED_TRACE("the structural brake");
+        auto scripted = openScriptedRecovery(std::vector<WalkFate>(20, WalkFate::Restart));
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            query.kill();
+            expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "restarted 3 times",
+                [&] { scripted.store->listRefs(scripted.ns); });
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 4u);
+    }
+    {
+        SCOPED_TRACE("the walk cap");
+        std::vector<WalkFate> fates(5, WalkFate::FailTransiently);
+        fates.insert(fates.end(), 3, WalkFate::Restart);
+        auto scripted = openScriptedRecovery(std::move(fates));
+        onKillableQueryThread([&](DB::Cas::tests::CasKillableQuery & query)
+        {
+            /// The owner stops once the failed walks are behind it: walks 6 to 8 follow successful walks.
+            scripted.script->before_walk = [&query](uint32_t walk)
+            {
+                if (walk == 6)
+                    query.kill();
+            };
+            expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the last walk restarted because the checkpoint or its base moved",
+                [&] { scripted.store->listRefs(scripted.ns); });
+            scripted.script->before_walk = {};
+        });
+        EXPECT_EQ(scripted.script->walks.load(), 8u);
+    }
 }
 
 /// ===================================================================================

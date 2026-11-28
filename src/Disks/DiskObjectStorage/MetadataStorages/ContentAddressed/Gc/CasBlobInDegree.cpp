@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasIntentRules.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
@@ -213,7 +214,8 @@ bool AdoptedRunReader::reportingRefusal(Read && read)
     }
     catch (const Exception & e)
     {
-        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+        /// A query's stored cause is no finding about the run, whatever its code.
+        if (e.code() != ErrorCodes::CORRUPTED_DATA || isQueryStoredCause(std::current_exception()))
             throw;
         refused = Refusal{.run_key = next_run > 0 ? currentRun().key : String{}, .message = e.message()};
         view.reset();
@@ -242,8 +244,9 @@ bool AdoptedRunReader::nextInRunChecked(SourceEdgeRecord & rec)
     }
     catch (Exception & e)
     {
+        /// The row read refills from the store, so this can be a stopped query's shared exception.
         if (e.code() == ErrorCodes::CORRUPTED_DATA)
-            e.addMessage(fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
+            addMessageUnlessQueryStoredCause(e, fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
         throw;
     }
     if (!got)

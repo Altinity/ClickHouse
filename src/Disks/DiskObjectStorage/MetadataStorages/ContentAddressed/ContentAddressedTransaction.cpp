@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasOwner.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
+#include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/getRandomASCIIString.h>
@@ -29,6 +32,7 @@
 #include <base/scope_guard.h>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -36,6 +40,11 @@ namespace ProfileEvents
 {
     extern const Event CASBlobUploadFanoutBatches;
     extern const Event CASBlobUploadFanoutTasks;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric IsServerShuttingDown;
 }
 
 namespace fs = std::filesystem;
@@ -61,6 +70,13 @@ namespace
 bool hasSuffix(std::string_view s, std::string_view suffix)
 {
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+}
+
+/// True when the removal is retried after a restart, so server shutdown may stop it: today only the catalog's drop
+/// worker removes an `Atomic` table directory without a query. A new such caller must requeue a failed removal.
+bool tableRemovalResumesAfterRestart(const std::string & path)
+{
+    return endsWithTableUuidPair(path) && !CurrentThread::tryGetQueryContext();
 }
 
 }
@@ -707,6 +723,8 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// dropped. `dropRefIfMatches` additionally guards against a concurrent repoint of the SAME ref
         /// since this call's own publish: it removes the ref only if it still names the exact
         /// `manifest_ref` this commit bound, leaving a newer binding untouched.
+        /// Owed to the failed commit: a stopped owner must not leave a ref of that commit live.
+        const auto owed = Cas::OwnerScope::owed();
         for (const auto & oc : part_outcomes)
             if (oc && oc->created)
                 metadata_storage.partAccess()->dropRefIfMatches({oc->ns, oc->ref}, oc->manifest_ref);
@@ -1317,6 +1335,13 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// file go in one dropNamespace.
     if (auto uuid = Cas::parseTableUuid(path))
     {
+        std::optional<Cas::OwnerScope> shutdown_owner;
+        if (Cas::tableRemovalResumesAfterRestart(path))
+            shutdown_owner.emplace(Cas::OwnerScope::background([]
+            {
+                if (CurrentMetrics::get(CurrentMetrics::IsServerShuttingDown))
+                    throw Exception(ErrorCodes::ABORTED, "CAS table namespace removal stopped by server shutdown");
+            }));
         metadata_storage.partAccess()->dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }
@@ -1768,6 +1793,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     /// attach via moveFile): delegate to moveDirectory, which owns directory shapes.
     if (src && dst && !src->ref.empty() && src->file.empty() && !dst->ref.empty() && dst->file.empty())
     {
+        /// Owed to the reserved name: only the undo reaches here, and SQL rejects a part left under it.
+        const auto owed = Cas::OwnerScope::owed();
         moveDirectory(path_from, path_to);
         return;
     }
@@ -2044,6 +2071,8 @@ void fanOutBlobUploads(
         size_t idx = 0;
         for (const auto & [ref, req] : grouped)
         {
+            /// The drain guard still joins the tasks already dispatched.
+            throwIfBackgroundStopped();
             std::optional<BlobUploadResult> * slot = &result_slots[idx++];
             BlobUploadRequest task_req = req;
             const BlobUploadFanoutHooksForTest * task_hooks = hooks;
@@ -2052,8 +2081,10 @@ void fanOutBlobUploads(
             /// Schedule and track in ONE no-throw step: `enqueueAndGiveOwnership` returns the handle (the
             /// task is now runnable) and the pre-reserved `emplace_back` records it without allocating, so
             /// there is no window in which a scheduled task is untracked.
-            handles.emplace_back(runner.enqueueAndGiveOwnership([slot, txn, req_by_value = std::move(task_req), task_hooks]
+            handles.emplace_back(runner.enqueueAndGiveOwnership([slot, txn, req_by_value = std::move(task_req), task_hooks,
+                                                                 group = CurrentThread::getGroup()]
             {
+                throwUnlessInThreadGroup(group, "CAS blob upload worker");
                 if (task_hooks && task_hooks->in_task)
                     task_hooks->in_task(req_by_value.ref);
                 *slot = txn->uploadBlobDetached(req_by_value);

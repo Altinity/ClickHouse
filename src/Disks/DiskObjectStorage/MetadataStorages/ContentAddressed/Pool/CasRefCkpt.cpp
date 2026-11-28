@@ -175,9 +175,11 @@ CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, c
         return CkptStampResult{.outcome = CkptStampOutcome::Stamped,
                                .stamped = CkptSample{.ckpt = std::move(stamped), .etag = committed->etag}};
     }
-    if (std::holds_alternative<Conflict>(result))
-        return CkptStampResult{.outcome = CkptStampOutcome::TokenMismatch, .stamped = std::nullopt};
-    return CkptStampResult{.outcome = CkptStampOutcome::Unresolved, .stamped = std::nullopt};
+    if (const auto * conflict = std::get_if<Conflict>(&result))
+        return CkptStampResult{.outcome = CkptStampOutcome::TokenMismatch, .stamped = std::nullopt,
+                               .observed_stop = conflict->observed_stop};
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    return CkptStampResult{.outcome = CkptStampOutcome::Unresolved, .stamped = std::nullopt, .sent_any = gave_up && gave_up->sent_any};
 }
 
 MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current)

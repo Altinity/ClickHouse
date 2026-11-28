@@ -942,7 +942,7 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
         "fold_ref_group", "fold_seal_read", "fold_ref_intake", "intent_sweep_list",
         "fold_reduce", "fold_seal_write",
         "pending_deletes", "round_commit", "handoff_reclaim",
-        "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};
+        "manifest_deletes", "orphan_sweep", "namespace_cleanup", "ref_object_cleanup"};
     EXPECT_EQ(phaseNames(rows, 0), expected);
 
     /// Every phase row is a Phase row of THIS round and carries a duration field (0 is a legitimate

@@ -11,9 +11,9 @@ services:
         condition: service_started
     volumes:
       # Compose resolves relative binds against the generated first compose file in
-      # `<test dir>/_instances-*/node`, not against this appended file, so `../..` is the
-      # directory holding this file.
-      - ../../s3_fault_proxy.py:/proxy/s3_fault_proxy.py:ro
+      # `<test dir>/_instances-*/node`, not against this appended file, so `../../..` is
+      # `tests/integration`.
+      - ../../../helpers/s3_mocks/s3_fault_proxy.py:/proxy/s3_fault_proxy.py:ro
     expose:
       - "11121"
     ports:
