@@ -145,7 +145,7 @@ Everywhere else the `CAS` requests of a stopped query run as on a plain S3 disk.
 
 The S3 client reports a stopped query's error in place of any failed answer from the store, as on a plain S3 disk. This includes an expected answer of a healthy store, such as `404` for a key that does not exist. So the query can still fail with `QUERY_WAS_CANCELLED` or `TIMEOUT_EXCEEDED` when the store answers with an error after the stop. A bulk delete that the store answers successfully, with an error for one of its keys, keeps that key's error. Writes of several queries to one table's metadata can be sent together by one of them. When that query is stopped, such a failed answer can fail the other queries' writes in the same request too.
 
-A metadata write that loses a race to another writer after the stop fails the query with `ABORTED` (236) and a message that says "conflict": the S3 client reports the stop in place of the store's refusal, and a read of the key shows the other writer's object.
+A metadata write that loses a race to another writer after the stop fails the query with `ABORTED` (236) and a message that says "conflict": the S3 client reports the stop in place of the store's refusal, and a read of the key shows the other writer's object. A write that lost its race before the stop reads the key again before its next attempt. When that read fails after the stop, the query fails with the read's error, which the S3 client reports as `QUERY_WAS_CANCELLED` or `TIMEOUT_EXCEEDED`. The exception is a write decided on the server's cached copy of the key: that read settles its refusal, and the query fails with `ABORTED` (236) and "conflict".
 
 Two background owners stop `CAS` work at its next step, with their own error:
 
