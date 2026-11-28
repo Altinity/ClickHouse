@@ -1207,7 +1207,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
     return std::make_unique<WriteBufferInlineOrBlob>(
         path, INLINE_CAP, /*create_blob_if_empty=*/false, std::move(create_local_blob_writer),
-        [this, route = std::move(*r), hash_algo](FinalizeResult result)
+        [this, route = std::move(*r), hash_algo](FinalizeResult && result)
         {
             auto * inlined = std::get_if<InlineData>(&result);
             if (!inlined)
@@ -1219,6 +1219,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             entry.path = route.file;
             entry.placement = Cas::EntryPlacement::Inline;
             entry.ref = Cas::poolContentHash(hash_algo, inlined->data);
+            /// Closed inline candidates keep their string allocations until commit. With 64 KiB writes,
+            /// a 600 KiB file can retain about 1 MiB of capacity. Trimming 64 such files saves about
+            /// 26.5 MiB of unused capacity across the transaction.
+            inlined->data.shrink_to_fit();
             entry.inline_bytes = std::move(inlined->data);
             putEntry(st, std::move(entry), nullptr);
         },
