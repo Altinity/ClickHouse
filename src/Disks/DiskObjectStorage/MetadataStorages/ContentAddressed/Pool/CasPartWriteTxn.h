@@ -15,6 +15,8 @@ namespace DB { class WriteBuffer; }
 namespace DB::Cas
 {
 
+inline constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
+
 /// Re-readable source for one content-addressed blob upload.
 ///
 /// `open` returns a fresh reader over exactly `size` logical bytes and may be called more than once.
